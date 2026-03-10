@@ -15,8 +15,6 @@ jobs:
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -28,11 +26,6 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Configure Git auth for private SDK dependency
-        shell: bash
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.SDK_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Install WiX Toolset
         if: runner.os == 'Windows'
