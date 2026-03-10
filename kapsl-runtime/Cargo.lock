@@ -687,15 +687,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cudarc"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
-dependencies = [
- "libloading",
-]
-
-[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1644,15 +1635,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "indoc"
-version = "2.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
 name = "io-extras"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1806,6 +1788,7 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "futures",
@@ -1816,7 +1799,7 @@ dependencies = [
  "kapsl-llm",
  "log",
  "lru",
- "ndarray 0.17.2",
+ "ndarray",
  "ort",
  "serde",
  "thiserror 1.0.69",
@@ -1826,6 +1809,7 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "flate2",
  "fs2",
@@ -1844,21 +1828,20 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "futures",
  "serde",
- "serde_json",
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "kapsl-hal"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
- "cudarc",
- "nvml-wrapper",
  "serde",
  "serde_json",
  "sys-info",
@@ -1868,6 +1851,7 @@ dependencies = [
 [[package]]
 name = "kapsl-ipc"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1885,6 +1869,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "kapsl-hal",
  "log",
@@ -1895,10 +1880,10 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-stream",
  "async-trait",
- "env_logger",
  "futures",
  "half",
  "kapsl-core",
@@ -1908,7 +1893,7 @@ dependencies = [
  "kapsl-quantization",
  "llama-cpp-2",
  "log",
- "ndarray 0.17.2",
+ "ndarray",
  "ort",
  "serde",
  "serde_json",
@@ -1922,6 +1907,7 @@ dependencies = [
 [[package]]
 name = "kapsl-monitor"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1933,24 +1919,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "kapsl-pyo3"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "kapsl-engine-api",
- "kapsl-ipc",
- "kapsl-shm",
- "kapsl-transport",
- "libc",
- "numpy",
- "pyo3",
- "serde",
- "tokio",
-]
-
-[[package]]
 name = "kapsl-quantization"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "anyhow",
  "half",
@@ -1964,6 +1935,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1982,6 +1954,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag-sdk"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "futures",
@@ -1993,6 +1966,7 @@ dependencies = [
 [[package]]
 name = "kapsl-scheduler"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "futures",
@@ -2006,6 +1980,7 @@ dependencies = [
 [[package]]
 name = "kapsl-shm"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2026,6 +2001,7 @@ dependencies = [
 [[package]]
 name = "kapsl-transport"
 version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2374,21 +2350,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "portable-atomic",
- "portable-atomic-util",
- "rawpointer",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
@@ -2466,44 +2427,6 @@ name = "number_prefix"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
-
-[[package]]
-name = "numpy"
-version = "0.22.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edb929bc0da91a4d85ed6c0a84deaa53d411abfb387fc271124f91bf6b89f14e"
-dependencies = [
- "libc",
- "ndarray 0.16.1",
- "num-complex",
- "num-integer",
- "num-traits",
- "pyo3",
- "rustc-hash 1.1.0",
-]
-
-[[package]]
-name = "nvml-wrapper"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9bff0aa1d48904a1385ea2a8b97576fbdcbc9a3cfccd0d31fe978e1c4038c5"
-dependencies = [
- "bitflags 2.10.0",
- "libloading",
- "nvml-wrapper-sys",
- "static_assertions",
- "thiserror 1.0.69",
- "wrapcenum-derive",
-]
-
-[[package]]
-name = "nvml-wrapper-sys"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "698d45156f28781a4e79652b6ebe2eaa0589057d588d3aec1333f6466f13fcb5"
-dependencies = [
- "libloading",
-]
 
 [[package]]
 name = "object"
@@ -2611,7 +2534,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5df903c0d2c07b56950f1058104ab0c8557159f2741782223704de9be73c3c"
 dependencies = [
  "half",
- "ndarray 0.17.2",
+ "ndarray",
  "ort-sys",
  "smallvec",
  "tracing",
@@ -2828,69 +2751,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7186d3822593aa4393561d186d1393b3923e9d6163d3fbfd6e825e3e6cf3e6a8"
 dependencies = [
  "num-traits",
-]
-
-[[package]]
-name = "pyo3"
-version = "0.22.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f402062616ab18202ae8319da13fa4279883a2b8a9d9f83f20dbade813ce1884"
-dependencies = [
- "cfg-if",
- "indoc",
- "libc",
- "memoffset 0.9.1",
- "once_cell",
- "portable-atomic",
- "pyo3-build-config",
- "pyo3-ffi",
- "pyo3-macros",
- "unindent",
-]
-
-[[package]]
-name = "pyo3-build-config"
-version = "0.22.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b14b5775b5ff446dd1056212d778012cbe8a0fbffd368029fd9e25b514479c38"
-dependencies = [
- "once_cell",
- "target-lexicon",
-]
-
-[[package]]
-name = "pyo3-ffi"
-version = "0.22.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ab5bcf04a2cdcbb50c7d6105de943f543f9ed92af55818fd17b660390fc8636"
-dependencies = [
- "libc",
- "pyo3-build-config",
-]
-
-[[package]]
-name = "pyo3-macros"
-version = "0.22.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fd24d897903a9e6d80b968368a34e1525aeb719d568dba8b3d4bfa5dc67d453"
-dependencies = [
- "proc-macro2",
- "pyo3-macros-backend",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "pyo3-macros-backend"
-version = "0.22.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36c011a03ba1e50152b4b394b479826cad97e7a21eb52df179cd91ac411cbfbe"
-dependencies = [
- "heck 0.5.0",
- "proc-macro2",
- "pyo3-build-config",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -3437,12 +3297,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
-
-[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3863,12 +3717,6 @@ name = "unicode_categories"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39ec24b3121d976906ece63c9daad25b85969647682eee313cb5779fdd69e14e"
-
-[[package]]
-name = "unindent"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
 
 [[package]]
 name = "unsafe-libyaml"
@@ -5077,18 +4925,6 @@ dependencies = [
  "log",
  "thiserror 1.0.69",
  "wast 35.0.2",
-]
-
-[[package]]
-name = "wrapcenum-derive"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a76ff259533532054cfbaefb115c613203c73707017459206380f03b3b3f266e"
-dependencies = [
- "darling",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
