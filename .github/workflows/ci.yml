@@ -21,7 +21,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Configure Git auth for private SDK dependency
-        run: git config --global url."https://x-access-token:${{ github.token }}@github.com/".insteadOf "https://github.com/"
+        run: git config --global url."https://x-access-token:${{ secrets.SDK_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "aimod-runtime/**"
+      - "kapsl-runtime/**"
       - ".github/workflows/windows-runtime-check.yml"
   push:
     branches:
       - main
     paths:
-      - "aimod-runtime/**"
+      - "kapsl-runtime/**"
       - ".github/workflows/windows-runtime-check.yml"
 
 permissions:
@@ -23,22 +23,29 @@ jobs:
   windows-runtime-check:
     name: Cargo check (Windows runtime)
     runs-on: windows-latest
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Configure Git auth for private SDK dependency
+        shell: pwsh
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SDK_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cargo check runtime crates
+      - name: Cargo check runtime CLI
         shell: pwsh
         run: |
-          cargo check --manifest-path aimod-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p aimod-shm -p aimod-pyo3 -p kapsl
+          cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
 
-      - name: Cargo check IPC deepseek example
+      - name: Cargo check runtime benchmarks
         shell: pwsh
         run: |
-          cargo check --manifest-path aimod-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p aimod-ipc --example deepseek_client
+          cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p shm-bench-native -p native-hybrid-client

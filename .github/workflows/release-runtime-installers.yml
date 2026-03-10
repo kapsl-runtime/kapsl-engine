@@ -15,6 +15,8 @@ jobs:
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +28,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Configure Git auth for private SDK dependency
+        shell: bash
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.SDK_REPO_ACCESS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Install WiX Toolset
         if: runner.os == 'Windows'
@@ -40,7 +47,7 @@ jobs:
       - name: Resolve runtime version (Unix)
         if: runner.os != 'Windows'
         run: |
-          raw_version="$(grep -m1 '^version = ' aimod-runtime/crates/aimod-cli/Cargo.toml | cut -d '"' -f2)"
+          raw_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
 
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
             raw_version="${GITHUB_REF_NAME#v}"
@@ -62,7 +69,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $cargoToml = Get-Content "aimod-runtime/crates/aimod-cli/Cargo.toml"
+          $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
           $rawVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
 
           if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME) {
@@ -82,13 +89,13 @@ jobs:
           "KAPSL_DEB_VERSION=$debVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kapsl
-        run: cargo build --manifest-path aimod-runtime/Cargo.toml -p kapsl --release
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
       - name: Package Debian installer (.deb)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist pkgroot/DEBIAN pkgroot/usr/local/bin
-          install -m 755 aimod-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+          install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
 
           arch="$(dpkg --print-architecture)"
 
@@ -111,7 +118,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist pkgroot/usr/local/bin
-          install -m 755 aimod-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+          install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
 
           arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
           case "${arch_name}" in
@@ -157,7 +164,7 @@ jobs:
           }
 
           $msiName = "kapsl-runtime-$($env:KAPSL_VERSION)-windows-$arch.msi"
-          Copy-Item "aimod-runtime/target/release/kapsl.exe" "wix/kapsl.exe" -Force
+          Copy-Item "kapsl-runtime/target/release/kapsl.exe" "wix/kapsl.exe" -Force
 
           $wxsLines = @(
             '<?xml version="1.0" encoding="UTF-8"?>'
