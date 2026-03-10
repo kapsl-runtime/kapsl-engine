@@ -2,8 +2,9 @@ name: Release Runtime Installers
 
 on:
   workflow_dispatch:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -209,7 +210,7 @@ jobs:
           if-no-files-found: error
 
   upload-release-assets:
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build-runtime-installers
     runs-on: ubuntu-latest
     steps:
