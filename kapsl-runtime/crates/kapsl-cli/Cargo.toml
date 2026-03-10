@@ -8,18 +8,18 @@ default = []
 infer-adapter-echo = []
 
 [dependencies]
-kapsl-core = { path = "../kapsl-core" }
-kapsl-hal = { path = "../kapsl-hal" }
-kapsl-engine-api = { path = "../kapsl-engine-api" }
-kapsl-backends = { path = "../kapsl-backends" }
-kapsl-scheduler = { path = "../kapsl-scheduler" }
-kapsl-ipc = { path = "../kapsl-ipc" }
-kapsl-monitor = { path = "../kapsl-monitor" }
-kapsl-transport = { path = "../kapsl-transport" }
-kapsl-shm = { path = "../kapsl-shm" }
-kapsl-llm = { path = "../kapsl-llm" }
-kapsl-rag = { path = "../kapsl-rag" }
-kapsl-rag-sdk = { path = "../kapsl-rag-sdk" }
+kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-core" }
+kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-hal" }
+kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-engine-api" }
+kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-backends" }
+kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-scheduler" }
+kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-ipc" }
+kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-monitor" }
+kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-transport" }
+kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-shm" }
+kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-llm" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-rag" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-rag-sdk" }
 warp = "0.3"
 prometheus = "0.14"
 parking_lot = "0.12"

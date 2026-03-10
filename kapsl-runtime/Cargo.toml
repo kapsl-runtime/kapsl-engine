@@ -1,19 +1,6 @@
 [workspace]
 members = [
-    "crates/kapsl-backends",
-    "crates/kapsl-hal",
-    "crates/kapsl-scheduler",
-    "crates/kapsl-engine-api",
     "crates/kapsl-cli",
-    "crates/kapsl-ipc",
-    "crates/kapsl-shm",
-    "crates/kapsl-pyo3",
-    "crates/kapsl-transport",
-    "crates/kapsl-llm",
-    "crates/kapsl-rag",
-    "crates/kapsl-rag-sdk",
-    "crates/kapsl-kernels",
-    "crates/kapsl-quantization",
     "benchmarks/shm-bench-native",
     "benchmarks/native-hybrid-client",
 ]

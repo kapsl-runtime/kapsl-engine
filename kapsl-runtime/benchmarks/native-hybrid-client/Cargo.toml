@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-kapsl-shm = { path = "../../crates/kapsl-shm" }
-kapsl-ipc = { path = "../../crates/kapsl-ipc" }
-kapsl-transport = { path = "../../crates/kapsl-transport" }
+kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-shm" }
+kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-ipc" }
+kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "main", package = "kapsl-transport" }
 tokio = { version = "1", features = ["full"] }
 bincode = "1.3"
 clap = { version = "4", features = ["derive"] }
