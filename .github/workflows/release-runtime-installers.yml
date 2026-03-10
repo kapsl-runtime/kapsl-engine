@@ -26,6 +26,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
 
       - name: Install WiX Toolset
         if: runner.os == 'Windows'

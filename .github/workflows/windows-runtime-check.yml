@@ -31,6 +31,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
 
       - name: Cargo check runtime CLI
