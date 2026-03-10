@@ -1,0 +1,918 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Kapsl Runtime Console</title>
+        <link rel="stylesheet" href="/ui/styles.css" />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link
+            href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+            rel="stylesheet"
+        />
+    </head>
+    <body>
+        <div id="auth-gate" class="auth-gate active">
+            <section class="auth-card">
+                <div class="auth-card-head">
+                    <div class="brand-mark" aria-hidden="true">K</div>
+                    <div>
+                        <h1>Kapsl Sign In</h1>
+                        <p>Authenticate to view runtime metrics and models.</p>
+                    </div>
+                </div>
+                <form id="login-form" class="auth-form">
+                    <label class="field">
+                        <span>API Key</span>
+                        <input
+                            id="login-token-input"
+                            class="input"
+                            type="password"
+                            autocomplete="off"
+                            placeholder="reader / writer / admin API key"
+                        />
+                    </label>
+                    <div class="auth-actions">
+                        <button
+                            id="login-submit-btn"
+                            class="btn btn-primary"
+                            type="submit"
+                        >
+                            Sign In
+                        </button>
+                        <button
+                            id="login-clear-btn"
+                            class="btn btn-secondary"
+                            type="button"
+                        >
+                            Clear
+                        </button>
+                    </div>
+                </form>
+                <p class="auth-help">
+                    Use a token with at least reader access. If API auth is
+                    disabled on localhost, an empty token is accepted.
+                </p>
+                <div id="login-feedback" class="status-line"></div>
+            </section>
+        </div>
+
+        <div id="app-shell" class="app-shell locked">
+            <header class="header">
+                <div class="header-content">
+                    <div class="brand">
+                        <div class="brand-mark" aria-hidden="true">K</div>
+                        <div class="brand-text">
+                            <h1>Kapsl</h1>
+                            <p>Runtime Console</p>
+                        </div>
+                    </div>
+
+                    <nav class="nav" aria-label="Primary">
+                        <button
+                            class="nav-item"
+                            type="button"
+                            data-view="dashboard"
+                        >
+                            Dashboard
+                        </button>
+                        <button
+                            class="nav-item"
+                            type="button"
+                            data-view="system"
+                        >
+                            System
+                        </button>
+                        <button
+                            class="nav-item"
+                            type="button"
+                            data-view="extensions"
+                        >
+                            Extensions
+                        </button>
+                        <button
+                            class="nav-item"
+                            type="button"
+                            data-view="access"
+                        >
+                            Access
+                        </button>
+                    </nav>
+
+                    <div class="header-stats">
+                        <div class="stat-card">
+                            <div class="stat-label">System Status</div>
+                            <div class="stat-value" id="system-status">
+                                <span class="status-dot status-loading"></span>
+                                <span>Loading...</span>
+                            </div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Total Models</div>
+                            <div class="stat-value" id="total-models">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Active Inferences</div>
+                            <div class="stat-value" id="total-active">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Session</div>
+                            <div class="stat-value" id="session-status">
+                                Locked
+                            </div>
+                            <div class="stat-meta" id="session-detail">
+                                mode: locked
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </header>
+
+            <main class="main-content">
+                <div class="container">
+                    <section
+                        id="view-dashboard"
+                        class="view active"
+                        data-view="dashboard"
+                    >
+                        <div class="section-header">
+                            <div class="section-title">
+                                <h2>Dashboard</h2>
+                                <p>Models, scaling, and quick start.</p>
+                            </div>
+                            <div class="refresh-indicator">
+                                <div class="pulse-dot"></div>
+                                <span>Live</span>
+                            </div>
+                        </div>
+
+                        <div class="grid-2">
+                            <section class="panel">
+                                <div class="panel-header">
+                                    <h3>Start Model</h3>
+                                    <p>Load a local .aimod package.</p>
+                                </div>
+                                <form id="start-model-form" class="form-grid">
+                                    <label class="field">
+                                        <span>Model Path</span>
+                                        <input
+                                            id="start-model-path"
+                                            class="input"
+                                            type="text"
+                                            placeholder="/path/to/model.aimod"
+                                            autocomplete="off"
+                                            required
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>Model ID (optional)</span>
+                                        <input
+                                            id="start-model-id"
+                                            class="input"
+                                            type="number"
+                                            min="1"
+                                            step="1"
+                                            placeholder="auto"
+                                        />
+                                    </label>
+                                    <label class="field">
+                                        <span>Topology</span>
+                                        <select
+                                            id="start-model-topology"
+                                            class="select"
+                                        >
+                                            <option value="data-parallel">
+                                                data-parallel
+                                            </option>
+                                            <option value="tensor-parallel">
+                                                tensor-parallel
+                                            </option>
+                                            <option value="pipeline-parallel">
+                                                pipeline-parallel
+                                            </option>
+                                            <option value="mixed">mixed</option>
+                                        </select>
+                                    </label>
+                                    <label class="field">
+                                        <span>TP Degree</span>
+                                        <input
+                                            id="start-model-tp-degree"
+                                            class="input"
+                                            type="number"
+                                            min="1"
+                                            step="1"
+                                            value="1"
+                                        />
+                                    </label>
+                                    <div class="form-actions">
+                                        <button
+                                            class="btn btn-primary"
+                                            type="submit"
+                                        >
+                                            Start
+                                        </button>
+                                        <button
+                                            class="btn btn-secondary"
+                                            id="start-model-clear"
+                                            type="button"
+                                        >
+                                            Clear
+                                        </button>
+                                    </div>
+                                </form>
+                                <div
+                                    id="start-model-feedback"
+                                    class="status-line"
+                                ></div>
+                            </section>
+
+                            <section class="panel">
+                                <div class="panel-header">
+                                    <h3>Hardware</h3>
+                                    <p>Detected providers and devices.</p>
+                                </div>
+                                <div class="kv-list">
+                                    <div class="kv-row">
+                                        <span>CPU</span>
+                                        <strong id="hw-cpu">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Memory</span>
+                                        <strong id="hw-mem">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>GPUs</span>
+                                        <strong id="hw-gpus">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Providers</span>
+                                        <strong id="hw-providers">-</strong>
+                                    </div>
+                                </div>
+                                <div
+                                    id="hardware-detail"
+                                    class="mono-block"
+                                ></div>
+                            </section>
+                        </div>
+
+                        <section class="panel">
+                            <div class="panel-header">
+                                <h3>Remote Artifacts</h3>
+                                <p>
+                                    Push and pull <code>.aimod</code> packages
+                                    via the deployed backend endpoint.
+                                </p>
+                            </div>
+                            <div class="inline-form">
+                                <input
+                                    id="engine-remote-url"
+                                    class="input"
+                                    type="text"
+                                    placeholder="http://idx-controller.local/v1 (optional)"
+                                />
+                            </div>
+                            <form id="engine-push-form" class="inline-form">
+                                <input
+                                    id="engine-push-target"
+                                    class="input"
+                                    type="text"
+                                    placeholder="repo/model:label (required)"
+                                />
+                                <input
+                                    id="engine-push-path"
+                                    class="input"
+                                    type="text"
+                                    placeholder="/path/to/package.aimod"
+                                />
+                                <button class="btn btn-primary" type="submit">
+                                    Push
+                                </button>
+                            </form>
+                            <form id="engine-pull-form" class="inline-form">
+                                <input
+                                    id="engine-pull-target"
+                                    class="input"
+                                    type="text"
+                                    placeholder="repo/model:label (required)"
+                                />
+                                <input
+                                    id="engine-pull-destination"
+                                    class="input"
+                                    type="text"
+                                    placeholder="destination dir (optional)"
+                                />
+                                <input
+                                    id="engine-pull-reference"
+                                    class="input"
+                                    type="text"
+                                    placeholder="OCI reference/tag (optional)"
+                                />
+                                <button class="btn btn-primary" type="submit">
+                                    Pull
+                                </button>
+                            </form>
+                            <div
+                                id="engine-remote-feedback"
+                                class="status-line"
+                            ></div>
+                            <div
+                                id="engine-remote-result"
+                                class="mono-block"
+                            ></div>
+                        </section>
+
+                        <div class="section-header">
+                            <div class="section-title">
+                                <h2>Running Models</h2>
+                                <p>
+                                    Primary models only (replicas are grouped).
+                                </p>
+                            </div>
+                        </div>
+
+                        <div id="loading-state" class="loading-state">
+                            <div class="loading-spinner"></div>
+                            <p>Connecting to the runtime API...</p>
+                        </div>
+
+                        <div
+                            id="error-state"
+                            class="error-state"
+                            style="display: none"
+                        >
+                            <h3>Unable to Connect</h3>
+                            <p id="error-message">
+                                Failed to connect to the runtime API
+                            </p>
+                            <button
+                                class="btn btn-secondary"
+                                onclick="app.fetchData()"
+                            >
+                                Retry
+                            </button>
+                        </div>
+
+                        <div
+                            id="empty-state"
+                            class="empty-state"
+                            style="display: none"
+                        >
+                            <h3>No Models Running</h3>
+                            <p>
+                                Start the runtime with models, or use Start
+                                Model.
+                            </p>
+                            <code>kapsl run --model /path/to/model.aimod</code>
+                        </div>
+
+                        <div
+                            id="models-grid"
+                            class="models-grid"
+                            style="display: none"
+                        ></div>
+                    </section>
+
+                    <section id="view-system" class="view" data-view="system">
+                        <div class="section-header">
+                            <div class="section-title">
+                                <h2>System</h2>
+                                <p>Aggregate metrics and trends.</p>
+                            </div>
+                            <div class="refresh-indicator">
+                                <div class="pulse-dot"></div>
+                                <span>Live</span>
+                            </div>
+                        </div>
+
+                        <div class="grid-3">
+                            <div class="metric-card">
+                                <div class="metric-label">Runtime RSS</div>
+                                <div class="metric-value" id="sys-rss">-</div>
+                                <canvas
+                                    id="chart-rss"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-label">Model Memory Sum</div>
+                                <div class="metric-value" id="sys-model-mem">
+                                    -
+                                </div>
+                                <canvas
+                                    id="chart-model-mem"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-label">GPU Utilization</div>
+                                <div class="metric-value" id="sys-gpu-util">
+                                    -
+                                </div>
+                                <canvas
+                                    id="chart-gpu-util"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-label">Throughput</div>
+                                <div class="metric-value" id="sys-throughput">
+                                    -
+                                </div>
+                                <canvas
+                                    id="chart-throughput"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-label">
+                                    Active Inferences
+                                </div>
+                                <div class="metric-value" id="sys-active">
+                                    -
+                                </div>
+                                <canvas
+                                    id="chart-active"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                            <div class="metric-card">
+                                <div class="metric-label">Queue Depth</div>
+                                <div class="metric-value" id="sys-queue">-</div>
+                                <canvas
+                                    id="chart-queue"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                        </div>
+
+                        <section class="panel">
+                            <div class="panel-header">
+                                <h3>Process</h3>
+                                <p>Host stats from /api/system/stats.</p>
+                            </div>
+                            <div class="kv-list">
+                                <div class="kv-row">
+                                    <span>PID</span>
+                                    <strong id="sys-pid">-</strong>
+                                </div>
+                                <div class="kv-row">
+                                    <span>GPU Memory</span>
+                                    <strong id="sys-gpu-mem">-</strong>
+                                </div>
+                                <div class="kv-row">
+                                    <span>Collected</span>
+                                    <strong id="sys-collected">-</strong>
+                                </div>
+                            </div>
+                            <div id="system-feedback" class="status-line"></div>
+                        </section>
+                    </section>
+
+                    <section
+                        id="view-extensions"
+                        class="view"
+                        data-view="extensions"
+                    >
+                        <div class="section-header">
+                            <div class="section-title">
+                                <h2>Extensions</h2>
+                                <p>Install and manage runtime extensions.</p>
+                            </div>
+                            <div class="inline-form">
+                                <label class="toggle">
+                                    <input
+                                        id="extensions-dev-toggle"
+                                        type="checkbox"
+                                    />
+                                    <span>Developer Features</span>
+                                </label>
+                                <button
+                                    class="btn btn-secondary"
+                                    id="extensions-refresh-btn"
+                                    type="button"
+                                >
+                                    Refresh
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="grid-2">
+                            <section class="panel">
+                                <div class="panel-header">
+                                    <h3>Marketplace</h3>
+                                    <p>Search and install extensions.</p>
+                                </div>
+                                <form
+                                    id="marketplace-search-form"
+                                    class="inline-form"
+                                >
+                                    <input
+                                        id="marketplace-query"
+                                        class="input"
+                                        type="text"
+                                        placeholder="Search extensions..."
+                                    />
+                                    <input
+                                        id="marketplace-url"
+                                        class="input"
+                                        type="text"
+                                        placeholder="marketplace URL (optional)"
+                                    />
+                                    <button
+                                        class="btn btn-primary"
+                                        type="submit"
+                                    >
+                                        Search
+                                    </button>
+                                </form>
+                                <div
+                                    id="marketplace-feedback"
+                                    class="status-line"
+                                ></div>
+                                <div
+                                    id="marketplace-results"
+                                    class="stack"
+                                ></div>
+                            </section>
+
+                            <section id="local-install-panel" class="panel">
+                                <div class="panel-header">
+                                    <h3>Install Local</h3>
+                                    <p>
+                                        Install from a local directory
+                                        containing an extension manifest.
+                                    </p>
+                                </div>
+                                <form
+                                    id="local-install-form"
+                                    class="inline-form"
+                                >
+                                    <input
+                                        id="local-extension-path"
+                                        class="input"
+                                        type="text"
+                                        placeholder="/path/to/extension-dir"
+                                    />
+                                    <button
+                                        class="btn btn-primary"
+                                        type="submit"
+                                    >
+                                        Install
+                                    </button>
+                                </form>
+                                <div
+                                    id="local-install-notice"
+                                    class="notice"
+                                ></div>
+                                <div
+                                    id="local-install-feedback"
+                                    class="status-line"
+                                ></div>
+                            </section>
+                        </div>
+                        <div
+                            id="local-install-disabled-note"
+                            class="notice"
+                            style="margin-top: -8px; margin-bottom: 16px"
+                        ></div>
+
+                        <section class="panel">
+                            <div class="panel-header">
+                                <h3>Installed Extensions</h3>
+                                <p>
+                                    Launch connectors and edit workspace config.
+                                </p>
+                            </div>
+                            <div class="inline-form">
+                                <input
+                                    id="extensions-workspace-id"
+                                    class="input"
+                                    type="text"
+                                    placeholder="workspace_id (required)"
+                                />
+                                <input
+                                    id="extensions-tenant-id"
+                                    class="input"
+                                    type="text"
+                                    placeholder="tenant_id (optional)"
+                                />
+                                <input
+                                    id="extensions-source-id"
+                                    class="input"
+                                    type="text"
+                                    placeholder="source_id (optional)"
+                                />
+                            </div>
+                            <div
+                                id="extensions-feedback"
+                                class="status-line"
+                            ></div>
+                            <div id="extensions-list" class="stack"></div>
+                        </section>
+                    </section>
+
+                    <section id="view-access" class="view" data-view="access">
+                        <div class="section-header access-section-header">
+                            <div class="section-title">
+                                <h2>Access Control</h2>
+                                <p>Users, API keys, and legacy role tokens.</p>
+                            </div>
+                            <button
+                                class="btn btn-secondary"
+                                id="refresh-access-btn"
+                                type="button"
+                            >
+                                Refresh
+                            </button>
+                        </div>
+
+                        <div class="access-grid">
+                            <section class="access-panel">
+                                <h3>Session Token</h3>
+                                <p class="access-help">
+                                    Save an admin API key to manage users and
+                                    keys.
+                                </p>
+                                <div class="access-inline-form">
+                                    <input
+                                        id="auth-token-input"
+                                        class="access-input access-token-input"
+                                        type="password"
+                                        autocomplete="off"
+                                        placeholder="Paste API key (with or without Bearer prefix)"
+                                    />
+                                    <button
+                                        id="save-auth-token-btn"
+                                        class="btn btn-primary"
+                                        type="button"
+                                    >
+                                        Save
+                                    </button>
+                                    <button
+                                        id="clear-auth-token-btn"
+                                        class="btn btn-secondary"
+                                        type="button"
+                                    >
+                                        Clear
+                                    </button>
+                                </div>
+                                <div
+                                    id="auth-token-status"
+                                    class="access-status-line"
+                                ></div>
+                                <div class="access-stats-grid">
+                                    <div class="access-stat">
+                                        <span class="label">Auth Enabled</span>
+                                        <strong id="access-auth-enabled"
+                                            >-</strong
+                                        >
+                                    </div>
+                                    <div class="access-stat">
+                                        <span class="label">Users</span>
+                                        <strong id="access-user-count"
+                                            >0</strong
+                                        >
+                                    </div>
+                                    <div class="access-stat">
+                                        <span class="label">Active Keys</span>
+                                        <strong id="access-active-key-count"
+                                            >0</strong
+                                        >
+                                    </div>
+                                    <div class="access-stat">
+                                        <span class="label"
+                                            >Active Admin Keys</span
+                                        >
+                                        <strong
+                                            id="access-active-admin-key-count"
+                                            >0</strong
+                                        >
+                                    </div>
+                                </div>
+                            </section>
+
+                            <section class="access-panel">
+                                <h3>Legacy Role Tokens</h3>
+                                <p class="access-help">
+                                    Compatibility tokens for reader/writer/admin
+                                    roles.
+                                </p>
+                                <form id="legacy-tokens-form" class="stack">
+                                    <input
+                                        id="legacy-reader-token"
+                                        class="access-input"
+                                        type="password"
+                                        placeholder="reader token"
+                                    />
+                                    <input
+                                        id="legacy-writer-token"
+                                        class="access-input"
+                                        type="password"
+                                        placeholder="writer token"
+                                    />
+                                    <input
+                                        id="legacy-admin-token"
+                                        class="access-input"
+                                        type="password"
+                                        placeholder="admin token"
+                                    />
+                                    <div class="access-inline-form">
+                                        <button
+                                            class="btn btn-primary"
+                                            id="legacy-save-btn"
+                                            type="submit"
+                                        >
+                                            Save Tokens
+                                        </button>
+                                        <button
+                                            class="btn btn-secondary"
+                                            id="legacy-refresh-btn"
+                                            type="button"
+                                        >
+                                            Reload
+                                        </button>
+                                    </div>
+                                </form>
+                                <div
+                                    id="legacy-feedback"
+                                    class="access-status-line"
+                                ></div>
+                            </section>
+                        </div>
+
+                        <div class="access-grid">
+                            <section class="access-panel">
+                                <h3>Role Summary</h3>
+                                <div id="access-roles" class="roles-grid"></div>
+                            </section>
+
+                            <section class="access-panel">
+                                <h3>Users</h3>
+                                <form
+                                    id="create-user-form"
+                                    class="access-inline-form access-wrap-form"
+                                >
+                                    <input
+                                        id="new-user-username"
+                                        class="access-input"
+                                        type="text"
+                                        placeholder="username"
+                                        required
+                                    />
+                                    <input
+                                        id="new-user-display-name"
+                                        class="access-input"
+                                        type="text"
+                                        placeholder="display name (optional)"
+                                    />
+                                    <select
+                                        id="new-user-role"
+                                        class="access-select"
+                                    >
+                                        <option value="admin">admin</option>
+                                        <option value="writer">writer</option>
+                                        <option value="reader">reader</option>
+                                    </select>
+                                    <select
+                                        id="new-user-status"
+                                        class="access-select"
+                                    >
+                                        <option value="active">active</option>
+                                        <option value="suspended">
+                                            suspended
+                                        </option>
+                                    </select>
+                                    <button
+                                        class="btn btn-primary"
+                                        type="submit"
+                                    >
+                                        Create User
+                                    </button>
+                                </form>
+                                <div
+                                    id="users-feedback"
+                                    class="access-status-line"
+                                ></div>
+                                <div class="table-wrap">
+                                    <table class="access-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Username</th>
+                                                <th>Display Name</th>
+                                                <th>Role</th>
+                                                <th>Status</th>
+                                                <th>Keys</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="access-users-body"></tbody>
+                                    </table>
+                                </div>
+                            </section>
+                        </div>
+
+                        <div class="access-grid">
+                            <section class="access-panel">
+                                <h3>API Keys</h3>
+                                <div
+                                    id="selected-user-label"
+                                    class="access-help"
+                                >
+                                    Select a user to manage API keys.
+                                </div>
+                                <form
+                                    id="create-key-form"
+                                    class="access-inline-form access-wrap-form"
+                                >
+                                    <input
+                                        id="new-key-name"
+                                        class="access-input"
+                                        type="text"
+                                        placeholder="key name"
+                                        required
+                                    />
+                                    <input
+                                        id="new-key-scopes"
+                                        class="access-input"
+                                        type="text"
+                                        placeholder="scopes (comma-separated, optional)"
+                                    />
+                                    <input
+                                        id="new-key-expiry"
+                                        class="access-input"
+                                        type="number"
+                                        min="1"
+                                        step="1"
+                                        placeholder="expires in days (optional)"
+                                    />
+                                    <button
+                                        class="btn btn-primary"
+                                        type="submit"
+                                    >
+                                        Create Key
+                                    </button>
+                                </form>
+                                <div
+                                    id="keys-feedback"
+                                    class="access-status-line"
+                                ></div>
+                                <div
+                                    id="new-key-once"
+                                    class="new-key-once"
+                                    style="display: none"
+                                ></div>
+                                <div class="table-wrap">
+                                    <table class="access-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Name</th>
+                                                <th>Prefix</th>
+                                                <th>Role</th>
+                                                <th>Status</th>
+                                                <th>Expires</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="access-keys-body"></tbody>
+                                    </table>
+                                </div>
+                            </section>
+                        </div>
+                    </section>
+                </div>
+            </main>
+
+            <!-- Model Detail Modal -->
+            <div id="model-modal" class="modal">
+                <div class="modal-overlay" onclick="app.closeModal()"></div>
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h2 id="modal-title">Model Details</h2>
+                        <button class="modal-close" onclick="app.closeModal()">
+                            ×
+                        </button>
+                    </div>
+                    <div class="modal-body" id="modal-body">
+                        <!-- Content loaded dynamically -->
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script src="/ui/app.js"></script>
+    </body>
+</html>

@@ -1,0 +1,146 @@
+name: Release Desktop Installers
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-installers:
+    name: Build installers (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxcursor-dev \
+            libxinerama-dev \
+            libxxf86vm-dev \
+            libasound2-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libgtk-3-dev \
+            desktop-file-utils \
+            rpm
+
+      - name: Install WiX Toolset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install wixtoolset --no-progress -y
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          if (Test-Path $wixBin) {
+            Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+          }
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build runtime binary
+        run: cargo build --manifest-path aimod-runtime/Cargo.toml -p kapsl --release
+
+      - name: Stage bundled runtime (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p aimod-desktop/resources/runtime
+          cp aimod-runtime/target/release/kapsl aimod-desktop/resources/runtime/kapsl
+          cp aimod-runtime/target/release/kapsl aimod-desktop/resources/runtime/kapsl.exe
+          chmod +x aimod-desktop/resources/runtime/kapsl
+          chmod +x aimod-desktop/resources/runtime/kapsl.exe
+
+      - name: Stage bundled runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "aimod-desktop/resources/runtime" -Force | Out-Null
+          Copy-Item "aimod-runtime/target/release/kapsl.exe" "aimod-desktop/resources/runtime/kapsl.exe" -Force
+          Copy-Item "aimod-runtime/target/release/kapsl.exe" "aimod-desktop/resources/runtime/kapsl" -Force
+
+      - name: Build installers
+        run: cargo bundle --manifest-path aimod-desktop/Cargo.toml --release
+
+      - name: Collect installer artifacts (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          find aimod-desktop/target/release/bundle -type f \
+            \( -name "*.dmg" -o -name "*.deb" -o -name "*.rpm" -o -name "*.AppImage" -o -name "*.msi" -o -name "*.exe" -o -name "*.tar.gz" \) \
+            -exec cp {} dist/ \;
+
+          if [ "${RUNNER_OS}" = "macOS" ]; then
+            while IFS= read -r -d '' app; do
+              name="$(basename "$app")"
+              ditto -c -k --sequesterRsrc --keepParent "$app" "dist/${name}.zip"
+            done < <(find aimod-desktop/target/release/bundle -type d -name "*.app" -print0)
+          fi
+
+          if [ -z "$(ls -A dist)" ]; then
+            echo "No installer artifacts found."
+            find aimod-desktop/target/release/bundle -maxdepth 4 -print
+            exit 1
+          fi
+
+          ls -la dist
+
+      - name: Collect installer artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $bundleRoot = "aimod-desktop/target/release/bundle"
+          Get-ChildItem -Path $bundleRoot -Recurse -File |
+            Where-Object { $_.Extension -in @(".msi", ".exe", ".dmg", ".deb", ".rpm", ".AppImage", ".gz") } |
+            Copy-Item -Destination dist -Force
+
+          if (-not (Get-ChildItem -Path dist -File | Select-Object -First 1)) {
+            Write-Host "No installer artifacts found."
+            Get-ChildItem -Path $bundleRoot -Recurse
+            throw "Installer artifacts missing"
+          }
+
+          Get-ChildItem dist
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-installers-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  upload-release-assets:
+    if: github.event_name == 'release'
+    needs: build-installers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**

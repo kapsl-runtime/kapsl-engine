@@ -1,0 +1,18 @@
+[package]
+name = "kapsl-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+tar = "0.4"
+flate2 = "1.0"
+thiserror = "1.0"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3.8"
+log = "0.4"
+serde_json = "1.0.145"
+parking_lot = "0.12"
+fs2 = "0.4"

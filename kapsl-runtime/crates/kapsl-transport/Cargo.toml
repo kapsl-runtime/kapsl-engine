@@ -1,0 +1,16 @@
+[package]
+name = "kapsl-transport"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kapsl-engine-api = { path = "../kapsl-engine-api" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1", features = ["sync", "net", "io-util", "rt", "macros", "time"] }
+log = "0.4"
+bincode = "1.3"
+
+[features]
+streaming = []

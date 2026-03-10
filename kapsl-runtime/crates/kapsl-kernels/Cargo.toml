@@ -1,0 +1,14 @@
+[package]
+name = "kapsl-kernels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kapsl-hal = { path = "../kapsl-hal" }
+thiserror = "1.0"
+log = "0.4"
+rayon = "1.11.0"
+
+[features]
+cuda = []
+rocm = []

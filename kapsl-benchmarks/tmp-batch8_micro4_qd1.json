@@ -1,0 +1,34 @@
+{
+  "kapsl": {
+    "models": {
+      "0": {
+        "benchmark": {
+          "requests": 2,
+          "ok": 2,
+          "errors": 0,
+          "duration_sec": 12.694050750000315,
+          "throughput_rps": 0.15755412038193958,
+          "latency_ms": {
+            "min": 6056.162207998568,
+            "max": 6637.254417000804,
+            "mean": 6346.708312499686,
+            "p50": 6346.708312499686,
+            "p90": 6579.1451961005805,
+            "p99": 6631.443494910782
+          }
+        }
+      }
+    },
+    "snapshot": {
+      "models": 1,
+      "total_memory_bytes": 0,
+      "max_model_memory_bytes": 0,
+      "fragmentation_estimate": null,
+      "runtime_rss_bytes": 3190276096,
+      "gpu_memory_bytes": null,
+      "system_gpu_utilization": 0.0,
+      "total_throughput": 0.0,
+      "avg_gpu_utilization": 0.0
+    }
+  }
+}

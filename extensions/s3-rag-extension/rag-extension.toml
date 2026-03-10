@@ -1,0 +1,74 @@
+id = "connector.s3"
+name = "S3 Connector"
+version = "0.1.0"
+runtime = "sidecar"
+capabilities = ["sync"]
+auth = ["aws-access-key", "aws-assume-role"]
+permissions = []
+description = "RAG connector for syncing documents from Amazon S3"
+entrypoint = "connector"
+
+[config_schema]
+type = "object"
+additionalProperties = true
+required = ["bucket"]
+
+[config_schema.properties.bucket]
+type = "string"
+description = "S3 bucket name"
+
+[config_schema.properties.region]
+type = "string"
+description = "AWS region (for example us-east-1)"
+
+[config_schema.properties.prefix]
+type = "string"
+description = "Optional prefix to scope documents"
+
+[config_schema.properties.endpoint_url]
+type = "string"
+description = "Optional S3-compatible endpoint (MinIO/LocalStack)"
+
+[config_schema.properties.profile]
+type = "string"
+description = "Optional AWS profile name"
+
+[config_schema.properties.access_key_id]
+type = "string"
+description = "Optional static AWS access key"
+
+[config_schema.properties.secret_access_key]
+type = "string"
+description = "Optional static AWS secret key"
+
+[config_schema.properties.session_token]
+type = "string"
+description = "Optional session token for temporary credentials"
+
+[config_schema.properties.source_id]
+type = "string"
+description = "Override default source identifier"
+
+[config_schema.properties.source_name]
+type = "string"
+description = "Override display name in source listings"
+
+[config_schema.properties.max_keys]
+type = "integer"
+description = "S3 ListObjectsV2 MaxKeys (1-1000)"
+minimum = 1
+maximum = 1000
+
+[config_schema.properties.max_sync_documents]
+type = "integer"
+description = "Maximum number of deltas returned by one sync"
+minimum = 1
+
+[config_schema.properties.include_extensions]
+type = "array"
+description = "Optional list of file extensions to include"
+items = { type = "string" }
+
+[config_schema.properties.force_path_style]
+type = "boolean"
+description = "Use path-style S3 addressing (useful for MinIO/LocalStack)"

@@ -1,0 +1,13 @@
+[package]
+name = "kapsl-monitor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kapsl-engine-api = { path = "../kapsl-engine-api" }
+prometheus = "0.14"
+anyhow = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+async-trait = "0.1"
+thiserror = "1.0"
+futures = "0.3.31"

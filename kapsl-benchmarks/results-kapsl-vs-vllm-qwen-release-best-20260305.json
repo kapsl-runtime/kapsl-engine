@@ -1,0 +1,60 @@
+{
+  "kapsl": {
+    "models": {
+      "0": {
+        "benchmark": {
+          "requests": 20,
+          "ok": 20,
+          "errors": 0,
+          "duration_sec": 123.37015220799731,
+          "throughput_rps": 0.16211376610998074,
+          "latency_ms": {
+            "min": 23840.19945899854,
+            "max": 25330.95987499837,
+            "mean": 24631.86371259926,
+            "p50": 25062.736062500335,
+            "p90": 25178.008633698846,
+            "p99": 25313.87079220858
+          }
+        }
+      }
+    },
+    "snapshot": {
+      "models": 1,
+      "total_memory_bytes": 0,
+      "max_model_memory_bytes": 0,
+      "fragmentation_estimate": null,
+      "runtime_rss_bytes": 3360047104,
+      "gpu_memory_bytes": null,
+      "system_gpu_utilization": 0.0,
+      "total_throughput": 0.0,
+      "avg_gpu_utilization": 0.0
+    }
+  },
+  "vllm": {
+    "models": {
+      "Qwen/Qwen2.5-1.5B-Instruct": {
+        "benchmark": {
+          "requests": 20,
+          "ok": 20,
+          "errors": 0,
+          "duration_sec": 41.31288216699977,
+          "throughput_rps": 0.48411049897592856,
+          "latency_ms": {
+            "min": 8178.120749998925,
+            "max": 8450.482165997528,
+            "mean": 8258.153160499569,
+            "p50": 8229.2601249992,
+            "p90": 8449.381275002088,
+            "p99": 8450.35511945789
+          }
+        },
+        "snapshot": {
+          "memory_used_bytes": null,
+          "memory_total_bytes": null,
+          "fragmentation_proxy": null
+        }
+      }
+    }
+  }
+}

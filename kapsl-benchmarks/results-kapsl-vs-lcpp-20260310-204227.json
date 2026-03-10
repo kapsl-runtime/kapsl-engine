@@ -1,0 +1,58 @@
+{
+  "kapsl": {
+    "models": {
+      "0": {
+        "benchmark": {
+          "requests": 20,
+          "ok": 20,
+          "errors": 0,
+          "duration_sec": 40.004061432000526,
+          "throughput_rps": 0.4999492372542294,
+          "latency_ms": {
+            "min": 7881.202225999914,
+            "max": 8134.1702150002675,
+            "mean": 8000.380666099954,
+            "p50": 8019.054381999922,
+            "p90": 8132.0921182995335,
+            "p99": 8133.8951609301785
+          }
+        }
+      }
+    },
+    "snapshot": {
+      "models": 1,
+      "total_memory_bytes": 0,
+      "max_model_memory_bytes": 0,
+      "fragmentation_estimate": null,
+      "runtime_rss_bytes": 2923307008,
+      "gpu_memory_bytes": null,
+      "system_gpu_utilization": 0.0,
+      "total_throughput": 0.0,
+      "avg_gpu_utilization": 0.0
+    }
+  },
+  "vllm": {
+    "models": {
+      "/home/ubuntu/models-gguf/qwen2.5-1.5b-instruct-q4_k_m.gguf": {
+        "benchmark": {
+          "requests": 20,
+          "ok": 20,
+          "errors": 0,
+          "duration_sec": 95.03181743200003,
+          "throughput_rps": 0.2104558298520492,
+          "latency_ms": {
+            "min": 1789.9757559998761,
+            "max": 19975.67938300017,
+            "mean": 17547.937155449974,
+            "p50": 19534.464342499632,
+            "p90": 19882.545262700205,
+            "p99": 19966.87023098012
+          }
+        },
+        "snapshot": {
+          "error": "Failed to fetch metrics: 404 {\"detail\":\"Not Found\"}"
+        }
+      }
+    }
+  }
+}

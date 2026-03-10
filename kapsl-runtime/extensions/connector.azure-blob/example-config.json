@@ -1,0 +1,11 @@
+{
+  "container": "my-rag-container",
+  "connection_string": "DefaultEndpointsProtocol=https;AccountName=example;AccountKey=...;EndpointSuffix=core.windows.net",
+  "prefix": "knowledge/",
+  "include_extensions": [
+    ".md",
+    ".txt",
+    ".pdf"
+  ],
+  "max_sync_documents": 1000
+}

@@ -1,0 +1,13 @@
+[package]
+name = "kapsl-scheduler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kapsl-engine-api = { path = "../kapsl-engine-api" }
+tokio = { version = "1.0", features = ["full"] }
+log = "0.4"
+rayon = "1.11.0"
+async-trait = "0.1"
+futures = "0.3.31"
+kapsl-hal = { path = "../kapsl-hal" }

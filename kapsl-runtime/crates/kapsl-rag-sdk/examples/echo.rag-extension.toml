@@ -1,0 +1,8 @@
+id = "connector.echo"
+name = "Echo Connector"
+version = "0.1.0"
+runtime = "sidecar"
+capabilities = ["sync"]
+auth = ["none"]
+permissions = []
+entrypoint = "echo"

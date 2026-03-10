@@ -1,0 +1,17 @@
+[package]
+name = "kapsl-hal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sys-info = "0.9"
+thiserror = "2.0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cudarc = { version = "0.12", features = ["nccl"], optional = true }
+nvml-wrapper = { version = "0.10", optional = true }
+
+[features]
+default = []
+nccl = ["cudarc"]
+nvml = ["dep:nvml-wrapper"]

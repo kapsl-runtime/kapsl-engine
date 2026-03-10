@@ -1,0 +1,16 @@
+[package]
+name = "shm-bench-native"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "shm_bench_native"
+path = "src/main.rs"
+
+[dependencies]
+kapsl-shm = { path = "../../crates/kapsl-shm" }
+kapsl-engine-api = { path = "../../crates/kapsl-engine-api" }
+kapsl-transport = { path = "../../crates/kapsl-transport" }
+bincode = "1.3"
+libc = "0.2"
+clap = { version = "4.0", features = ["derive"] }

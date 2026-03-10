@@ -1,0 +1,44 @@
+id = "connector.local-storage"
+name = "Local Storage Connector"
+version = "0.1.0"
+runtime = "sidecar"
+capabilities = ["sync"]
+auth = ["none"]
+permissions = []
+description = "RAG connector for syncing documents from local filesystem storage"
+entrypoint = "connector"
+
+[config_schema]
+type = "object"
+additionalProperties = true
+required = ["root_path"]
+
+[config_schema.properties.root_path]
+type = "string"
+description = "Absolute path to local document root"
+
+[config_schema.properties.prefix]
+type = "string"
+description = "Optional subdirectory under root_path"
+
+[config_schema.properties.source_id]
+type = "string"
+description = "Override source identifier"
+
+[config_schema.properties.source_name]
+type = "string"
+description = "Override display name"
+
+[config_schema.properties.include_extensions]
+type = "array"
+description = "Optional filename suffix filter"
+items = { type = "string" }
+
+[config_schema.properties.max_sync_documents]
+type = "integer"
+description = "Maximum number of deltas returned by one sync"
+minimum = 1
+
+[config_schema.properties.follow_symlinks]
+type = "boolean"
+description = "Whether recursive sync follows symlinked directories"

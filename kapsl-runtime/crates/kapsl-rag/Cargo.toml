@@ -1,0 +1,21 @@
+[package]
+name = "kapsl-rag"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kapsl-rag-sdk = { path = "../kapsl-rag-sdk" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+rusqlite = { version = "0.31", features = ["bundled"] }
+toml = "0.8"
+wasmtime = "16"
+wasmtime-wasi = "16"
+cap-std = "2"
+bytes = "1"
+
+[dev-dependencies]
+serde_json = "1.0"

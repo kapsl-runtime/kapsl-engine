@@ -1,0 +1,28 @@
+{
+  "vllm": {
+    "models": {
+      "Qwen/Qwen2.5-1.5B-Instruct": {
+        "benchmark": {
+          "requests": 50,
+          "ok": 50,
+          "errors": 0,
+          "duration_sec": 105.08475995799927,
+          "throughput_rps": 0.47580638733898445,
+          "latency_ms": {
+            "min": 5556.14341600085,
+            "max": 8612.565583000105,
+            "mean": 8183.140953320035,
+            "p50": 8306.041978999929,
+            "p90": 8475.062841700674,
+            "p99": 8612.404536660397
+          }
+        },
+        "snapshot": {
+          "memory_used_bytes": null,
+          "memory_total_bytes": null,
+          "fragmentation_proxy": null
+        }
+      }
+    }
+  }
+}
