@@ -85,6 +85,14 @@ jobs:
           "KAPSL_DEB_VERSION=$debVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kapsl
+        if: runner.os != 'Windows'
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
+
+      - name: Build kapsl (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C debuginfo=0
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
       - name: Package Debian installer (.deb)
