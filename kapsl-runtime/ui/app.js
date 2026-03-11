@@ -218,6 +218,7 @@ class KapslApp {
     document.getElementById("auth-gate").classList.add("active");
     document.getElementById("app-shell").classList.add("locked");
     this.updateSessionStatus();
+    this.updateDeveloperModeUI();
     this.setLoginFeedback(message, isError);
   }
 
@@ -230,6 +231,7 @@ class KapslApp {
     document.getElementById("auth-gate").classList.remove("active");
     document.getElementById("app-shell").classList.remove("locked");
     this.updateSessionStatus();
+    this.updateDeveloperModeUI();
   }
 
   updateSessionStatus() {
@@ -1240,8 +1242,14 @@ class KapslApp {
     const submit = document.querySelector(
       "#local-install-form button[type='submit']",
     );
+    const devToggleLabel = document.getElementById(
+      "extensions-dev-toggle",
+    ).parentElement;
 
-    const enabled = Boolean(this.extensionsDeveloperMode);
+    const isAdmin = this.sessionRole === "admin";
+    const enabled = isAdmin && Boolean(this.extensionsDeveloperMode);
+
+    devToggleLabel.hidden = !isAdmin;
     localPanel.hidden = !enabled;
     input.disabled = !enabled;
     submit.disabled = !enabled;
@@ -1249,9 +1257,10 @@ class KapslApp {
     notice.textContent = enabled
       ? ""
       : "Local extension install is available only in developer mode.";
-    disabledNote.textContent = enabled
-      ? ""
-      : "Enable Developer Features to reveal local extension install.";
+    disabledNote.hidden = !isAdmin;
+    disabledNote.textContent = isAdmin && !enabled
+      ? "Enable Developer Features to reveal local extension install."
+      : "";
 
     if (!enabled) {
       this.setAccessFeedback("local-install-feedback", "", false);

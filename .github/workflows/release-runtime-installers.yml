@@ -254,3 +254,38 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release-assets/**
+
+  upload-r2:
+    needs: build-runtime-installers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve upload version
+        id: version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials (R2)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          aws-region: auto
+
+      - name: Upload installers to R2
+        run: |
+          aws s3 cp release-assets/ \
+            s3://kapsl-installer/runtime/v${{ steps.version.outputs.version }}/ \
+            --recursive \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
