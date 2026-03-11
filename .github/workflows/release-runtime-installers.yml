@@ -114,7 +114,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          RUSTFLAGS: -C debuginfo=0
+          RUSTFLAGS: -C debuginfo=0 -C link-arg=/DEBUG:NONE
+          CARGO_INCREMENTAL: "0"
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
       - name: Package Debian installer (.deb)
