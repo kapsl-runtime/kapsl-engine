@@ -276,14 +276,11 @@ jobs:
             echo "version=dev" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Configure AWS credentials (R2)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.R2_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          aws-region: auto
-
       - name: Upload installers to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
         run: |
           aws s3 cp release-assets/ \
             s3://kapsl-installer/runtime/v${{ steps.version.outputs.version }}/ \
