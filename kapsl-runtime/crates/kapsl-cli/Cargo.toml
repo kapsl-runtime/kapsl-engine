@@ -41,3 +41,5 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 ureq = { version = "3.1.4", default-features = false, features = ["native-tls"] }
 rand = "0.8"
 sha2 = "0.10"
+rust-embed = "8.0"
+mime_guess = "2.0"

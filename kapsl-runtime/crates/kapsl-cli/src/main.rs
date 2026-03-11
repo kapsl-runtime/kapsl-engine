@@ -65,11 +65,18 @@ use sysinfo::{Pid, System};
 use tar::{Archive, Builder};
 use tokio::sync::Mutex as AsyncMutex;
 use warp::{Filter, Reply};
+use rust_embed::RustEmbed;
+use warp::http::StatusCode;
+use mime_guess;
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 
 mod infer_adapter;
+
+#[derive(RustEmbed)]
+#[folder = "../../../ui"]
+struct UiAssets;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;
@@ -12529,19 +12536,41 @@ async fn main() -> Result<(), DynError> {
                 }
             });
 
-        // Static file serving for web UI
-        let ui_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("ui");
-
+        // Static file serving for web UI (from embedded assets)
         let index_route = warp::path::end()
             .and(warp::get())
-            .and(warp::fs::file(ui_dir.join("index.html")));
+            .and_then(|| async {
+                if let Some(content) = UiAssets::get("index.html") {
+                    Ok::<_, warp::Rejection>(warp::reply::with_header(
+                        content.data.into_owned(),
+                        "content-type",
+                        "text/html; charset=utf-8",
+                    ))
+                } else {
+                    Err(warp::reject::not_found())
+                }
+            });
 
-        let static_files = warp::path("ui").and(warp::fs::dir(ui_dir.clone()));
+        let ui_static_files = warp::path("ui")
+            .and(warp::path::tail())
+            .and(warp::get())
+            .and_then(|tail: warp::path::Tail| async move {
+                let filename = tail.as_str();
+                if let Some(content) = UiAssets::get(filename) {
+                    let mime_type = mime_guess::from_path(filename)
+                        .first_or_octet_stream()
+                        .to_string();
+                    Ok::<_, warp::Rejection>(warp::reply::with_header(
+                        content.data.into_owned(),
+                        "content-type",
+                        mime_type,
+                    ))
+                } else {
+                    Err(warp::reject::not_found())
+                }
+            });
+
+        let static_files = ui_static_files;
 
         let reader_api_routes = list_models
             .or(get_model)
