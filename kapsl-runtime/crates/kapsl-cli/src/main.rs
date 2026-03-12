@@ -75,7 +75,7 @@ use std::os::unix::net::UnixStream;
 mod infer_adapter;
 
 #[derive(RustEmbed)]
-#[folder = "../../../ui"]
+#[folder = "../../ui"]
 struct UiAssets;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
