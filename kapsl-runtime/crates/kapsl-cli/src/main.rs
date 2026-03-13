@@ -9318,10 +9318,7 @@ fn load_model_blocking(
 
     // Create ReplicaPool and add the primary scheduler
     let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
-    // Use block_on to call the async add_replica
-    tokio::runtime::Handle::current().block_on(async {
-        pool.add_replica(0, scheduler).await;
-    });
+    pool.add_replica(0, scheduler);
 
     log::info!("✓ Scheduler started for Model ID {}\n", model_id);
     Ok(Arc::new(pool))
@@ -9630,7 +9627,7 @@ async fn load_model(
 
     // Create ReplicaPool and add the primary scheduler
     let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
-    pool.add_replica(0, scheduler).await;
+    pool.add_replica(0, scheduler);
 
     log::info!("✓ Scheduler started for Model ID {}\n", model_id);
 
@@ -9876,7 +9873,7 @@ async fn scale_down_model(
     // Remove replica from pool
     let pool = replica_pools.read().get(&base_model_id).cloned();
     if let Some(pool) = pool {
-        let removed = pool.remove_replica(replica_id).await;
+        let removed = pool.remove_replica(replica_id);
         if !removed {
             let _ = model_registry.set_status(unique_id, ModelStatus::Active);
             return Err(format!(
@@ -12911,7 +12908,7 @@ async fn main() -> Result<(), DynError> {
                                 let pool =
                                     replica_pools_for_scaler.read().get(&base_model_id).cloned();
                                 if let Some(pool) = pool {
-                                    pool.add_replica(next_replica_id, scheduler).await;
+                                    pool.add_replica(next_replica_id, scheduler);
                                 }
                             }
                             Err(e) => {

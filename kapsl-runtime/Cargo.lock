@@ -1790,7 +1790,7 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "futures",
@@ -1811,7 +1811,7 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "flate2",
  "fs2",
@@ -1830,7 +1830,7 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1842,7 +1842,7 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "serde",
  "serde_json",
@@ -1853,7 +1853,7 @@ dependencies = [
 [[package]]
 name = "kapsl-ipc"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1871,7 +1871,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "kapsl-hal",
  "log",
@@ -1882,7 +1882,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1909,7 +1909,7 @@ dependencies = [
 [[package]]
 name = "kapsl-monitor"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1923,7 +1923,7 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "anyhow",
  "half",
@@ -1937,7 +1937,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1956,7 +1956,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag-sdk"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "futures",
@@ -1968,13 +1968,14 @@ dependencies = [
 [[package]]
 name = "kapsl-scheduler"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "futures",
  "kapsl-engine-api",
  "kapsl-hal",
  "log",
+ "parking_lot",
  "rayon",
  "tokio",
 ]
@@ -1982,7 +1983,7 @@ dependencies = [
 [[package]]
 name = "kapsl-shm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2003,7 +2004,7 @@ dependencies = [
 [[package]]
 name = "kapsl-transport"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#d53a1795816c8a20b65a24dcead9bb617be97446"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#41b38bd755dd57c9d47967715f74046283dffb04"
 dependencies = [
  "async-trait",
  "bincode",
