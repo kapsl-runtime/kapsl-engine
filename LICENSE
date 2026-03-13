@@ -1,0 +1,107 @@
+Apache License
+Version 2.0, January 2004
+http://www.apache.org/licenses/
+
+Copyright 2026 The Kapsl Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
+
+1. Definitions.
+
+   "License" shall mean the terms and conditions for use, reproduction,
+   and distribution as defined by Sections 1 through 9 of this document.
+
+   "Licensor" shall mean the copyright owner or entity authorized by
+   the copyright owner that is granting the License.
+
+   "Legal Entity" shall mean the union of the acting entity and all
+   other entities that control, are controlled by, or are under common
+   control with that entity.
+
+   "You" (or "Your") shall mean an individual or Legal Entity
+   exercising permissions granted by this License.
+
+   "Source" form shall mean the preferred form for making modifications,
+   including but not limited to software source code, documentation
+   source, and configuration files.
+
+   "Object" form shall mean any form resulting from mechanical
+   transformation or translation of a Source form.
+
+   "Work" shall mean the work of authorship, whether in Source or
+   Object form, made available under the License.
+
+   "Derivative Works" shall mean any work that is based on the Work
+   and represents an original work of authorship.
+
+   "Contribution" shall mean any work intentionally submitted to the
+   Licensor for inclusion in the Work.
+
+   "Contributor" shall mean Licensor and any individual or Legal Entity
+   on behalf of whom a Contribution has been received.
+
+2. Grant of Copyright License.
+
+   Each Contributor grants you a perpetual, worldwide, non-exclusive,
+   no-charge, royalty-free, irrevocable copyright license to reproduce,
+   prepare Derivative Works of, publicly display, publicly perform,
+   sublicense, and distribute the Work and such Derivative Works.
+
+3. Grant of Patent License.
+
+   Each Contributor grants you a perpetual, worldwide, non-exclusive,
+   no-charge, royalty-free patent license to make, use, sell, import,
+   and otherwise transfer the Work.
+
+   If you institute patent litigation against any entity alleging that
+   the Work infringes a patent, any patent licenses granted to you under
+   this License shall terminate as of the date such litigation is filed.
+
+4. Redistribution.
+
+   You may reproduce and distribute copies of the Work or Derivative
+   Works thereof in any medium, with or without modifications,
+   provided that you:
+
+   (a) give recipients a copy of this License
+
+   (b) cause modified files to carry prominent notices stating that
+       you changed the files
+
+   (c) retain all copyright, patent, trademark, and attribution
+       notices in the source form
+
+   (d) include a readable copy of the NOTICE file if one exists
+
+5. Submission of Contributions.
+
+   Unless explicitly stated otherwise, any Contribution submitted
+   for inclusion in the Work shall be under the terms of this License.
+
+6. Trademarks.
+
+   This License does not grant permission to use the trade names,
+   trademarks, service marks, or product names of the Licensor.
+
+7. Disclaimer of Warranty.
+
+   The Work is provided "AS IS", WITHOUT WARRANTIES OR CONDITIONS
+   OF ANY KIND, either express or implied.
+
+8. Limitation of Liability.
+
+   In no event shall any Contributor be liable for any damages
+   arising from the use of the Work.
+
+9. Accepting Warranty or Additional Liability.
+
+   While redistributing the Work, you may offer support or warranties,
+   but only on your own behalf and responsibility.
+
+END OF TERMS AND CONDITIONS
