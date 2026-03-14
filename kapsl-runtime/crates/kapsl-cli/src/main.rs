@@ -43,10 +43,12 @@ use kapsl_scheduler::{
 use kapsl_shm::memory::ShmManager;
 use kapsl_shm::ShmServer;
 use kapsl_transport::TransportServer;
+use mime_guess;
 use parking_lot::{Mutex, RwLock};
 use prometheus::{Encoder, Registry, TextEncoder};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use rust_embed::RustEmbed;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -64,10 +66,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
 use tar::{Archive, Builder};
 use tokio::sync::Mutex as AsyncMutex;
-use warp::{Filter, Reply};
-use rust_embed::RustEmbed;
 use warp::http::StatusCode;
-use mime_guess;
+use warp::{Filter, Reply};
 
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
@@ -496,7 +496,7 @@ struct PullCommandArgs {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Login Options")]
 struct LoginCommandArgs {
-    /// Backend base URL (defaults to KAPSL_REMOTE_URL or http://127.0.0.1:8080/v1)
+    /// Backend base URL (defaults to KAPSL_REMOTE_URL or https://api.kapsl.net/v1)
     #[arg(long, value_name = "URL")]
     remote_url: Option<String>,
 
@@ -677,10 +677,10 @@ struct AppliedPerformanceTuning {
     auto_tune_rationale: Option<String>,
 }
 
-const DEFAULT_REMOTE_URL: &str = "http://127.0.0.1:8080/v1";
+const DEFAULT_REMOTE_URL: &str = "https://api.kapsl.net/v1";
 const REMOTE_PLACEHOLDER_URL: &str = "https://placeholder-kapsl-registry.example.com/v1";
 const REMOTE_PLACEHOLDER_DIR: &str = ".kapsl-remote-placeholder";
-const EXTENSION_MARKETPLACE_URL: &str = "http://127.0.0.1:8080/api/v1/extensions/marketplace";
+const EXTENSION_MARKETPLACE_URL: &str = "https://api.kapsl.net/api/v1/extensions/marketplace";
 const API_TOKEN_ENV: &str = "KAPSL_API_TOKEN";
 const API_READER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_READER";
 const API_WRITER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_WRITER";
@@ -3453,8 +3453,8 @@ mod security_tests {
     #[test]
     fn test_auth_base_url_from_remote_url() {
         assert_eq!(
-            auth_base_url_from_remote_url("http://127.0.0.1:8080/v1").expect("valid"),
-            "http://127.0.0.1:8080"
+            auth_base_url_from_remote_url("https://api.kapsl.net/v1").expect("valid"),
+            "https://api.kapsl.net"
         );
         assert_eq!(
             auth_base_url_from_remote_url("https://idx.example.com/api/v1").expect("valid"),
@@ -3811,7 +3811,11 @@ mod security_tests {
         assert!(tuning.batch_size.is_some());
         assert!(tuning.auto_tune_rationale.is_some());
         let rationale = tuning.auto_tune_rationale.unwrap();
-        assert!(rationale.contains("unknown"), "rationale should say unknown: {}", rationale);
+        assert!(
+            rationale.contains("unknown"),
+            "rationale should say unknown: {}",
+            rationale
+        );
     }
 
     #[test]
@@ -9666,8 +9670,7 @@ async fn scale_up_model(
         PackageLoader::from_raw_file(&absolute_path)
             .map_err(|e| format!("Failed to load raw model: {e}"))?
     } else {
-        PackageLoader::load(&absolute_path)
-            .map_err(|e| format!("Failed to load model: {e}"))?
+        PackageLoader::load(&absolute_path).map_err(|e| format!("Failed to load model: {e}"))?
     };
     let model_file_path = loader.get_model_path();
     let queue_overflow_policy = resolve_queue_overflow_policy(&loader.manifest);
@@ -12534,19 +12537,17 @@ async fn main() -> Result<(), DynError> {
             });
 
         // Static file serving for web UI (from embedded assets)
-        let index_route = warp::path::end()
-            .and(warp::get())
-            .and_then(|| async {
-                if let Some(content) = UiAssets::get("index.html") {
-                    Ok::<_, warp::Rejection>(warp::reply::with_header(
-                        content.data.into_owned(),
-                        "content-type",
-                        "text/html; charset=utf-8",
-                    ))
-                } else {
-                    Err(warp::reject::not_found())
-                }
-            });
+        let index_route = warp::path::end().and(warp::get()).and_then(|| async {
+            if let Some(content) = UiAssets::get("index.html") {
+                Ok::<_, warp::Rejection>(warp::reply::with_header(
+                    content.data.into_owned(),
+                    "content-type",
+                    "text/html; charset=utf-8",
+                ))
+            } else {
+                Err(warp::reject::not_found())
+            }
+        });
 
         let ui_static_files = warp::path("ui")
             .and(warp::path::tail())
