@@ -184,7 +184,7 @@ Target format:
 
 Default remote behavior:
 
-- Uses `http://127.0.0.1:8080/v1` by default.
+- Uses `https://api.kapsl.net/v1` by default.
 - If remote URL resolves to the legacy placeholder URL, mirrors artifacts to a local directory (configurable env var).
 - If `remote_url` is overridden, uses HTTP PUT/GET remote backend.
 - If `remote_url` starts with `oci://`, uses ORAS to push/pull the `.aimod` as an OCI artifact.

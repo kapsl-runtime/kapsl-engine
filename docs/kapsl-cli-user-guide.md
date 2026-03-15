@@ -293,9 +293,9 @@ kapsl run --model ./models/model.aimod
 
 ## Notes on Default Remote Behavior
 
-If you do not pass `--remote-url`, `push`/`pull` use `http://127.0.0.1:8080/v1` by default.
+If you do not pass `--remote-url`, `push`/`pull` use `https://api.kapsl.net/v1` by default.
 
-- This is useful when your `idx-controller` API is exposed locally (for example via `kubectl port-forward`).
+- This is useful when you want to use the shared hosted backend without passing `--remote-url` explicitly.
 - For production sharing across users/machines, use a dedicated remote URL via `--remote-url` (or set `KAPSL_REMOTE_URL`).
 - For authenticated remotes, use `--remote-token` or set `KAPSL_REMOTE_TOKEN` (`KAPSL_REMOTE_TOKEN` legacy).
 
