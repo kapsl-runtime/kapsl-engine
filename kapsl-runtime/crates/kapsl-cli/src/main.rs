@@ -1944,8 +1944,19 @@ fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
     // Base policy from model file size
     let (mut batch_size, mut micro_batch, delay_ms, mut queue_size, size_tier) =
         if model_size_mb == 0 {
-            // Can't stat model — use safe conservative defaults identical to Standard
-            (4usize, 4usize, 2u64, 256usize, "unknown")
+            // Unknown model size should remain deterministic across environments.
+            // Keep the conservative Standard-equivalent defaults unchanged rather
+            // than layering in host-dependent RAM/CPU reductions.
+            return AutoTunedPolicy {
+                batch_size: 4,
+                scheduler_max_micro_batch: 4,
+                scheduler_queue_delay_ms: 2,
+                scheduler_queue_size: 256,
+                rationale: format!(
+                    "model={}MB (unknown), ram_avail={}GB, cpu_cores={}, conservative-defaults",
+                    model_size_mb, available_ram_gb, cpu_cores
+                ),
+            };
         } else if model_size_mb < 500 {
             (16, 16, 6, 2048, "tiny (<500 MB)")
         } else if model_size_mb < 2_000 {
