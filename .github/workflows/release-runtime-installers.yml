@@ -141,8 +141,26 @@ jobs:
           sha256sum "${deb_path}" > "${deb_path}.sha256"
           ls -la dist
 
+      - name: Import Apple signing certificate
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 16)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
       - name: Package macOS installer (.pkg)
         if: runner.os == 'macOS'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           mkdir -p dist pkgroot/usr/local/bin
           install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
@@ -153,16 +171,41 @@ jobs:
             arm64) arch_name="aarch64" ;;
           esac
 
+          # Sign the binary
+          codesign --force --options runtime --sign "Developer ID Application: Kapsl ($APPLE_TEAM_ID)" \
+            pkgroot/usr/local/bin/kapsl
+
+          unsigned_pkg="$RUNNER_TEMP/kapsl-runtime-unsigned.pkg"
           pkg_path="dist/kapsl-runtime-${KAPSL_VERSION}-macos-${arch_name}.pkg"
+
           pkgbuild \
             --root pkgroot \
             --identifier com.kapsl.runtime \
             --version "${KAPSL_NUMERIC_VERSION}" \
             --install-location / \
-            "${pkg_path}"
+            "${unsigned_pkg}"
+
+          # Sign the package
+          productsign --sign "Developer ID Installer: Kapsl ($APPLE_TEAM_ID)" \
+            "${unsigned_pkg}" "${pkg_path}"
 
           shasum -a 256 "${pkg_path}" > "${pkg_path}.sha256"
           ls -la dist
+
+      - name: Notarize macOS installer
+        if: runner.os == 'macOS'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          pkg_path="$(ls dist/*.pkg)"
+          xcrun notarytool submit "${pkg_path}" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "${pkg_path}"
 
       - name: Package Windows installer (.msi)
         if: runner.os == 'Windows'
@@ -232,6 +275,28 @@ jobs:
           "$hash  $msiName" | Set-Content -Path "dist/$msiName.sha256"
 
           Get-ChildItem dist
+
+      - name: Sign Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $certPath = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+
+          $msiPath = (Get-ChildItem "dist\*.msi").FullName
+          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign `
+            /fd sha256 `
+            /tr http://timestamp.digicert.com `
+            /td sha256 `
+            /f $certPath `
+            /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+            $msiPath
+
+          Remove-Item $certPath -Force
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4

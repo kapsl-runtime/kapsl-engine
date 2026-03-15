@@ -298,6 +298,7 @@ If you do not pass `--remote-url`, `push`/`pull` use `https://api.kapsl.net/v1` 
 - This is useful when you want to use the shared hosted backend without passing `--remote-url` explicitly.
 - For production sharing across users/machines, use a dedicated remote URL via `--remote-url` (or set `KAPSL_REMOTE_URL`).
 - For authenticated remotes, use `--remote-token` or set `KAPSL_REMOTE_TOKEN` (`KAPSL_REMOTE_TOKEN` legacy).
+- If you install the CLI with Cargo, prefer `cargo install --path crates/kapsl-cli --locked` so the binary matches the checked-in lockfile and dependency feature set.
 
 ## Authentication (API)
 
