@@ -4488,7 +4488,10 @@ fn perform_device_code_login_flow(
         provider.route_segment()
     );
 
-    let mut start_response = ureq::post(&start_url)
+    let agent = native_tls_http_agent();
+
+    let mut start_response = agent
+        .post(&start_url)
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .send("{}")
@@ -4572,7 +4575,8 @@ fn perform_device_code_login_flow(
         let poll_payload = serde_json::json!({
             "device_code": device_code
         });
-        let mut poll_response = ureq::post(&poll_url)
+        let mut poll_response = agent
+            .post(&poll_url)
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .send(
@@ -4662,6 +4666,17 @@ struct RemoteHttpRequestError {
 
 impl RemoteHttpRequestError {}
 
+fn looks_like_auth_transport_failure(http_error: &RemoteHttpRequestError) -> bool {
+    if http_error.status_code.is_some() {
+        return false;
+    }
+
+    let message = http_error.message.to_ascii_lowercase();
+    message.contains("broken pipe")
+        || message.contains("connection reset")
+        || message.contains("connection closed")
+}
+
 fn maybe_auto_login_for_remote(
     remote_url: &str,
     request_has_explicit_token: bool,
@@ -4672,7 +4687,7 @@ fn maybe_auto_login_for_remote(
     if !interactive_login || request_has_explicit_token || remote_token.is_some() {
         return Ok(false);
     }
-    if http_error.status_code != Some(401) {
+    if http_error.status_code != Some(401) && !looks_like_auth_transport_failure(http_error) {
         return Ok(false);
     }
 
@@ -4973,6 +4988,17 @@ fn format_remote_http_error(error: ureq::Error) -> String {
     }
 }
 
+fn native_tls_http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .build()
+        .into()
+}
+
 fn push_kapsl_to_http_remote(
     artifact_url: &str,
     source_path: &Path,
@@ -4995,7 +5021,10 @@ fn push_kapsl_to_http_remote(
         ),
     })?;
 
-    let mut request = ureq::put(artifact_url).header("Content-Type", "application/octet-stream");
+    let agent = native_tls_http_agent();
+    let mut request = agent
+        .put(artifact_url)
+        .header("Content-Type", "application/octet-stream");
     if let Some(header) = authorization_header {
         request = request.header("Authorization", header);
     }
@@ -5021,7 +5050,8 @@ fn pull_kapsl_from_http_remote(
     artifact_url: &str,
     authorization_header: Option<&str>,
 ) -> Result<Vec<u8>, RemoteHttpRequestError> {
-    let mut request = ureq::get(artifact_url);
+    let agent = native_tls_http_agent();
+    let mut request = agent.get(artifact_url);
     if let Some(header) = authorization_header {
         request = request.header("Authorization", header);
     }
@@ -5816,7 +5846,8 @@ fn fetch_extension_marketplace(
     marketplace_url: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let marketplace_url = extension_marketplace_url(marketplace_url);
-    let mut request = ureq::get(&marketplace_url);
+    let agent = native_tls_http_agent();
+    let mut request = agent.get(&marketplace_url);
 
     if let Some(q) = query {
         let trimmed = q.trim();
@@ -5936,7 +5967,8 @@ fn install_extension_from_marketplace(
         extension_id
     );
 
-    let mut response = ureq::get(&download_url).call().map_err(|e| {
+    let agent = native_tls_http_agent();
+    let mut response = agent.get(&download_url).call().map_err(|e| {
         format!(
             "Failed to download extension `{}` from marketplace {}: {}",
             extension_id,
