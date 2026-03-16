@@ -4966,7 +4966,7 @@ fn is_default_placeholder_remote(remote_url: &str) -> bool {
 
 fn artifact_url_for_remote(remote_url: &str, target: &ModelTargetRef) -> String {
     format!(
-        "{}/kapsl/{}/{}:{}",
+        "{}/aimod/{}/{}:{}",
         remote_url.trim_end_matches('/'),
         target.repo,
         target.model,
@@ -5024,7 +5024,8 @@ fn push_kapsl_to_http_remote(
     let agent = native_tls_http_agent();
     let mut request = agent
         .put(artifact_url)
-        .header("Content-Type", "application/octet-stream");
+        .header("Content-Type", "application/octet-stream")
+        .header("Content-Length", &file_size.len().to_string());
     if let Some(header) = authorization_header {
         request = request.header("Authorization", header);
     }
