@@ -58,6 +58,10 @@ Supported outputs:
 - macOS: `.pkg`
 - Windows: `.msi`
 
+macOS and Windows signing are optional in CI. If the Apple or Windows
+certificate secrets are not configured, the workflow still produces
+unsigned installers instead of failing.
+
 Publishing flow:
 
 1. Create a version tag such as `v0.1.1`
