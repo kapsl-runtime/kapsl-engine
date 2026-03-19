@@ -9,17 +9,3 @@ resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-
-[patch."https://github.com/kapsl-runtime/kapsl-sdk.git"]
-kapsl-core = { path = "../../kapsl-sdk/crates/kapsl-core" }
-kapsl-hal = { path = "../../kapsl-sdk/crates/kapsl-hal" }
-kapsl-engine-api = { path = "../../kapsl-sdk/crates/kapsl-engine-api" }
-kapsl-backends = { path = "../../kapsl-sdk/crates/kapsl-backends" }
-kapsl-scheduler = { path = "../../kapsl-sdk/crates/kapsl-scheduler" }
-kapsl-ipc = { path = "../../kapsl-sdk/crates/kapsl-ipc" }
-kapsl-monitor = { path = "../../kapsl-sdk/crates/kapsl-monitor" }
-kapsl-transport = { path = "../../kapsl-sdk/crates/kapsl-transport" }
-kapsl-shm = { path = "../../kapsl-sdk/crates/kapsl-shm" }
-kapsl-llm = { path = "../../kapsl-sdk/crates/kapsl-llm" }
-kapsl-rag = { path = "../../kapsl-sdk/crates/kapsl-rag" }
-kapsl-rag-sdk = { path = "../../kapsl-sdk/crates/kapsl-rag-sdk" }
