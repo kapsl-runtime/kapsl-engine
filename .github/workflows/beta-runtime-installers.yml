@@ -1,0 +1,333 @@
+name: Beta Runtime Installers
+
+on:
+  push:
+    branches:
+      - develop
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+  APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+  APPLE_ID: ${{ secrets.APPLE_ID }}
+  APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+  WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+  WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
+jobs:
+  build-runtime-installers:
+    name: Build runtime installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - name: Install WiX Toolset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install wixtoolset --no-progress -y
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          if (Test-Path $wixBin) {
+            Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+          }
+
+      - name: Resolve beta version (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          short_sha="${GITHUB_SHA::8}"
+          date_str="$(date -u +%Y%m%d)"
+          raw_version="${manifest_version}-beta.${date_str}.${short_sha}"
+
+          if [[ "$manifest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          else
+            numeric_version="0.1.0"
+          fi
+
+          deb_version="$(echo "$raw_version" | sed 's/-/~/g')"
+
+          echo "KAPSL_VERSION=$raw_version" >> "$GITHUB_ENV"
+          echo "KAPSL_NUMERIC_VERSION=$numeric_version" >> "$GITHUB_ENV"
+          echo "KAPSL_DEB_VERSION=$deb_version" >> "$GITHUB_ENV"
+
+      - name: Resolve beta version (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
+          $manifestVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
+          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
+          $dateStr = (Get-Date -Format "yyyyMMdd")
+          $rawVersion = "$manifestVersion-beta.$dateStr.$shortSha"
+
+          if ($manifestVersion -match '^(\d+)\.(\d+)\.(\d+)') {
+            $numericVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+          } else {
+            $numericVersion = "0.1.0"
+          }
+
+          $debVersion = $rawVersion -replace '-', '~'
+
+          "KAPSL_VERSION=$rawVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KAPSL_NUMERIC_VERSION=$numericVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KAPSL_DEB_VERSION=$debVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build kapsl
+        if: runner.os != 'Windows'
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
+
+      - name: Build kapsl (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTFLAGS: -C debuginfo=0 -C link-arg=/DEBUG:NONE
+          CARGO_INCREMENTAL: "0"
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
+
+      - name: Package Debian installer (.deb)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist pkgroot/DEBIAN pkgroot/usr/local/bin
+          install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+
+          arch="$(dpkg --print-architecture)"
+
+          {
+            echo "Package: kapsl-runtime"
+            echo "Version: ${KAPSL_DEB_VERSION}"
+            echo "Section: utils"
+            echo "Priority: optional"
+            echo "Architecture: ${arch}"
+            echo "Maintainer: Kapsl Team <support@kapsl.ai>"
+            echo "Description: Kapsl runtime CLI and local inference server (beta)."
+          } > pkgroot/DEBIAN/control
+
+          deb_path="dist/kapsl-runtime_${KAPSL_DEB_VERSION}_${arch}.deb"
+          dpkg-deb --build pkgroot "${deb_path}"
+          sha256sum "${deb_path}" > "${deb_path}.sha256"
+          ls -la dist
+
+      - name: Import Apple signing certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.APPLE_TEAM_ID != ''
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 16)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Package macOS installer (.pkg)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist pkgroot/usr/local/bin
+          install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+
+          arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+          case "${arch_name}" in
+            x64) arch_name="x86_64" ;;
+            arm64) arch_name="aarch64" ;;
+          esac
+
+          unsigned_pkg="$RUNNER_TEMP/kapsl-runtime-unsigned.pkg"
+          pkg_path="dist/kapsl-runtime-${KAPSL_VERSION}-macos-${arch_name}.pkg"
+
+          if [ -n "${APPLE_TEAM_ID:-}" ]; then
+            codesign --force --options runtime --sign "Developer ID Application: Kapsl ($APPLE_TEAM_ID)" \
+              pkgroot/usr/local/bin/kapsl
+          else
+            echo "APPLE_TEAM_ID is not set; building unsigned macOS package."
+          fi
+
+          pkgbuild \
+            --root pkgroot \
+            --identifier com.kapsl.runtime \
+            --version "${KAPSL_NUMERIC_VERSION}" \
+            --install-location / \
+            "${unsigned_pkg}"
+
+          if [ -n "${APPLE_TEAM_ID:-}" ]; then
+            productsign --sign "Developer ID Installer: Kapsl ($APPLE_TEAM_ID)" \
+              "${unsigned_pkg}" "${pkg_path}"
+          else
+            cp "${unsigned_pkg}" "${pkg_path}"
+          fi
+
+          shasum -a 256 "${pkg_path}" > "${pkg_path}.sha256"
+          ls -la dist
+
+      - name: Notarize macOS installer
+        if: runner.os == 'macOS' && env.APPLE_ID != '' && env.APPLE_APP_PASSWORD != '' && env.APPLE_TEAM_ID != ''
+        run: |
+          pkg_path="$(ls dist/*.pkg)"
+          xcrun notarytool submit "${pkg_path}" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple "${pkg_path}"
+
+      - name: Package Windows installer (.msi)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          New-Item -ItemType Directory -Path wix -Force | Out-Null
+
+          $runnerArch = $env:RUNNER_ARCH.ToLower()
+          $arch = $runnerArch
+          if ($arch -eq "x64") { $arch = "x86_64" }
+          if ($arch -eq "arm64") { $arch = "aarch64" }
+
+          $wixArch = "x86"
+          $programFilesFolderId = "ProgramFilesFolder"
+          $win64 = "no"
+          if ($runnerArch -eq "x64") {
+            $wixArch = "x64"
+            $programFilesFolderId = "ProgramFiles64Folder"
+            $win64 = "yes"
+          }
+          if ($runnerArch -eq "arm64") {
+            $wixArch = "arm64"
+            $programFilesFolderId = "ProgramFiles64Folder"
+            $win64 = "yes"
+          }
+
+          $msiName = "kapsl-runtime-$($env:KAPSL_VERSION)-windows-$arch.msi"
+          Copy-Item "kapsl-runtime/target/release/kapsl.exe" "wix/kapsl.exe" -Force
+
+          $wxsLines = @(
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">'
+            '  <Product'
+            '    Id="*"'
+            '    Name="Kapsl Runtime (Beta)"'
+            '    Language="1033"'
+            "    Version=""$($env:KAPSL_NUMERIC_VERSION)"""
+            '    Manufacturer="Kapsl"'
+            '    UpgradeCode="{A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D}">'
+            '    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />'
+            '    <MajorUpgrade DowngradeErrorMessage="A newer version of Kapsl Runtime Beta is already installed." />'
+            '    <MediaTemplate EmbedCab="yes" />'
+            '    <Directory Id="TARGETDIR" Name="SourceDir">'
+            "      <Directory Id=""$programFilesFolderId"">"
+            '        <Directory Id="INSTALLFOLDER" Name="Kapsl">'
+            "          <Component Id=""KapslExeComponent"" Guid=""*"" Win64=""$win64"">"
+            '            <File Id="KapslExeFile" Source="kapsl.exe" KeyPath="yes" />'
+            '          </Component>'
+            '        </Directory>'
+            '      </Directory>'
+            '    </Directory>'
+            '    <Feature Id="MainFeature" Title="Kapsl Runtime Beta" Level="1">'
+            '      <ComponentRef Id="KapslExeComponent" />'
+            '    </Feature>'
+            '  </Product>'
+            '</Wix>'
+          )
+          $wxsLines | Set-Content -Path "wix/installer.wxs" -Encoding utf8
+
+          Push-Location "wix"
+          candle.exe -arch $wixArch installer.wxs
+          light.exe installer.wixobj -o "../dist/$msiName"
+          Pop-Location
+
+          $hash = (Get-FileHash -Path "dist/$msiName" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $msiName" | Set-Content -Path "dist/$msiName.sha256"
+
+          Get-ChildItem dist
+
+      - name: Sign Windows installer
+        if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERTIFICATE_PASSWORD != ''
+        shell: pwsh
+        run: |
+          $certBytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $certPath = "$env:RUNNER_TEMP\cert.pfx"
+          [IO.File]::WriteAllBytes($certPath, $certBytes)
+
+          $msiPath = (Get-ChildItem "dist\*.msi").FullName
+          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign `
+            /fd sha256 `
+            /tr http://timestamp.digicert.com `
+            /td sha256 `
+            /f $certPath `
+            /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+            $msiPath
+
+          Remove-Item $certPath -Force
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-installers-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish-beta-release:
+    needs: build-runtime-installers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve beta version
+        id: version
+        run: |
+          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          short_sha="${GITHUB_SHA::8}"
+          date_str="$(date -u +%Y%m%d)"
+          beta_version="${manifest_version}-beta.${date_str}.${short_sha}"
+          echo "version=$beta_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${beta_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: "Beta ${{ steps.version.outputs.version }}"
+          prerelease: true
+          generate_release_notes: true
+          files: release-assets/**
+
+      - name: Upload beta installers to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws s3 cp release-assets/ \
+            s3://kapsl-installer/runtime/beta/v${{ steps.version.outputs.version }}/ \
+            --recursive \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          # Also overwrite the "latest-beta" pointer so clients can always find the newest beta
+          aws s3 cp release-assets/ \
+            s3://kapsl-installer/runtime/beta/latest/ \
+            --recursive \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
