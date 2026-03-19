@@ -68,7 +68,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
 use tar::{Archive, Builder};
 use tokio::sync::Mutex as AsyncMutex;
-use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 #[cfg(unix)]
@@ -142,14 +141,23 @@ impl SharedKvState {
     }
 
     /// Attach a new engine to the shared pool and register it with the global
-    /// scheduler.  Returns the allocator to pass to `LLMBackend::with_shared_pool`.
-    fn attach_engine(&self, device_id: usize) -> SharedBlockAllocator {
+    /// scheduler.  Returns the allocator and the recommended per-engine
+    /// total_blocks cap so that the block budget is divided fairly across all
+    /// replicas sharing this device.
+    fn attach_engine(&self, device_id: usize) -> (SharedBlockAllocator, usize) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         self.scheduler
             .lock()
             .register(KvEngineHandle { engine_id, share_weight: 1 });
-        allocator
+        // Divide the device's block budget evenly across all registered engines.
+        const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
+        const MIN_BLOCKS_PER_ENGINE: usize = 256;
+        let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+        let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
+        let engine_count = (engine_id + 1) as usize; // engine_id was 0-based before this call
+        let blocks_per_engine = (total_blocks / engine_count).max(MIN_BLOCKS_PER_ENGINE);
+        (allocator, blocks_per_engine)
     }
 
     /// Deregister an engine (call on model unload).
@@ -9339,7 +9347,8 @@ fn load_model_blocking(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            backend = backend.with_shared_pool(shared_kv.attach_engine(primary_device));
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+            backend = backend.with_shared_pool(kv_pool).with_kv_blocks_cap(kv_blocks_cap);
             tokio::runtime::Handle::current()
                 .block_on(backend.load(&model_file_path))
                 .map_err(|e| {
@@ -9655,7 +9664,8 @@ async fn load_model(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            backend = backend.with_shared_pool(shared_kv.attach_engine(primary_device));
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+            backend = backend.with_shared_pool(kv_pool).with_kv_blocks_cap(kv_blocks_cap);
             backend.load(&model_file_path).await.map_err(|e| {
                 let err: Box<dyn std::error::Error + Send + Sync> =
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
@@ -9929,7 +9939,8 @@ async fn scale_up_model(
             LLMBackend::with_device_ids(device_ids.clone())
         };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-        backend = backend.with_shared_pool(shared_kv.attach_engine(primary_device));
+        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+        backend = backend.with_shared_pool(kv_pool).with_kv_blocks_cap(kv_blocks_cap);
         backend.load(&model_file_path).await.map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
