@@ -378,6 +378,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "chrono"
+version = "0.4.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
+dependencies = [
+ "iana-time-zone",
+ "js-sys",
+ "num-traits",
+ "wasm-bindgen",
+ "windows-link",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -612,6 +625,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "cron"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f8c3e73077b4b4a6ab1ea5047c37c57aee77657bc8ecd6f29b0af082d0b0c07"
+dependencies = [
+ "chrono",
+ "nom",
+ "once_cell",
 ]
 
 [[package]]
@@ -1748,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1760,16 +1784,16 @@ dependencies = [
  "image",
  "kapsl-backends",
  "kapsl-core",
- "kapsl-engine-api",
- "kapsl-hal",
- "kapsl-ipc",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-ipc 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "kapsl-llm",
  "kapsl-monitor",
  "kapsl-rag",
  "kapsl-rag-sdk",
- "kapsl-scheduler",
- "kapsl-shm",
- "kapsl-transport",
+ "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "mime_guess",
  "parking_lot",
@@ -1790,14 +1814,14 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "async-trait",
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api",
- "kapsl-hal",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "kapsl-llm",
  "log",
  "lru",
@@ -1811,7 +1835,7 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "flate2",
  "fs2",
@@ -1840,9 +1864,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "kapsl-engine-api"
+version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "kapsl-hal"
 version = "0.1.0"
 source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sys-info",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "kapsl-hal"
+version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "serde",
  "serde_json",
@@ -1858,10 +1905,28 @@ dependencies = [
  "async-trait",
  "bincode",
  "futures",
- "kapsl-engine-api",
- "kapsl-scheduler",
- "kapsl-shm",
- "kapsl-transport",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "log",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "kapsl-ipc"
+version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "futures",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "serde",
  "thiserror 1.0.69",
@@ -1871,9 +1936,9 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
- "kapsl-hal",
+ "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "rayon",
  "thiserror 1.0.69",
@@ -1882,15 +1947,15 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "async-stream",
  "async-trait",
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api",
- "kapsl-hal",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "kapsl-kernels",
  "kapsl-quantization",
  "llama-cpp-2",
@@ -1909,12 +1974,12 @@ dependencies = [
 [[package]]
 name = "kapsl-monitor"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "prometheus",
  "thiserror 1.0.69",
  "tokio",
@@ -1923,7 +1988,7 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "anyhow",
  "half",
@@ -1937,7 +2002,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1956,7 +2021,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag-sdk"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
 dependencies = [
  "async-trait",
  "futures",
@@ -1972,8 +2037,25 @@ source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fme
 dependencies = [
  "async-trait",
  "futures",
- "kapsl-engine-api",
- "kapsl-hal",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "log",
+ "parking_lot",
+ "rayon",
+ "tokio",
+]
+
+[[package]]
+name = "kapsl-scheduler"
+version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cron",
+ "futures",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "parking_lot",
  "rayon",
@@ -1988,9 +2070,30 @@ dependencies = [
  "async-trait",
  "bincode",
  "crossbeam",
- "kapsl-engine-api",
- "kapsl-scheduler",
- "kapsl-transport",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "libc",
+ "log",
+ "memmap2",
+ "prometheus",
+ "serde",
+ "shared_memory",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "kapsl-shm"
+version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "crossbeam",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "libc",
  "log",
  "memmap2",
@@ -2008,7 +2111,21 @@ source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fme
 dependencies = [
  "async-trait",
  "bincode",
- "kapsl-engine-api",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "log",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "kapsl-transport"
+version = "0.1.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+dependencies = [
+ "async-trait",
+ "bincode",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "serde",
  "thiserror 1.0.69",
@@ -2328,9 +2445,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "clap",
- "kapsl-ipc",
- "kapsl-shm",
- "kapsl-transport",
+ "kapsl-ipc 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
  "tokio",
 ]
 
@@ -3232,9 +3349,9 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "clap",
- "kapsl-engine-api",
- "kapsl-shm",
- "kapsl-transport",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
+ "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
  "libc",
 ]
 
