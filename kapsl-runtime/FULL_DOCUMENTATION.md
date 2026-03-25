@@ -1,6 +1,6 @@
 # kapsl-runtime Full Documentation
 
-Last updated: 2026-03-05  
+Last updated: 2026-03-25
 Primary runtime binary: `kapsl` (`kapsl-runtime/crates/kapsl-cli`)
 
 ## 1. What `kapsl-runtime` Is
@@ -88,6 +88,8 @@ Defaults:
 - `kapsl build ...`
 - `kapsl push ...`
 - `kapsl pull ...`
+- `kapsl login ...`
+- `kapsl control ...`
 - `kapsl --model ...` (legacy compatibility for `run`)
 
 ### 4.1 Run Options
@@ -104,8 +106,20 @@ Key run flags:
 - `--scheduler-queue-size` (default `256`).
 - `--scheduler-max-micro-batch` (default `4`).
 - `--scheduler-queue-delay-ms` (default `2`).
-- `--performance-profile <standard|balanced|throughput|latency>`.
+- `--performance-profile <auto|standard|balanced|throughput|latency>` (default `auto`).
 - `--topology` and `--tp-degree` for parallel topology hints.
+- `--state-dir <PATH>`: root directory for runtime state (rag-data, extensions, extensions-config, auth-store.json). Overrides `KAPSL_RAG_STORAGE_ROOT`, `KAPSL_EXTENSIONS_ROOT`, `KAPSL_EXT_CONFIG_ROOT`, and `KAPSL_AUTH_STORE_PATH` when set.
+- `--shm-size-mb <MIB>` (default `256`): size of the shared memory segment when using `shm` or `hybrid` transport. Also read from `KAPSL_SHM_SIZE_MB`.
+
+ONNX runtime tuning flags:
+
+- `--onnx-memory-pattern <BOOL>`: enable/disable ONNX memory pattern optimization.
+- `--onnx-disable-cpu-mem-arena <BOOL>`: disable CPU memory arena allocator.
+- `--onnx-session-buckets <N>`: number of dynamic-shape session buckets.
+- `--onnx-bucket-dim-granularity <N>`: granularity for bucket dimension rounding.
+- `--onnx-bucket-max-dims <N>`: maximum dynamic dimensions tracked per bucket.
+- `--onnx-peak-concurrency-hint <N>`: hint for peak concurrent ONNX session usage.
+- `--onnx-model-tuning <SPEC>` (repeatable): per-model ONNX tuning overrides. Format: `<model_id|*>:key=value[,key=value...]`.
 
 ### 4.2 Queue Overflow Policy
 
@@ -121,6 +135,7 @@ The policy is not yet a CLI flag; it is set programmatically via `Scheduler::wit
 
 Performance profile tuning (applies only when related flags are not explicitly passed):
 
+- `auto` (default): automatically selects parameters based on model size and system resources.
 - `balanced`: batch `8`, transport `hybrid`, queue size `512`, micro-batch `batch_size`, delay `3ms`.
 - `throughput`: batch `16`, transport `hybrid`, queue size `2048`, micro-batch `batch_size`, delay `6ms`.
 - `latency`: batch `1`, transport `socket`, queue size `128`, micro-batch `1`, delay `0ms`.
@@ -177,6 +192,12 @@ Pull:
 kapsl pull acme/model:prod --destination-dir ./models
 ```
 
+OCI pull with digest ref:
+
+```bash
+kapsl pull acme/model:prod --ref sha256:abc123... --destination-dir ./models
+```
+
 Target format:
 
 - Required for push and pull: `<repo_name>/<model>:<label>`
@@ -187,7 +208,52 @@ Default remote behavior:
 - Uses `https://api.kapsl.net/v1` by default.
 - If remote URL resolves to the legacy placeholder URL, mirrors artifacts to a local directory (configurable env var).
 - If `remote_url` is overridden, uses HTTP PUT/GET remote backend.
-- If `remote_url` starts with `oci://`, uses ORAS to push/pull the `.aimod` as an OCI artifact.
+- If `remote_url` starts with `oci://`, uses ORAS to push/pull the `.aimod` as an OCI artifact (MIME type `application/vnd.kapsl.aimod.v1`). Requires the `oras` binary (path configurable via `KAPSL_ORAS_BIN`). Credentials use `KAPSL_OCI_USERNAME` and `KAPSL_OCI_PASSWORD`.
+
+### 4.4 Login Command
+
+`kapsl login` authenticates with the Kapsl registry via OAuth.
+
+Flags:
+
+- `--provider <github|google>` (default `github`).
+- `--callback-host <HOST>` (default `127.0.0.1`).
+- `--callback-port <PORT>` (default `0` = ephemeral).
+- `--timeout-seconds <SECONDS>` (default `180`).
+- `--no-browser`: skip automatic browser launch.
+- `--device-code`: use device code flow (headless/SSH environments; GitHub only).
+
+Credentials are stored in `~/.kapsl/tokens.json` (path overridable via `KAPSL_REMOTE_TOKEN_STORE_PATH`).
+
+### 4.5 Control Command
+
+`kapsl control` runs a multi-runtime control loop that orchestrates cross-runtime weight distribution and scaling policy based on observed pressure and GPU utilization.
+
+Required flags:
+
+- `--runtime <NAME=URL>` (repeatable): registers a named runtime endpoint (e.g. `primary=http://127.0.0.1:9095`).
+
+Optional flags:
+
+- `--runtime-profile <NAME=PROFILE>`: per-runtime performance profile override (`latency|balanced|throughput`).
+- `--runtime-token <NAME=TOKEN>`: per-runtime auth token.
+- `--auth-token <TOKEN>`: default auth token used when no per-runtime token is set.
+- `--memory-budget-bytes <NAME=BYTES>`: per-runtime memory budget constraint.
+- `--interval-seconds <N>` (default `5`): control loop polling interval.
+- `--timeout-ms <N>` (default `1500`): per-request timeout for health/stats checks.
+- `--queue-target <N>` (default `10`): desired queue depth per runtime.
+- `--high-pressure-score <F>` (default `0.85`): pressure score threshold for high-pressure state.
+- `--low-pressure-score <F>` (default `0.45`): pressure score threshold for low-pressure state.
+- `--hot-gpu-utilization <F>` (default `0.92`): GPU utilization ratio above which a runtime is considered hot.
+- `--hot-memory-utilization <F>` (default `0.90`): memory utilization ratio above which a runtime is considered hot.
+- `--overload-window-seconds <N>` (default `30`): sliding window for overload detection.
+- `--hot-window-seconds <N>` (default `20`): sliding window for hot-GPU detection.
+- `--unhealthy-hold-seconds <N>` (default `30`): time before an unhealthy runtime is reconsidered.
+- `--weight-step <F>` (default `0.10`): increment/decrement per weight adjustment cycle.
+- `--weight-floor <F>` (default `0.05`): minimum weight assigned to any active runtime.
+- `--overload-shift-fraction <F>` (default `0.20`): fraction of traffic shifted away on overload.
+- `--dry-run`: compute and log weight decisions without applying them.
+- `--weights-file <PATH>` (default `runtime-control-weights.json`): file where current weight assignments are persisted.
 
 ## 5. `.aimod` Package Format
 
@@ -326,6 +392,10 @@ Writer endpoints:
 - `GET /api/extensions/:id/config?workspace_id=...`
 - `POST /api/extensions/:id/launch`
 - `POST /api/extensions/:id/sync`
+
+Unauthenticated endpoints:
+
+- `POST /api/auth/login`: probe auth status or validate a token. Request body: `{"token": "<optional>"}`. Response: `{"authenticated": bool, "auth_enabled": bool, "legacy_auth_enabled": bool, "role": "...", "scopes": [...], "mode": "...", "access": {"read": bool, "write": bool, "admin": bool}}`.
 
 Admin endpoints:
 
@@ -581,6 +651,7 @@ Primary runtime env vars:
 - `KAPSL_ALLOW_INSECURE_HTTP`
 - `KAPSL_PROVIDER_POLICY` (`fastest` or `manifest`)
 - `KAPSL_LLM_ISOLATE_PROCESS`
+- `KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH`: allow the scheduler to micro-batch LLM requests.
 - `KAPSL_LOG_SENSITIVE_IDS` (set truthy to disable request/session redaction)
 - `KAPSL_RAG_STORAGE_ROOT`
 - `KAPSL_EXTENSIONS_ROOT`
@@ -589,8 +660,33 @@ Primary runtime env vars:
 - `KAPSL_REMOTE_URL`
 - `KAPSL_REMOTE_PLACEHOLDER_URL`
 - `KAPSL_REMOTE_PLACEHOLDER_DIR`
+- `KAPSL_REMOTE_TOKEN_STORE_PATH`: path to the OAuth token store file (default `~/.kapsl/tokens.json`).
 - `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS`
 - `KAPSL_INFER_ADAPTERS` (optional adapters; e.g. `echo_tensor` when built with feature)
+- `KAPSL_SHM_SIZE_MB`: size of the shared memory segment in MiB (default `256`).
+- `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY` (legacy alias `KAPSL_LITE_INGRESS_BACKPRESSURE`): sets the queue overflow policy (`block|drop_newest|drop_oldest`).
+
+OCI / ORAS env vars:
+
+- `KAPSL_ORAS_BIN`: path to the `oras` binary used for OCI push/pull (defaults to `oras` on `PATH`).
+- `KAPSL_OCI_USERNAME`: username for OCI registry authentication.
+- `KAPSL_OCI_PASSWORD`: password for OCI registry authentication.
+
+Inter-model relay env vars:
+
+- `KAPSL_INTER_MODEL_ROUTES` (legacy alias `KAPSL_LITE_INTER_MODEL_ROUTES`): JSON-encoded map of source model ID to list of destination model IDs for automatic inter-model relay.
+- `KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS` (legacy alias `KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS`): minimum interval in ms between relay publishes (default `2000`).
+
+Server pressure env vars:
+
+- `KAPSL_SERVER_PRESSURE_MEMORY_CONSERVE_PCT`: memory usage % above which runtime enters conserve pressure state.
+- `KAPSL_SERVER_PRESSURE_MEMORY_EMERGENCY_PCT`: memory usage % above which runtime enters emergency pressure state.
+- `KAPSL_SERVER_PRESSURE_GPU_UTIL_CONSERVE_PCT`: GPU utilization % threshold for conserve state.
+- `KAPSL_SERVER_PRESSURE_GPU_UTIL_EMERGENCY_PCT`: GPU utilization % threshold for emergency state.
+- `KAPSL_SERVER_PRESSURE_GPU_MEM_CONSERVE_PCT`: GPU memory usage % threshold for conserve state.
+- `KAPSL_SERVER_PRESSURE_GPU_MEM_EMERGENCY_PCT`: GPU memory usage % threshold for emergency state.
+- `KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS`: max new tokens allowed per request in conserve state.
+- `KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS`: max new tokens allowed per request in emergency state.
 
 Model cache / disk-check env vars (read by `kapsl-core` loader):
 
@@ -601,7 +697,45 @@ Model cache / disk-check env vars (read by `kapsl-core` loader):
 
 All above support legacy `KAPSL_*` aliases in runtime code.
 
-## 13. Example API Calls
+## 13. Inter-Model Relay
+
+The runtime supports routing inference outputs from one model as inputs to one or more downstream models within the same process.
+
+Configuration is via `KAPSL_INTER_MODEL_ROUTES` (or legacy `KAPSL_LITE_INTER_MODEL_ROUTES`): a JSON map from source model ID to a list of destination model IDs.
+
+Example:
+
+```json
+{"encoder": ["decoder-a", "decoder-b"]}
+```
+
+Relay sessions are prefixed with `relay/` internally. The relay publishes at most once every `KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS` (default `2000 ms`).
+
+## 13a. Runtime Pressure Management
+
+The runtime monitors system resource utilization and adjusts inference behavior when under pressure. There are three pressure states:
+
+| State | Meaning |
+| --- | --- |
+| `Normal` | No constraints applied. |
+| `Conserve` | Token generation is capped to `KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS`. |
+| `Emergency` | Token generation is capped to `KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS`. |
+
+Thresholds are configured via env vars (see Section 12). The runtime evaluates pressure state continuously using `evaluate_runtime_pressure_state()`.
+
+## 13b. LLM Shared KV Cache
+
+For multi-model deployments with LLM backends, the runtime coordinates a shared KV cache block pool across all LLM engine instances on the same device.
+
+Key details:
+
+- Each KV block is 2 MB.
+- Block size is 16 tokens.
+- The `SharedKvState` coordinates device-level block allocator pools and a `GlobalKvScheduler`.
+- Each LLM engine attaches to the shared pool on startup and detaches on shutdown.
+- Cross-model token-budget coordination prevents any single engine from monopolising device memory.
+
+## 14. Example API Calls
 
 Health:
 
@@ -640,7 +774,7 @@ curl -X POST http://127.0.0.1:9095/api/engine/package \
   }'
 ```
 
-## 14. Testing and Benchmarks
+## 15. Testing and Benchmarks
 
 Useful scripts:
 
@@ -662,7 +796,7 @@ engine/kapsl-benchmarks/run_kapsl_vs_vllm_qwen.sh
 The script starts a tuned kapsl instance, waits for vLLM to be ready on its own port, runs throughput/latency sweeps against both, and prints a concise summary table.
 See `engine/kapsl-benchmarks/README.md` for reproducible usage and common options.
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 Common issues:
 
@@ -673,8 +807,10 @@ Common issues:
 - Push/pull placeholder error: ensure pushed artifact exists in placeholder mirror dir.
 - Unauthorized/forbidden API: verify role token/api key and required route scope.
 - `InsufficientDiskSpace` on load: the loader could not free enough cache space. Either set `KAPSL_MODEL_CACHE_MAX_BYTES`/`KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` to a larger threshold, point `KAPSL_MODEL_CACHE_DIR` at a volume with more space, or remove stale entries from the cache directory manually.
+- OCI push/pull fails: ensure `oras` is on `PATH` (or set `KAPSL_ORAS_BIN`), and that `KAPSL_OCI_USERNAME`/`KAPSL_OCI_PASSWORD` are set correctly.
+- `kapsl control` not shifting weights: check that each `--runtime` URL is reachable and that `--auth-token` / `--runtime-token` are set if auth is enabled. Use `--dry-run` to validate decisions without applying them.
 
-## 16. Known Constraints
+## 17. Known Constraints
 
 - HTTP infer is synchronous; token streaming is available on IPC protocol/Python stream client path.
 - RAG embeddings are currently lightweight hash-based embeddings (not external embedding model-backed).
