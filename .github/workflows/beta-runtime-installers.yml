@@ -233,6 +233,7 @@ jobs:
             '        <Directory Id="INSTALLFOLDER" Name="Kapsl">'
             "          <Component Id=""KapslExeComponent"" Guid=""*"" Win64=""$win64"">"
             '            <File Id="KapslExeFile" Source="kapsl.exe" KeyPath="yes" />'
+            '            <Environment Id="KapslPathEnv" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last" Permanent="no" System="yes" />'
             '          </Component>'
             '        </Directory>'
             '      </Directory>'
