@@ -5203,6 +5203,20 @@ fn native_tls_http_agent() -> ureq::Agent {
         .into()
 }
 
+/// Agent with no global timeout, suitable for large file uploads/downloads.
+/// Uses rustls to avoid macOS native-tls rejecting certs with long validity periods.
+fn http_agent_for_transfer() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::Rustls)
+                .build(),
+        )
+        .timeout_global(None)
+        .build()
+        .into()
+}
+
 fn fetch_remote_artifact_inventory(
     custom_remote_url: Option<&str>,
 ) -> Result<RuntimeRemoteArtifactInventoryResponse, String> {
@@ -5259,6 +5273,84 @@ fn fetch_remote_artifact_inventory(
     })
 }
 
+/// Try to get a presigned upload URL from the server. Returns None if the
+/// server does not support presigned uploads (404 or 501).
+fn request_presigned_upload_url(
+    artifact_url: &str,
+    authorization_header: Option<&str>,
+) -> Result<Option<PresignedUploadResponse>, RemoteHttpRequestError> {
+    let upload_endpoint = format!("{}/upload", artifact_url);
+    let agent = http_agent_for_transfer();
+    let mut request = agent
+        .post(&upload_endpoint)
+        .header("Content-Type", "application/json");
+    if let Some(header) = authorization_header {
+        request = request.header("Authorization", header);
+    }
+    match request.send_empty() {
+        Ok(resp) => {
+            let body: String = resp
+                .into_body()
+                .read_to_string()
+                .map_err(|e| RemoteHttpRequestError {
+                    status_code: None,
+                    message: format!("Failed to read presigned upload response: {}", e),
+                })?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| RemoteHttpRequestError {
+                    status_code: None,
+                    message: format!("Invalid presigned upload response JSON: {}", e),
+                })?;
+            let upload_url = parsed["upload_url"]
+                .as_str()
+                .ok_or_else(|| RemoteHttpRequestError {
+                    status_code: None,
+                    message: "Presigned upload response missing 'upload_url' field".to_string(),
+                })?
+                .to_string();
+            let method = parsed["method"]
+                .as_str()
+                .unwrap_or("PUT")
+                .to_string();
+            let headers: Vec<(String, String)> = parsed["headers"]
+                .as_object()
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(Some(PresignedUploadResponse {
+                upload_url,
+                method,
+                headers,
+            }))
+        }
+        Err(ureq::Error::StatusCode(code)) if code == 404 || code == 501 => Ok(None),
+        Err(e) => {
+            // Other errors (auth, server error) — propagate.
+            let status = match e {
+                ureq::Error::StatusCode(code) => Some(code),
+                _ => None,
+            };
+            Err(RemoteHttpRequestError {
+                status_code: status,
+                message: format!(
+                    "Failed to request presigned upload URL from {}: {}",
+                    upload_endpoint,
+                    format_remote_http_error(e)
+                ),
+            })
+        }
+    }
+}
+
+struct PresignedUploadResponse {
+    upload_url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+}
+
 fn push_kapsl_to_http_remote(
     artifact_url: &str,
     source_path: &Path,
@@ -5272,6 +5364,53 @@ fn push_kapsl_to_http_remote(
             e
         ),
     })?;
+
+    // Try presigned URL flow first.
+    if let Some(presigned) = request_presigned_upload_url(artifact_url, authorization_header)? {
+        eprintln!(
+            "Uploading via presigned URL ({} bytes)...",
+            file_size.len()
+        );
+        let file = File::open(source_path).map_err(|e| RemoteHttpRequestError {
+            status_code: None,
+            message: format!(
+                "Failed to open .aimod for upload {}: {}",
+                source_path.display(),
+                e
+            ),
+        })?;
+
+        let agent = http_agent_for_transfer();
+        let mut request = if presigned.method == "PUT" {
+            agent.put(&presigned.upload_url)
+        } else {
+            agent.post(&presigned.upload_url)
+        };
+        request = request
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", &file_size.len().to_string());
+        for (key, value) in &presigned.headers {
+            request = request.header(key, value);
+        }
+        // No Authorization header — the SAS token is in the URL.
+        request.send(file).map_err(|e| {
+            let status = match e {
+                ureq::Error::StatusCode(code) => Some(code),
+                _ => None,
+            };
+            RemoteHttpRequestError {
+                status_code: status,
+                message: format!(
+                    "Failed to upload .aimod to presigned URL: {}",
+                    format_remote_http_error(e)
+                ),
+            }
+        })?;
+
+        return Ok(file_size.len());
+    }
+
+    // Fallback: direct upload to the API server.
     let file = File::open(source_path).map_err(|e| RemoteHttpRequestError {
         status_code: None,
         message: format!(
@@ -5281,7 +5420,7 @@ fn push_kapsl_to_http_remote(
         ),
     })?;
 
-    let agent = native_tls_http_agent();
+    let agent = http_agent_for_transfer();
     let mut request = agent
         .put(artifact_url)
         .header("Content-Type", "application/octet-stream")
@@ -5307,13 +5446,68 @@ fn push_kapsl_to_http_remote(
     Ok(file_size.len())
 }
 
-fn pull_kapsl_from_http_remote(
+/// Try to get a presigned download URL from the server. Returns None if the
+/// server does not support presigned downloads (404 or 501).
+fn request_presigned_download_url(
     artifact_url: &str,
     authorization_header: Option<&str>,
+) -> Result<Option<String>, RemoteHttpRequestError> {
+    let download_endpoint = format!("{}/download", artifact_url);
+    let agent = http_agent_for_transfer();
+    let mut request = agent
+        .post(&download_endpoint)
+        .header("Content-Type", "application/json");
+    if let Some(header) = authorization_header {
+        request = request.header("Authorization", header);
+    }
+    match request.send_empty() {
+        Ok(resp) => {
+            let body: String = resp
+                .into_body()
+                .read_to_string()
+                .map_err(|e| RemoteHttpRequestError {
+                    status_code: None,
+                    message: format!("Failed to read presigned download response: {}", e),
+                })?;
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).map_err(|e| RemoteHttpRequestError {
+                    status_code: None,
+                    message: format!("Invalid presigned download response JSON: {}", e),
+                })?;
+            let download_url = parsed["download_url"]
+                .as_str()
+                .ok_or_else(|| RemoteHttpRequestError {
+                    status_code: None,
+                    message: "Presigned download response missing 'download_url' field".to_string(),
+                })?
+                .to_string();
+            Ok(Some(download_url))
+        }
+        Err(ureq::Error::StatusCode(code)) if code == 404 || code == 501 => Ok(None),
+        Err(e) => {
+            let status = match e {
+                ureq::Error::StatusCode(code) => Some(code),
+                _ => None,
+            };
+            Err(RemoteHttpRequestError {
+                status_code: status,
+                message: format!(
+                    "Failed to request presigned download URL from {}: {}",
+                    download_endpoint,
+                    format_remote_http_error(e)
+                ),
+            })
+        }
+    }
+}
+
+fn download_to_file(
+    url: &str,
     output_path: &Path,
+    authorization_header: Option<&str>,
 ) -> Result<u64, RemoteHttpRequestError> {
-    let agent = native_tls_http_agent();
-    let mut request = agent.get(artifact_url);
+    let agent = http_agent_for_transfer();
+    let mut request = agent.get(url);
     if let Some(header) = authorization_header {
         request = request.header("Authorization", header);
     }
@@ -5325,8 +5519,8 @@ fn pull_kapsl_from_http_remote(
         RemoteHttpRequestError {
             status_code: status,
             message: format!(
-                "Failed to download .aimod from remote backend {}: {}",
-                artifact_url,
+                "Failed to download .aimod from {}: {}",
+                url,
                 format_remote_http_error(e)
             ),
         }
@@ -5338,7 +5532,7 @@ fn pull_kapsl_from_http_remote(
             status_code: None,
             message: format!(
                 "Failed to create staging file for pull {} -> {}: {}",
-                artifact_url,
+                url,
                 staged_path.display(),
                 e
             ),
@@ -5350,7 +5544,7 @@ fn pull_kapsl_from_http_remote(
                 status_code: None,
                 message: format!(
                     "Failed to stream .aimod response body from {} to {}: {}",
-                    artifact_url,
+                    url,
                     staged_path.display(),
                     e
                 ),
@@ -5387,6 +5581,24 @@ fn pull_kapsl_from_http_remote(
     })?;
 
     Ok(bytes_downloaded)
+}
+
+fn pull_kapsl_from_http_remote(
+    artifact_url: &str,
+    authorization_header: Option<&str>,
+    output_path: &Path,
+) -> Result<u64, RemoteHttpRequestError> {
+    // Try presigned URL flow first.
+    if let Some(download_url) =
+        request_presigned_download_url(artifact_url, authorization_header)?
+    {
+        eprintln!("Downloading via presigned URL...");
+        // No auth header needed — the SAS token is in the URL.
+        return download_to_file(&download_url, output_path, None);
+    }
+
+    // Fallback: direct download from the API server.
+    download_to_file(artifact_url, output_path, authorization_header)
 }
 
 #[derive(Debug, Clone)]
@@ -6520,6 +6732,7 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
         model_file: model_file_name.clone(),
         metadata,
         hardware_requirements: kapsl_core::HardwareRequirements::default(),
+        cron_jobs: Vec::new(),
     };
 
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -7127,6 +7340,7 @@ fn create_kapsl_package_from_context(
         model_file,
         metadata: metadata_value,
         hardware_requirements: hardware_requirements_from_manifest.unwrap_or_default(),
+        cron_jobs: Vec::new(),
     };
 
     let output_file = File::create(&output_path).map_err(|e| {
