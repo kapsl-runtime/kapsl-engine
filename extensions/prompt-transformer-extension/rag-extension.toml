@@ -1,0 +1,43 @@
+id = "transformer.prompt-format"
+name = "Prompt Format Transformer"
+version = "0.1.0"
+runtime = "sidecar"
+capabilities = ["prompt-transform"]
+auth = ["none"]
+permissions = []
+description = "Transforms plain prompts into model-specific chat formats with EOS/end-of-turn markers"
+entrypoint = "connector"
+
+[config_schema]
+type = "object"
+additionalProperties = false
+required = ["format"]
+
+[config_schema.properties.format]
+type = "string"
+description = "Built-in output format"
+enum = ["gemma", "chatml", "llama3", "custom"]
+
+[config_schema.properties.trim_input]
+type = "boolean"
+description = "Trim surrounding whitespace before wrapping the prompt"
+
+[config_schema.properties.bos_token]
+type = "string"
+description = "Optional BOS token override"
+
+[config_schema.properties.user_prefix]
+type = "string"
+description = "Custom format prefix inserted before the user prompt"
+
+[config_schema.properties.user_suffix]
+type = "string"
+description = "Custom format suffix inserted after the user prompt, often an EOS/end-of-turn token"
+
+[config_schema.properties.assistant_prefix]
+type = "string"
+description = "Custom format assistant prefix appended after the user suffix"
+
+[config_schema.properties.think_suffix]
+type = "string"
+description = "Optional suffix appended after the assistant prefix"
