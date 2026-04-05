@@ -58,7 +58,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{Cursor, Read, Write};
+use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -5147,7 +5147,8 @@ fn push_kapsl_to_http_remote(
 fn pull_kapsl_from_http_remote(
     artifact_url: &str,
     authorization_header: Option<&str>,
-) -> Result<Vec<u8>, RemoteHttpRequestError> {
+    output_path: &Path,
+) -> Result<u64, RemoteHttpRequestError> {
     let agent = native_tls_http_agent();
     let mut request = agent.get(artifact_url);
     if let Some(header) = authorization_header {
@@ -5168,16 +5169,61 @@ fn pull_kapsl_from_http_remote(
         }
     })?;
 
-    response
-        .body_mut()
-        .read_to_vec()
-        .map_err(|e| RemoteHttpRequestError {
+    let staged_path = staged_output_path(output_path, "download");
+    let write_result = (|| -> Result<u64, RemoteHttpRequestError> {
+        let file = File::create(&staged_path).map_err(|e| RemoteHttpRequestError {
             status_code: None,
             message: format!(
-                "Failed to read .aimod response body from {}: {}",
-                artifact_url, e
+                "Failed to create staging file for pull {} -> {}: {}",
+                artifact_url,
+                staged_path.display(),
+                e
             ),
-        })
+        })?;
+        let mut writer = BufWriter::new(file);
+        let mut reader = response.body_mut().as_reader();
+        let bytes_downloaded =
+            std::io::copy(&mut reader, &mut writer).map_err(|e| RemoteHttpRequestError {
+                status_code: None,
+                message: format!(
+                    "Failed to stream .aimod response body from {} to {}: {}",
+                    artifact_url,
+                    staged_path.display(),
+                    e
+                ),
+            })?;
+        writer.flush().map_err(|e| RemoteHttpRequestError {
+            status_code: None,
+            message: format!(
+                "Failed to flush pulled .aimod to {}: {}",
+                staged_path.display(),
+                e
+            ),
+        })?;
+        Ok(bytes_downloaded)
+    })();
+    let bytes_downloaded = match write_result {
+        Ok(bytes_downloaded) => bytes_downloaded,
+        Err(error) => {
+            let _ = fs::remove_file(&staged_path);
+            return Err(error);
+        }
+    };
+
+    replace_output_file(&staged_path, output_path).map_err(|e| {
+        let _ = fs::remove_file(&staged_path);
+        RemoteHttpRequestError {
+            status_code: None,
+            message: format!(
+                "Failed to finalize pulled .aimod {} -> {}: {}",
+                staged_path.display(),
+                output_path.display(),
+                e
+            ),
+        }
+    })?;
+
+    Ok(bytes_downloaded)
 }
 
 #[derive(Debug, Clone)]
@@ -5201,10 +5247,16 @@ struct TempDirGuard {
 
 impl TempDirGuard {
     fn new(prefix: &str) -> Result<Self, String> {
-        let mut nonce_bytes = [0u8; 8];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = hex_encode(&nonce_bytes);
-        let dir = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nonce));
+        Self::new_in(&std::env::temp_dir(), prefix)
+    }
+
+    fn new_in(parent: &Path, prefix: &str) -> Result<Self, String> {
+        let dir = parent.join(format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            temp_nonce()
+        ));
         fs::create_dir_all(&dir).map_err(|e| {
             format!(
                 "Failed to create temporary directory {}: {}",
@@ -5224,6 +5276,34 @@ impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn temp_nonce() -> String {
+    let mut nonce_bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    hex_encode(&nonce_bytes)
+}
+
+fn staged_output_path(output_path: &Path, prefix: &str) -> PathBuf {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact.aimod");
+    parent.join(format!(
+        ".{}.{}-{}-{}.part",
+        file_name,
+        prefix,
+        std::process::id(),
+        temp_nonce()
+    ))
+}
+
+fn replace_output_file(staged_path: &Path, output_path: &Path) -> std::io::Result<()> {
+    if output_path.exists() {
+        fs::remove_file(output_path)?;
+    }
+    fs::rename(staged_path, output_path)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -5806,7 +5886,14 @@ fn pull_kapsl_from_oci_remote(
     let reference = build_oci_reference(&repo, &target.label, reference_override)?;
     let filename = format!("{}.aimod", target.model);
 
-    let temp_dir = TempDirGuard::new("kapsl-oci-pull")?;
+    fs::create_dir_all(destination_dir).map_err(|e| {
+        format!(
+            "Failed to create destination directory {}: {}",
+            destination_dir.display(),
+            e
+        )
+    })?;
+    let temp_dir = TempDirGuard::new_in(destination_dir, ".kapsl-oci-pull")?;
     let auth = load_oras_auth_from_env()?;
     let docker_config_dir = if auth.is_some() {
         let docker_dir = temp_dir.path().join("docker-config");
@@ -5879,17 +5966,10 @@ fn pull_kapsl_from_oci_remote(
         }
     };
 
-    fs::create_dir_all(destination_dir).map_err(|e| {
-        format!(
-            "Failed to create destination directory {}: {}",
-            destination_dir.display(),
-            e
-        )
-    })?;
     let output_path = destination_dir.join(&filename);
-    fs::copy(&pulled_path, &output_path).map_err(|e| {
+    replace_output_file(&pulled_path, &output_path).map_err(|e| {
         format!(
-            "Failed to write pulled .aimod to {}: {}",
+            "Failed to move pulled .aimod to {}: {}",
             output_path.display(),
             e
         )
@@ -7074,8 +7154,8 @@ fn pull_kapsl_from_placeholder_remote(
             )
         })?
     } else {
-        let bytes = match pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref()) {
-            Ok(bytes) => bytes,
+        match pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref(), &output_path) {
+            Ok(bytes_downloaded) => bytes_downloaded,
             Err(http_error) => {
                 if maybe_auto_login_for_remote(
                     &remote_url,
@@ -7084,21 +7164,17 @@ fn pull_kapsl_from_placeholder_remote(
                     &mut remote_token,
                     &http_error,
                 )? {
-                    pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref())
+                    pull_kapsl_from_http_remote(
+                        &artifact_url,
+                        remote_token.as_deref(),
+                        &output_path,
+                    )
                         .map_err(|e| e.message)?
                 } else {
                     return Err(http_error.message);
                 }
             }
-        };
-        fs::write(&output_path, &bytes).map_err(|e| {
-            format!(
-                "Failed to write pulled .aimod to {}: {}",
-                output_path.display(),
-                e
-            )
-        })?;
-        bytes.len() as u64
+        }
     };
 
     let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
