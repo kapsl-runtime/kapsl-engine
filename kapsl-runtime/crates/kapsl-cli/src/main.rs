@@ -786,6 +786,7 @@ const OCI_REMOTE_PREFIX: &str = "oci://";
 const KAPSL_OCI_ARTIFACT_TYPE: &str = "application/vnd.kapsl.aimod.v1";
 const KAPSL_OCI_LAYER_TYPE: &str = "application/vnd.kapsl.aimod.v1";
 const KAPSL_OCI_CONFIG_TYPE: &str = "application/vnd.kapsl.aimod.config.v1+json";
+const OCI_PRECOMPUTE_SHA256_ENV: &str = "KAPSL_OCI_PRECOMPUTE_SHA256";
 const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
 const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
 const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
@@ -5237,7 +5238,8 @@ struct OrasAuth {
 struct KapslOciConfig {
     artifact_type: String,
     filename: String,
-    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
     size: u64,
 }
 
@@ -5304,6 +5306,53 @@ fn replace_output_file(staged_path: &Path, output_path: &Path) -> std::io::Resul
         fs::remove_file(output_path)?;
     }
     fs::rename(staged_path, output_path)
+}
+
+fn stage_link_or_copy_file(source_path: &Path, output_path: &Path, prefix: &str) -> Result<u64, String> {
+    if source_path == output_path {
+        return fs::metadata(source_path)
+            .map(|meta| meta.len())
+            .map_err(|e| format!("Failed to stat {}: {}", source_path.display(), e));
+    }
+
+    let staged_path = staged_output_path(output_path, prefix);
+    let stage_result = match fs::hard_link(source_path, &staged_path) {
+        Ok(()) => fs::metadata(source_path).map(|meta| meta.len()).map_err(|e| {
+            format!(
+                "Failed to stat staged linked artifact {}: {}",
+                source_path.display(),
+                e
+            )
+        }),
+        Err(_) => fs::copy(source_path, &staged_path).map_err(|e| {
+            format!(
+                "Failed to copy artifact {} to staging path {}: {}",
+                source_path.display(),
+                staged_path.display(),
+                e
+            )
+        }),
+    };
+
+    let bytes = match stage_result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&staged_path);
+            return Err(error);
+        }
+    };
+
+    replace_output_file(&staged_path, output_path).map_err(|e| {
+        let _ = fs::remove_file(&staged_path);
+        format!(
+            "Failed to finalize staged artifact {} -> {}: {}",
+            staged_path.display(),
+            output_path.display(),
+            e
+        )
+    })?;
+
+    Ok(bytes)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -5761,7 +5810,11 @@ fn push_kapsl_to_oci_remote(
     let bytes_uploaded = fs::metadata(absolute_path)
         .map_err(|e| format!("Failed to stat .aimod {}: {}", absolute_path.display(), e))?
         .len();
-    let sha256 = sha256_file_hex(absolute_path)?;
+    let sha256 = if parse_env_bool(OCI_PRECOMPUTE_SHA256_ENV).unwrap_or(false) {
+        Some(sha256_file_hex(absolute_path)?)
+    } else {
+        None
+    };
 
     let manifest = read_manifest_from_kapsl_archive(absolute_path).ok();
 
@@ -5771,11 +5824,13 @@ fn push_kapsl_to_oci_remote(
     annotations.push(("io.kapsl.aimod.model".to_string(), target.model.clone()));
     annotations.push(("io.kapsl.aimod.label".to_string(), target.label.clone()));
     annotations.push(("io.kapsl.aimod.filename".to_string(), filename.to_string()));
-    annotations.push(("io.kapsl.aimod.sha256".to_string(), sha256.clone()));
     annotations.push((
         "io.kapsl.aimod.size".to_string(),
         bytes_uploaded.to_string(),
     ));
+    if let Some(sha256) = sha256.as_ref() {
+        annotations.push(("io.kapsl.aimod.sha256".to_string(), sha256.clone()));
+    }
     if let Some(manifest) = manifest.as_ref() {
         annotations.push((
             "io.kapsl.aimod.project_name".to_string(),
@@ -7055,13 +7110,15 @@ fn push_kapsl_to_placeholder_remote(
                 e
             )
         })?;
-        let bytes_uploaded = fs::copy(&absolute_path, &mirrored_path).map_err(|e| {
-            format!(
-                "Failed to mirror .aimod into placeholder remote {}: {}",
-                mirrored_path.display(),
-                e
-            )
-        })?;
+        let bytes_uploaded =
+            stage_link_or_copy_file(&absolute_path, &mirrored_path, "placeholder-push")
+                .map_err(|e| {
+                    format!(
+                        "Failed to mirror .aimod into placeholder remote {}: {}",
+                        mirrored_path.display(),
+                        e
+                    )
+                })?;
 
         (mirrored_path.to_string_lossy().to_string(), bytes_uploaded)
     } else {
@@ -7146,13 +7203,15 @@ fn pull_kapsl_from_placeholder_remote(
                 target.as_string()
             ));
         }
-        fs::copy(&mirrored_path, &output_path).map_err(|e| {
-            format!(
-                "Failed to pull placeholder remote artifact to {}: {}",
-                output_path.display(),
-                e
-            )
-        })?
+        stage_link_or_copy_file(&mirrored_path, &output_path, "placeholder-pull").map_err(
+            |e| {
+                format!(
+                    "Failed to pull placeholder remote artifact to {}: {}",
+                    output_path.display(),
+                    e
+                )
+            },
+        )?
     } else {
         match pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref(), &output_path) {
             Ok(bytes_downloaded) => bytes_downloaded,
