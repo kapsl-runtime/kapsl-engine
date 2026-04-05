@@ -4243,6 +4243,7 @@ llm:
             model_file: "model.onnx".to_string(),
             metadata: None,
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
         };
 
         let choice = resolve_effective_topology_choice(&manifest, "pipeline-parallel", 4, None);
