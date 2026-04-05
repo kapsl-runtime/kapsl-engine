@@ -1,10 +1,9 @@
-name: Release Runtime Installers
+name: Beta Runtime Installers
 
 on:
-  workflow_dispatch:
   push:
-    tags:
-      - "v*"
+    branches:
+      - develop
 
 permissions:
   contents: write
@@ -32,28 +31,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate tag matches runtime version (Unix)
-        if: runner.os != 'Windows' && startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$manifest_version" != "$tag_version" ]; then
-            echo "Tag version ($tag_version) does not match kapsl runtime version ($manifest_version)."
-            exit 1
-          fi
-
-      - name: Validate tag matches runtime version (Windows)
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
-          $manifestVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
-          $tagVersion = $env:GITHUB_REF_NAME.TrimStart("v")
-          if ($manifestVersion -ne $tagVersion) {
-            throw "Tag version ($tagVersion) does not match kapsl runtime version ($manifestVersion)."
-          }
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,16 +46,15 @@ jobs:
             Add-Content -Path $env:GITHUB_PATH -Value $wixBin
           }
 
-      - name: Resolve runtime version (Unix)
+      - name: Resolve beta version (Unix)
         if: runner.os != 'Windows'
         run: |
-          raw_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          short_sha="${GITHUB_SHA::8}"
+          date_str="$(date -u +%Y%m%d)"
+          raw_version="${manifest_version}-beta.${date_str}.${short_sha}"
 
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            raw_version="${GITHUB_REF_NAME#v}"
-          fi
-
-          if [[ "$raw_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+          if [[ "$manifest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
             numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
           else
             numeric_version="0.1.0"
@@ -90,18 +66,17 @@ jobs:
           echo "KAPSL_NUMERIC_VERSION=$numeric_version" >> "$GITHUB_ENV"
           echo "KAPSL_DEB_VERSION=$deb_version" >> "$GITHUB_ENV"
 
-      - name: Resolve runtime version (Windows)
+      - name: Resolve beta version (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
-          $rawVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
+          $manifestVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
+          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
+          $dateStr = (Get-Date -Format "yyyyMMdd")
+          $rawVersion = "$manifestVersion-beta.$dateStr.$shortSha"
 
-          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME) {
-            $rawVersion = $env:GITHUB_REF_NAME.TrimStart("v")
-          }
-
-          if ($rawVersion -match '^(\d+)\.(\d+)\.(\d+)') {
+          if ($manifestVersion -match '^(\d+)\.(\d+)\.(\d+)') {
             $numericVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
           } else {
             $numericVersion = "0.1.0"
@@ -140,7 +115,7 @@ jobs:
             echo "Priority: optional"
             echo "Architecture: ${arch}"
             echo "Maintainer: Kapsl Team <support@kapsl.ai>"
-            echo "Description: Kapsl runtime CLI and local inference server."
+            echo "Description: Kapsl runtime CLI and local inference server (beta)."
           } > pkgroot/DEBIAN/control
 
           deb_path="dist/kapsl-runtime_${KAPSL_DEB_VERSION}_${arch}.deb"
@@ -245,13 +220,13 @@ jobs:
             '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">'
             '  <Product'
             '    Id="*"'
-            '    Name="Kapsl Runtime"'
+            '    Name="Kapsl Runtime (Beta)"'
             '    Language="1033"'
             "    Version=""$($env:KAPSL_NUMERIC_VERSION)"""
             '    Manufacturer="Kapsl"'
-            '    UpgradeCode="{DF997FCA-4EFD-447B-B368-376A32522B9B}">'
+            '    UpgradeCode="{A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D}">'
             '    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />'
-            '    <MajorUpgrade DowngradeErrorMessage="A newer version of Kapsl Runtime is already installed." />'
+            '    <MajorUpgrade DowngradeErrorMessage="A newer version of Kapsl Runtime Beta is already installed." />'
             '    <MediaTemplate EmbedCab="yes" />'
             '    <Directory Id="TARGETDIR" Name="SourceDir">'
             "      <Directory Id=""$programFilesFolderId"">"
@@ -263,7 +238,7 @@ jobs:
             '        </Directory>'
             '      </Directory>'
             '    </Directory>'
-            '    <Feature Id="MainFeature" Title="Kapsl Runtime" Level="1">'
+            '    <Feature Id="MainFeature" Title="Kapsl Runtime Beta" Level="1">'
             '      <ComponentRef Id="KapslExeComponent" />'
             '    </Feature>'
             '  </Product>'
@@ -307,50 +282,53 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  upload-release-assets:
-    if: startsWith(github.ref, 'refs/tags/v')
+  publish-beta-release:
     needs: build-runtime-installers
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve beta version
+        id: version
+        run: |
+          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          short_sha="${GITHUB_SHA::8}"
+          date_str="$(date -u +%Y%m%d)"
+          beta_version="${manifest_version}-beta.${date_str}.${short_sha}"
+          echo "version=$beta_version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${beta_version}" >> "$GITHUB_OUTPUT"
+
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Publish release assets
+      - name: Create GitHub pre-release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: "Beta ${{ steps.version.outputs.version }}"
+          prerelease: true
+          generate_release_notes: true
           files: release-assets/**
 
-  upload-r2:
-    needs: build-runtime-installers
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download installer artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-assets
-          merge-multiple: true
-
-      - name: Resolve upload version
-        id: version
-        shell: bash
-        run: |
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=dev" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Upload installers to R2
+      - name: Upload beta installers to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/v${{ steps.version.outputs.version }}/ \
+            s3://kapsl-installer/runtime/beta/v${{ steps.version.outputs.version }}/ \
+            --recursive \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          # Also overwrite the "latest-beta" pointer so clients can always find the newest beta
+          aws s3 cp release-assets/ \
+            s3://kapsl-installer/runtime/beta/latest/ \
             --recursive \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com

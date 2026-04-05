@@ -22,6 +22,8 @@ use kapsl_ipc::{
     IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
     STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
 };
+use kapsl_llm::block_manager::{new_shared_allocator, SharedBlockAllocator};
+use kapsl_llm::global_scheduler::{EngineHandle as KvEngineHandle, GlobalKvScheduler};
 use kapsl_llm::llm_backend::LLMBackend;
 use kapsl_llm::rag::{
     build_rag_prompt, CitationStyle, RagChunk, RagPromptConfig, WhitespaceTokenCounter,
@@ -56,7 +58,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{Cursor, Read, Write};
+use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -66,7 +68,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
 use tar::{Archive, Builder};
 use tokio::sync::Mutex as AsyncMutex;
-use warp::http::StatusCode;
 use warp::{Filter, Reply};
 
 #[cfg(unix)]
@@ -80,6 +81,91 @@ struct UiAssets;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;
+
+/// Shared KV cache pool registry and cross-model token-budget coordinator.
+///
+/// One instance is created at server startup and cloned into every model-load
+/// path.  All `LLMBackend` instances on the same physical GPU share the same
+/// `SharedBlockAllocator`, enforcing a single unified block budget.
+#[derive(Clone, Debug)]
+struct SharedKvState {
+    /// Total VRAM bytes per device ID — used to size pools on first access.
+    device_bytes: HashMap<usize, usize>,
+    /// Per-device shared KV block allocators (lazily created).
+    pools: Arc<Mutex<HashMap<usize, SharedBlockAllocator>>>,
+    /// Cross-model token-budget coordinator.
+    scheduler: Arc<Mutex<GlobalKvScheduler>>,
+    /// Monotonically increasing counter for stable engine IDs.
+    next_engine_id: Arc<AtomicU32>,
+}
+
+impl SharedKvState {
+    fn new(device_info: &DeviceInfo) -> Self {
+        const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
+        const KV_BLOCK_SIZE: usize = 16;
+        let mut device_bytes = HashMap::new();
+        let mut estimated_kv_tokens: usize = 0;
+        for device in &device_info.devices {
+            if device.backend.to_string().eq_ignore_ascii_case("cpu") {
+                continue;
+            }
+            let total = (device.memory_mb as usize).saturating_mul(1024 * 1024);
+            device_bytes.insert(device.id, total);
+            let kv_blocks = (total / 2) / KV_BYTES_PER_BLOCK;
+            estimated_kv_tokens = estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
+        }
+        Self {
+            device_bytes,
+            pools: Arc::new(Mutex::new(HashMap::new())),
+            scheduler: Arc::new(Mutex::new(GlobalKvScheduler::new(
+                estimated_kv_tokens.max(16_384),
+            ))),
+            next_engine_id: Arc::new(AtomicU32::new(1)),
+        }
+    }
+
+    /// Return (or lazily create) the shared block allocator for `device_id`.
+    fn get_or_create_pool(&self, device_id: usize) -> SharedBlockAllocator {
+        let mut pools = self.pools.lock();
+        if let Some(existing) = pools.get(&device_id) {
+            return existing.clone();
+        }
+        const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
+        const KV_BLOCK_SIZE: usize = 16;
+        let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+        let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(256);
+        let allocator = new_shared_allocator(total_blocks, KV_BLOCK_SIZE, device_id);
+        pools.insert(device_id, allocator.clone());
+        allocator
+    }
+
+    /// Attach a new engine to the shared pool and register it with the global
+    /// scheduler.  Returns the allocator and the recommended per-engine
+    /// total_blocks cap so that the block budget is divided fairly across all
+    /// replicas sharing this device.
+    fn attach_engine(&self, device_id: usize) -> (SharedBlockAllocator, usize) {
+        let allocator = self.get_or_create_pool(device_id);
+        let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
+        self.scheduler.lock().register(KvEngineHandle {
+            engine_id,
+            share_weight: 1,
+        });
+        // Divide the device's block budget evenly across all registered engines.
+        const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
+        const MIN_BLOCKS_PER_ENGINE: usize = 256;
+        let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+        let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
+        let engine_count = (engine_id + 1) as usize; // engine_id was 0-based before this call
+        let blocks_per_engine = (total_blocks / engine_count).max(MIN_BLOCKS_PER_ENGINE);
+        (allocator, blocks_per_engine)
+    }
+
+    /// Deregister an engine (call on model unload).
+    #[allow(dead_code)]
+    fn detach_engine(&self, engine_id: u32) {
+        self.scheduler.lock().deregister(engine_id);
+    }
+}
 
 const CLI_AFTER_HELP: &str = "\
 Examples:
@@ -700,6 +786,7 @@ const OCI_REMOTE_PREFIX: &str = "oci://";
 const KAPSL_OCI_ARTIFACT_TYPE: &str = "application/vnd.kapsl.aimod.v1";
 const KAPSL_OCI_LAYER_TYPE: &str = "application/vnd.kapsl.aimod.v1";
 const KAPSL_OCI_CONFIG_TYPE: &str = "application/vnd.kapsl.aimod.config.v1+json";
+const OCI_PRECOMPUTE_SHA256_ENV: &str = "KAPSL_OCI_PRECOMPUTE_SHA256";
 const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
 const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
 const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
@@ -1786,6 +1873,46 @@ struct PullKapslResponse {
     bytes_downloaded: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteArtifactLabelSummary {
+    label: String,
+    reference: String,
+    size_bytes: u64,
+    updated_at: String,
+    download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteArtifactModelSummary {
+    name: String,
+    latest_label: Option<String>,
+    latest_reference: Option<String>,
+    artifact_count: usize,
+    #[serde(default)]
+    labels: Vec<RemoteArtifactLabelSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteArtifactInventoryResponse {
+    status: String,
+    repo: String,
+    #[serde(default)]
+    available_repos: Vec<String>,
+    #[serde(default)]
+    models: Vec<RemoteArtifactModelSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeRemoteArtifactInventoryResponse {
+    status: String,
+    remote_url: String,
+    repo: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    available_repos: Vec<String>,
+    #[serde(default)]
+    models: Vec<RemoteArtifactModelSummary>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RemoteTokenStoreFile {
     #[serde(default)]
@@ -1944,8 +2071,19 @@ fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
     // Base policy from model file size
     let (mut batch_size, mut micro_batch, delay_ms, mut queue_size, size_tier) =
         if model_size_mb == 0 {
-            // Can't stat model — use safe conservative defaults identical to Standard
-            (4usize, 4usize, 2u64, 256usize, "unknown")
+            // Unknown model size should remain deterministic across environments.
+            // Keep the conservative Standard-equivalent defaults unchanged rather
+            // than layering in host-dependent RAM/CPU reductions.
+            return AutoTunedPolicy {
+                batch_size: 4,
+                scheduler_max_micro_batch: 4,
+                scheduler_queue_delay_ms: 2,
+                scheduler_queue_size: 256,
+                rationale: format!(
+                    "model={}MB (unknown), ram_avail={}GB, cpu_cores={}, conservative-defaults",
+                    model_size_mb, available_ram_gb, cpu_cores
+                ),
+            };
         } else if model_size_mb < 500 {
             (16, 16, 6, 2048, "tiny (<500 MB)")
         } else if model_size_mb < 2_000 {
@@ -2215,6 +2353,49 @@ fn print_build_summary(kapsl_path: &str) {
     }
 }
 
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", duration.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.2}s")
+    } else {
+        let minutes = (secs / 60.0).floor() as u64;
+        let rem_secs = secs - (minutes as f64 * 60.0);
+        format!("{minutes}m {rem_secs:.1}s")
+    }
+}
+
+fn transfer_backend_label(remote_url: &str) -> &'static str {
+    if is_oci_remote_url(remote_url) {
+        "oci"
+    } else if is_default_placeholder_remote(remote_url) {
+        "placeholder"
+    } else {
+        "http"
+    }
+}
+
+fn print_transfer_summary(
+    action: &str,
+    remote_url: &str,
+    bytes: u64,
+    elapsed: Duration,
+    path_or_target: &str,
+) {
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let bytes_per_sec = (bytes as f64 / elapsed_secs).round() as u64;
+    eprintln!(
+        "✓ {} {} via {} in {} ({}/s)",
+        action,
+        format_human_bytes(bytes),
+        transfer_backend_label(remote_url),
+        format_elapsed(elapsed),
+        format_human_bytes(bytes_per_sec),
+    );
+    eprintln!("  {}", path_or_target);
+}
+
 fn discover_kapsl_in_current_dir() -> Result<PathBuf, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("Failed to read current directory: {}", e))?;
@@ -2382,9 +2563,17 @@ fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError> {
         interactive_login: true,
     };
 
+    let started_at = Instant::now();
     let response = run_with_loading("Uploading package", || {
         push_kapsl_to_placeholder_remote(&request).map_err(dyn_error_from_message)
     })?;
+    print_transfer_summary(
+        "Uploaded",
+        &response.remote_url,
+        response.bytes_uploaded,
+        started_at.elapsed(),
+        &response.artifact_url,
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&response)
@@ -2415,9 +2604,17 @@ fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError> {
         interactive_login: true,
     };
 
+    let started_at = Instant::now();
     let response = run_with_loading("Downloading package", || {
         pull_kapsl_from_placeholder_remote(&request).map_err(dyn_error_from_message)
     })?;
+    print_transfer_summary(
+        "Downloaded",
+        &response.remote_url,
+        response.bytes_downloaded,
+        started_at.elapsed(),
+        &response.kapsl_path,
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&response)
@@ -4974,6 +5171,13 @@ fn artifact_url_for_remote(remote_url: &str, target: &ModelTargetRef) -> String 
     )
 }
 
+fn remote_inventory_url_for_remote(remote_url: &str) -> String {
+    format!(
+        "{}/kapsl/repositories/current/models",
+        remote_url.trim_end_matches('/')
+    )
+}
+
 fn placeholder_remote_artifact_path(target: &ModelTargetRef) -> PathBuf {
     placeholder_remote_storage_dir()
         .join(&target.repo)
@@ -4997,6 +5201,62 @@ fn native_tls_http_agent() -> ureq::Agent {
         )
         .build()
         .into()
+}
+
+fn fetch_remote_artifact_inventory(
+    custom_remote_url: Option<&str>,
+) -> Result<RuntimeRemoteArtifactInventoryResponse, String> {
+    let remote_url = resolved_login_remote_url(custom_remote_url);
+    if is_oci_remote_url(&remote_url) {
+        return Err(
+            "Remote artifact browsing is not available for oci:// remotes yet.".to_string(),
+        );
+    }
+
+    let inventory_url = remote_inventory_url_for_remote(&remote_url);
+    let authorization_header = resolved_remote_token(&remote_url, None);
+    let agent = native_tls_http_agent();
+    let mut request = agent
+        .get(&inventory_url)
+        .header("Accept", "application/json");
+    if let Some(header) = authorization_header.as_deref() {
+        request = request.header("Authorization", header);
+    }
+
+    let mut response = request.call().map_err(|error| match error {
+        ureq::Error::StatusCode(401) | ureq::Error::StatusCode(403) => format!(
+            "Remote artifact inventory requires authentication for {}. Run `kapsl login --remote-url {}` first.",
+            remote_url, remote_url
+        ),
+        other => format!(
+            "Failed to fetch remote artifact inventory from {}: {}",
+            inventory_url,
+            format_remote_http_error(other)
+        ),
+    })?;
+
+    let body = response.body_mut().read_to_string().map_err(|error| {
+        format!(
+            "Failed to read remote artifact inventory response from {}: {}",
+            inventory_url, error
+        )
+    })?;
+
+    let payload: RemoteArtifactInventoryResponse =
+        serde_json::from_str(&body).map_err(|error| {
+            format!(
+                "Failed to parse remote artifact inventory response from {}: {}",
+                inventory_url, error
+            )
+        })?;
+
+    Ok(RuntimeRemoteArtifactInventoryResponse {
+        status: payload.status,
+        remote_url,
+        repo: payload.repo,
+        available_repos: payload.available_repos,
+        models: payload.models,
+    })
 }
 
 fn push_kapsl_to_http_remote(
@@ -5050,7 +5310,8 @@ fn push_kapsl_to_http_remote(
 fn pull_kapsl_from_http_remote(
     artifact_url: &str,
     authorization_header: Option<&str>,
-) -> Result<Vec<u8>, RemoteHttpRequestError> {
+    output_path: &Path,
+) -> Result<u64, RemoteHttpRequestError> {
     let agent = native_tls_http_agent();
     let mut request = agent.get(artifact_url);
     if let Some(header) = authorization_header {
@@ -5071,16 +5332,61 @@ fn pull_kapsl_from_http_remote(
         }
     })?;
 
-    response
-        .body_mut()
-        .read_to_vec()
-        .map_err(|e| RemoteHttpRequestError {
+    let staged_path = staged_output_path(output_path, "download");
+    let write_result = (|| -> Result<u64, RemoteHttpRequestError> {
+        let file = File::create(&staged_path).map_err(|e| RemoteHttpRequestError {
             status_code: None,
             message: format!(
-                "Failed to read .aimod response body from {}: {}",
-                artifact_url, e
+                "Failed to create staging file for pull {} -> {}: {}",
+                artifact_url,
+                staged_path.display(),
+                e
             ),
-        })
+        })?;
+        let mut writer = BufWriter::new(file);
+        let mut reader = response.body_mut().as_reader();
+        let bytes_downloaded =
+            std::io::copy(&mut reader, &mut writer).map_err(|e| RemoteHttpRequestError {
+                status_code: None,
+                message: format!(
+                    "Failed to stream .aimod response body from {} to {}: {}",
+                    artifact_url,
+                    staged_path.display(),
+                    e
+                ),
+            })?;
+        writer.flush().map_err(|e| RemoteHttpRequestError {
+            status_code: None,
+            message: format!(
+                "Failed to flush pulled .aimod to {}: {}",
+                staged_path.display(),
+                e
+            ),
+        })?;
+        Ok(bytes_downloaded)
+    })();
+    let bytes_downloaded = match write_result {
+        Ok(bytes_downloaded) => bytes_downloaded,
+        Err(error) => {
+            let _ = fs::remove_file(&staged_path);
+            return Err(error);
+        }
+    };
+
+    replace_output_file(&staged_path, output_path).map_err(|e| {
+        let _ = fs::remove_file(&staged_path);
+        RemoteHttpRequestError {
+            status_code: None,
+            message: format!(
+                "Failed to finalize pulled .aimod {} -> {}: {}",
+                staged_path.display(),
+                output_path.display(),
+                e
+            ),
+        }
+    })?;
+
+    Ok(bytes_downloaded)
 }
 
 #[derive(Debug, Clone)]
@@ -5094,7 +5400,8 @@ struct OrasAuth {
 struct KapslOciConfig {
     artifact_type: String,
     filename: String,
-    sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
     size: u64,
 }
 
@@ -5104,10 +5411,16 @@ struct TempDirGuard {
 
 impl TempDirGuard {
     fn new(prefix: &str) -> Result<Self, String> {
-        let mut nonce_bytes = [0u8; 8];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = hex_encode(&nonce_bytes);
-        let dir = std::env::temp_dir().join(format!("{}-{}-{}", prefix, std::process::id(), nonce));
+        Self::new_in(&std::env::temp_dir(), prefix)
+    }
+
+    fn new_in(parent: &Path, prefix: &str) -> Result<Self, String> {
+        let dir = parent.join(format!(
+            "{}-{}-{}",
+            prefix,
+            std::process::id(),
+            temp_nonce()
+        ));
         fs::create_dir_all(&dir).map_err(|e| {
             format!(
                 "Failed to create temporary directory {}: {}",
@@ -5127,6 +5440,81 @@ impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
+}
+
+fn temp_nonce() -> String {
+    let mut nonce_bytes = [0u8; 8];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    hex_encode(&nonce_bytes)
+}
+
+fn staged_output_path(output_path: &Path, prefix: &str) -> PathBuf {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("artifact.aimod");
+    parent.join(format!(
+        ".{}.{}-{}-{}.part",
+        file_name,
+        prefix,
+        std::process::id(),
+        temp_nonce()
+    ))
+}
+
+fn replace_output_file(staged_path: &Path, output_path: &Path) -> std::io::Result<()> {
+    if output_path.exists() {
+        fs::remove_file(output_path)?;
+    }
+    fs::rename(staged_path, output_path)
+}
+
+fn stage_link_or_copy_file(source_path: &Path, output_path: &Path, prefix: &str) -> Result<u64, String> {
+    if source_path == output_path {
+        return fs::metadata(source_path)
+            .map(|meta| meta.len())
+            .map_err(|e| format!("Failed to stat {}: {}", source_path.display(), e));
+    }
+
+    let staged_path = staged_output_path(output_path, prefix);
+    let stage_result = match fs::hard_link(source_path, &staged_path) {
+        Ok(()) => fs::metadata(source_path).map(|meta| meta.len()).map_err(|e| {
+            format!(
+                "Failed to stat staged linked artifact {}: {}",
+                source_path.display(),
+                e
+            )
+        }),
+        Err(_) => fs::copy(source_path, &staged_path).map_err(|e| {
+            format!(
+                "Failed to copy artifact {} to staging path {}: {}",
+                source_path.display(),
+                staged_path.display(),
+                e
+            )
+        }),
+    };
+
+    let bytes = match stage_result {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = fs::remove_file(&staged_path);
+            return Err(error);
+        }
+    };
+
+    replace_output_file(&staged_path, output_path).map_err(|e| {
+        let _ = fs::remove_file(&staged_path);
+        format!(
+            "Failed to finalize staged artifact {} -> {}: {}",
+            staged_path.display(),
+            output_path.display(),
+            e
+        )
+    })?;
+
+    Ok(bytes)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -5248,43 +5636,6 @@ fn ensure_oras_support(oras_bin: &str) -> Result<(), String> {
             version.status.code().unwrap_or(-1),
             stderr.trim()
         ));
-    }
-
-    let push_help = Command::new(oras_bin)
-        .args(["push", "--help"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to execute `{}`: {}", oras_bin, e))?;
-    let push_help_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&push_help.stdout),
-        String::from_utf8_lossy(&push_help.stderr)
-    );
-    for required in ["--artifact-type", "--annotation", "--config"] {
-        if !push_help_text.contains(required) {
-            return Err(format!(
-                "`oras push` does not support required flag {}. Please upgrade ORAS.",
-                required
-            ));
-        }
-    }
-
-    let pull_help = Command::new(oras_bin)
-        .args(["pull", "--help"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to execute `{}`: {}", oras_bin, e))?;
-    let pull_help_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&pull_help.stdout),
-        String::from_utf8_lossy(&pull_help.stderr)
-    );
-    if !pull_help_text.contains("--output") {
-        return Err(
-            "`oras pull` does not appear to support `--output`. Please upgrade ORAS.".to_string(),
-        );
     }
 
     Ok(())
@@ -5584,7 +5935,11 @@ fn push_kapsl_to_oci_remote(
     let bytes_uploaded = fs::metadata(absolute_path)
         .map_err(|e| format!("Failed to stat .aimod {}: {}", absolute_path.display(), e))?
         .len();
-    let sha256 = sha256_file_hex(absolute_path)?;
+    let sha256 = if parse_env_bool(OCI_PRECOMPUTE_SHA256_ENV).unwrap_or(false) {
+        Some(sha256_file_hex(absolute_path)?)
+    } else {
+        None
+    };
 
     let manifest = read_manifest_from_kapsl_archive(absolute_path).ok();
 
@@ -5594,11 +5949,13 @@ fn push_kapsl_to_oci_remote(
     annotations.push(("io.kapsl.aimod.model".to_string(), target.model.clone()));
     annotations.push(("io.kapsl.aimod.label".to_string(), target.label.clone()));
     annotations.push(("io.kapsl.aimod.filename".to_string(), filename.to_string()));
-    annotations.push(("io.kapsl.aimod.sha256".to_string(), sha256.clone()));
     annotations.push((
         "io.kapsl.aimod.size".to_string(),
         bytes_uploaded.to_string(),
     ));
+    if let Some(sha256) = sha256.as_ref() {
+        annotations.push(("io.kapsl.aimod.sha256".to_string(), sha256.clone()));
+    }
     if let Some(manifest) = manifest.as_ref() {
         annotations.push((
             "io.kapsl.aimod.project_name".to_string(),
@@ -5709,7 +6066,14 @@ fn pull_kapsl_from_oci_remote(
     let reference = build_oci_reference(&repo, &target.label, reference_override)?;
     let filename = format!("{}.aimod", target.model);
 
-    let temp_dir = TempDirGuard::new("kapsl-oci-pull")?;
+    fs::create_dir_all(destination_dir).map_err(|e| {
+        format!(
+            "Failed to create destination directory {}: {}",
+            destination_dir.display(),
+            e
+        )
+    })?;
+    let temp_dir = TempDirGuard::new_in(destination_dir, ".kapsl-oci-pull")?;
     let auth = load_oras_auth_from_env()?;
     let docker_config_dir = if auth.is_some() {
         let docker_dir = temp_dir.path().join("docker-config");
@@ -5782,17 +6146,10 @@ fn pull_kapsl_from_oci_remote(
         }
     };
 
-    fs::create_dir_all(destination_dir).map_err(|e| {
-        format!(
-            "Failed to create destination directory {}: {}",
-            destination_dir.display(),
-            e
-        )
-    })?;
     let output_path = destination_dir.join(&filename);
-    fs::copy(&pulled_path, &output_path).map_err(|e| {
+    replace_output_file(&pulled_path, &output_path).map_err(|e| {
         format!(
-            "Failed to write pulled .aimod to {}: {}",
+            "Failed to move pulled .aimod to {}: {}",
             output_path.display(),
             e
         )
@@ -6878,13 +7235,15 @@ fn push_kapsl_to_placeholder_remote(
                 e
             )
         })?;
-        let bytes_uploaded = fs::copy(&absolute_path, &mirrored_path).map_err(|e| {
-            format!(
-                "Failed to mirror .aimod into placeholder remote {}: {}",
-                mirrored_path.display(),
-                e
-            )
-        })?;
+        let bytes_uploaded =
+            stage_link_or_copy_file(&absolute_path, &mirrored_path, "placeholder-push")
+                .map_err(|e| {
+                    format!(
+                        "Failed to mirror .aimod into placeholder remote {}: {}",
+                        mirrored_path.display(),
+                        e
+                    )
+                })?;
 
         (mirrored_path.to_string_lossy().to_string(), bytes_uploaded)
     } else {
@@ -6969,16 +7328,18 @@ fn pull_kapsl_from_placeholder_remote(
                 target.as_string()
             ));
         }
-        fs::copy(&mirrored_path, &output_path).map_err(|e| {
-            format!(
-                "Failed to pull placeholder remote artifact to {}: {}",
-                output_path.display(),
-                e
-            )
-        })?
+        stage_link_or_copy_file(&mirrored_path, &output_path, "placeholder-pull").map_err(
+            |e| {
+                format!(
+                    "Failed to pull placeholder remote artifact to {}: {}",
+                    output_path.display(),
+                    e
+                )
+            },
+        )?
     } else {
-        let bytes = match pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref()) {
-            Ok(bytes) => bytes,
+        match pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref(), &output_path) {
+            Ok(bytes_downloaded) => bytes_downloaded,
             Err(http_error) => {
                 if maybe_auto_login_for_remote(
                     &remote_url,
@@ -6987,21 +7348,17 @@ fn pull_kapsl_from_placeholder_remote(
                     &mut remote_token,
                     &http_error,
                 )? {
-                    pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref())
+                    pull_kapsl_from_http_remote(
+                        &artifact_url,
+                        remote_token.as_deref(),
+                        &output_path,
+                    )
                         .map_err(|e| e.message)?
                 } else {
                     return Err(http_error.message);
                 }
             }
-        };
-        fs::write(&output_path, &bytes).map_err(|e| {
-            format!(
-                "Failed to write pulled .aimod to {}: {}",
-                output_path.display(),
-                e
-            )
-        })?;
-        bytes.len() as u64
+        }
     };
 
     let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
@@ -9024,6 +9381,7 @@ async fn run_worker(
         model_id,
         model_path,
         device_info,
+        SharedKvState::new(device_info),
         args.batch_size,
         args.scheduler_queue_size,
         args.scheduler_max_micro_batch,
@@ -9055,6 +9413,7 @@ fn load_model_blocking(
     model_id: u32,
     model_path: &PathBuf,
     device_info: &DeviceInfo,
+    shared_kv: SharedKvState,
     batch_size: usize,
     scheduler_queue_size: usize,
     scheduler_max_micro_batch: usize,
@@ -9243,10 +9602,15 @@ fn load_model_blocking(
                     .get_device(0)
                     .map(|d| d.backend.to_string())
                     .unwrap_or_else(|| "cpu".to_string());
-                LLMBackend::with_devices(provider, device_ids)
+                LLMBackend::with_devices(provider, device_ids.clone())
             } else {
-                LLMBackend::with_device_ids(device_ids)
+                LLMBackend::with_device_ids(device_ids.clone())
             };
+            let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+            backend = backend
+                .with_shared_pool(kv_pool)
+                .with_kv_blocks_cap(kv_blocks_cap);
             tokio::runtime::Handle::current()
                 .block_on(backend.load(&model_file_path))
                 .map_err(|e| {
@@ -9367,6 +9731,7 @@ async fn load_model(
     model_id: u32,
     model_path: &PathBuf,
     device_info: &DeviceInfo,
+    shared_kv: SharedKvState,
     batch_size: usize,
     scheduler_queue_size: usize,
     scheduler_max_micro_batch: usize,
@@ -9556,10 +9921,15 @@ async fn load_model(
                     .get_device(0)
                     .map(|d| d.backend.to_string())
                     .unwrap_or_else(|| "cpu".to_string());
-                LLMBackend::with_devices(provider, device_ids)
+                LLMBackend::with_devices(provider, device_ids.clone())
             } else {
-                LLMBackend::with_device_ids(device_ids)
+                LLMBackend::with_device_ids(device_ids.clone())
             };
+            let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+            backend = backend
+                .with_shared_pool(kv_pool)
+                .with_kv_blocks_cap(kv_blocks_cap);
             backend.load(&model_file_path).await.map_err(|e| {
                 let err: Box<dyn std::error::Error + Send + Sync> =
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
@@ -9679,6 +10049,7 @@ async fn scale_up_model(
     unique_id: u32,
     model_path: &PathBuf,
     device_info: &DeviceInfo,
+    shared_kv: SharedKvState,
     batch_size: usize,
     scheduler_queue_size: usize,
     scheduler_max_micro_batch: usize,
@@ -9827,10 +10198,15 @@ async fn scale_up_model(
                 .first()
                 .map(|d| d.backend.to_string())
                 .unwrap_or_else(|| "cpu".to_string());
-            LLMBackend::with_devices(provider, device_ids)
+            LLMBackend::with_devices(provider, device_ids.clone())
         } else {
-            LLMBackend::with_device_ids(device_ids)
+            LLMBackend::with_device_ids(device_ids.clone())
         };
+        let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
+        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+        backend = backend
+            .with_shared_pool(kv_pool)
+            .with_kv_blocks_cap(kv_blocks_cap);
         backend.load(&model_file_path).await.map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
@@ -10124,6 +10500,9 @@ async fn main() -> Result<(), DynError> {
         _ => {}
     }
 
+    // Unified shared KV cache pool and cross-model token budget coordinator.
+    let shared_kv = SharedKvState::new(&device_info);
+
     // Use Arc<RwLock<>> for thread-safe dynamic scheduler management
     let replica_pools: Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -10252,6 +10631,7 @@ async fn main() -> Result<(), DynError> {
                 model_id,
                 model_path,
                 &device_info,
+                shared_kv.clone(),
                 args.batch_size,
                 args.scheduler_queue_size,
                 args.scheduler_max_micro_batch,
@@ -10453,18 +10833,40 @@ async fn main() -> Result<(), DynError> {
     let (http_ready_tx, http_ready_rx) =
         tokio::sync::oneshot::channel::<Result<std::net::SocketAddr, String>>();
 
+    // Clone before the API server spawn so the auto-scaler task can use the same state.
+    let shared_kv_for_autoscaler = shared_kv.clone();
+
     tokio::spawn(async move {
         // Metrics endpoint (admin scope when auth is enabled; loopback only when disabled)
-        let metrics_route = warp::path("metrics")
-            .and(warp::get())
-            .map(move || {
-                let encoder = TextEncoder::new();
-                let metric_families = registry_arc.gather();
-                let mut buffer = vec![];
-                encoder.encode(&metric_families, &mut buffer).unwrap();
-                String::from_utf8(buffer).unwrap()
-            })
-            .map(reply_into_response);
+        let metrics_route =
+            warp::path("metrics")
+                .and(warp::get())
+                .map(move || -> warp::reply::Response {
+                    let encoder = TextEncoder::new();
+                    let metric_families = registry_arc.gather();
+                    let mut buffer = vec![];
+                    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+                        log::error!("Failed to encode Prometheus metrics: {e}");
+                        return warp::http::Response::builder()
+                            .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                            .body(warp::hyper::Body::from("metrics encoding error"))
+                            .unwrap_or_default();
+                    }
+                    match String::from_utf8(buffer) {
+                        Ok(text) => warp::http::Response::builder()
+                            .status(warp::http::StatusCode::OK)
+                            .header(warp::http::header::CONTENT_TYPE, encoder.format_type())
+                            .body(warp::hyper::Body::from(text))
+                            .unwrap_or_default(),
+                        Err(e) => {
+                            log::error!("Prometheus metrics output is not valid UTF-8: {e}");
+                            warp::http::Response::builder()
+                                .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(warp::hyper::Body::from("metrics encoding error"))
+                                .unwrap_or_default()
+                        }
+                    }
+                });
         let metrics_route = api_auth_filter(
             ApiRole::Admin,
             ApiScope::Admin,
@@ -10789,6 +11191,28 @@ async fn main() -> Result<(), DynError> {
                     Err(error) => warp::reply::with_status(
                         warp::reply::json(&ErrorResponse { error }),
                         StatusCode::BAD_REQUEST,
+                    ),
+                }
+            });
+
+        let list_remote_artifacts = warp::path!("api" / "engine" / "remote-artifacts")
+            .and(warp::get())
+            .and(warp::query::<HashMap<String, String>>())
+            .map(|query: HashMap<String, String>| {
+                use warp::http::StatusCode;
+
+                #[derive(Serialize)]
+                struct ErrorResponse {
+                    error: String,
+                }
+
+                match fetch_remote_artifact_inventory(query.get("remote_url").map(String::as_str)) {
+                    Ok(response) => {
+                        warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
+                    }
+                    Err(error) => warp::reply::with_status(
+                        warp::reply::json(&ErrorResponse { error }),
+                        StatusCode::BAD_GATEWAY,
                     ),
                 }
             });
@@ -11535,6 +11959,7 @@ async fn main() -> Result<(), DynError> {
         let recycled_model_ids_for_start = recycled_model_ids.clone();
         let model_paths_for_start = model_paths_clone.clone();
         let onnx_tuning_profile_for_start = onnx_tuning_profile_for_api.clone();
+        let shared_kv_for_start = shared_kv.clone();
 
         let start_model = warp::path!("api" / "models" / "start")
             .and(warp::post())
@@ -11543,6 +11968,7 @@ async fn main() -> Result<(), DynError> {
                 let model_registry = model_registry_for_start.clone();
                 let replica_pools = replica_pools_for_start.clone();
                 let device_info = device_info_for_start.clone();
+                let shared_kv = shared_kv_for_start.clone();
                 let shared_metrics = shared_metrics_for_start.clone();
                 let model_id_counter = model_id_counter_for_start.clone();
                 let recycled_model_ids = recycled_model_ids_for_start.clone();
@@ -11691,6 +12117,7 @@ async fn main() -> Result<(), DynError> {
                         let recycled_model_ids = recycled_model_ids.clone();
                         let tp_degree = req.tp_degree;
                         let onnx_tuning = onnx_tuning.clone();
+                        let shared_kv = shared_kv.clone();
                         async move {
                             let model_registry_clone = model_registry.clone();
                             let device_info_clone = device_info.clone();
@@ -11703,6 +12130,7 @@ async fn main() -> Result<(), DynError> {
                                     model_id,
                                     &model_path_thread,
                                     &device_info_clone,
+                                    shared_kv,
                                     batch_size_for_start,
                                     scheduler_queue_size_for_start,
                                     scheduler_max_micro_batch_for_start,
@@ -12608,6 +13036,7 @@ async fn main() -> Result<(), DynError> {
             .or(health)
             .or(hardware)
             .or(system_stats)
+            .or(list_remote_artifacts)
             .or(query_rag)
             .or(infer_route)
             .or(get_scaling)
@@ -12765,6 +13194,7 @@ async fn main() -> Result<(), DynError> {
     let device_info_for_scaler = device_info.clone();
     let unique_id_counter_for_scaler = unique_id_counter.clone();
     let shared_metrics_for_scaler = shared_metrics.clone();
+    let shared_kv_for_scaler = shared_kv_for_autoscaler;
     let batch_size_for_scaler = args.batch_size;
     let scheduler_queue_size_for_scaler = args.scheduler_queue_size;
     let scheduler_max_micro_batch_for_scaler = args.scheduler_max_micro_batch;
@@ -12924,6 +13354,7 @@ async fn main() -> Result<(), DynError> {
                             unique_id,
                             &model_path,
                             &device_info_for_scaler,
+                            shared_kv_for_scaler.clone(),
                             batch_size_for_scaler,
                             scheduler_queue_size_for_scaler,
                             scheduler_max_micro_batch_for_scaler,

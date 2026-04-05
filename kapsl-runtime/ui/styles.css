@@ -582,6 +582,13 @@ body::before {
     flex-wrap: wrap;
 }
 
+.remote-artifacts-meta {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+}
+
 .stack {
     display: flex;
     flex-direction: column;
@@ -737,6 +744,15 @@ code {
     border-color: rgba(11, 107, 203, 0.26);
 }
 
+.remote-card .model-status {
+    background: rgba(10, 155, 124, 0.08);
+    border-color: rgba(10, 155, 124, 0.18);
+}
+
+.remote-models-grid {
+    margin-top: 12px;
+}
+
 .model-header {
     display: flex;
     align-items: flex-start;
@@ -815,6 +831,27 @@ code {
 
 .model-actions .btn {
     flex: 1 1 auto;
+}
+
+.artifact-label-row {
+    align-items: center;
+}
+
+.artifact-label-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.artifact-reference {
+    max-width: 100%;
+}
+
+.artifact-meta {
+    font-size: 12px;
+    color: var(--text-3);
+    font-weight: 700;
 }
 
 .detail-row {
