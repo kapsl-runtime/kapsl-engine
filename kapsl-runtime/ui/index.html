@@ -272,50 +272,61 @@
                                     type="text"
                                     placeholder="http://idx-controller.local/v1 (optional)"
                                 />
-                            </div>
-                            <form id="engine-push-form" class="inline-form">
-                                <input
-                                    id="engine-push-target"
-                                    class="input"
-                                    type="text"
-                                    placeholder="repo/model:label (required)"
-                                />
-                                <input
-                                    id="engine-push-path"
-                                    class="input"
-                                    type="text"
-                                    placeholder="/path/to/package.aimod"
-                                />
-                                <button class="btn btn-primary" type="submit">
-                                    Push
-                                </button>
-                            </form>
-                            <form id="engine-pull-form" class="inline-form">
-                                <input
-                                    id="engine-pull-target"
-                                    class="input"
-                                    type="text"
-                                    placeholder="repo/model:label (required)"
-                                />
                                 <input
                                     id="engine-pull-destination"
                                     class="input"
                                     type="text"
                                     placeholder="destination dir (optional)"
                                 />
-                                <input
-                                    id="engine-pull-reference"
-                                    class="input"
-                                    type="text"
-                                    placeholder="OCI reference/tag (optional)"
-                                />
-                                <button class="btn btn-primary" type="submit">
-                                    Pull
+                                <button
+                                    id="engine-remote-refresh"
+                                    class="btn btn-secondary"
+                                    type="button"
+                                >
+                                    Refresh
                                 </button>
-                            </form>
+                            </div>
+                            <div class="remote-artifacts-meta">
+                                <div class="metric">
+                                    <div class="metric-label">
+                                        Current Repository
+                                    </div>
+                                    <div
+                                        class="metric-value"
+                                        id="engine-remote-repo"
+                                    >
+                                        -
+                                    </div>
+                                </div>
+                                <div class="metric">
+                                    <div class="metric-label">Models</div>
+                                    <div
+                                        class="metric-value"
+                                        id="engine-remote-count"
+                                    >
+                                        0
+                                    </div>
+                                </div>
+                            </div>
                             <div
                                 id="engine-remote-feedback"
                                 class="status-line"
+                            ></div>
+                            <div
+                                id="engine-remote-empty"
+                                class="empty-state"
+                                style="display: none"
+                            >
+                                <h3>No Remote Models</h3>
+                                <p>
+                                    This repository does not have any published
+                                    models yet.
+                                </p>
+                            </div>
+                            <div
+                                id="engine-remote-grid"
+                                class="models-grid remote-models-grid"
+                                style="display: none"
                             ></div>
                             <div
                                 id="engine-remote-result"
