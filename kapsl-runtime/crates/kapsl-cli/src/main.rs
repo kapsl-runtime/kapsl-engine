@@ -4168,6 +4168,7 @@ runtime:
             model_file: "model.onnx".to_string(),
             metadata: Some(metadata),
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
         };
 
         let policy = manifest_queue_overflow_policy(&manifest);
@@ -4187,6 +4188,7 @@ runtime:
             model_file: "model.onnx".to_string(),
             metadata: None,
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
         };
 
         let choice = resolve_effective_topology_choice(&manifest, "tensor-parallel", 4, None);
@@ -4219,6 +4221,7 @@ llm:
             model_file: "model.onnx".to_string(),
             metadata: Some(metadata),
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
         };
         let stages = manifest_llm_pipeline_stages(&manifest);
 
