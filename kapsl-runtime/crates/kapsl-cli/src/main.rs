@@ -112,8 +112,7 @@ impl SharedKvState {
             let total = (device.memory_mb as usize).saturating_mul(1024 * 1024);
             device_bytes.insert(device.id, total);
             let kv_blocks = (total / 2) / KV_BYTES_PER_BLOCK;
-            estimated_kv_tokens =
-                estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
+            estimated_kv_tokens = estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
         }
         Self {
             device_bytes,
@@ -147,9 +146,10 @@ impl SharedKvState {
     fn attach_engine(&self, device_id: usize) -> (SharedBlockAllocator, usize) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
-        self.scheduler
-            .lock()
-            .register(KvEngineHandle { engine_id, share_weight: 1 });
+        self.scheduler.lock().register(KvEngineHandle {
+            engine_id,
+            share_weight: 1,
+        });
         // Divide the device's block budget evenly across all registered engines.
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
@@ -1871,6 +1871,46 @@ struct PullKapslResponse {
     artifact_url: String,
     kapsl_path: String,
     bytes_downloaded: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteArtifactLabelSummary {
+    label: String,
+    reference: String,
+    size_bytes: u64,
+    updated_at: String,
+    download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteArtifactModelSummary {
+    name: String,
+    latest_label: Option<String>,
+    latest_reference: Option<String>,
+    artifact_count: usize,
+    #[serde(default)]
+    labels: Vec<RemoteArtifactLabelSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RemoteArtifactInventoryResponse {
+    status: String,
+    repo: String,
+    #[serde(default)]
+    available_repos: Vec<String>,
+    #[serde(default)]
+    models: Vec<RemoteArtifactModelSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RuntimeRemoteArtifactInventoryResponse {
+    status: String,
+    remote_url: String,
+    repo: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    available_repos: Vec<String>,
+    #[serde(default)]
+    models: Vec<RemoteArtifactModelSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -5131,6 +5171,13 @@ fn artifact_url_for_remote(remote_url: &str, target: &ModelTargetRef) -> String 
     )
 }
 
+fn remote_inventory_url_for_remote(remote_url: &str) -> String {
+    format!(
+        "{}/kapsl/repositories/current/models",
+        remote_url.trim_end_matches('/')
+    )
+}
+
 fn placeholder_remote_artifact_path(target: &ModelTargetRef) -> PathBuf {
     placeholder_remote_storage_dir()
         .join(&target.repo)
@@ -5154,6 +5201,62 @@ fn native_tls_http_agent() -> ureq::Agent {
         )
         .build()
         .into()
+}
+
+fn fetch_remote_artifact_inventory(
+    custom_remote_url: Option<&str>,
+) -> Result<RuntimeRemoteArtifactInventoryResponse, String> {
+    let remote_url = resolved_login_remote_url(custom_remote_url);
+    if is_oci_remote_url(&remote_url) {
+        return Err(
+            "Remote artifact browsing is not available for oci:// remotes yet.".to_string(),
+        );
+    }
+
+    let inventory_url = remote_inventory_url_for_remote(&remote_url);
+    let authorization_header = resolved_remote_token(&remote_url, None);
+    let agent = native_tls_http_agent();
+    let mut request = agent
+        .get(&inventory_url)
+        .header("Accept", "application/json");
+    if let Some(header) = authorization_header.as_deref() {
+        request = request.header("Authorization", header);
+    }
+
+    let mut response = request.call().map_err(|error| match error {
+        ureq::Error::StatusCode(401) | ureq::Error::StatusCode(403) => format!(
+            "Remote artifact inventory requires authentication for {}. Run `kapsl login --remote-url {}` first.",
+            remote_url, remote_url
+        ),
+        other => format!(
+            "Failed to fetch remote artifact inventory from {}: {}",
+            inventory_url,
+            format_remote_http_error(other)
+        ),
+    })?;
+
+    let body = response.body_mut().read_to_string().map_err(|error| {
+        format!(
+            "Failed to read remote artifact inventory response from {}: {}",
+            inventory_url, error
+        )
+    })?;
+
+    let payload: RemoteArtifactInventoryResponse =
+        serde_json::from_str(&body).map_err(|error| {
+            format!(
+                "Failed to parse remote artifact inventory response from {}: {}",
+                inventory_url, error
+            )
+        })?;
+
+    Ok(RuntimeRemoteArtifactInventoryResponse {
+        status: payload.status,
+        remote_url,
+        repo: payload.repo,
+        available_repos: payload.available_repos,
+        models: payload.models,
+    })
 }
 
 fn push_kapsl_to_http_remote(
@@ -9505,7 +9608,9 @@ fn load_model_blocking(
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
             let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
-            backend = backend.with_shared_pool(kv_pool).with_kv_blocks_cap(kv_blocks_cap);
+            backend = backend
+                .with_shared_pool(kv_pool)
+                .with_kv_blocks_cap(kv_blocks_cap);
             tokio::runtime::Handle::current()
                 .block_on(backend.load(&model_file_path))
                 .map_err(|e| {
@@ -9822,7 +9927,9 @@ async fn load_model(
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
             let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
-            backend = backend.with_shared_pool(kv_pool).with_kv_blocks_cap(kv_blocks_cap);
+            backend = backend
+                .with_shared_pool(kv_pool)
+                .with_kv_blocks_cap(kv_blocks_cap);
             backend.load(&model_file_path).await.map_err(|e| {
                 let err: Box<dyn std::error::Error + Send + Sync> =
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
@@ -10097,7 +10204,9 @@ async fn scale_up_model(
         };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
         let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
-        backend = backend.with_shared_pool(kv_pool).with_kv_blocks_cap(kv_blocks_cap);
+        backend = backend
+            .with_shared_pool(kv_pool)
+            .with_kv_blocks_cap(kv_blocks_cap);
         backend.load(&model_file_path).await.map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
@@ -10729,34 +10838,35 @@ async fn main() -> Result<(), DynError> {
 
     tokio::spawn(async move {
         // Metrics endpoint (admin scope when auth is enabled; loopback only when disabled)
-        let metrics_route = warp::path("metrics")
-            .and(warp::get())
-            .map(move || -> warp::reply::Response {
-                let encoder = TextEncoder::new();
-                let metric_families = registry_arc.gather();
-                let mut buffer = vec![];
-                if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
-                    log::error!("Failed to encode Prometheus metrics: {e}");
-                    return warp::http::Response::builder()
-                        .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(warp::hyper::Body::from("metrics encoding error"))
-                        .unwrap_or_default();
-                }
-                match String::from_utf8(buffer) {
-                    Ok(text) => warp::http::Response::builder()
-                        .status(warp::http::StatusCode::OK)
-                        .header(warp::http::header::CONTENT_TYPE, encoder.format_type())
-                        .body(warp::hyper::Body::from(text))
-                        .unwrap_or_default(),
-                    Err(e) => {
-                        log::error!("Prometheus metrics output is not valid UTF-8: {e}");
-                        warp::http::Response::builder()
+        let metrics_route =
+            warp::path("metrics")
+                .and(warp::get())
+                .map(move || -> warp::reply::Response {
+                    let encoder = TextEncoder::new();
+                    let metric_families = registry_arc.gather();
+                    let mut buffer = vec![];
+                    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+                        log::error!("Failed to encode Prometheus metrics: {e}");
+                        return warp::http::Response::builder()
                             .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
                             .body(warp::hyper::Body::from("metrics encoding error"))
-                            .unwrap_or_default()
+                            .unwrap_or_default();
                     }
-                }
-            });
+                    match String::from_utf8(buffer) {
+                        Ok(text) => warp::http::Response::builder()
+                            .status(warp::http::StatusCode::OK)
+                            .header(warp::http::header::CONTENT_TYPE, encoder.format_type())
+                            .body(warp::hyper::Body::from(text))
+                            .unwrap_or_default(),
+                        Err(e) => {
+                            log::error!("Prometheus metrics output is not valid UTF-8: {e}");
+                            warp::http::Response::builder()
+                                .status(warp::http::StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(warp::hyper::Body::from("metrics encoding error"))
+                                .unwrap_or_default()
+                        }
+                    }
+                });
         let metrics_route = api_auth_filter(
             ApiRole::Admin,
             ApiScope::Admin,
@@ -11081,6 +11191,28 @@ async fn main() -> Result<(), DynError> {
                     Err(error) => warp::reply::with_status(
                         warp::reply::json(&ErrorResponse { error }),
                         StatusCode::BAD_REQUEST,
+                    ),
+                }
+            });
+
+        let list_remote_artifacts = warp::path!("api" / "engine" / "remote-artifacts")
+            .and(warp::get())
+            .and(warp::query::<HashMap<String, String>>())
+            .map(|query: HashMap<String, String>| {
+                use warp::http::StatusCode;
+
+                #[derive(Serialize)]
+                struct ErrorResponse {
+                    error: String,
+                }
+
+                match fetch_remote_artifact_inventory(query.get("remote_url").map(String::as_str)) {
+                    Ok(response) => {
+                        warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
+                    }
+                    Err(error) => warp::reply::with_status(
+                        warp::reply::json(&ErrorResponse { error }),
+                        StatusCode::BAD_GATEWAY,
                     ),
                 }
             });
@@ -12904,6 +13036,7 @@ async fn main() -> Result<(), DynError> {
             .or(health)
             .or(hardware)
             .or(system_stats)
+            .or(list_remote_artifacts)
             .or(query_rag)
             .or(infer_route)
             .or(get_scaling)
