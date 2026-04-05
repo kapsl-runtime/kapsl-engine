@@ -1814,7 +1814,7 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "futures",
@@ -1835,11 +1835,12 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "flate2",
  "fs2",
  "hex",
+ "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "parking_lot",
  "serde",
@@ -1866,7 +1867,7 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1889,7 +1890,7 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "serde",
  "serde_json",
@@ -1918,7 +1919,7 @@ dependencies = [
 [[package]]
 name = "kapsl-ipc"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1936,7 +1937,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
@@ -1947,7 +1948,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1974,7 +1975,7 @@ dependencies = [
 [[package]]
 name = "kapsl-monitor"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1988,7 +1989,7 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "anyhow",
  "half",
@@ -2002,7 +2003,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2021,7 +2022,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag-sdk"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "futures",
@@ -2048,17 +2049,19 @@ dependencies = [
 [[package]]
 name = "kapsl-scheduler"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "chrono",
  "cron",
  "futures",
+ "kapsl-core",
  "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
  "log",
  "parking_lot",
  "rayon",
+ "serde",
  "tokio",
 ]
 
@@ -2086,7 +2089,7 @@ dependencies = [
 [[package]]
 name = "kapsl-shm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2121,7 +2124,7 @@ dependencies = [
 [[package]]
 name = "kapsl-transport"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#1235d42a1e0abc709e14a50b84100374b94f5223"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
 dependencies = [
  "async-trait",
  "bincode",
@@ -3033,6 +3036,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
+name = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "getrandom 0.2.16",
+ "libc",
+ "untrusted",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3127,12 +3144,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls"
+version = "0.23.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+dependencies = [
+ "log",
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21e6f2ab2928ca4291b86736a8bd920a277a399bba1589409d72154ff87c1282"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.103.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+dependencies = [
+ "ring",
+ "rustls-pki-types",
+ "untrusted",
 ]
 
 [[package]]
@@ -3455,6 +3498,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
@@ -3879,6 +3928,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
+name = "untrusted"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
 name = "ureq"
 version = "3.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3889,11 +3944,13 @@ dependencies = [
  "log",
  "native-tls",
  "percent-encoding",
+ "rustls",
  "rustls-pki-types",
  "socks",
  "ureq-proto",
  "utf-8",
  "webpki-root-certs",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -4567,6 +4624,15 @@ name = "webpki-root-certs"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36a29fc0408b113f68cf32637857ab740edfafdf460c326cd2afaa2d84cc05dc"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
 dependencies = [
  "rustls-pki-types",
 ]

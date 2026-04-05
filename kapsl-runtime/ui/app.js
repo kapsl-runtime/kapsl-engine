@@ -40,6 +40,9 @@ class KapslApp {
       localStorage.getItem("kapsl_remote_placeholder_url") || "";
     this.extensions = [];
     this.marketplaceExtensions = [];
+    this.remoteArtifacts = { remote_url: "", repo: "", available_repos: [], models: [] };
+    this.remoteArtifactsLoading = false;
+    this.currentRemoteArtifactName = null;
 
     this.coreFetchInFlight = false;
     this.isAuthenticated = false;
@@ -362,6 +365,7 @@ class KapslApp {
         this.refreshLegacyTokens({ silent: true }),
         this.refreshAccessData({ silent: true }),
         this.refreshExtensionsData({ silent: true }),
+        this.refreshRemoteArtifacts({ silent: true }),
       ]);
       this.startAutoRefresh();
       return true;
@@ -562,15 +566,20 @@ class KapslApp {
     remoteUrlInput.value = this.remotePlaceholderUrl;
     remoteUrlInput.addEventListener("change", () => {
       this.persistRemotePlaceholderUrl(remoteUrlInput.value);
+      this.refreshRemoteArtifacts();
     });
 
     document
-      .getElementById("engine-push-form")
-      .addEventListener("submit", (event) => this.handlePushKapsl(event));
+      .getElementById("engine-remote-refresh")
+      .addEventListener("click", () => this.refreshRemoteArtifacts());
 
     document
-      .getElementById("engine-pull-form")
-      .addEventListener("submit", (event) => this.handlePullKapsl(event));
+      .getElementById("engine-remote-grid")
+      .addEventListener("click", (event) => this.handleRemoteArtifactsClick(event));
+
+    document
+      .getElementById("modal-body")
+      .addEventListener("click", (event) => this.handleModalActionClick(event));
   }
 
   bindExtensionsControls() {
@@ -2582,6 +2591,291 @@ class KapslApp {
     return trimmed;
   }
 
+  async refreshRemoteArtifacts({ silent = false } = {}) {
+    if (!this.isAuthenticated) {
+      return;
+    }
+
+    const remoteUrl = this.currentRemotePlaceholderUrl();
+    const params = new URLSearchParams();
+    if (remoteUrl) {
+      params.set("remote_url", remoteUrl);
+    }
+
+    this.remoteArtifactsLoading = true;
+    this.renderRemoteArtifacts();
+    if (!silent) {
+      this.setAccessFeedback(
+        "engine-remote-feedback",
+        "Loading remote repository models...",
+        false,
+      );
+    }
+
+    try {
+      const path = params.toString()
+        ? `/api/engine/remote-artifacts?${params.toString()}`
+        : "/api/engine/remote-artifacts";
+      const result = await this.requestJson(path);
+      if (!result.ok) {
+        throw new Error(
+          result.data?.error ||
+            `Remote artifact request failed (HTTP ${result.status})`,
+        );
+      }
+
+      const payload = result.data || {};
+      this.remoteArtifacts = {
+        remote_url: payload.remote_url || remoteUrl,
+        repo: payload.repo || "",
+        available_repos: Array.isArray(payload.available_repos)
+          ? payload.available_repos
+          : [],
+        models: Array.isArray(payload.models) ? payload.models : [],
+      };
+      this.renderRemoteArtifacts();
+      if (!silent) {
+        this.setAccessFeedback("engine-remote-feedback", "", false);
+      }
+    } catch (error) {
+      console.error("Remote artifacts refresh error:", error);
+      this.remoteArtifacts = {
+        remote_url: remoteUrl,
+        repo: "",
+        available_repos: [],
+        models: [],
+      };
+      this.renderRemoteArtifacts();
+      this.setAccessFeedback("engine-remote-feedback", error.message, true);
+    } finally {
+      this.remoteArtifactsLoading = false;
+      this.renderRemoteArtifacts();
+    }
+  }
+
+  renderRemoteArtifacts() {
+    const repoEl = document.getElementById("engine-remote-repo");
+    const countEl = document.getElementById("engine-remote-count");
+    const grid = document.getElementById("engine-remote-grid");
+    const empty = document.getElementById("engine-remote-empty");
+    const models = Array.isArray(this.remoteArtifacts.models)
+      ? this.remoteArtifacts.models
+      : [];
+
+    repoEl.textContent = this.remoteArtifacts.repo || "-";
+    countEl.textContent = String(models.length);
+
+    if (this.remoteArtifactsLoading) {
+      empty.style.display = "block";
+      empty.querySelector("h3").textContent = "Loading Remote Models";
+      empty.querySelector("p").textContent =
+        "Fetching your current repository and published models...";
+      grid.style.display = "none";
+      grid.innerHTML = "";
+      return;
+    }
+
+    if (!models.length) {
+      empty.style.display = "block";
+      empty.querySelector("h3").textContent = this.remoteArtifacts.repo
+        ? "No Remote Models"
+        : "Remote Repository Unavailable";
+      empty.querySelector("p").textContent = this.remoteArtifacts.repo
+        ? "This repository does not have any published models yet."
+        : "Configure a reachable remote URL and authenticate with the remote backend.";
+      grid.style.display = "none";
+      grid.innerHTML = "";
+      return;
+    }
+
+    empty.style.display = "none";
+    grid.style.display = "grid";
+    grid.innerHTML = models.map((model) => this.createRemoteArtifactCard(model)).join("");
+  }
+
+  createRemoteArtifactCard(model) {
+    const labels = Array.isArray(model.labels) ? model.labels : [];
+    const latest = labels[0] || null;
+    const latestReference =
+      latest?.reference || model.latest_reference || "";
+    const latestLabel = latest?.label || model.latest_label || "-";
+    const latestSize = latest ? this.formatBytes(latest.size_bytes || 0) : "-";
+    const updatedAt = latest?.updated_at
+      ? this.formatDateTime(latest.updated_at)
+      : "-";
+
+    return `
+      <div class="model-card remote-card" data-model-name="${this.escapeHtml(model.name || "")}">
+        <div class="model-header">
+          <div class="model-info">
+            <h3>${this.escapeHtml(model.name || "Unnamed Model")}</h3>
+            <div class="model-id">${this.escapeHtml(this.remoteArtifacts.repo || "-")}</div>
+          </div>
+          <div class="model-status">
+            <span class="status-dot status-healthy"></span>
+            ${this.escapeHtml(latestLabel)}
+          </div>
+        </div>
+
+        <div class="model-metrics">
+          <div class="metric">
+            <div class="metric-label">Artifacts</div>
+            <div class="metric-value">${Number(model.artifact_count || labels.length || 0)}</div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Latest Size</div>
+            <div class="metric-value">${this.escapeHtml(latestSize)}</div>
+          </div>
+        </div>
+
+        <div class="model-details">
+          <div class="detail-row">
+            <span class="detail-label">Target:</span>
+            <span class="detail-value">${this.escapeHtml(latestReference || "-")}</span>
+          </div>
+          <div class="detail-row">
+            <span class="detail-label">Updated:</span>
+            <span class="detail-value">${this.escapeHtml(updatedAt)}</span>
+          </div>
+        </div>
+
+        <div class="model-actions">
+          <button class="btn btn-secondary" type="button" data-action="remote-details">Details</button>
+          <button class="btn btn-primary" type="button" data-action="remote-pull" data-reference="${this.escapeHtml(latestReference)}" ${latestReference ? "" : "disabled"}>
+            Pull
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  handleRemoteArtifactsClick(event) {
+    const button = event.target.closest("button[data-action]");
+    const card = event.target.closest(".remote-card");
+    if (!card) {
+      return;
+    }
+
+    const modelName = card.dataset.modelName;
+    if (!modelName) {
+      return;
+    }
+
+    if (button) {
+      const action = button.dataset.action;
+      if (action === "remote-pull") {
+        event.stopPropagation();
+        const reference = button.dataset.reference;
+        if (reference) {
+          this.pullRemoteArtifact(reference);
+        }
+        return;
+      }
+      if (action === "remote-details") {
+        event.stopPropagation();
+        this.showRemoteArtifactDetail(modelName);
+        return;
+      }
+    }
+
+    this.showRemoteArtifactDetail(modelName);
+  }
+
+  handleModalActionClick(event) {
+    const button = event.target.closest("button[data-action]");
+    if (!button) {
+      return;
+    }
+
+    const action = button.dataset.action;
+    if (action === "remote-modal-pull" || action === "remote-pull") {
+      const reference = button.dataset.reference;
+      if (reference) {
+        this.pullRemoteArtifact(reference);
+      }
+    }
+  }
+
+  findRemoteArtifactModel(modelName) {
+    const models = Array.isArray(this.remoteArtifacts.models)
+      ? this.remoteArtifacts.models
+      : [];
+    return models.find((model) => String(model.name || "") === String(modelName || "")) || null;
+  }
+
+  showRemoteArtifactDetail(modelName) {
+    const model = this.findRemoteArtifactModel(modelName);
+    if (!model) {
+      return;
+    }
+
+    this.currentRemoteArtifactName = modelName;
+    this.currentModalId = null;
+
+    const modalTitle = document.getElementById("modal-title");
+    const modalBody = document.getElementById("modal-body");
+    const labels = Array.isArray(model.labels) ? model.labels : [];
+    const latest = labels[0] || null;
+
+    modalTitle.textContent = `${model.name} (${this.remoteArtifacts.repo || "-"})`;
+    modalBody.innerHTML = `
+      <div class="modal-section">
+        <h3>Repository Artifact</h3>
+        <div class="modal-actions-row">
+          <div class="model-status">
+            <span class="status-dot status-healthy"></span>
+            ${this.escapeHtml(latest?.label || model.latest_label || "latest")}
+          </div>
+          <div class="modal-actions-buttons">
+            <button
+              class="btn btn-primary"
+              type="button"
+              data-action="remote-modal-pull"
+              data-reference="${this.escapeHtml(latest?.reference || model.latest_reference || "")}"
+              ${(latest?.reference || model.latest_reference) ? "" : "disabled"}
+            >
+              Pull Latest
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>Model Information</h3>
+        <div class="info-grid">
+          <div class="info-row"><div class="info-label">Repository</div><div class="info-value">${this.escapeHtml(this.remoteArtifacts.repo || "-")}</div></div>
+          <div class="info-row"><div class="info-label">Model</div><div class="info-value">${this.escapeHtml(model.name || "-")}</div></div>
+          <div class="info-row"><div class="info-label">Artifacts</div><div class="info-value">${Number(model.artifact_count || labels.length || 0)}</div></div>
+          <div class="info-row"><div class="info-label">Remote URL</div><div class="info-value">${this.escapeHtml(this.remoteArtifacts.remote_url || this.currentRemotePlaceholderUrl() || "-")}</div></div>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>Available Labels</h3>
+        <div class="info-grid">
+          ${labels
+            .map(
+              (label) => `
+                <div class="info-row artifact-label-row">
+                  <div class="artifact-label-copy">
+                    <div class="info-label">${this.escapeHtml(label.label || "-")}</div>
+                    <div class="info-value artifact-reference">${this.escapeHtml(label.reference || "-")}</div>
+                    <div class="artifact-meta">${this.escapeHtml(this.formatBytes(label.size_bytes || 0))} • ${this.escapeHtml(this.formatDateTime(label.updated_at || ""))}</div>
+                  </div>
+                  <button class="btn btn-secondary" type="button" data-action="remote-modal-pull" data-reference="${this.escapeHtml(label.reference || "")}">
+                    Pull
+                  </button>
+                </div>
+              `,
+            )
+            .join("")}
+        </div>
+      </div>
+    `;
+
+    document.getElementById("model-modal").classList.add("active");
+  }
+
   updateEngineRemoteResult(payload) {
     const block = document.getElementById("engine-remote-result");
     if (!payload) {
@@ -2589,6 +2883,53 @@ class KapslApp {
       return;
     }
     block.textContent = JSON.stringify(payload, null, 2);
+  }
+
+  async pullRemoteArtifact(reference) {
+    const target = String(reference || "").trim();
+    if (!target) {
+      return;
+    }
+
+    const remoteUrl = this.currentRemotePlaceholderUrl();
+    const destinationDir = document
+      .getElementById("engine-pull-destination")
+      .value.trim();
+    const payload = { target };
+    if (destinationDir) {
+      payload.destination_dir = destinationDir;
+    }
+    if (remoteUrl) {
+      payload.remote_url = remoteUrl;
+    }
+
+    this.setAccessFeedback("engine-remote-feedback", `Pulling ${target}...`, false);
+    this.updateEngineRemoteResult(null);
+
+    try {
+      const result = await this.requestJson("/api/engine/pull", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!result.ok) {
+        throw new Error(
+          result.data?.error || `Pull failed (HTTP ${result.status})`,
+        );
+      }
+
+      const downloadedBytes = Number(result.data?.bytes_downloaded || 0);
+      const kapslPath = result.data?.kapsl_path || "local path unavailable";
+      this.setAccessFeedback(
+        "engine-remote-feedback",
+        `Pulled ${target} (${downloadedBytes.toLocaleString()} bytes) to ${kapslPath}.`,
+        false,
+      );
+      this.updateEngineRemoteResult(result.data);
+    } catch (error) {
+      this.setAccessFeedback("engine-remote-feedback", error.message, true);
+    }
   }
 
   async handlePushKapsl(event) {
@@ -3289,6 +3630,7 @@ class KapslApp {
     const modal = document.getElementById("model-modal");
     modal.classList.remove("active");
     this.currentModalId = null;
+    this.currentRemoteArtifactName = null;
   }
 
   showError(message) {
@@ -3377,6 +3719,19 @@ class KapslApp {
     } catch (_) {
       return "invalid";
     }
+  }
+
+  formatDateTime(value) {
+    const raw = String(value || "").trim();
+    if (!raw) {
+      return "-";
+    }
+
+    const date = new Date(raw);
+    if (Number.isNaN(date.getTime())) {
+      return raw;
+    }
+    return date.toLocaleString();
   }
 
   escapeHtml(value) {
