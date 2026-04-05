@@ -2313,6 +2313,49 @@ fn print_build_summary(kapsl_path: &str) {
     }
 }
 
+fn format_elapsed(duration: Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 1.0 {
+        format!("{}ms", duration.as_millis())
+    } else if secs < 60.0 {
+        format!("{secs:.2}s")
+    } else {
+        let minutes = (secs / 60.0).floor() as u64;
+        let rem_secs = secs - (minutes as f64 * 60.0);
+        format!("{minutes}m {rem_secs:.1}s")
+    }
+}
+
+fn transfer_backend_label(remote_url: &str) -> &'static str {
+    if is_oci_remote_url(remote_url) {
+        "oci"
+    } else if is_default_placeholder_remote(remote_url) {
+        "placeholder"
+    } else {
+        "http"
+    }
+}
+
+fn print_transfer_summary(
+    action: &str,
+    remote_url: &str,
+    bytes: u64,
+    elapsed: Duration,
+    path_or_target: &str,
+) {
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let bytes_per_sec = (bytes as f64 / elapsed_secs).round() as u64;
+    eprintln!(
+        "✓ {} {} via {} in {} ({}/s)",
+        action,
+        format_human_bytes(bytes),
+        transfer_backend_label(remote_url),
+        format_elapsed(elapsed),
+        format_human_bytes(bytes_per_sec),
+    );
+    eprintln!("  {}", path_or_target);
+}
+
 fn discover_kapsl_in_current_dir() -> Result<PathBuf, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("Failed to read current directory: {}", e))?;
@@ -2480,9 +2523,17 @@ fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError> {
         interactive_login: true,
     };
 
+    let started_at = Instant::now();
     let response = run_with_loading("Uploading package", || {
         push_kapsl_to_placeholder_remote(&request).map_err(dyn_error_from_message)
     })?;
+    print_transfer_summary(
+        "Uploaded",
+        &response.remote_url,
+        response.bytes_uploaded,
+        started_at.elapsed(),
+        &response.artifact_url,
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&response)
@@ -2513,9 +2564,17 @@ fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError> {
         interactive_login: true,
     };
 
+    let started_at = Instant::now();
     let response = run_with_loading("Downloading package", || {
         pull_kapsl_from_placeholder_remote(&request).map_err(dyn_error_from_message)
     })?;
+    print_transfer_summary(
+        "Downloaded",
+        &response.remote_url,
+        response.bytes_downloaded,
+        started_at.elapsed(),
+        &response.kapsl_path,
+    );
     println!(
         "{}",
         serde_json::to_string_pretty(&response)
@@ -5474,43 +5533,6 @@ fn ensure_oras_support(oras_bin: &str) -> Result<(), String> {
             version.status.code().unwrap_or(-1),
             stderr.trim()
         ));
-    }
-
-    let push_help = Command::new(oras_bin)
-        .args(["push", "--help"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to execute `{}`: {}", oras_bin, e))?;
-    let push_help_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&push_help.stdout),
-        String::from_utf8_lossy(&push_help.stderr)
-    );
-    for required in ["--artifact-type", "--annotation", "--config"] {
-        if !push_help_text.contains(required) {
-            return Err(format!(
-                "`oras push` does not support required flag {}. Please upgrade ORAS.",
-                required
-            ));
-        }
-    }
-
-    let pull_help = Command::new(oras_bin)
-        .args(["pull", "--help"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to execute `{}`: {}", oras_bin, e))?;
-    let pull_help_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&pull_help.stdout),
-        String::from_utf8_lossy(&pull_help.stderr)
-    );
-    if !pull_help_text.contains("--output") {
-        return Err(
-            "`oras pull` does not appear to support `--output`. Please upgrade ORAS.".to_string(),
-        );
     }
 
     Ok(())
