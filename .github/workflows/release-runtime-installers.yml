@@ -300,6 +300,32 @@ jobs:
 
           Remove-Item $certPath -Force
 
+      - name: Package raw binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+          case "${arch_name}" in
+            x64) arch_name="x86_64" ;;
+            arm64) arch_name="aarch64" ;;
+          esac
+          os_name="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+          bin_name="kapsl-${KAPSL_VERSION}-${os_name}-${arch_name}"
+          cp kapsl-runtime/target/release/kapsl "dist/${bin_name}"
+          chmod +x "dist/${bin_name}"
+          sha256sum "dist/${bin_name}" > "dist/${bin_name}.sha256" 2>/dev/null || shasum -a 256 "dist/${bin_name}" > "dist/${bin_name}.sha256"
+
+      - name: Package raw binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arch = $env:RUNNER_ARCH.ToLower()
+          if ($arch -eq "x64") { $arch = "x86_64" }
+          if ($arch -eq "arm64") { $arch = "aarch64" }
+          $binName = "kapsl-$($env:KAPSL_VERSION)-windows-$arch.exe"
+          Copy-Item "kapsl-runtime/target/release/kapsl.exe" "dist/$binName"
+          $hash = (Get-FileHash -Path "dist/$binName" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $binName" | Set-Content -Path "dist/$binName.sha256"
+
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
