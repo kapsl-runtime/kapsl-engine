@@ -1,0 +1,62 @@
+name: Cleanup R2 Installers
+
+on:
+  schedule:
+    # Run on the 1st of every month at 02:00 UTC
+    - cron: "0 2 1 * *"
+  workflow_dispatch:
+    inputs:
+      keep_latest:
+        description: "Number of most recent versions to keep"
+        required: false
+        default: "3"
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install AWS CLI
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            pip install --quiet awscli
+          fi
+
+      - name: List and delete old installer versions
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          KEEP_LATEST: ${{ github.event.inputs.keep_latest || '3' }}
+        run: |
+          echo "Listing installer versions in R2..."
+
+          # List all version prefixes under runtime/v*
+          versions=$(aws s3 ls s3://kapsl-installer/runtime/ \
+            --endpoint-url "$R2_ENDPOINT" \
+            | awk '{print $NF}' \
+            | grep '^v' \
+            | sed 's|/$||' \
+            | sort -V)
+
+          total=$(echo "$versions" | grep -c .)
+          echo "Found $total version(s): $(echo $versions | tr '\n' ' ')"
+
+          if [ "$total" -le "$KEEP_LATEST" ]; then
+            echo "Nothing to delete — $total version(s) present, keeping $KEEP_LATEST."
+            exit 0
+          fi
+
+          to_delete=$(echo "$versions" | head -n $(( total - KEEP_LATEST )))
+          echo "Deleting $(echo "$to_delete" | grep -c .): $(echo $to_delete | tr '\n' ' ')"
+
+          for version in $to_delete; do
+            echo "  Deleting s3://kapsl-installer/runtime/$version/"
+            aws s3 rm "s3://kapsl-installer/runtime/$version/" \
+              --recursive \
+              --no-progress \
+              --endpoint-url "$R2_ENDPOINT"
+          done
+
+          echo "Done. Retained: $(echo "$versions" | tail -n "$KEEP_LATEST" | tr '\n' ' ')"
