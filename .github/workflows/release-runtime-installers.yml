@@ -300,6 +300,32 @@ jobs:
 
           Remove-Item $certPath -Force
 
+      - name: Package raw binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
+          case "${arch_name}" in
+            x64) arch_name="x86_64" ;;
+            arm64) arch_name="aarch64" ;;
+          esac
+          os_name="$(echo "${RUNNER_OS}" | tr '[:upper:]' '[:lower:]')"
+          bin_name="kapsl-${KAPSL_VERSION}-${os_name}-${arch_name}"
+          cp kapsl-runtime/target/release/kapsl "dist/${bin_name}"
+          chmod +x "dist/${bin_name}"
+          sha256sum "dist/${bin_name}" > "dist/${bin_name}.sha256" 2>/dev/null || shasum -a 256 "dist/${bin_name}" > "dist/${bin_name}.sha256"
+
+      - name: Package raw binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $arch = $env:RUNNER_ARCH.ToLower()
+          if ($arch -eq "x64") { $arch = "x86_64" }
+          if ($arch -eq "arm64") { $arch = "aarch64" }
+          $binName = "kapsl-$($env:KAPSL_VERSION)-windows-$arch.exe"
+          Copy-Item "kapsl-runtime/target/release/kapsl.exe" "dist/$binName"
+          $hash = (Get-FileHash -Path "dist/$binName" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $binName" | Set-Content -Path "dist/$binName.sha256"
+
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -327,6 +353,9 @@ jobs:
     needs: build-runtime-installers
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
@@ -352,5 +381,17 @@ jobs:
           aws s3 cp release-assets/ \
             s3://kapsl-installer/runtime/v${{ steps.version.outputs.version }}/ \
             --recursive \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+      - name: Upload install.sh to R2 (stable URL)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws s3 cp install.sh \
+            s3://kapsl-installer/install.sh \
+            --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
