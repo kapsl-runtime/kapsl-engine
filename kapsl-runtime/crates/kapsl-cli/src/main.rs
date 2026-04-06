@@ -216,6 +216,8 @@ enum KapslCommand {
     Pull(PullCommandArgs),
     /// Authenticate with a remote backend and save token locally
     Login(LoginCommandArgs),
+    /// Add a model to an already-running runtime without restarting
+    AddModel(AddModelCommandArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -613,6 +615,42 @@ struct LoginCommandArgs {
         default_value_t = false
     )]
     device_code: bool,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(next_help_heading = "Add-Model Options")]
+struct AddModelCommandArgs {
+    /// Path(s) to .aimod package(s) to add (repeat for each model)
+    #[arg(short, long, required = true, value_name = "PATH")]
+    model: Vec<PathBuf>,
+
+    /// HTTP API port of the running runtime (default 9095)
+    #[arg(long, default_value_t = 9095, value_name = "PORT")]
+    http_port: u16,
+
+    /// HTTP bind address of the running runtime
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    http_host: String,
+
+    /// Full HTTP base URL of the running runtime (overrides --http-host and --http-port)
+    #[arg(long, value_name = "URL")]
+    http_url: Option<String>,
+
+    /// Bearer token for authenticated runtimes
+    #[arg(long, value_name = "TOKEN")]
+    auth_token: Option<String>,
+
+    /// Mesh topology for the added model(s) (data-parallel, tensor-parallel, pipeline-parallel, mixed)
+    #[arg(long, default_value = "data-parallel", value_name = "TOPOLOGY")]
+    topology: String,
+
+    /// Tensor parallelism degree for the added model(s)
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    tp_degree: usize,
+
+    /// Per-request timeout in milliseconds when contacting the runtime API
+    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -2655,6 +2693,91 @@ fn execute_login_command(args: LoginCommandArgs) -> Result<(), DynError> {
     );
 
     Ok(())
+}
+
+fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> {
+    if args.model.is_empty() {
+        return Err(dyn_error_from_message(
+            "At least one --model PATH is required.",
+        ));
+    }
+
+    let base_url = match &args.http_url {
+        Some(url) => url.trim_end_matches('/').to_string(),
+        None => format!("http://{}:{}", args.http_host, args.http_port),
+    };
+
+    let timeout = std::time::Duration::from_millis(args.timeout_ms.max(1));
+    let agent_config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_per_call(Some(timeout))
+        .build();
+    let agent: ureq::Agent = agent_config.into();
+
+    let start_url = format!("{}/api/models/start", base_url);
+
+    let mut any_error = false;
+    for model_path in &args.model {
+        let absolute_path = match model_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "error: model path {:?} is invalid: {}",
+                    model_path, e
+                );
+                any_error = true;
+                continue;
+            }
+        };
+
+        let payload = serde_json::json!({
+            "model_path": absolute_path.to_string_lossy(),
+            "topology": args.topology,
+            "tp_degree": args.tp_degree,
+        });
+
+        let payload_str = serde_json::to_string(&payload)
+            .map_err(|e| dyn_error_from_message(format!("Failed to serialize request: {}", e)))?;
+
+        let mut request = agent
+            .post(&start_url)
+            .header("Content-Type", "application/json");
+        if let Some(token) = &args.auth_token {
+            request = request.header("Authorization", &format!("Bearer {}", token));
+        }
+
+        match request.send(payload_str) {
+            Ok(mut response) => {
+                let body = response
+                    .body_mut()
+                    .read_to_string()
+                    .unwrap_or_else(|_| String::new());
+                match serde_json::from_str::<serde_json::Value>(&body) {
+                    Ok(json) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json).unwrap_or(body)
+                    ),
+                    Err(_) => println!("{}", body),
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: failed to add model {:?}: {}",
+                    model_path,
+                    format_remote_http_error(e)
+                );
+                any_error = true;
+            }
+        }
+    }
+
+    if any_error {
+        Err(dyn_error_from_message(
+            "One or more models could not be added.",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -10571,6 +10694,7 @@ async fn main() -> Result<(), DynError> {
         Some(KapslCommand::Pull(args)) => return execute_pull_command(args),
         Some(KapslCommand::Login(args)) => return execute_login_command(args),
         Some(KapslCommand::Control(args)) => return execute_control_command(args),
+        Some(KapslCommand::AddModel(args)) => return execute_add_model_command(args),
         Some(KapslCommand::Run(_)) | None => {}
     }
 
