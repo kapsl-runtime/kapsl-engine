@@ -3,6 +3,7 @@
 The `kapsl` CLI helps you:
 
 - run model packages
+- add models to a running runtime without restarting
 - build `.aimod` packages
 - push packages to a remote backend
 - pull packages from a remote backend
@@ -25,6 +26,12 @@ Run with `cargo run` during development:
 cargo run -p kapsl -- --help
 ```
 
+Or install the pre-built binary:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
 ## Command Overview
 
 ```bash
@@ -34,6 +41,7 @@ kapsl [OPTIONS] [COMMAND]
 Commands:
 
 - `run`: run the runtime server
+- `add-model`: add model(s) to an already-running runtime
 - `build`: build a `.aimod` package
 - `push`: upload a `.aimod` package
 - `pull`: download a `.aimod` package
@@ -50,7 +58,46 @@ This is equivalent to:
 kapsl run --model models/mnist/mnist.aimod
 ```
 
-## 1) Run Models (`kapsl run`)
+## 1) Install
+
+### Pre-built binary (recommended)
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
+Installs to `~/.local/bin/kapsl`. If that directory is not on your `PATH`, the script will print the export line to add to your shell profile.
+
+Install a specific version:
+
+```bash
+KAPSL_VERSION=0.1.13 curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
+Install to a custom directory:
+
+```bash
+KAPSL_INSTALL_DIR=/usr/local/bin curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
+Test the script locally (without hitting the real server):
+
+```bash
+# Serve a local staging directory
+cd /tmp/kapsl-test-serve && python3 -m http.server 8787
+
+# In another terminal — override the base URL
+KAPSL_BASE_URL=http://127.0.0.1:8787 KAPSL_INSTALL_DIR=/tmp/kapsl-out sh install.sh
+```
+
+### Build from source
+
+```bash
+cd kapsl-runtime
+cargo build --release -p kapsl
+```
+
+## 2) Run Models (`kapsl run`)
 
 Run one or more `.aimod` packages:
 
@@ -95,7 +142,54 @@ kapsl run \
   --performance-profile latency
 ```
 
-## 2) Build Packages (`kapsl build`)
+## 3) Add Models to a Running Runtime (`kapsl add-model`)
+
+Add one or more models to a runtime that is already running, without stopping or restarting it.
+
+```bash
+kapsl add-model --model ./model.aimod
+```
+
+Add multiple models at once:
+
+```bash
+kapsl add-model \
+  --model ./model1.aimod \
+  --model ./model2.aimod
+```
+
+Target a non-default HTTP port:
+
+```bash
+kapsl add-model --model ./model.aimod --http-port 9100
+```
+
+Authenticated runtime:
+
+```bash
+kapsl add-model --model ./model.aimod --auth-token "$KAPSL_API_TOKEN"
+```
+
+Full URL override (e.g. remote host):
+
+```bash
+kapsl add-model --model ./model.aimod --http-url http://192.168.1.10:9095
+```
+
+Options:
+
+- `--model <PATH>` — path to `.aimod` package (repeat for each model, required)
+- `--http-port <PORT>` — HTTP API port of the running runtime (default: `9095`)
+- `--http-host <HOST>` — HTTP bind address of the running runtime (default: `127.0.0.1`)
+- `--http-url <URL>` — full base URL, overrides `--http-host` and `--http-port`
+- `--auth-token <TOKEN>` — bearer token for authenticated runtimes
+- `--topology <TOPOLOGY>` — mesh topology for added models (default: `data-parallel`)
+- `--tp-degree <N>` — tensor parallelism degree (default: `1`)
+- `--timeout-ms <MS>` — per-request timeout when contacting the runtime API (default: `30000`)
+
+The command sends `POST /api/models/start` for each model. The runtime loads it asynchronously and returns the assigned `model_id`. All transport, port, and scheduler configuration of the running instance is preserved.
+
+## 4) Build Packages (`kapsl build`)
 
 You can build in two modes.
 
@@ -140,7 +234,7 @@ cd ./models/gpt-llm
 kapsl build
 ```
 
-## 3) Push Packages (`kapsl push`)
+## 5) Push Packages (`kapsl push`)
 
 Push target format:
 - Required: `<repo_name>/<model>:<label>`
@@ -214,7 +308,7 @@ Optional CI auth (otherwise use `oras login` / docker credential store):
 - `KAPSL_OCI_USERNAME`
 - `KAPSL_OCI_PASSWORD`
 
-## 4) Pull Packages (`kapsl pull`)
+## 6) Pull Packages (`kapsl pull`)
 
 Pull by target:
 
@@ -393,8 +487,14 @@ kapsl run --model ./model.aimod --http-bind 127.0.0.1 --metrics-port 9095
 ## Quick Reference
 
 ```bash
+# install
+curl -fsSL https://downloads.kapsl.net/install.sh | sh
+
 # run
 kapsl run --model <path-to-kapsl>
+
+# add model to running runtime
+kapsl add-model --model <path-to-kapsl> [--http-port <port>] [--auth-token <token>]
 
 # build
 kapsl build <path-to-model-file> --output <output.aimod>
