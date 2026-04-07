@@ -5,12 +5,19 @@
 Use it to:
 
 - run `.aimod` model packages
+- add models to a running runtime without restarting
 - build `.aimod` packages from model files
 - push/pull packages from a remote backend
 
-## Install / Build
+## Install
 
-From this repository:
+Pre-built binary:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
+From source:
 
 ```bash
 cd kapsl-runtime
@@ -46,6 +53,18 @@ Run model package:
 
 ```bash
 kapsl run --model ./model.aimod
+```
+
+Add a model to an already-running runtime (no restart needed):
+
+```bash
+kapsl add-model --model ./model.aimod
+```
+
+Add to a specific port or authenticated runtime:
+
+```bash
+kapsl add-model --model ./model.aimod --http-port 9100 --auth-token "$KAPSL_API_TOKEN"
 ```
 
 Build package from model file:

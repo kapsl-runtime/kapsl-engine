@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
 # Kapsl CLI installer
-# Usage: curl -fsSL https://kapsl.ai/install.sh | sh
+# Usage: curl -fsSL https://downloads.kapsl.net/install.sh | sh
 set -e
 
-REPO="kapsl-runtime/kapsl-runtime"
+BASE_URL="${KAPSL_BASE_URL:-https://downloads.kapsl.net}"
 BIN_NAME="kapsl"
 INSTALL_DIR="${KAPSL_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -36,14 +36,14 @@ detect_platform() {
 }
 
 # ---------------------------------------------------------------------------
-# Resolve latest version from GitHub
+# Resolve latest version from R2
 # ---------------------------------------------------------------------------
 latest_version() {
-    url="https://api.github.com/repos/${REPO}/releases/latest"
+    url="${BASE_URL}/runtime/latest.txt"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/'
+        curl -fsSL "$url"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$url" | grep '"tag_name"' | sed 's/.*"tag_name": *"v\([^"]*\)".*/\1/'
+        wget -qO- "$url"
     else
         echo "curl or wget is required" >&2
         exit 1
@@ -76,7 +76,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/v${VERSION}/${BIN_FILE}"
+DOWNLOAD_URL="${BASE_URL}/runtime/v${VERSION}/${BIN_FILE}"
 
 echo "Installing kapsl ${VERSION} (${PLATFORM}) to ${INSTALL_DIR}..."
 
