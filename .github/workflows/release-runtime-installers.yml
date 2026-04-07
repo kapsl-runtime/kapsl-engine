@@ -384,7 +384,7 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-      - name: Upload install.sh to R2 (stable URL)
+      - name: Upload install.sh and latest.txt to R2 (stable URLs)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -395,3 +395,10 @@ jobs:
             --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          echo -n "${{ steps.version.outputs.version }}" \
+            | aws s3 cp - \
+              s3://kapsl-installer/runtime/latest.txt \
+              --content-type "text/plain" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
