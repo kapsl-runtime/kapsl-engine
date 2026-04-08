@@ -369,7 +369,7 @@ jobs:
           # Always use the Cargo.toml version as the canonical version for
           # binary naming and paths. On workflow_dispatch (non-tag) runs,
           # prefix with "dev-" so test builds don't collide with releases.
-          cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          cargo_version="$(grep -m1 '^version = ' kapsl-engine/kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
@@ -396,7 +396,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          aws s3 cp install.sh \
+          aws s3 cp kapsl-engine/install.sh \
             s3://kapsl-installer/install.sh \
             --content-type "text/plain" \
             --no-progress \
