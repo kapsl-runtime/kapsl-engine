@@ -13798,6 +13798,11 @@ async fn main() -> Result<(), DynError> {
         http_bound_addr.port()
     );
     println!(
+        "→ Dashboard on http://{}:{}",
+        http_bound_addr.ip(),
+        http_bound_addr.port()
+    );
+    println!(
         "→ Metrics on http://{}:{}/metrics",
         http_bound_addr.ip(),
         http_bound_addr.port()
