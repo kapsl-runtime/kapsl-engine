@@ -1584,9 +1584,9 @@ class KapslApp {
   }
 
   getWorkspaceInputs() {
-    const workspaceId = document
-      .getElementById("extensions-workspace-id")
-      .value.trim();
+    const workspaceId =
+      document.getElementById("extensions-workspace-id").value.trim() ||
+      "default";
     const tenantId = document
       .getElementById("extensions-tenant-id")
       .value.trim();
