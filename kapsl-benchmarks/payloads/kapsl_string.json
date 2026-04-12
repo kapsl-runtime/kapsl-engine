@@ -1,8 +1,0 @@
-{
-  "input": {
-    "shape": [1, 1],
-    "dtype": "string",
-    "data": [72, 101, 108, 108, 111]
-  },
-  "session_id": null
-}

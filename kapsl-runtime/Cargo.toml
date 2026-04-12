@@ -1,8 +1,6 @@
 [workspace]
 members = [
     "crates/kapsl-cli",
-    "benchmarks/shm-bench-native",
-    "benchmarks/native-hybrid-client",
 ]
 
 resolver = "2"
