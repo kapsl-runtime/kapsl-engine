@@ -2,22 +2,14 @@
 
 `kapsl-engine` is the runtime repository in the Kapsl split-repo layout.
 
-This repo owns:
-
-- the `kapsl` runtime CLI and local inference server
-- runtime-specific benchmark crates
-- runtime extensions and extension configuration
-- inference testing and benchmark payloads
+This repo owns the `kapsl` runtime CLI and local inference server.
 
 Shared Rust libraries are maintained in [`kapsl-sdk`](https://github.com/kapsl-runtime/kapsl-sdk). This repo consumes those shared crates as Git dependencies.
 
 ## Repository Layout
 
-- `kapsl-runtime/`: main Rust workspace for the runtime binary and benchmark crates
-- `extensions/`: runtime extensions
-- `extensions-config/`: extension configuration
-- `kapsl-benchmarks/`: benchmark assets and helpers
-- `testing-inference/`: inference test harnesses and payloads
+- `kapsl-runtime/`: main Rust workspace for the runtime binary
+- `docker/`: Dockerfiles for CPU and CUDA images
 - `docs/`: runtime-specific documentation
 
 ## Requirements
@@ -79,7 +71,9 @@ git push origin v0.1.1
 
 ## Related Repositories
 
-- `kapsl-sdk`: shared Rust crates and Python package
-- `kapsl-lite`: lightweight runtime distribution
-- `kapsl-desktop`: desktop application and bundled installer flow
-- `penasys`: Go backend and Kubernetes deployment assets
+- [kapsl-sdk](https://github.com/kapsl-runtime/kapsl-sdk) — shared Rust crates and Python package
+- [kapsl-extensions](https://github.com/kapsl-runtime/kapsl-extensions) — runtime extensions (RAG connectors, prompt transformer)
+- [kapsl-benchmarks](https://github.com/kapsl-runtime/kapsl-benchmarks) — benchmarks and inference test harnesses
+- [kapsl-lite](https://github.com/kapsl-runtime/kapsl-lite) — lightweight runtime distribution
+- [kapsl-desktop](https://github.com/kapsl-runtime/kapsl-desktop) — desktop application and bundled installer flow
+- [penasys](https://github.com/kapsl-runtime/penasys) — Go backend and Kubernetes deployment assets

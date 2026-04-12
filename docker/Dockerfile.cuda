@@ -1,0 +1,39 @@
+# Kapsl Runtime — CUDA image
+# Uses NVIDIA CUDA base for runtime GPU support.
+
+# ---------------------------------------------------------------------------
+# Stage 1: Build
+# ---------------------------------------------------------------------------
+FROM rust:1.92-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake pkg-config libssl-dev protobuf-compiler git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY kapsl-runtime/ kapsl-runtime/
+COPY .cargo/ .cargo/ 2>/dev/null || true
+
+RUN cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/kapsl-runtime/target/release/kapsl /usr/local/bin/kapsl
+
+RUN mkdir -p /models /data
+ENV KAPSL_MODEL_DIR=/models
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 9095
+
+ENTRYPOINT ["kapsl"]
+CMD ["--help"]
