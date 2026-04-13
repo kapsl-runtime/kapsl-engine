@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 
+COPY .cargo/ .cargo/
 COPY kapsl-runtime/ kapsl-runtime/
-COPY .cargo/ .cargo/ 2>/dev/null || true
 
 RUN cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
