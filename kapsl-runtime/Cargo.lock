@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl"
-version = "0.1.14"
+version = "0.1.16"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1784,16 +1784,16 @@ dependencies = [
  "image",
  "kapsl-backends",
  "kapsl-core",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-ipc 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
+ "kapsl-hal",
+ "kapsl-ipc",
  "kapsl-llm",
  "kapsl-monitor",
  "kapsl-rag",
  "kapsl-rag-sdk",
- "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-scheduler",
+ "kapsl-shm",
+ "kapsl-transport",
  "log",
  "mime_guess",
  "parking_lot",
@@ -1814,14 +1814,15 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6460e19d1eeb85f114121575989e4855195e4f5dccc862a75aac4452470bbd3"
 dependencies = [
  "async-trait",
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
+ "kapsl-hal",
  "kapsl-llm",
  "log",
  "lru",
@@ -1835,12 +1836,13 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15baf44e1e2d8971ae3efa8f48f70ed94113b14d55684218c9b8a0671fa80c3c"
 dependencies = [
  "flate2",
  "fs2",
  "hex",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
  "log",
  "parking_lot",
  "serde",
@@ -1855,19 +1857,8 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "futures",
- "serde",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "kapsl-engine-api"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d847c705843f3b7930f227bd02224f1f2befeda1431afaa6660e35a2beeda8f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1879,18 +1870,8 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
-dependencies = [
- "serde",
- "serde_json",
- "sys-info",
- "thiserror 2.0.17",
-]
-
-[[package]]
-name = "kapsl-hal"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "769601e200d294484fd15ad49cafbc84e0c369220fadd1316e8e343a7eef290f"
 dependencies = [
  "serde",
  "serde_json",
@@ -1901,33 +1882,16 @@ dependencies = [
 [[package]]
 name = "kapsl-ipc"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88c40081c2e2457972057ac3e26d0a4fcf75ab2b2323f66af35aaf6755a3c03a"
 dependencies = [
  "async-trait",
  "bincode",
  "futures",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "log",
- "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-ipc"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
-dependencies = [
- "async-trait",
- "bincode",
- "futures",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
+ "kapsl-scheduler",
+ "kapsl-shm",
+ "kapsl-transport",
  "log",
  "serde",
  "thiserror 1.0.69",
@@ -1937,9 +1901,10 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d76692030b6d76e091a8e3ae0b954a365f591b165b9e3df35401f0389f79ff4c"
 dependencies = [
- "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-hal",
  "log",
  "rayon",
  "thiserror 1.0.69",
@@ -1948,15 +1913,16 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04111131d87ed0bed22cbb6ca253a64b8f191283bf97798ba139958a8cfd1a2e"
 dependencies = [
  "async-stream",
  "async-trait",
  "futures",
  "half",
  "kapsl-core",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
+ "kapsl-hal",
  "kapsl-kernels",
  "kapsl-quantization",
  "llama-cpp-2",
@@ -1975,12 +1941,13 @@ dependencies = [
 [[package]]
 name = "kapsl-monitor"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7e33bce8057caa9f7020f012354e5576dbc541b30b3fbfeba3c7e5ea8c36598"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
  "prometheus",
  "thiserror 1.0.69",
  "tokio",
@@ -1989,7 +1956,8 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec317ece98012f129f0d029931bd7bc52e692e9077470cc6d920c76ea35e90bc"
 dependencies = [
  "anyhow",
  "half",
@@ -2003,7 +1971,8 @@ dependencies = [
 [[package]]
 name = "kapsl-rag"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d88a3b0dd3b90eb356517016d54e62689a1547623c67fd22cf8c9d54c8955a8"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2022,7 +1991,8 @@ dependencies = [
 [[package]]
 name = "kapsl-rag-sdk"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be8b6a23b560f09391629950fa41f4194a56fb16b93a6cf03e92dbf84591ccbb"
 dependencies = [
  "async-trait",
  "futures",
@@ -2034,30 +2004,16 @@ dependencies = [
 [[package]]
 name = "kapsl-scheduler"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
-dependencies = [
- "async-trait",
- "futures",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "log",
- "parking_lot",
- "rayon",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-scheduler"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38c29b4c499795c0612664910749ca364036dc90ccee7fd81e4d4d5ef0a343e6"
 dependencies = [
  "async-trait",
  "chrono",
  "cron",
  "futures",
  "kapsl-core",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-hal 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
+ "kapsl-hal",
  "log",
  "parking_lot",
  "rayon",
@@ -2068,35 +2024,15 @@ dependencies = [
 [[package]]
 name = "kapsl-shm"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4135bd00c8e066647597ee03591dd2e49500b814457a46561a1c7be9081c32b6"
 dependencies = [
  "async-trait",
  "bincode",
  "crossbeam",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "libc",
- "log",
- "memmap2",
- "prometheus",
- "serde",
- "shared_memory",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-shm"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
-dependencies = [
- "async-trait",
- "bincode",
- "crossbeam",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-scheduler 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
+ "kapsl-scheduler",
+ "kapsl-transport",
  "libc",
  "log",
  "memmap2",
@@ -2110,25 +2046,12 @@ dependencies = [
 [[package]]
 name = "kapsl-transport"
 version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation#7b3071d78770ed92a3451eec33cfb4bdfabeffdd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b47cc248acf7413fdab2200a472006d6021a16729f49416c238134e8580214a"
 dependencies = [
  "async-trait",
  "bincode",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "log",
- "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "kapsl-transport"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main#4e11d8046ace578e6494e6969ae54e0cd3da8a6a"
-dependencies = [
- "async-trait",
- "bincode",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=main)",
+ "kapsl-engine-api",
  "log",
  "serde",
  "thiserror 1.0.69",
@@ -2440,18 +2363,6 @@ dependencies = [
  "mime",
  "spin",
  "version_check",
-]
-
-[[package]]
-name = "native-hybrid-client"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "clap",
- "kapsl-ipc 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "tokio",
 ]
 
 [[package]]
@@ -3385,18 +3296,6 @@ name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
-
-[[package]]
-name = "shm-bench-native"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "clap",
- "kapsl-engine-api 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-shm 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "kapsl-transport 0.1.0 (git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=feature%2Fmemory-isolation)",
- "libc",
-]
 
 [[package]]
 name = "signal-hook-registry"
