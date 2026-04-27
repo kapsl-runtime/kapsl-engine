@@ -7,8 +7,20 @@ resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-kapsl-core = { path = "../../kapsl-sdk/crates/kapsl-core" }
-kapsl-engine-api = { path = "../../kapsl-sdk/crates/kapsl-engine-api" }
-kapsl-backends = { path = "../../kapsl-sdk/crates/kapsl-backends" }
-kapsl-hal = { path = "../../kapsl-sdk/crates/kapsl-hal" }
-kapsl-monitor = { path = "../../kapsl-sdk/crates/kapsl-monitor" }
+kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-loader = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-optimizer = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
+kapsl-pyo3 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
