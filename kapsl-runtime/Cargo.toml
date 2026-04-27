@@ -7,3 +7,8 @@ resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
+kapsl-core = { path = "../../kapsl-sdk/crates/kapsl-core" }
+kapsl-engine-api = { path = "../../kapsl-sdk/crates/kapsl-engine-api" }
+kapsl-backends = { path = "../../kapsl-sdk/crates/kapsl-backends" }
+kapsl-hal = { path = "../../kapsl-sdk/crates/kapsl-hal" }
+kapsl-monitor = { path = "../../kapsl-sdk/crates/kapsl-monitor" }

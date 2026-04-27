@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 default = []
+native = ["kapsl-backends/native"]
 infer-adapter-echo = []
 
 [dependencies]

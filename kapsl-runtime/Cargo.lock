@@ -711,6 +711,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38cd60a9a42ec83a2ed7effb0b1f073270264ea99da7acfc44f7e8d74dee0384"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1787,7 +1796,7 @@ dependencies = [
  "kapsl-engine-api",
  "kapsl-hal",
  "kapsl-ipc",
- "kapsl-llm",
+ "kapsl-llm 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "kapsl-monitor",
  "kapsl-rag",
  "kapsl-rag-sdk",
@@ -1814,20 +1823,22 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6460e19d1eeb85f114121575989e4855195e4f5dccc862a75aac4452470bbd3"
 dependencies = [
  "async-trait",
+ "cudarc",
  "futures",
  "half",
  "kapsl-core",
  "kapsl-engine-api",
  "kapsl-hal",
- "kapsl-llm",
+ "kapsl-kernels 0.1.0",
+ "kapsl-llm 0.1.0",
+ "kapsl-loader",
  "log",
  "lru",
  "ndarray",
  "ort",
+ "rand",
  "serde",
  "thiserror 1.0.69",
  "tokio",
@@ -1836,8 +1847,6 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15baf44e1e2d8971ae3efa8f48f70ed94113b14d55684218c9b8a0671fa80c3c"
 dependencies = [
  "flate2",
  "fs2",
@@ -1857,8 +1866,6 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d847c705843f3b7930f227bd02224f1f2befeda1431afaa6660e35a2beeda8f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1870,9 +1877,10 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "769601e200d294484fd15ad49cafbc84e0c369220fadd1316e8e343a7eef290f"
 dependencies = [
+ "cudarc",
+ "half",
+ "log",
  "serde",
  "serde_json",
  "sys-info",
@@ -1901,6 +1909,18 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.0"
+dependencies = [
+ "cudarc",
+ "half",
+ "kapsl-hal",
+ "log",
+ "rayon",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "kapsl-kernels"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d76692030b6d76e091a8e3ae0b954a365f591b165b9e3df35401f0389f79ff4c"
 dependencies = [
@@ -1908,6 +1928,32 @@ dependencies = [
  "log",
  "rayon",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "kapsl-llm"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "futures",
+ "half",
+ "kapsl-core",
+ "kapsl-engine-api",
+ "kapsl-hal",
+ "kapsl-kernels 0.1.0",
+ "kapsl-quantization 0.1.0",
+ "llama-cpp-2",
+ "log",
+ "ndarray",
+ "ort",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokenizers",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1923,8 +1969,8 @@ dependencies = [
  "kapsl-core",
  "kapsl-engine-api",
  "kapsl-hal",
- "kapsl-kernels",
- "kapsl-quantization",
+ "kapsl-kernels 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "kapsl-quantization 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "llama-cpp-2",
  "log",
  "ndarray",
@@ -1939,10 +1985,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kapsl-loader"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "kapsl-hal",
+ "log",
+ "memmap2",
+ "safetensors 0.4.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "kapsl-monitor"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7e33bce8057caa9f7020f012354e5576dbc541b30b3fbfeba3c7e5ea8c36598"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1956,13 +2014,27 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "log",
+ "safetensors 0.3.3",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "turboquant-rs",
+]
+
+[[package]]
+name = "kapsl-quantization"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec317ece98012f129f0d029931bd7bc52e692e9077470cc6d920c76ea35e90bc"
 dependencies = [
  "anyhow",
  "half",
  "log",
- "safetensors",
+ "safetensors 0.3.3",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3112,6 +3184,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "safetensors"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3767,6 +3849,16 @@ dependencies = [
  "thiserror 1.0.69",
  "url",
  "utf-8",
+]
+
+[[package]]
+name = "turboquant-rs"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70b40b47dd129bd875499ffbc0b5a86872ca9a95e8d1d5323a41c67a87128ad6"
+dependencies = [
+ "half",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

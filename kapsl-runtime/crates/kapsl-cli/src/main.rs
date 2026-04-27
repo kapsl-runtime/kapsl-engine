@@ -170,6 +170,7 @@ impl SharedKvState {
 const CLI_AFTER_HELP: &str = "\
 Examples:
   kapsl run --model models/mnist/mnist.aimod
+  kapsl add-model --model models/mnist/mnist.aimod
   kapsl control --runtime gpu0=http://127.0.0.1:9095 --runtime gpu1=http://127.0.0.1:9096
   kapsl build ./models/gpt-llm
   kapsl build --model ./model.onnx --output ./model.aimod
@@ -330,6 +331,13 @@ struct Args {
     /// bucket_dim_granularity, bucket_max_dims, peak_concurrency.
     #[arg(long, value_name = "SPEC")]
     onnx_model_tuning: Vec<String>,
+
+    /// TurboQuant KV-cache compression bit-width (2, 3, or 4).
+    /// 3-bit gives ~2.7× memory reduction with minimal quality loss.
+    /// When unset or 0, KV entries are stored uncompressed in FP16.
+    /// Can also be set via KAPSL_LLM_KV_COMPRESSION_BITS.
+    #[arg(long, value_name = "BITS")]
+    kv_compression_bits: Option<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6739,8 +6747,31 @@ fn looks_like_model_file_path(path: &Path) -> bool {
     )
 }
 
-fn append_tar_bytes_entry(
-    builder: &mut Builder<GzEncoder<File>>,
+/// Resolve a model path to a `PackageLoader`.
+///
+/// Priority:
+/// 1. Known single-file extension (`.gguf`, `.onnx`, `.safetensors` …) →
+///    `from_raw_file`
+/// 2. Directory with safetensors shards → `from_directory`
+/// 3. `.aimod` archive → `PackageLoader::load`
+fn resolve_package_loader(
+    path: &Path,
+    model_id: impl std::fmt::Display,
+) -> Result<PackageLoader, Box<dyn std::error::Error + Send + Sync>> {
+    if looks_like_model_file_path(path) {
+        return PackageLoader::from_raw_file(path)
+            .map_err(|e| format!("Failed to load raw model {model_id}: {e}").into());
+    }
+    if path.is_dir() {
+        return PackageLoader::from_directory(path)
+            .map_err(|e| format!("Failed to load model directory {model_id}: {e}").into());
+    }
+    PackageLoader::load(path)
+        .map_err(|e| format!("Failed to load model {model_id}: {e}").into())
+}
+
+fn append_tar_bytes_entry<W: Write>(
+    builder: &mut Builder<W>,
     entry_path: &str,
     bytes: &[u8],
 ) -> Result<(), String> {
@@ -6871,7 +6902,14 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
             e
         )
     })?;
-    let encoder = GzEncoder::new(output_file, Compression::default());
+    // Model weights are binary float data — nearly incompressible. Use level 1
+    // (fast) instead of the default level 6 to avoid burning CPU for no gain.
+    // The 8 MiB BufWriter reduces syscall overhead from one call per 32 KiB
+    // GzEncoder output chunk to one call per 8 MiB.
+    let encoder = GzEncoder::new(
+        BufWriter::with_capacity(8 << 20, output_file),
+        Compression::fast(),
+    );
     let mut archive = Builder::new(encoder);
 
     append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
@@ -6883,9 +6921,12 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
     let encoder = archive
         .into_inner()
         .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
-    encoder
+    let mut buf_writer = encoder
         .finish()
         .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
+    buf_writer
+        .flush()
+        .map_err(|e| format!("Failed to flush output package: {}", e))?;
 
     let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
 
@@ -7477,7 +7518,10 @@ fn create_kapsl_package_from_context(
             e
         )
     })?;
-    let encoder = GzEncoder::new(output_file, Compression::default());
+    let encoder = GzEncoder::new(
+        BufWriter::with_capacity(8 << 20, output_file),
+        Compression::fast(),
+    );
     let mut archive = Builder::new(encoder);
 
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)
@@ -7498,9 +7542,12 @@ fn create_kapsl_package_from_context(
     let encoder = archive
         .into_inner()
         .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
-    encoder
+    let mut buf_writer = encoder
         .finish()
         .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
+    buf_writer
+        .flush()
+        .map_err(|e| format!("Failed to flush output package: {}", e))?;
 
     let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
     Ok(PackageKapslResponse {
@@ -7822,6 +7869,7 @@ mod state_layout_tests {
             onnx_peak_concurrency_hint: None,
             onnx_model_tuning: Vec::new(),
             shm_size_mb: None,
+            kv_compression_bits: Some(3 as u8)
         };
 
         let layout = resolve_runtime_state_layout(&args);
@@ -9718,7 +9766,7 @@ async fn run_worker(
     let model_registry = Arc::new(ModelRegistry::new());
     let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
 
-    let pool = load_model(
+    let (pool, _) = load_model(
         model_id,
         model_path,
         device_info,
@@ -9764,7 +9812,7 @@ fn load_model_blocking(
     topology: &str,
     tp_degree: usize,
     onnx_tuning: OnnxRuntimeTuning,
-) -> Result<Arc<ReplicaPool<Scheduler>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
         "Current directory: {:?}",
         std::env::current_dir().unwrap_or_default()
@@ -9783,25 +9831,7 @@ fn load_model_blocking(
     };
     log::info!("Loading Model ID {}: {:?}", model_id, absolute_path);
 
-    let loader = if looks_like_model_file_path(absolute_path.as_path()) {
-        match PackageLoader::from_raw_file(absolute_path.as_path()) {
-            Ok(loader) => {
-                log::info!("Loading raw model file (no .aimod packaging)");
-                loader
-            }
-            Err(e) => {
-                return Err(format!("Failed to load raw model {}: {}", model_id, e).into());
-            }
-        }
-    } else {
-        match PackageLoader::load(absolute_path.as_path()) {
-            Ok(loader) => loader,
-            Err(e) => {
-                log::error!("Failed to load model {}: {}", model_id, e);
-                return Err(format!("Failed to load model {}: {}", model_id, e).into());
-            }
-        }
-    };
+    let loader = resolve_package_loader(absolute_path.as_path(), model_id)?;
     log::info!("✓ Package loaded");
     log::info!("  Project: {}", loader.manifest.project_name);
     log::info!("  Framework: {}", loader.manifest.framework);
@@ -9884,6 +9914,7 @@ fn load_model_blocking(
 
     // Create engines for each device in the mesh
     let mut engines: Vec<EngineHandle> = Vec::new();
+    let mut swap_handles: Vec<EngineHandle> = Vec::new();
     let worker = if isolate_process {
         match spawn_worker_process(
             model_id,
@@ -9931,7 +9962,9 @@ fn load_model_blocking(
                 shared_metrics.clone(),
             );
             let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-            engines.push(Arc::from(engine_box));
+            let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
         } else {
             let device_ids: Vec<i32> = (0..device_mesh.world_size)
                 .filter_map(|rank| device_mesh.get_device(rank))
@@ -9967,7 +10000,9 @@ fn load_model_blocking(
                 shared_metrics.clone(),
             );
             let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-            engines.push(Arc::from(engine_box));
+            let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
         }
     } else {
         // We need to iterate over ranks in the mesh
@@ -9982,7 +10017,9 @@ fn load_model_blocking(
                         shared_metrics.clone(),
                     );
                     let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-                    engines.push(Arc::from(engine_box));
+                    let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
                     continue;
                 }
                 let provider = device.backend.to_string();
@@ -10015,7 +10052,9 @@ fn load_model_blocking(
                 );
 
                 let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-                engines.push(Arc::from(engine_box));
+                let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
             }
         }
     }
@@ -10063,7 +10102,7 @@ fn load_model_blocking(
     pool.add_replica(0, scheduler);
 
     log::info!("✓ Scheduler started for Model ID {}\n", model_id);
-    Ok(Arc::new(pool))
+    Ok((Arc::new(pool), swap_handles))
 }
 
 /// Load a model and create its scheduler
@@ -10082,7 +10121,7 @@ async fn load_model(
     topology: &str,
     tp_degree: usize,
     onnx_tuning: OnnxRuntimeTuning,
-) -> Result<Arc<ReplicaPool<Scheduler>>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
         "Current directory: {:?}",
         std::env::current_dir().unwrap_or_default()
@@ -10101,25 +10140,7 @@ async fn load_model(
     };
     log::info!("Loading Model ID {}: {:?}", model_id, absolute_path);
 
-    let loader = if looks_like_model_file_path(&absolute_path) {
-        match PackageLoader::from_raw_file(&absolute_path) {
-            Ok(loader) => {
-                log::info!("Loading raw model file (no .aimod packaging)");
-                loader
-            }
-            Err(e) => {
-                return Err(format!("Failed to load raw model {}: {}", model_id, e).into());
-            }
-        }
-    } else {
-        match PackageLoader::load(&absolute_path) {
-            Ok(loader) => loader,
-            Err(e) => {
-                log::error!("Failed to load model {}: {}", model_id, e);
-                return Err(format!("Failed to load model {}: {}", model_id, e).into());
-            }
-        }
-    };
+    let loader = resolve_package_loader(&absolute_path, model_id)?;
     log::info!("✓ Package loaded");
     log::info!("  Project: {}", loader.manifest.project_name);
     log::info!("  Framework: {}", loader.manifest.framework);
@@ -10202,6 +10223,7 @@ async fn load_model(
 
     // Create engines for each device in the mesh
     let mut engines: Vec<EngineHandle> = Vec::new();
+    let mut swap_handles: Vec<EngineHandle> = Vec::new();
     let worker = if isolate_process {
         match spawn_worker_process(
             model_id,
@@ -10250,7 +10272,9 @@ async fn load_model(
                 shared_metrics.clone(),
             );
             let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-            engines.push(Arc::from(engine_box));
+            let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
         } else {
             let device_ids: Vec<i32> = (0..device_mesh.world_size)
                 .filter_map(|rank| device_mesh.get_device(rank))
@@ -10284,7 +10308,9 @@ async fn load_model(
                 shared_metrics.clone(),
             );
             let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-            engines.push(Arc::from(engine_box));
+            let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
         }
     } else {
         // We need to iterate over ranks in the mesh
@@ -10299,7 +10325,9 @@ async fn load_model(
                         shared_metrics.clone(),
                     );
                     let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-                    engines.push(Arc::from(engine_box));
+                    let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
                     continue;
                 }
                 let provider = device.backend.to_string();
@@ -10330,7 +10358,9 @@ async fn load_model(
                 );
 
                 let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
-                engines.push(Arc::from(engine_box));
+                let engine_arc: EngineHandle = Arc::from(engine_box);
+            swap_handles.push(engine_arc.clone());
+            engines.push(engine_arc);
             }
         }
     }
@@ -10379,7 +10409,7 @@ async fn load_model(
 
     log::info!("✓ Scheduler started for Model ID {}\n", model_id);
 
-    Ok(Arc::new(pool))
+    Ok((Arc::new(pool), swap_handles))
 }
 
 /// Scale up a model by adding a new replica
@@ -10400,7 +10430,7 @@ async fn scale_up_model(
     model_registry: &ModelRegistry,
     shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
     onnx_tuning: OnnxRuntimeTuning,
-) -> Result<Arc<Scheduler>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(Arc<Scheduler>, EngineHandle), Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
         "Scaling up Model ID {} - Creating replica #{}",
         base_model_id,
@@ -10411,12 +10441,7 @@ async fn scale_up_model(
         .canonicalize()
         .map_err(|e| format!("Invalid model path {:?}: {}", model_path, e))?;
 
-    let loader = if looks_like_model_file_path(&absolute_path) {
-        PackageLoader::from_raw_file(&absolute_path)
-            .map_err(|e| format!("Failed to load raw model: {e}"))?
-    } else {
-        PackageLoader::load(&absolute_path).map_err(|e| format!("Failed to load model: {e}"))?
-    };
+    let loader = resolve_package_loader(&absolute_path, base_model_id)?;
     let model_file_path = loader.get_model_path();
     let queue_overflow_policy = resolve_queue_overflow_policy(&loader.manifest);
     log_queue_policy_caveat(queue_overflow_policy);
@@ -10581,6 +10606,7 @@ async fn scale_up_model(
         );
         Arc::new(monitored_backend)
     };
+    let swap_handle = engine.clone();
     let scheduler = Arc::new(
         Scheduler::new(
             vec![engine],
@@ -10601,7 +10627,7 @@ async fn scale_up_model(
         base_model_id
     );
 
-    Ok(scheduler)
+    Ok((scheduler, swap_handle))
 }
 
 /// Scale down a model by removing a replica
@@ -10705,6 +10731,20 @@ async fn main() -> Result<(), DynError> {
         build_onnx_tuning_profile(&args)
             .map_err(|e| format!("Invalid ONNX tuning configuration: {}", e))?,
     );
+    // Propagate --kv-compression-bits to the env var read by kapsl-llm engine.rs.
+    // This lets the existing metadata/env override chain pick it up without
+    // threading an extra parameter through every load_model call site.
+    if let Some(bits) = args.kv_compression_bits {
+        if (2..=4).contains(&bits) {
+            // SAFETY: single-threaded startup path; no other threads reading env yet.
+            unsafe { std::env::set_var("KAPSL_LLM_KV_COMPRESSION_BITS", bits.to_string()) };
+        } else {
+            eprintln!(
+                "Warning: --kv-compression-bits {} is invalid (must be 2, 3, or 4); ignoring",
+                bits
+            );
+        }
+    }
     env_logger::init();
     if let Some(rationale) = &applied_tuning.auto_tune_rationale {
         log::info!("[auto-tune] {}", rationale);
@@ -10848,11 +10888,9 @@ async fn main() -> Result<(), DynError> {
     // Use Arc<RwLock<>> for thread-safe dynamic scheduler management
     let replica_pools: Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    // Keep replica_schedulers for auto-scaler to track individual instances if needed,
-    // but actually we can just rely on ModelRegistry and ReplicaPool.
-    // However, scale_up_model returns a Scheduler, which we need to add to the pool.
-    // We also need to store it somewhere if we want to access it directly?
-    // ReplicaPool stores it. So we don't need separate replica_schedulers map.
+    // Per-model engine handles for hot-swap stage/swap operations.
+    let swap_map: Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
 
     let registry = Arc::new(Registry::new());
     let model_registry = Arc::new(ModelRegistry::new());
@@ -10967,7 +11005,7 @@ async fn main() -> Result<(), DynError> {
             .map(str::to_string)
             .unwrap_or_else(|| model_path.to_string_lossy().to_string());
         let load_label = format!("Loading {}", model_label);
-        let pool = match run_with_loading_async(
+        let (pool, handles) = match run_with_loading_async(
             &load_label,
             load_model(
                 model_id,
@@ -10987,13 +11025,14 @@ async fn main() -> Result<(), DynError> {
         )
         .await
         {
-            Ok(pool) => pool,
+            Ok(result) => result,
             Err(e) => {
                 recycle_model_id(model_id, &recycled_model_ids);
                 return Err(e);
             }
         };
         replica_pools.write().insert(model_id, pool);
+        swap_map.write().insert(model_id, handles);
         model_paths.write().insert(model_id, model_path.clone());
 
         // Register default scaling policy for each model
@@ -11177,6 +11216,7 @@ async fn main() -> Result<(), DynError> {
 
     // Clone before the API server spawn so the auto-scaler task can use the same state.
     let shared_kv_for_autoscaler = shared_kv.clone();
+    let swap_map_for_autoscaler = swap_map.clone();
 
     tokio::spawn(async move {
         // Metrics endpoint (admin scope when auth is enabled; loopback only when disabled)
@@ -12302,6 +12342,7 @@ async fn main() -> Result<(), DynError> {
         let model_paths_for_start = model_paths_clone.clone();
         let onnx_tuning_profile_for_start = onnx_tuning_profile_for_api.clone();
         let shared_kv_for_start = shared_kv.clone();
+        let swap_map_for_start = swap_map.clone();
 
         let start_model = warp::path!("api" / "models" / "start")
             .and(warp::post())
@@ -12316,6 +12357,7 @@ async fn main() -> Result<(), DynError> {
                 let recycled_model_ids = recycled_model_ids_for_start.clone();
                 let model_paths = model_paths_for_start.clone();
                 let onnx_tuning_profile = onnx_tuning_profile_for_start.clone();
+                let swap_map = swap_map_for_start.clone();
 
                 async move {
                     use warp::http::StatusCode;
@@ -12495,8 +12537,9 @@ async fn main() -> Result<(), DynError> {
                                         recycle_model_id(model_id, &recycled_model_ids);
                                     }
                                 }
-                                Ok(Ok(pool)) => {
+                                Ok(Ok((pool, handles))) => {
                                     replica_pools.write().insert(model_id, pool);
+                                    swap_map.write().insert(model_id, handles);
                                     model_paths.write().insert(model_id, model_path);
                                     let _ =
                                         model_registry.set_status(model_id, ModelStatus::Active);
@@ -12529,6 +12572,7 @@ async fn main() -> Result<(), DynError> {
         // POST /api/models/:id/stop - Stop a model
         let model_registry_for_stop = model_registry_clone.clone();
         let replica_pools_for_stop = replica_pools_clone.clone();
+        let swap_map_for_stop = swap_map.clone();
 
         let stop_model = warp::path!("api" / "models" / u32 / "stop")
             .and(warp::post())
@@ -12568,6 +12612,7 @@ async fn main() -> Result<(), DynError> {
 
                 // Remove pool (this will drop it and clean up resources)
                 replica_pools_for_stop.write().remove(&model_id);
+                swap_map_for_stop.write().remove(&model_id);
 
                 // Update status to Inactive
                 if let Err(e) = model_registry_for_stop.set_status(model_id, ModelStatus::Inactive)
@@ -12591,6 +12636,7 @@ async fn main() -> Result<(), DynError> {
         let model_registry_for_remove = model_registry_clone.clone();
         let replica_pools_for_remove = replica_pools_clone.clone();
         let model_paths_for_remove = model_paths_clone.clone();
+        let swap_map_for_remove = swap_map.clone();
 
         let remove_model = warp::path!("api" / "models" / u32 / "remove")
             .and(warp::post())
@@ -12627,6 +12673,7 @@ async fn main() -> Result<(), DynError> {
                 }
 
                 replica_pools_for_remove.write().remove(&base_model_id);
+                swap_map_for_remove.write().remove(&base_model_id);
                 model_paths_for_remove.write().remove(&base_model_id);
 
                 for replica in replicas {
@@ -12639,6 +12686,136 @@ async fn main() -> Result<(), DynError> {
                     }),
                     StatusCode::OK,
                 )
+            });
+
+        // Shared response types for the three hot-swap endpoints.
+        #[derive(Serialize)]
+        struct SwapMsgResp { message: String }
+        #[derive(Serialize)]
+        struct SwapErrResp { error: String }
+        #[derive(Serialize)]
+        struct SwapStatusResp { model_id: u32, supports_swap: bool, staged: bool }
+
+        // Returns the engine handles for a model, or an error reply if not found.
+        fn lookup_swap_handles(
+            swap_map: &Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>>,
+            model_id: u32,
+        ) -> Result<Vec<EngineHandle>, warp::reply::WithStatus<warp::reply::Json>> {
+            let g = swap_map.read();
+            match g.get(&model_id) {
+                Some(v) => Ok(v.clone()),
+                None => Err(warp::reply::with_status(
+                    warp::reply::json(&SwapErrResp {
+                        error: format!("model {} not found", model_id),
+                    }),
+                    warp::http::StatusCode::NOT_FOUND,
+                )),
+            }
+        }
+
+        // POST /api/models/:id/stage - Pre-load next model weights into CPU RAM
+        let swap_map_for_stage = swap_map.clone();
+        let stage_model_route = warp::path!("api" / "models" / u32 / "stage")
+            .and(warp::post())
+            .and(warp::body::json())
+            .then(move |model_id: u32, body: serde_json::Value| {
+                let swap_map = swap_map_for_stage.clone();
+                async move {
+                    use warp::http::StatusCode;
+                    let path_str = match body.get("model_path").and_then(|v| v.as_str()) {
+                        Some(s) => s.to_string(),
+                        None => return warp::reply::with_status(
+                            warp::reply::json(&SwapErrResp { error: "missing model_path".into() }),
+                            StatusCode::BAD_REQUEST,
+                        ),
+                    };
+                    let handles = match lookup_swap_handles(&swap_map, model_id) {
+                        Ok(h) => h,
+                        Err(r) => return r,
+                    };
+                    if !handles.iter().any(|e| e.supports_swap()) {
+                        return warp::reply::with_status(
+                            warp::reply::json(&SwapErrResp {
+                                error: "backend does not support hot-swap".into(),
+                            }),
+                            StatusCode::BAD_REQUEST,
+                        );
+                    }
+                    let path = std::path::PathBuf::from(&path_str);
+                    for engine in &handles {
+                        if let Err(e) = engine.stage(&path).await {
+                            return warp::reply::with_status(
+                                warp::reply::json(&SwapErrResp { error: e.to_string() }),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            );
+                        }
+                    }
+                    warp::reply::with_status(
+                        warp::reply::json(&SwapMsgResp {
+                            message: format!(
+                                "model {} staged from {}; call /swap when ready",
+                                model_id, path_str
+                            ),
+                        }),
+                        StatusCode::OK,
+                    )
+                }
+            });
+
+        // POST /api/models/:id/swap - Activate staged weights (PCIe transfer only)
+        let swap_map_for_swap = swap_map.clone();
+        let swap_model_route = warp::path!("api" / "models" / u32 / "swap")
+            .and(warp::post())
+            .then(move |model_id: u32| {
+                let swap_map = swap_map_for_swap.clone();
+                async move {
+                    use warp::http::StatusCode;
+                    let handles = match lookup_swap_handles(&swap_map, model_id) {
+                        Ok(h) => h,
+                        Err(r) => return r,
+                    };
+                    for engine in &handles {
+                        if let Err(e) = engine.swap().await {
+                            return warp::reply::with_status(
+                                warp::reply::json(&SwapErrResp { error: e.to_string() }),
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            );
+                        }
+                    }
+                    warp::reply::with_status(
+                        warp::reply::json(&SwapMsgResp {
+                            message: format!("model {} swapped to staged weights", model_id),
+                        }),
+                        StatusCode::OK,
+                    )
+                }
+            });
+
+        // GET /api/models/:id/swap-status - Check hot-swap staging readiness
+        let swap_map_for_status = swap_map.clone();
+        let swap_status_route = warp::path!("api" / "models" / u32 / "swap-status")
+            .and(warp::get())
+            .then(move |model_id: u32| {
+                let swap_map = swap_map_for_status.clone();
+                async move {
+                    use warp::http::StatusCode;
+                    let handles = match lookup_swap_handles(&swap_map, model_id) {
+                        Ok(h) => h,
+                        Err(r) => return r,
+                    };
+                    let supports = handles.iter().any(|e| e.supports_swap());
+                    // All swap-capable engines must have weights staged.
+                    let staged = supports
+                        && handles.iter().filter(|e| e.supports_swap()).all(|e| e.is_staged());
+                    warp::reply::with_status(
+                        warp::reply::json(&SwapStatusResp {
+                            model_id,
+                            supports_swap: supports,
+                            staged,
+                        }),
+                        StatusCode::OK,
+                    )
+                }
             });
 
         // POST /api/models/:id/infer - Synchronous inference
@@ -13414,6 +13591,9 @@ async fn main() -> Result<(), DynError> {
             .or(start_model)
             .or(stop_model)
             .or(remove_model)
+            .or(stage_model_route)
+            .or(swap_model_route)
+            .or(swap_status_route)
             .or(update_scaling)
             .or(get_role_tokens)
             .or(set_role_tokens)
@@ -13475,6 +13655,9 @@ async fn main() -> Result<(), DynError> {
         log::info!("   - GET /api/models - List all models");
         log::info!("   - GET /api/models/:id - Get model details");
         log::info!("   - POST /api/models/:id/remove - Remove a model");
+        log::info!("   - POST /api/models/:id/stage      - Pre-load next model into CPU RAM (hot-swap phase 1)");
+        log::info!("   - GET  /api/models/:id/swap-status - Check if staging is complete");
+        log::info!("   - POST /api/models/:id/swap        - Activate staged weights via PCIe transfer (hot-swap phase 2)");
         log::info!("   - POST /api/models/:id/infer - Tensor or base64 media inference");
         log::info!("   - GET /api/health - System health check");
         log::info!("   - GET /api/hardware - Hardware info");
@@ -13532,6 +13715,7 @@ async fn main() -> Result<(), DynError> {
     let auto_scaler_clone = auto_scaler.clone();
     let model_registry_for_scaler = model_registry.clone();
     let replica_pools_for_scaler = replica_pools.clone();
+    let swap_map_for_scaler = swap_map_for_autoscaler.clone();
     let model_paths_for_scaler = model_paths.clone();
     let device_info_for_scaler = device_info.clone();
     let unique_id_counter_for_scaler = unique_id_counter.clone();
@@ -13709,7 +13893,7 @@ async fn main() -> Result<(), DynError> {
                         )
                         .await
                         {
-                            Ok(scheduler) => {
+                            Ok((scheduler, handle)) => {
                                 // Add new replica to the pool
                                 // Clone the pool to avoid holding the lock across await
                                 let pool =
@@ -13717,6 +13901,12 @@ async fn main() -> Result<(), DynError> {
                                 if let Some(pool) = pool {
                                     pool.add_replica(next_replica_id, scheduler);
                                 }
+                                // Register engine handle for hot-swap
+                                swap_map_for_scaler
+                                    .write()
+                                    .entry(base_model_id)
+                                    .or_default()
+                                    .push(handle);
                             }
                             Err(e) => {
                                 log::error!("Failed to scale up model {}: {}", base_model_id, e);
