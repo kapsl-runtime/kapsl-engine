@@ -216,9 +216,44 @@ impl ModelRequestAdapter for TensorRequestAdapter {
     }
 
     fn adapt(&self, payload: serde_json::Value) -> InferResult<InferenceRequest> {
-        serde_json::from_value::<InferenceRequest>(payload).map_err(|e| {
-            InferRequestError::bad_request(format!("Invalid tensor infer payload: {}", e))
-        })
+        // Extract top-level generation params before consuming the payload.
+        // Callers often send {"input": ..., "max_tokens": 256, "min_tokens": 256}
+        // which serde would silently drop since they're not InferenceRequest fields.
+        let top_max_tokens = payload
+            .get("max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let top_min_tokens = payload
+            .get("min_tokens")
+            .or_else(|| payload.get("min_new_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let top_temperature = payload
+            .get("temperature")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+
+        let mut request =
+            serde_json::from_value::<InferenceRequest>(payload).map_err(|e| {
+                InferRequestError::bad_request(format!("Invalid tensor infer payload: {}", e))
+            })?;
+
+        if top_max_tokens.is_some() || top_min_tokens.is_some() || top_temperature.is_some() {
+            let meta = request
+                .metadata
+                .get_or_insert_with(EngineRequestMetadata::default);
+            if meta.max_new_tokens.is_none() {
+                meta.max_new_tokens = top_max_tokens;
+            }
+            if meta.min_new_tokens.is_none() {
+                meta.min_new_tokens = top_min_tokens;
+            }
+            if meta.temperature.is_none() {
+                meta.temperature = top_temperature;
+            }
+        }
+
+        Ok(request)
     }
 }
 
