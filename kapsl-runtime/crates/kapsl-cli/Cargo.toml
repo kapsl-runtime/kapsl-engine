@@ -4,8 +4,9 @@ version = "0.1.16"
 edition = "2021"
 
 [features]
-default = []
+default = ["gguf-native"]
 native = ["kapsl-backends/native"]
+gguf-native = ["kapsl-backends/gguf-native"]
 infer-adapter-echo = []
 
 [dependencies]
