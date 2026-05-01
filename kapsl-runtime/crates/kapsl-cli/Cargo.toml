@@ -4,9 +4,13 @@ version = "0.1.16"
 edition = "2021"
 
 [features]
-default = ["gguf-native"]
+# Default build is portable: CPU/standard backends only, no CUDA toolkit required.
+default = []
 native = ["kapsl-backends/native"]
 gguf-native = ["kapsl-backends/gguf-native"]
+gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
+# Full NVIDIA build: llama.cpp CUDA plus Kapsl native CUDA/shared-pool backend.
+cuda = ["gguf-cuda", "gguf-native"]
 infer-adapter-echo = []
 
 [dependencies]

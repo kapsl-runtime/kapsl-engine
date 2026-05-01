@@ -233,10 +233,9 @@ impl ModelRequestAdapter for TensorRequestAdapter {
             .and_then(|v| v.as_f64())
             .map(|v| v as f32);
 
-        let mut request =
-            serde_json::from_value::<InferenceRequest>(payload).map_err(|e| {
-                InferRequestError::bad_request(format!("Invalid tensor infer payload: {}", e))
-            })?;
+        let mut request = serde_json::from_value::<InferenceRequest>(payload).map_err(|e| {
+            InferRequestError::bad_request(format!("Invalid tensor infer payload: {}", e))
+        })?;
 
         if top_max_tokens.is_some() || top_min_tokens.is_some() || top_temperature.is_some() {
             let meta = request

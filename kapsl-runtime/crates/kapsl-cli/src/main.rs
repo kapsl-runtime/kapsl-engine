@@ -8,7 +8,7 @@ use clap::{
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures::stream;
+use futures::{stream, StreamExt};
 use infer_adapter::{default_request_adapter_registry, parse_inference_request_with_registry};
 use kapsl_backends::{BackendFactory, OnnxRuntimeTuning};
 use kapsl_core::loader::Manifest;
@@ -18,6 +18,8 @@ use kapsl_engine_api::{
     InferenceRequest, TensorDtype,
 };
 use kapsl_hal::device::DeviceInfo;
+#[cfg(feature = "gguf-native")]
+use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_ipc::{
     IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
     STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
@@ -62,6 +64,8 @@ use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(feature = "gguf-native")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,12 +86,27 @@ struct UiAssets;
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;
 
+#[cfg(feature = "gguf-native")]
+#[derive(Clone)]
+struct GpuPoolMember {
+    model_id: u32,
+    weight: u32,
+    cap: Arc<AtomicUsize>,
+}
+
+#[cfg(feature = "gguf-native")]
+#[derive(Clone)]
+struct DeviceGpuPoolState {
+    handle: GpuPoolHandle,
+    members: Vec<GpuPoolMember>,
+}
+
 /// Shared KV cache pool registry and cross-model token-budget coordinator.
 ///
 /// One instance is created at server startup and cloned into every model-load
 /// path.  All `LLMBackend` instances on the same physical GPU share the same
 /// `SharedBlockAllocator`, enforcing a single unified block budget.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SharedKvState {
     /// Total VRAM bytes per device ID — used to size pools on first access.
     device_bytes: HashMap<usize, usize>,
@@ -97,6 +116,11 @@ struct SharedKvState {
     scheduler: Arc<Mutex<GlobalKvScheduler>>,
     /// Monotonically increasing counter for stable engine IDs.
     next_engine_id: Arc<AtomicU32>,
+    /// Per-device GPU pool registry for gguf-native/native backends.
+    /// Stores compatible pools and their members so quota caps can be
+    /// rebalanced by model priority.
+    #[cfg(feature = "gguf-native")]
+    gpu_pools: Arc<Mutex<HashMap<usize, Vec<DeviceGpuPoolState>>>>,
 }
 
 impl SharedKvState {
@@ -121,7 +145,81 @@ impl SharedKvState {
                 estimated_kv_tokens.max(16_384),
             ))),
             next_engine_id: Arc::new(AtomicU32::new(1)),
+            #[cfg(feature = "gguf-native")]
+            gpu_pools: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return the existing pool handle for `device_id` so a new backend can
+    /// attach to it before calling load().
+    #[cfg(feature = "gguf-native")]
+    fn get_gpu_pool(&self, device_id: usize) -> Option<GpuPoolHandle> {
+        self.gpu_pools
+            .lock()
+            .get(&device_id)
+            .and_then(|pools| pools.first())
+            .map(|state| state.handle.for_engine(state.handle.cap()))
+    }
+
+    /// Register (or re-register) a pool handle after a backend finishes load().
+    /// Rebalances per-engine caps by model priority weight. If load created a
+    /// private pool due to incompatible geometry, it becomes a separate pool
+    /// group for future compatible models.
+    #[cfg(feature = "gguf-native")]
+    fn attach_gpu_pool(&self, device_id: usize, model_id: u32, weight: u32, handle: GpuPoolHandle) {
+        const MIN_BLOCKS_PER_ENGINE: usize = 64;
+        let mut pools = self.gpu_pools.lock();
+        let device_pools = pools.entry(device_id).or_default();
+        let pool_index = device_pools
+            .iter()
+            .position(|state| Arc::ptr_eq(&state.handle.pool, &handle.pool));
+
+        let state = if let Some(index) = pool_index {
+            &mut device_pools[index]
+        } else {
+            device_pools.push(DeviceGpuPoolState {
+                handle: GpuPoolHandle::with_cap(handle.pool.clone(), handle.pool.total_blocks()),
+                members: Vec::new(),
+            });
+            device_pools.last_mut().expect("inserted pool state")
+        };
+
+        state.members.push(GpuPoolMember {
+            model_id,
+            weight: weight.max(1),
+            cap: handle.blocks_per_engine.clone(),
+        });
+
+        let total_weight = state
+            .members
+            .iter()
+            .map(|member| member.weight as usize)
+            .sum::<usize>()
+            .max(1);
+        let total_blocks = state.handle.pool.total_blocks();
+        for member in &state.members {
+            let weighted_cap = total_blocks.saturating_mul(member.weight as usize) / total_weight;
+            member
+                .cap
+                .store(weighted_cap.max(MIN_BLOCKS_PER_ENGINE), Ordering::Relaxed);
+        }
+        log::info!(
+            "[gpu-pool] device {}: {} model(s) sharing {} blocks with weighted caps: {}",
+            device_id,
+            state.members.len(),
+            total_blocks,
+            state
+                .members
+                .iter()
+                .map(|member| format!(
+                    "model={} weight={} cap={}",
+                    member.model_id,
+                    member.weight,
+                    member.cap.load(Ordering::Relaxed)
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
     }
 
     /// Return (or lazily create) the shared block allocator for `device_id`.
@@ -143,12 +241,12 @@ impl SharedKvState {
     /// scheduler.  Returns the allocator and the recommended per-engine
     /// total_blocks cap so that the block budget is divided fairly across all
     /// replicas sharing this device.
-    fn attach_engine(&self, device_id: usize) -> (SharedBlockAllocator, usize) {
+    fn attach_engine(&self, device_id: usize, weight: u32) -> (SharedBlockAllocator, usize) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         self.scheduler.lock().register(KvEngineHandle {
             engine_id,
-            share_weight: 1,
+            share_weight: weight.max(1),
         });
         // Divide the device's block budget evenly across all registered engines.
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
@@ -840,6 +938,8 @@ const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
 const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
+const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
+const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
 const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
 const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
 const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
@@ -2076,6 +2176,17 @@ fn optional_env_var_alias(primary: &str, legacy: &str) -> Option<String> {
     optional_env_var(primary).or_else(|| optional_env_var(legacy))
 }
 
+fn resolve_model_load_parallelism(model_count: usize) -> usize {
+    if model_count <= 1 {
+        return 1;
+    }
+    optional_env_var(MODEL_LOAD_PARALLELISM_ENV)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| model_count.min(4))
+        .clamp(1, model_count)
+}
+
 fn arg_user_supplied(matches: &ArgMatches, arg: &str) -> bool {
     !matches!(
         matches.value_source(arg),
@@ -2731,10 +2842,7 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
         let absolute_path = match model_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "error: model path {:?} is invalid: {}",
-                    model_path, e
-                );
+                eprintln!("error: model path {:?} is invalid: {}", model_path, e);
                 any_error = true;
                 continue;
             }
@@ -2763,10 +2871,7 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
                     .read_to_string()
                     .unwrap_or_else(|_| String::new());
                 match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(json) => println!(
-                        "{}",
-                        serde_json::to_string_pretty(&json).unwrap_or(body)
-                    ),
+                    Ok(json) => println!("{}", serde_json::to_string_pretty(&json).unwrap_or(body)),
                     Err(_) => println!("{}", body),
                 }
             }
@@ -5426,13 +5531,13 @@ fn request_presigned_upload_url(
     }
     match request.send_empty() {
         Ok(resp) => {
-            let body: String = resp
-                .into_body()
-                .read_to_string()
-                .map_err(|e| RemoteHttpRequestError {
-                    status_code: None,
-                    message: format!("Failed to read presigned upload response: {}", e),
-                })?;
+            let body: String =
+                resp.into_body()
+                    .read_to_string()
+                    .map_err(|e| RemoteHttpRequestError {
+                        status_code: None,
+                        message: format!("Failed to read presigned upload response: {}", e),
+                    })?;
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).map_err(|e| RemoteHttpRequestError {
                     status_code: None,
@@ -5445,10 +5550,7 @@ fn request_presigned_upload_url(
                     message: "Presigned upload response missing 'upload_url' field".to_string(),
                 })?
                 .to_string();
-            let method = parsed["method"]
-                .as_str()
-                .unwrap_or("PUT")
-                .to_string();
+            let method = parsed["method"].as_str().unwrap_or("PUT").to_string();
             let headers: Vec<(String, String)> = parsed["headers"]
                 .as_object()
                 .map(|obj| {
@@ -5504,10 +5606,7 @@ fn push_kapsl_to_http_remote(
 
     // Try presigned URL flow first.
     if let Some(presigned) = request_presigned_upload_url(artifact_url, authorization_header)? {
-        eprintln!(
-            "Uploading via presigned URL ({} bytes)...",
-            file_size.len()
-        );
+        eprintln!("Uploading via presigned URL ({} bytes)...", file_size.len());
         let file = File::open(source_path).map_err(|e| RemoteHttpRequestError {
             status_code: None,
             message: format!(
@@ -5599,13 +5698,13 @@ fn request_presigned_download_url(
     }
     match request.send_empty() {
         Ok(resp) => {
-            let body: String = resp
-                .into_body()
-                .read_to_string()
-                .map_err(|e| RemoteHttpRequestError {
-                    status_code: None,
-                    message: format!("Failed to read presigned download response: {}", e),
-                })?;
+            let body: String =
+                resp.into_body()
+                    .read_to_string()
+                    .map_err(|e| RemoteHttpRequestError {
+                        status_code: None,
+                        message: format!("Failed to read presigned download response: {}", e),
+                    })?;
             let parsed: serde_json::Value =
                 serde_json::from_str(&body).map_err(|e| RemoteHttpRequestError {
                     status_code: None,
@@ -5726,8 +5825,7 @@ fn pull_kapsl_from_http_remote(
     output_path: &Path,
 ) -> Result<u64, RemoteHttpRequestError> {
     // Try presigned URL flow first.
-    if let Some(download_url) =
-        request_presigned_download_url(artifact_url, authorization_header)?
+    if let Some(download_url) = request_presigned_download_url(artifact_url, authorization_header)?
     {
         eprintln!("Downloading via presigned URL...");
         // No auth header needed — the SAS token is in the URL.
@@ -5819,7 +5917,11 @@ fn replace_output_file(staged_path: &Path, output_path: &Path) -> std::io::Resul
     fs::rename(staged_path, output_path)
 }
 
-fn stage_link_or_copy_file(source_path: &Path, output_path: &Path, prefix: &str) -> Result<u64, String> {
+fn stage_link_or_copy_file(
+    source_path: &Path,
+    output_path: &Path,
+    prefix: &str,
+) -> Result<u64, String> {
     if source_path == output_path {
         return fs::metadata(source_path)
             .map(|meta| meta.len())
@@ -5828,13 +5930,15 @@ fn stage_link_or_copy_file(source_path: &Path, output_path: &Path, prefix: &str)
 
     let staged_path = staged_output_path(output_path, prefix);
     let stage_result = match fs::hard_link(source_path, &staged_path) {
-        Ok(()) => fs::metadata(source_path).map(|meta| meta.len()).map_err(|e| {
-            format!(
-                "Failed to stat staged linked artifact {}: {}",
-                source_path.display(),
-                e
-            )
-        }),
+        Ok(()) => fs::metadata(source_path)
+            .map(|meta| meta.len())
+            .map_err(|e| {
+                format!(
+                    "Failed to stat staged linked artifact {}: {}",
+                    source_path.display(),
+                    e
+                )
+            }),
         Err(_) => fs::copy(source_path, &staged_path).map_err(|e| {
             format!(
                 "Failed to copy artifact {} to staging path {}: {}",
@@ -6768,8 +6872,7 @@ fn resolve_package_loader(
         return PackageLoader::from_directory(path)
             .map_err(|e| format!("Failed to load model directory {model_id}: {e}").into());
     }
-    PackageLoader::load(path)
-        .map_err(|e| format!("Failed to load model {model_id}: {e}").into())
+    PackageLoader::load(path).map_err(|e| format!("Failed to load model {model_id}: {e}").into())
 }
 
 fn append_tar_bytes_entry<W: Write>(
@@ -7626,14 +7729,15 @@ fn push_kapsl_to_placeholder_remote(
             )
         })?;
         let bytes_uploaded =
-            stage_link_or_copy_file(&absolute_path, &mirrored_path, "placeholder-push")
-                .map_err(|e| {
+            stage_link_or_copy_file(&absolute_path, &mirrored_path, "placeholder-push").map_err(
+                |e| {
                     format!(
                         "Failed to mirror .aimod into placeholder remote {}: {}",
                         mirrored_path.display(),
                         e
                     )
-                })?;
+                },
+            )?;
 
         (mirrored_path.to_string_lossy().to_string(), bytes_uploaded)
     } else {
@@ -7718,15 +7822,13 @@ fn pull_kapsl_from_placeholder_remote(
                 target.as_string()
             ));
         }
-        stage_link_or_copy_file(&mirrored_path, &output_path, "placeholder-pull").map_err(
-            |e| {
-                format!(
-                    "Failed to pull placeholder remote artifact to {}: {}",
-                    output_path.display(),
-                    e
-                )
-            },
-        )?
+        stage_link_or_copy_file(&mirrored_path, &output_path, "placeholder-pull").map_err(|e| {
+            format!(
+                "Failed to pull placeholder remote artifact to {}: {}",
+                output_path.display(),
+                e
+            )
+        })?
     } else {
         match pull_kapsl_from_http_remote(&artifact_url, remote_token.as_deref(), &output_path) {
             Ok(bytes_downloaded) => bytes_downloaded,
@@ -7743,7 +7845,7 @@ fn pull_kapsl_from_placeholder_remote(
                         remote_token.as_deref(),
                         &output_path,
                     )
-                        .map_err(|e| e.message)?
+                    .map_err(|e| e.message)?
                 } else {
                     return Err(http_error.message);
                 }
@@ -7791,6 +7893,14 @@ fn yaml_bool(value: &serde_yaml::Value) -> Option<bool> {
             "0" | "false" | "no" | "off" => Some(false),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn yaml_u32(value: &serde_yaml::Value) -> Option<u32> {
+    match value {
+        serde_yaml::Value::Number(number) => number.as_u64().and_then(|v| u32::try_from(v).ok()),
+        serde_yaml::Value::String(text) => text.trim().parse::<u32>().ok(),
         _ => None,
     }
 }
@@ -7871,7 +7981,7 @@ mod state_layout_tests {
             onnx_peak_concurrency_hint: None,
             onnx_model_tuning: Vec::new(),
             shm_size_mb: None,
-            kv_compression_bits: Some(3 as u8)
+            kv_compression_bits: Some(3 as u8),
         };
 
         let layout = resolve_runtime_state_layout(&args);
@@ -8593,6 +8703,48 @@ fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
         target,
         GGUF_MAX_CONCURRENT_ENV
     );
+}
+
+fn parse_priority_weight_override(raw: &str, model_id: u32) -> Option<u32> {
+    for entry in raw.split(',') {
+        let Some((selector, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let selector = selector.trim();
+        let selector_matches = selector == "*" || selector.parse::<u32>().ok() == Some(model_id);
+        if !selector_matches {
+            continue;
+        }
+        if let Ok(weight) = value.trim().parse::<u32>() {
+            return Some(weight.max(1));
+        }
+    }
+    None
+}
+
+fn manifest_priority_weight(manifest: &Manifest) -> Option<u32> {
+    let meta = manifest.metadata.as_ref()?;
+    for path in [
+        &["scheduling", "priority_weight"][..],
+        &["runtime", "scheduling", "priority_weight"][..],
+        &["llm", "priority_weight"][..],
+        &["priority_weight"][..],
+    ] {
+        if let Some(value) = yaml_lookup(meta, path).and_then(yaml_u32) {
+            return Some(value.max(1));
+        }
+    }
+    None
+}
+
+fn resolve_model_priority_weight(manifest: &Manifest, model_id: u32) -> u32 {
+    if let Some(raw) = optional_env_var(MODEL_PRIORITY_WEIGHTS_ENV) {
+        if let Some(weight) = parse_priority_weight_override(&raw, model_id) {
+            return weight;
+        }
+    }
+
+    manifest_priority_weight(manifest).unwrap_or(1).max(1)
 }
 
 fn parse_queue_overflow_policy_literal(
@@ -9834,7 +9986,10 @@ fn load_model_blocking(
     topology: &str,
     tp_degree: usize,
     onnx_tuning: OnnxRuntimeTuning,
-) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     log::info!(
         "Current directory: {:?}",
         std::env::current_dir().unwrap_or_default()
@@ -9870,6 +10025,8 @@ fn load_model_blocking(
             scheduler_max_micro_batch,
             scheduler_queue_delay_ms,
         );
+    let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
+    log::info!("  Priority weight: {}", priority_weight);
     export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
@@ -10004,7 +10161,7 @@ fn load_model_blocking(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, priority_weight);
             backend = backend
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap);
@@ -10041,11 +10198,42 @@ fn load_model_blocking(
                     );
                     let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
                     let engine_arc: EngineHandle = Arc::from(engine_box);
-            swap_handles.push(engine_arc.clone());
-            engines.push(engine_arc);
+                    swap_handles.push(engine_arc.clone());
+                    engines.push(engine_arc);
                     continue;
                 }
                 let provider = device.backend.to_string();
+
+                #[cfg(feature = "gguf-native")]
+                if loader.manifest.framework == "gguf" {
+                    let existing_handle = shared_kv.get_gpu_pool(device.id);
+                    let mut b =
+                        BackendFactory::create_gguf_native(device.id as i32, existing_handle)?;
+                    tokio::runtime::Handle::current()
+                        .block_on(b.load(&model_file_path))
+                        .map_err(|e| {
+                            let err: Box<dyn std::error::Error + Send + Sync> = format!(
+                                "Failed to load gguf-native model {} on device {}: {}",
+                                model_id, device.id, e
+                            )
+                            .into();
+                            err
+                        })?;
+                    if let Some(handle) = b.pool_handle() {
+                        shared_kv.attach_gpu_pool(device.id, model_id, priority_weight, handle);
+                    }
+                    let monitored = MonitoringMiddleware::new_with_metrics(
+                        b,
+                        model_id.to_string(),
+                        loader.manifest.version.clone(),
+                        shared_metrics.clone(),
+                    );
+                    let arc: EngineHandle =
+                        Arc::from(Box::new(monitored) as Box<dyn kapsl_engine_api::Engine>);
+                    swap_handles.push(arc.clone());
+                    engines.push(arc);
+                    continue;
+                }
 
                 // Create backend for this specific device
                 let mut backend = BackendFactory::create_backend_for_device_with_tuning(
@@ -10076,8 +10264,8 @@ fn load_model_blocking(
 
                 let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
                 let engine_arc: EngineHandle = Arc::from(engine_box);
-            swap_handles.push(engine_arc.clone());
-            engines.push(engine_arc);
+                swap_handles.push(engine_arc.clone());
+                engines.push(engine_arc);
             }
         }
     }
@@ -10144,7 +10332,10 @@ async fn load_model(
     topology: &str,
     tp_degree: usize,
     onnx_tuning: OnnxRuntimeTuning,
-) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     log::info!(
         "Current directory: {:?}",
         std::env::current_dir().unwrap_or_default()
@@ -10180,6 +10371,8 @@ async fn load_model(
             scheduler_max_micro_batch,
             scheduler_queue_delay_ms,
         );
+    let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
+    log::info!("  Priority weight: {}", priority_weight);
     export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
@@ -10315,7 +10508,7 @@ async fn load_model(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, priority_weight);
             backend = backend
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap);
@@ -10350,11 +10543,40 @@ async fn load_model(
                     );
                     let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
                     let engine_arc: EngineHandle = Arc::from(engine_box);
-            swap_handles.push(engine_arc.clone());
-            engines.push(engine_arc);
+                    swap_handles.push(engine_arc.clone());
+                    engines.push(engine_arc);
                     continue;
                 }
                 let provider = device.backend.to_string();
+
+                #[cfg(feature = "gguf-native")]
+                if loader.manifest.framework == "gguf" {
+                    let existing_handle = shared_kv.get_gpu_pool(device.id);
+                    let mut b =
+                        BackendFactory::create_gguf_native(device.id as i32, existing_handle)?;
+                    b.load(&model_file_path).await.map_err(|e| {
+                        let err: Box<dyn std::error::Error + Send + Sync> = format!(
+                            "Failed to load gguf-native model {} on device {}: {}",
+                            model_id, device.id, e
+                        )
+                        .into();
+                        err
+                    })?;
+                    if let Some(handle) = b.pool_handle() {
+                        shared_kv.attach_gpu_pool(device.id, model_id, priority_weight, handle);
+                    }
+                    let monitored = MonitoringMiddleware::new_with_metrics(
+                        b,
+                        model_id.to_string(),
+                        loader.manifest.version.clone(),
+                        shared_metrics.clone(),
+                    );
+                    let arc: EngineHandle =
+                        Arc::from(Box::new(monitored) as Box<dyn kapsl_engine_api::Engine>);
+                    swap_handles.push(arc.clone());
+                    engines.push(arc);
+                    continue;
+                }
 
                 // Create backend for this specific device
                 let mut backend = BackendFactory::create_backend_for_device_with_tuning(
@@ -10383,8 +10605,8 @@ async fn load_model(
 
                 let engine_box: Box<dyn kapsl_engine_api::Engine> = Box::new(monitored_backend);
                 let engine_arc: EngineHandle = Arc::from(engine_box);
-            swap_handles.push(engine_arc.clone());
-            engines.push(engine_arc);
+                swap_handles.push(engine_arc.clone());
+                engines.push(engine_arc);
             }
         }
     }
@@ -10475,6 +10697,7 @@ async fn scale_up_model(
             scheduler_max_micro_batch,
             scheduler_queue_delay_ms,
         );
+    let priority_weight = resolve_model_priority_weight(&loader.manifest, base_model_id);
     let pipeline_stages = manifest_llm_pipeline_stages(&loader.manifest);
     let EffectiveTopologyChoice {
         mesh_topology: _,
@@ -10593,7 +10816,7 @@ async fn scale_up_model(
             LLMBackend::with_device_ids(device_ids.clone())
         };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device);
+        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, priority_weight);
         backend = backend
             .with_shared_pool(kv_pool)
             .with_kv_blocks_cap(kv_blocks_cap);
@@ -10611,24 +10834,50 @@ async fn scale_up_model(
         );
         Arc::new(monitored_backend)
     } else {
-        let mut backend = BackendFactory::create_best_backend_with_tuning(
-            &loader.manifest,
-            device_info,
-            &onnx_tuning,
-        )?;
-        backend.load(&model_file_path).await.map_err(|e| {
-            let err: Box<dyn std::error::Error + Send + Sync> =
-                format!("Failed to load replica {}: {}", replica_id, e).into();
-            err
-        })?;
+        #[allow(unused_labels)]
+        'engine: {
+            #[cfg(feature = "gguf-native")]
+            if loader.manifest.framework == "gguf" {
+                let device_id =
+                    loader.manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
+                let existing_handle = shared_kv.get_gpu_pool(device_id);
+                let mut b = BackendFactory::create_gguf_native(device_id as i32, existing_handle)?;
+                b.load(&model_file_path).await.map_err(|e| {
+                    let err: Box<dyn std::error::Error + Send + Sync> =
+                        format!("Failed to load gguf-native replica {}: {}", replica_id, e).into();
+                    err
+                })?;
+                if let Some(handle) = b.pool_handle() {
+                    shared_kv.attach_gpu_pool(device_id, base_model_id, priority_weight, handle);
+                }
+                let monitored = MonitoringMiddleware::new_with_metrics(
+                    b,
+                    base_model_id.to_string(),
+                    loader.manifest.version.clone(),
+                    shared_metrics.clone(),
+                );
+                #[allow(clippy::needless_break)]
+                break 'engine Arc::new(monitored);
+            }
 
-        let monitored_backend = MonitoringMiddleware::new_with_metrics(
-            backend,
-            base_model_id.to_string(),
-            loader.manifest.version.clone(),
-            shared_metrics.clone(),
-        );
-        Arc::new(monitored_backend)
+            let mut backend = BackendFactory::create_best_backend_with_tuning(
+                &loader.manifest,
+                device_info,
+                &onnx_tuning,
+            )?;
+            backend.load(&model_file_path).await.map_err(|e| {
+                let err: Box<dyn std::error::Error + Send + Sync> =
+                    format!("Failed to load replica {}: {}", replica_id, e).into();
+                err
+            })?;
+            let monitored_backend = MonitoringMiddleware::new_with_metrics(
+                backend,
+                base_model_id.to_string(),
+                loader.manifest.version.clone(),
+                shared_metrics.clone(),
+            );
+            Arc::new(monitored_backend)
+        }
     };
     let swap_handle = engine.clone();
     let scheduler = Arc::new(
@@ -11021,48 +11270,92 @@ async fn main() -> Result<(), DynError> {
 
     // 2. Load Packagesƒ
     log::info!("=== Package Loading ===");
-    for model_path in args.model.iter() {
-        let model_id = allocate_model_id(&model_id_counter, &recycled_model_ids);
-        let model_label = model_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-            .unwrap_or_else(|| model_path.to_string_lossy().to_string());
-        let load_label = format!("Loading {}", model_label);
-        let (pool, handles) = match run_with_loading_async(
-            &load_label,
-            load_model(
-                model_id,
-                model_path,
-                &device_info,
-                shared_kv.clone(),
-                args.batch_size,
-                args.scheduler_queue_size,
-                args.scheduler_max_micro_batch,
-                args.scheduler_queue_delay_ms,
-                &model_registry,
-                &shared_metrics,
-                &args.topology,
-                args.tp_degree,
-                onnx_tuning_profile.resolve(model_id),
-            ),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                recycle_model_id(model_id, &recycled_model_ids);
-                return Err(e);
-            }
-        };
-        replica_pools.write().insert(model_id, pool);
-        swap_map.write().insert(model_id, handles);
-        model_paths.write().insert(model_id, model_path.clone());
+    let load_parallelism = resolve_model_load_parallelism(args.model.len());
+    if args.model.len() > 1 {
+        log::info!(
+            "Loading {} model packages with parallelism {} ({}=N to override)",
+            args.model.len(),
+            load_parallelism,
+            MODEL_LOAD_PARALLELISM_ENV
+        );
+    }
+    let load_specs = args
+        .model
+        .iter()
+        .map(|model_path| {
+            (
+                allocate_model_id(&model_id_counter, &recycled_model_ids),
+                model_path.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
 
-        // Register default scaling policy for each model
-        auto_scaler
-            .write()
-            .register_policy(model_id, ScalingPolicy::default());
+    let load_results = run_with_loading_async("Loading model packages", {
+        let device_info = device_info.clone();
+        let shared_kv = shared_kv.clone();
+        let model_registry = model_registry.clone();
+        let shared_metrics = shared_metrics.clone();
+        let topology = args.topology.clone();
+        let onnx_tuning_profile = onnx_tuning_profile.clone();
+        async move {
+            let results = stream::iter(load_specs.into_iter().map(|(model_id, model_path)| {
+                let device_info = device_info.clone();
+                let shared_kv = shared_kv.clone();
+                let model_registry = model_registry.clone();
+                let shared_metrics = shared_metrics.clone();
+                let topology = topology.clone();
+                let onnx_tuning = onnx_tuning_profile.resolve(model_id);
+                async move {
+                    let result = load_model(
+                        model_id,
+                        &model_path,
+                        &device_info,
+                        shared_kv,
+                        args.batch_size,
+                        args.scheduler_queue_size,
+                        args.scheduler_max_micro_batch,
+                        args.scheduler_queue_delay_ms,
+                        &model_registry,
+                        &shared_metrics,
+                        &topology,
+                        args.tp_degree,
+                        onnx_tuning,
+                    )
+                    .await;
+                    (model_id, model_path, result)
+                }
+            }))
+            .buffer_unordered(load_parallelism)
+            .collect::<Vec<_>>()
+            .await;
+            Ok::<_, DynError>(results)
+        }
+    })
+    .await?;
+
+    let mut first_load_error: Option<DynError> = None;
+    for (model_id, model_path, result) in load_results {
+        match result {
+            Ok((pool, handles)) => {
+                replica_pools.write().insert(model_id, pool);
+                swap_map.write().insert(model_id, handles);
+                model_paths.write().insert(model_id, model_path);
+
+                // Register default scaling policy for each model
+                auto_scaler
+                    .write()
+                    .register_policy(model_id, ScalingPolicy::default());
+            }
+            Err(error) => {
+                recycle_model_id(model_id, &recycled_model_ids);
+                if first_load_error.is_none() {
+                    first_load_error = Some(error);
+                }
+            }
+        }
+    }
+    if let Some(error) = first_load_error {
+        return Err(error);
     }
 
     log::info!("=== Starting Transport Server ===");
@@ -12714,11 +13007,19 @@ async fn main() -> Result<(), DynError> {
 
         // Shared response types for the three hot-swap endpoints.
         #[derive(Serialize)]
-        struct SwapMsgResp { message: String }
+        struct SwapMsgResp {
+            message: String,
+        }
         #[derive(Serialize)]
-        struct SwapErrResp { error: String }
+        struct SwapErrResp {
+            error: String,
+        }
         #[derive(Serialize)]
-        struct SwapStatusResp { model_id: u32, supports_swap: bool, staged: bool }
+        struct SwapStatusResp {
+            model_id: u32,
+            supports_swap: bool,
+            staged: bool,
+        }
 
         // Returns the engine handles for a model, or an error reply if not found.
         fn lookup_swap_handles(
@@ -12748,10 +13049,14 @@ async fn main() -> Result<(), DynError> {
                     use warp::http::StatusCode;
                     let path_str = match body.get("model_path").and_then(|v| v.as_str()) {
                         Some(s) => s.to_string(),
-                        None => return warp::reply::with_status(
-                            warp::reply::json(&SwapErrResp { error: "missing model_path".into() }),
-                            StatusCode::BAD_REQUEST,
-                        ),
+                        None => {
+                            return warp::reply::with_status(
+                                warp::reply::json(&SwapErrResp {
+                                    error: "missing model_path".into(),
+                                }),
+                                StatusCode::BAD_REQUEST,
+                            )
+                        }
                     };
                     let handles = match lookup_swap_handles(&swap_map, model_id) {
                         Ok(h) => h,
@@ -12769,7 +13074,9 @@ async fn main() -> Result<(), DynError> {
                     for engine in &handles {
                         if let Err(e) = engine.stage(&path).await {
                             return warp::reply::with_status(
-                                warp::reply::json(&SwapErrResp { error: e.to_string() }),
+                                warp::reply::json(&SwapErrResp {
+                                    error: e.to_string(),
+                                }),
                                 StatusCode::INTERNAL_SERVER_ERROR,
                             );
                         }
@@ -12801,7 +13108,9 @@ async fn main() -> Result<(), DynError> {
                     for engine in &handles {
                         if let Err(e) = engine.swap().await {
                             return warp::reply::with_status(
-                                warp::reply::json(&SwapErrResp { error: e.to_string() }),
+                                warp::reply::json(&SwapErrResp {
+                                    error: e.to_string(),
+                                }),
                                 StatusCode::INTERNAL_SERVER_ERROR,
                             );
                         }
@@ -12830,7 +13139,10 @@ async fn main() -> Result<(), DynError> {
                     let supports = handles.iter().any(|e| e.supports_swap());
                     // All swap-capable engines must have weights staged.
                     let staged = supports
-                        && handles.iter().filter(|e| e.supports_swap()).all(|e| e.is_staged());
+                        && handles
+                            .iter()
+                            .filter(|e| e.supports_swap())
+                            .all(|e| e.is_staged());
                     warp::reply::with_status(
                         warp::reply::json(&SwapStatusResp {
                             model_id,
