@@ -838,6 +838,8 @@ const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
 const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
 const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
+const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
+const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
 const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
 const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
 const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
@@ -8573,6 +8575,26 @@ fn resolve_scheduler_tuning_for_framework(
     (resolved_micro_batch, resolved_queue_delay_ms)
 }
 
+fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
+    if !manifest.framework.eq_ignore_ascii_case("llm") {
+        return;
+    }
+    if std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_some()
+        || std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_some()
+    {
+        return;
+    }
+
+    let target = batch_size.max(1);
+    std::env::set_var(GGUF_TARGET_CONCURRENCY_ENV, target.to_string());
+    log::info!(
+        "Framework=llm: setting {}={} from runtime batch_size. Set {} to override GGUF context reservation.",
+        GGUF_TARGET_CONCURRENCY_ENV,
+        target,
+        GGUF_MAX_CONCURRENT_ENV
+    );
+}
+
 fn parse_queue_overflow_policy_literal(
     value: &str,
 ) -> Option<kapsl_scheduler::QueueOverflowPolicy> {
@@ -9848,6 +9870,7 @@ fn load_model_blocking(
             scheduler_max_micro_batch,
             scheduler_queue_delay_ms,
         );
+    export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
@@ -10157,6 +10180,7 @@ async fn load_model(
             scheduler_max_micro_batch,
             scheduler_queue_delay_ms,
         );
+    export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
