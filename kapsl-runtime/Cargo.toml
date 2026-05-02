@@ -21,6 +21,4 @@ kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "
 kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
 kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
 kapsl-loader = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
-kapsl-optimizer = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
 kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
-kapsl-pyo3 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/turboquant" }
