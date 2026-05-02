@@ -9,10 +9,7 @@ default = []
 native = ["kapsl-backends/native"]
 gguf-native = ["kapsl-backends/gguf-native"]
 gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
-# NVIDIA build for benchmarks: llama.cpp CUDA only. The Kapsl native CUDA
-# shared-pool backend is still experimental and must be enabled explicitly via
-# `gguf-native`.
-cuda = ["gguf-cuda"]
+cuda = ["gguf-cuda", "gguf-native"]
 infer-adapter-echo = []
 
 [dependencies]
