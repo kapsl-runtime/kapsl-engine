@@ -103,28 +103,32 @@ struct DeviceGpuPoolState {
 
 /// Shared KV cache pool registry and cross-model token-budget coordinator.
 ///
-/// One instance is created at server startup and cloned into every model-load
-/// path.  All `LLMBackend` instances on the same physical GPU share the same
-/// `SharedBlockAllocator`, enforcing a single unified block budget.
-#[derive(Clone)]
-struct SharedKvState {
+/// Always held behind `Arc` (`type SharedKvState = Arc<SharedKvStateInner>`)
+/// so cloning is a single atomic reference-count increment with no heap
+/// allocation.  All `LLMBackend` instances on the same physical GPU share the
+/// same `SharedBlockAllocator`, enforcing a single unified block budget.
+struct SharedKvStateInner {
     /// Total VRAM bytes per device ID — used to size pools on first access.
     device_bytes: HashMap<usize, usize>,
     /// Per-device shared KV block allocators (lazily created).
-    pools: Arc<Mutex<HashMap<usize, SharedBlockAllocator>>>,
+    pools: Mutex<HashMap<usize, SharedBlockAllocator>>,
     /// Cross-model token-budget coordinator.
-    scheduler: Arc<Mutex<GlobalKvScheduler>>,
+    scheduler: Mutex<GlobalKvScheduler>,
     /// Monotonically increasing counter for stable engine IDs.
-    next_engine_id: Arc<AtomicU32>,
+    next_engine_id: AtomicU32,
+    /// model_id → engine_ids assigned by attach_engine (supports multiple replicas).
+    model_engine_ids: Mutex<HashMap<u32, Vec<u32>>>,
     /// Per-device GPU pool registry for gguf-native/native backends.
     /// Stores compatible pools and their members so quota caps can be
     /// rebalanced by model priority.
     #[cfg(feature = "gguf-native")]
-    gpu_pools: Arc<Mutex<HashMap<usize, Vec<DeviceGpuPoolState>>>>,
+    gpu_pools: Mutex<HashMap<usize, Vec<DeviceGpuPoolState>>>,
 }
 
-impl SharedKvState {
-    fn new(device_info: &DeviceInfo) -> Self {
+type SharedKvState = Arc<SharedKvStateInner>;
+
+impl SharedKvStateInner {
+    fn new(device_info: &DeviceInfo) -> SharedKvState {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const KV_BLOCK_SIZE: usize = 16;
         let mut device_bytes = HashMap::new();
@@ -138,16 +142,17 @@ impl SharedKvState {
             let kv_blocks = (total / 2) / KV_BYTES_PER_BLOCK;
             estimated_kv_tokens = estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
         }
-        Self {
+        Arc::new(Self {
             device_bytes,
-            pools: Arc::new(Mutex::new(HashMap::new())),
-            scheduler: Arc::new(Mutex::new(GlobalKvScheduler::new(
+            pools: Mutex::new(HashMap::new()),
+            scheduler: Mutex::new(GlobalKvScheduler::new(
                 estimated_kv_tokens.max(16_384),
-            ))),
-            next_engine_id: Arc::new(AtomicU32::new(1)),
+            )),
+            next_engine_id: AtomicU32::new(1),
+            model_engine_ids: Mutex::new(HashMap::new()),
             #[cfg(feature = "gguf-native")]
-            gpu_pools: Arc::new(Mutex::new(HashMap::new())),
-        }
+            gpu_pools: Mutex::new(HashMap::new()),
+        })
     }
 
     /// Return the existing pool handle for `device_id` so a new backend can
@@ -241,13 +246,17 @@ impl SharedKvState {
     /// scheduler.  Returns the allocator and the recommended per-engine
     /// total_blocks cap so that the block budget is divided fairly across all
     /// replicas sharing this device.
-    fn attach_engine(&self, device_id: usize, weight: u32) -> (SharedBlockAllocator, usize) {
+    fn attach_engine(&self, device_id: usize, model_id: u32, weight: u32) -> (SharedBlockAllocator, usize) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         self.scheduler.lock().register(KvEngineHandle {
             engine_id,
             share_weight: weight.max(1),
         });
+        self.model_engine_ids.lock()
+            .entry(model_id)
+            .or_default()
+            .push(engine_id);
         // Divide the device's block budget evenly across all registered engines.
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
@@ -258,10 +267,62 @@ impl SharedKvState {
         (allocator, blocks_per_engine)
     }
 
-    /// Deregister an engine (call on model unload).
-    #[allow(dead_code)]
     fn detach_engine(&self, engine_id: u32) {
         self.scheduler.lock().deregister(engine_id);
+    }
+
+    /// Deregister all engines for a model (call on full model stop/remove).
+    fn detach_engine_for_model(&self, model_id: u32) {
+        if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
+            let mut sched = self.scheduler.lock();
+            for id in ids {
+                sched.deregister(id);
+            }
+        }
+    }
+
+    /// Remove a model from the GPU block pool registry and rebalance remaining
+    /// members' quota caps.  No-op if the model is not registered.
+    #[cfg(feature = "gguf-native")]
+    fn detach_gpu_pool(&self, model_id: u32) {
+        const MIN_BLOCKS_PER_ENGINE: usize = 64;
+        let mut pools = self.gpu_pools.lock();
+        for device_pools in pools.values_mut() {
+            for state in device_pools.iter_mut() {
+                let before = state.members.len();
+                state.members.retain(|m| m.model_id != model_id);
+                if state.members.len() == before {
+                    continue;
+                }
+                if state.members.is_empty() {
+                    log::info!("[gpu-pool] model {} detached; pool now empty", model_id);
+                    continue;
+                }
+                let total_weight = state.members.iter()
+                    .map(|m| m.weight as usize)
+                    .sum::<usize>()
+                    .max(1);
+                let total_blocks = state.handle.pool.total_blocks();
+                for member in &state.members {
+                    let weighted_cap =
+                        total_blocks.saturating_mul(member.weight as usize) / total_weight;
+                    member.cap.store(
+                        weighted_cap.max(MIN_BLOCKS_PER_ENGINE),
+                        Ordering::Relaxed,
+                    );
+                }
+                log::info!(
+                    "[gpu-pool] model {} detached; {} member(s) remaining, caps rebalanced: {}",
+                    model_id,
+                    state.members.len(),
+                    state.members.iter()
+                        .map(|m| format!("model={} cap={}", m.model_id, m.cap.load(Ordering::Relaxed)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            device_pools.retain(|state| !state.members.is_empty());
+        }
     }
 }
 
@@ -9944,7 +10005,7 @@ async fn run_worker(
         model_id,
         model_path,
         device_info,
-        SharedKvState::new(device_info),
+        SharedKvStateInner::new(device_info),
         args.batch_size,
         args.scheduler_queue_size,
         args.scheduler_max_micro_batch,
@@ -10161,7 +10222,7 @@ fn load_model_blocking(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, priority_weight);
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, model_id, priority_weight);
             backend = backend
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap);
@@ -10508,7 +10569,7 @@ async fn load_model(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, priority_weight);
+            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, model_id, priority_weight);
             backend = backend
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap);
@@ -10816,7 +10877,7 @@ async fn scale_up_model(
             LLMBackend::with_device_ids(device_ids.clone())
         };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, priority_weight);
+        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, base_model_id, priority_weight);
         backend = backend
             .with_shared_pool(kv_pool)
             .with_kv_blocks_cap(kv_blocks_cap);
@@ -11156,7 +11217,7 @@ async fn main() -> Result<(), DynError> {
     }
 
     // Unified shared KV cache pool and cross-model token budget coordinator.
-    let shared_kv = SharedKvState::new(&device_info);
+    let shared_kv = SharedKvStateInner::new(&device_info);
 
     // Use Arc<RwLock<>> for thread-safe dynamic scheduler management
     let replica_pools: Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>> =
@@ -12890,6 +12951,7 @@ async fn main() -> Result<(), DynError> {
         let model_registry_for_stop = model_registry_clone.clone();
         let replica_pools_for_stop = replica_pools_clone.clone();
         let swap_map_for_stop = swap_map.clone();
+        let shared_kv_for_stop = shared_kv.clone();
 
         let stop_model = warp::path!("api" / "models" / u32 / "stop")
             .and(warp::post())
@@ -12930,6 +12992,9 @@ async fn main() -> Result<(), DynError> {
                 // Remove pool (this will drop it and clean up resources)
                 replica_pools_for_stop.write().remove(&model_id);
                 swap_map_for_stop.write().remove(&model_id);
+                shared_kv_for_stop.detach_engine_for_model(model_id);
+                #[cfg(feature = "gguf-native")]
+                shared_kv_for_stop.detach_gpu_pool(model_id);
 
                 // Update status to Inactive
                 if let Err(e) = model_registry_for_stop.set_status(model_id, ModelStatus::Inactive)
@@ -12954,6 +13019,7 @@ async fn main() -> Result<(), DynError> {
         let replica_pools_for_remove = replica_pools_clone.clone();
         let model_paths_for_remove = model_paths_clone.clone();
         let swap_map_for_remove = swap_map.clone();
+        let shared_kv_for_remove = shared_kv.clone();
 
         let remove_model = warp::path!("api" / "models" / u32 / "remove")
             .and(warp::post())
@@ -12992,6 +13058,9 @@ async fn main() -> Result<(), DynError> {
                 replica_pools_for_remove.write().remove(&base_model_id);
                 swap_map_for_remove.write().remove(&base_model_id);
                 model_paths_for_remove.write().remove(&base_model_id);
+                shared_kv_for_remove.detach_engine_for_model(base_model_id);
+                #[cfg(feature = "gguf-native")]
+                shared_kv_for_remove.detach_gpu_pool(base_model_id);
 
                 for replica in replicas {
                     model_registry_for_remove.unregister(replica.id);
