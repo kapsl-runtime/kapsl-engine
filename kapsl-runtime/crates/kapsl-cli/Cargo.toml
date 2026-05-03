@@ -12,6 +12,9 @@ gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
 cuda = ["gguf-cuda", "gguf-native"]
 infer-adapter-echo = []
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 kapsl-core = "0.1.0"
 kapsl-hal = "0.1.0"
