@@ -1795,6 +1795,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
+ "cc",
  "clap",
  "env_logger",
  "flate2",
