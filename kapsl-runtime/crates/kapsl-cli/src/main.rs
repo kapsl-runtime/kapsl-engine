@@ -19,6 +19,8 @@ use kapsl_engine_api::{
 };
 use kapsl_hal::device::DeviceInfo;
 #[cfg(feature = "gguf-native")]
+use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
+#[cfg(feature = "gguf-native")]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_ipc::{
     IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
@@ -64,9 +66,7 @@ use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(feature = "gguf-native")]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
@@ -112,17 +112,26 @@ struct SharedKvStateInner {
     device_bytes: HashMap<usize, usize>,
     /// Per-device shared KV block allocators (lazily created).
     pools: Mutex<HashMap<usize, SharedBlockAllocator>>,
-    /// Cross-model token-budget coordinator.
-    scheduler: Mutex<GlobalKvScheduler>,
+    /// Cross-model token-budget coordinator (hard admission gate in Phase 2).
+    /// Wrapped in Arc<std::sync::Mutex> so it can be shared with LLMBackend
+    /// instances without pulling parking_lot into kapsl-llm.
+    scheduler: std::sync::Arc<std::sync::Mutex<GlobalKvScheduler>>,
     /// Monotonically increasing counter for stable engine IDs.
     next_engine_id: AtomicU32,
     /// model_id → engine_ids assigned by attach_engine (supports multiple replicas).
     model_engine_ids: Mutex<HashMap<u32, Vec<u32>>>,
+    /// Live per-engine KV block caps shared with LLMBackend instances.
+    /// Updated by rebalance_kv_caps() on every engine attach / detach so that
+    /// backends read the current fair-share cap without needing a restart.
+    live_kv_caps: Mutex<HashMap<u32, Arc<AtomicUsize>>>,
     /// Per-device GPU pool registry for gguf-native/native backends.
     /// Stores compatible pools and their members so quota caps can be
     /// rebalanced by model priority.
     #[cfg(feature = "gguf-native")]
     gpu_pools: Mutex<HashMap<usize, Vec<DeviceGpuPoolState>>>,
+    /// GPU-wide session-level block admission and cross-device migration.
+    #[cfg(feature = "gguf-native")]
+    cross_device_sched: Mutex<CrossDevicePoolScheduler>,
 }
 
 type SharedKvState = Arc<SharedKvStateInner>;
@@ -145,13 +154,16 @@ impl SharedKvStateInner {
         Arc::new(Self {
             device_bytes,
             pools: Mutex::new(HashMap::new()),
-            scheduler: Mutex::new(GlobalKvScheduler::new(
-                estimated_kv_tokens.max(16_384),
+            scheduler: std::sync::Arc::new(std::sync::Mutex::new(
+                GlobalKvScheduler::new(estimated_kv_tokens.max(16_384)),
             )),
             next_engine_id: AtomicU32::new(1),
             model_engine_ids: Mutex::new(HashMap::new()),
+            live_kv_caps: Mutex::new(HashMap::new()),
             #[cfg(feature = "gguf-native")]
             gpu_pools: Mutex::new(HashMap::new()),
+            #[cfg(feature = "gguf-native")]
+            cross_device_sched: Mutex::new(CrossDevicePoolScheduler::new(0.85, 2048)),
         })
     }
 
@@ -225,6 +237,10 @@ impl SharedKvStateInner {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+
+        // Also register with the cross-device scheduler so session-level
+        // admission and migration can see this pool.
+        self.cross_device_sched.lock().register_pool(device_id, handle.pool.clone());
     }
 
     /// Return (or lazily create) the shared block allocator for `device_id`.
@@ -243,41 +259,94 @@ impl SharedKvStateInner {
     }
 
     /// Attach a new engine to the shared pool and register it with the global
-    /// scheduler.  Returns the allocator and the recommended per-engine
-    /// total_blocks cap so that the block budget is divided fairly across all
-    /// replicas sharing this device.
-    fn attach_engine(&self, device_id: usize, model_id: u32, weight: u32) -> (SharedBlockAllocator, usize) {
+    /// scheduler.  Returns:
+    /// - the shared block allocator
+    /// - the recommended per-engine `total_blocks` cap
+    /// - an `Arc` to the global scheduler (for `LLMBackend::with_global_scheduler`)
+    /// - the stable engine ID assigned to this engine
+    fn attach_engine(
+        &self,
+        device_id: usize,
+        model_id: u32,
+        weight: u32,
+    ) -> (SharedBlockAllocator, usize, std::sync::Arc<std::sync::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
-        self.scheduler.lock().register(KvEngineHandle {
+        self.scheduler.lock().unwrap().register(KvEngineHandle {
             engine_id,
             share_weight: weight.max(1),
+            guaranteed_min_tokens: 0,
+            max_tokens: None,
         });
         self.model_engine_ids.lock()
             .entry(model_id)
             .or_default()
             .push(engine_id);
-        // Divide the device's block budget evenly across all registered engines.
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
         let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
         let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
-        let engine_count = (engine_id + 1) as usize; // engine_id was 0-based before this call
-        let blocks_per_engine = (total_blocks / engine_count).max(MIN_BLOCKS_PER_ENGINE);
-        (allocator, blocks_per_engine)
+        let engine_count = (engine_id + 1) as usize;
+        let initial_cap = (total_blocks / engine_count).max(MIN_BLOCKS_PER_ENGINE);
+        // Register live-cap atomic and trigger rebalancing across all engines.
+        let live_cap = Arc::new(AtomicUsize::new(initial_cap));
+        self.live_kv_caps.lock().insert(engine_id, live_cap.clone());
+        self.rebalance_kv_caps();
+        (allocator, initial_cap, self.scheduler.clone(), engine_id, live_cap)
     }
 
     fn detach_engine(&self, engine_id: u32) {
-        self.scheduler.lock().deregister(engine_id);
+        self.scheduler.lock().unwrap().deregister(engine_id);
+        self.live_kv_caps.lock().remove(&engine_id);
+        self.rebalance_kv_caps();
     }
 
     /// Deregister all engines for a model (call on full model stop/remove).
     fn detach_engine_for_model(&self, model_id: u32) {
         if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
-            let mut sched = self.scheduler.lock();
+            let mut sched = self.scheduler.lock().unwrap();
+            let mut caps  = self.live_kv_caps.lock();
             for id in ids {
                 sched.deregister(id);
+                caps.remove(&id);
             }
+        }
+        self.rebalance_kv_caps();
+    }
+
+    /// Recompute per-engine KV block caps from the global scheduler's budget
+    /// allocation and push the new values into each engine's `Arc<AtomicUsize>`.
+    ///
+    /// Called on every engine attach/detach so live caps track the current set
+    /// of loaded models without requiring engine restarts.
+    fn rebalance_kv_caps(&self) {
+        const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
+        const MIN_BLOCKS_PER_ENGINE: usize = 256;
+
+        let budgets = self.scheduler.lock().unwrap().allocate_budgets();
+        if budgets.is_empty() { return; }
+
+        let total_tokens: usize = budgets.iter().map(|b| b.max_tokens).sum::<usize>().max(1);
+        let caps = self.live_kv_caps.lock();
+
+        for budget in &budgets {
+            let Some(cap_atom) = caps.get(&budget.engine_id) else { continue };
+            // Translate token fraction → block fraction using the device's
+            // total block pool for this engine's device.
+            let device_id = self.model_engine_ids.lock()
+                .values()
+                .find(|ids| ids.contains(&budget.engine_id))
+                .and_then(|_| {
+                    // We don't track engine_id→device_id directly; use device_bytes
+                    // to get the first device that has memory configured.
+                    self.device_bytes.keys().next().copied()
+                })
+                .unwrap_or(0);
+            let total_bytes  = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+            let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
+            let new_cap = (total_blocks * budget.max_tokens / total_tokens)
+                .max(MIN_BLOCKS_PER_ENGINE);
+            cap_atom.store(new_cap, Ordering::Relaxed);
         }
     }
 
@@ -286,42 +355,60 @@ impl SharedKvStateInner {
     #[cfg(feature = "gguf-native")]
     fn detach_gpu_pool(&self, model_id: u32) {
         const MIN_BLOCKS_PER_ENGINE: usize = 64;
-        let mut pools = self.gpu_pools.lock();
-        for device_pools in pools.values_mut() {
-            for state in device_pools.iter_mut() {
-                let before = state.members.len();
-                state.members.retain(|m| m.model_id != model_id);
-                if state.members.len() == before {
-                    continue;
-                }
-                if state.members.is_empty() {
-                    log::info!("[gpu-pool] model {} detached; pool now empty", model_id);
-                    continue;
-                }
-                let total_weight = state.members.iter()
-                    .map(|m| m.weight as usize)
-                    .sum::<usize>()
-                    .max(1);
-                let total_blocks = state.handle.pool.total_blocks();
-                for member in &state.members {
-                    let weighted_cap =
-                        total_blocks.saturating_mul(member.weight as usize) / total_weight;
-                    member.cap.store(
-                        weighted_cap.max(MIN_BLOCKS_PER_ENGINE),
-                        Ordering::Relaxed,
+        let emptied_devices: Vec<usize> = {
+            let mut pools = self.gpu_pools.lock();
+            for device_pools in pools.values_mut() {
+                for state in device_pools.iter_mut() {
+                    let before = state.members.len();
+                    state.members.retain(|m| m.model_id != model_id);
+                    if state.members.len() == before {
+                        continue;
+                    }
+                    if state.members.is_empty() {
+                        log::info!("[gpu-pool] model {} detached; pool now empty", model_id);
+                        continue;
+                    }
+                    let total_weight = state.members.iter()
+                        .map(|m| m.weight as usize)
+                        .sum::<usize>()
+                        .max(1);
+                    let total_blocks = state.handle.pool.total_blocks();
+                    for member in &state.members {
+                        let weighted_cap =
+                            total_blocks.saturating_mul(member.weight as usize) / total_weight;
+                        member.cap.store(
+                            weighted_cap.max(MIN_BLOCKS_PER_ENGINE),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    log::info!(
+                        "[gpu-pool] model {} detached; {} member(s) remaining, caps rebalanced: {}",
+                        model_id,
+                        state.members.len(),
+                        state.members.iter()
+                            .map(|m| format!("model={} cap={}", m.model_id, m.cap.load(Ordering::Relaxed)))
+                            .collect::<Vec<_>>()
+                            .join(", "),
                     );
                 }
-                log::info!(
-                    "[gpu-pool] model {} detached; {} member(s) remaining, caps rebalanced: {}",
-                    model_id,
-                    state.members.len(),
-                    state.members.iter()
-                        .map(|m| format!("model={} cap={}", m.model_id, m.cap.load(Ordering::Relaxed)))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
+                device_pools.retain(|state| !state.members.is_empty());
             }
-            device_pools.retain(|state| !state.members.is_empty());
+            // Collect device IDs whose last pool was just removed before we release
+            // the lock, so we can clean up the cross-device scheduler outside it.
+            pools
+                .iter()
+                .filter(|(_, v)| v.is_empty())
+                .map(|(&k, _)| k)
+                .collect()
+        };
+
+        // Unregister fully-empty devices from the cross-device scheduler now
+        // that gpu_pools lock is released.
+        if !emptied_devices.is_empty() {
+            let mut sched = self.cross_device_sched.lock();
+            for dev_id in emptied_devices {
+                sched.unregister_device(dev_id);
+            }
         }
     }
 }
@@ -10222,10 +10309,13 @@ fn load_model_blocking(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, model_id, priority_weight);
+            let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) =
+                shared_kv.attach_engine(primary_device, model_id, priority_weight);
             backend = backend
                 .with_shared_pool(kv_pool)
-                .with_kv_blocks_cap(kv_blocks_cap);
+                .with_kv_blocks_cap(kv_blocks_cap)
+                .with_global_scheduler(global_sched, sched_engine_id)
+                .with_live_kv_cap(live_cap);
             tokio::runtime::Handle::current()
                 .block_on(backend.load(&model_file_path))
                 .map_err(|e| {
@@ -10569,10 +10659,13 @@ async fn load_model(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-            let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, model_id, priority_weight);
+            let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) =
+                shared_kv.attach_engine(primary_device, model_id, priority_weight);
             backend = backend
                 .with_shared_pool(kv_pool)
-                .with_kv_blocks_cap(kv_blocks_cap);
+                .with_kv_blocks_cap(kv_blocks_cap)
+                .with_global_scheduler(global_sched, sched_engine_id)
+                .with_live_kv_cap(live_cap);
             backend.load(&model_file_path).await.map_err(|e| {
                 let err: Box<dyn std::error::Error + Send + Sync> =
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
@@ -10877,10 +10970,13 @@ async fn scale_up_model(
             LLMBackend::with_device_ids(device_ids.clone())
         };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
-        let (kv_pool, kv_blocks_cap) = shared_kv.attach_engine(primary_device, base_model_id, priority_weight);
+        let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) =
+            shared_kv.attach_engine(primary_device, base_model_id, priority_weight);
         backend = backend
             .with_shared_pool(kv_pool)
-            .with_kv_blocks_cap(kv_blocks_cap);
+            .with_kv_blocks_cap(kv_blocks_cap)
+            .with_global_scheduler(global_sched, sched_engine_id)
+            .with_live_kv_cap(live_cap);
         backend.load(&model_file_path).await.map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
