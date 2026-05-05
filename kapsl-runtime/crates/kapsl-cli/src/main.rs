@@ -18,9 +18,9 @@ use kapsl_engine_api::{
     InferenceRequest, TensorDtype,
 };
 use kapsl_hal::device::DeviceInfo;
-#[cfg(feature = "gguf-native")]
+#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
-#[cfg(feature = "gguf-native")]
+#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_ipc::{
     IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
@@ -86,7 +86,7 @@ struct UiAssets;
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;
 
-#[cfg(feature = "gguf-native")]
+#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 #[derive(Clone)]
 struct GpuPoolMember {
     model_id: u32,
@@ -94,7 +94,7 @@ struct GpuPoolMember {
     cap: Arc<AtomicUsize>,
 }
 
-#[cfg(feature = "gguf-native")]
+#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 #[derive(Clone)]
 struct DeviceGpuPoolState {
     handle: GpuPoolHandle,
@@ -127,10 +127,10 @@ struct SharedKvStateInner {
     /// Per-device GPU pool registry for gguf-native/native backends.
     /// Stores compatible pools and their members so quota caps can be
     /// rebalanced by model priority.
-    #[cfg(feature = "gguf-native")]
+    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
     gpu_pools: Mutex<HashMap<usize, Vec<DeviceGpuPoolState>>>,
     /// GPU-wide session-level block admission and cross-device migration.
-    #[cfg(feature = "gguf-native")]
+    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
     cross_device_sched: Mutex<CrossDevicePoolScheduler>,
 }
 
@@ -160,16 +160,16 @@ impl SharedKvStateInner {
             next_engine_id: AtomicU32::new(1),
             model_engine_ids: Mutex::new(HashMap::new()),
             live_kv_caps: Mutex::new(HashMap::new()),
-            #[cfg(feature = "gguf-native")]
+            #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
             gpu_pools: Mutex::new(HashMap::new()),
-            #[cfg(feature = "gguf-native")]
+            #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
             cross_device_sched: Mutex::new(CrossDevicePoolScheduler::new(0.85, 2048)),
         })
     }
 
     /// Return the existing pool handle for `device_id` so a new backend can
     /// attach to it before calling load().
-    #[cfg(feature = "gguf-native")]
+    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
     fn get_gpu_pool(&self, device_id: usize) -> Option<GpuPoolHandle> {
         self.gpu_pools
             .lock()
@@ -182,7 +182,7 @@ impl SharedKvStateInner {
     /// Rebalances per-engine caps by model priority weight. If load created a
     /// private pool due to incompatible geometry, it becomes a separate pool
     /// group for future compatible models.
-    #[cfg(feature = "gguf-native")]
+    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
     fn attach_gpu_pool(&self, device_id: usize, model_id: u32, weight: u32, handle: GpuPoolHandle) {
         const MIN_BLOCKS_PER_ENGINE: usize = 64;
         let mut pools = self.gpu_pools.lock();
@@ -352,7 +352,7 @@ impl SharedKvStateInner {
 
     /// Remove a model from the GPU block pool registry and rebalance remaining
     /// members' quota caps.  No-op if the model is not registered.
-    #[cfg(feature = "gguf-native")]
+    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
     fn detach_gpu_pool(&self, model_id: u32) {
         const MIN_BLOCKS_PER_ENGINE: usize = 64;
         let emptied_devices: Vec<usize> = {
@@ -10365,6 +10365,39 @@ fn load_model_blocking(
                         .map_err(|e| {
                             let err: Box<dyn std::error::Error + Send + Sync> = format!(
                                 "Failed to load gguf-native model {} on device {}: {}",
+                                model_id, device.id, e
+                            )
+                            .into();
+                            err
+                        })?;
+                    if let Some(handle) = b.pool_handle() {
+                        shared_kv.attach_gpu_pool(device.id, model_id, priority_weight, handle);
+                    }
+                    let monitored = MonitoringMiddleware::new_with_metrics(
+                        b,
+                        model_id.to_string(),
+                        loader.manifest.version.clone(),
+                        shared_metrics.clone(),
+                    );
+                    let arc: EngineHandle =
+                        Arc::from(Box::new(monitored) as Box<dyn kapsl_engine_api::Engine>);
+                    swap_handles.push(arc.clone());
+                    engines.push(arc);
+                    continue;
+                }
+
+                #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
+                if loader.manifest.framework == "gguf" {
+                    let existing_handle = shared_kv.get_gpu_pool(device.id);
+                    let mut b = BackendFactory::create_gguf_cuda_shared_kv(
+                        device.id as i32,
+                        existing_handle,
+                    )?;
+                    tokio::runtime::Handle::current()
+                        .block_on(b.load(&model_file_path))
+                        .map_err(|e| {
+                            let err: Box<dyn std::error::Error + Send + Sync> = format!(
+                                "Failed to load gguf-cuda-shared-kv model {} on device {}: {}",
                                 model_id, device.id, e
                             )
                             .into();

@@ -9,6 +9,7 @@ default = []
 native = ["kapsl-backends/native"]
 gguf-native = ["kapsl-backends/gguf-native"]
 gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
+gguf-cuda-shared-kv = ["kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
 cuda = ["gguf-cuda"]
 infer-adapter-echo = []
 
