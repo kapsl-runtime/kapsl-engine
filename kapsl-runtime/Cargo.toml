@@ -22,5 +22,4 @@ kapsl-shm = { path = "../../kapsl-sdk/crates/kapsl-shm" }
 kapsl-rag = { path = "../../kapsl-sdk/crates/kapsl-rag" }
 kapsl-rag-sdk = { path = "../../kapsl-sdk/crates/kapsl-rag-sdk" }
 kapsl-kernels = { path = "../../kapsl-sdk/crates/kapsl-kernels" }
-kapsl-loader = { path = "../../kapsl-sdk/crates/kapsl-loader" }
 kapsl-quantization = { path = "../../kapsl-sdk/crates/kapsl-quantization" }
