@@ -4,8 +4,17 @@ version = "0.1.16"
 edition = "2021"
 
 [features]
+# Default build is portable: CPU/standard backends only, no CUDA toolkit required.
 default = []
+native = ["kapsl-backends/native"]
+gguf-native = ["kapsl-backends/gguf-native"]
+gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
+gguf-cuda-shared-kv = ["kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
+cuda = ["gguf-cuda"]
 infer-adapter-echo = []
+
+[build-dependencies]
+cc = "1"
 
 [dependencies]
 kapsl-core = "0.1.0"
