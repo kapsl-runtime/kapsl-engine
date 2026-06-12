@@ -590,6 +590,12 @@
                                         placeholder="/path/to/extension-dir"
                                     />
                                     <button
+                                        id="browse-extension-path-btn"
+                                        class="btn btn-secondary"
+                                        type="button"
+                                        title="Browse server filesystem"
+                                    >Browse…</button>
+                                    <button
                                         class="btn btn-primary"
                                         type="submit"
                                     >
@@ -925,7 +931,7 @@
                 <div class="modal-overlay" onclick="app.closeFileBrowser()"></div>
                 <div class="modal-content modal-content-sm">
                     <div class="modal-header">
-                        <h2>Browse Model Files</h2>
+                        <h2 id="fb-modal-title">Browse</h2>
                         <button class="modal-close" onclick="app.closeFileBrowser()">×</button>
                     </div>
                     <div class="fb-path-bar">

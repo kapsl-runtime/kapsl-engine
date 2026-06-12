@@ -661,6 +661,17 @@ class KapslApp {
     this.updateDeveloperModeUI();
 
     document
+      .getElementById("browse-extension-path-btn")
+      ?.addEventListener("click", () =>
+        this.openFileBrowser(
+          (path) => {
+            document.getElementById("local-extension-path").value = path;
+          },
+          { title: "Browse Extension Directory", dirsOnly: true },
+        ),
+      );
+
+    document
       .getElementById("local-install-form")
       .addEventListener("submit", (event) =>
         this.handleLocalExtensionInstall(event),
@@ -2733,8 +2744,32 @@ class KapslApp {
 
   // ── File browser ────────────────────────────────────────────────────────
 
-  openFileBrowser(callback, startPath = "") {
+  openFileBrowser(callback, { startPath = "", title = "Browse Files", dirsOnly = false } = {}) {
     this.fileBrowserCallback = callback;
+    this.fileBrowserDirsOnly = dirsOnly;
+    const titleEl = document.getElementById("fb-modal-title");
+    if (titleEl) titleEl.textContent = title;
+
+    // Show/hide the "Select this folder" footer button
+    let selectBtn = document.getElementById("fb-select-dir-btn");
+    if (dirsOnly && !selectBtn) {
+      const footer = document.querySelector("#file-browser-modal .modal-footer");
+      selectBtn = document.createElement("button");
+      selectBtn.id = "fb-select-dir-btn";
+      selectBtn.className = "btn btn-primary";
+      selectBtn.type = "button";
+      selectBtn.textContent = "Select This Folder";
+      selectBtn.addEventListener("click", () => {
+        const currentPath = document.getElementById("fb-current-path").textContent;
+        if (this.fileBrowserCallback && currentPath && currentPath !== "—") {
+          this.fileBrowserCallback(currentPath);
+        }
+        this.closeFileBrowser();
+      });
+      footer.insertBefore(selectBtn, footer.firstChild);
+    }
+    if (selectBtn) selectBtn.style.display = dirsOnly ? "" : "none";
+
     document.getElementById("file-browser-modal").classList.add("active");
     this.browseTo(startPath);
   }
@@ -2742,6 +2777,7 @@ class KapslApp {
   closeFileBrowser() {
     document.getElementById("file-browser-modal").classList.remove("active");
     this.fileBrowserCallback = null;
+    this.fileBrowserDirsOnly = false;
   }
 
   async browseTo(path = "") {
@@ -2751,6 +2787,7 @@ class KapslApp {
 
     listEl.innerHTML = '<div class="fb-loading">Loading…</div>';
     feedbackEl.textContent = "";
+    feedbackEl.classList.remove("error");
 
     const params = new URLSearchParams();
     if (path) params.set("path", path);
@@ -2769,17 +2806,21 @@ class KapslApp {
       pathEl.textContent = currentPath || "/";
       listEl.innerHTML = "";
 
-      if (!entries || entries.length === 0) {
-        listEl.innerHTML = '<div class="fb-empty">No model files found here.</div>';
+      const dirsOnly = Boolean(this.fileBrowserDirsOnly);
+
+      const visible = (entries || []).filter(
+        (e) => dirsOnly ? e.is_dir : true,
+      );
+
+      if (!visible.length) {
+        listEl.innerHTML = `<div class="fb-empty">${dirsOnly ? "No subdirectories found here." : "No model files found here."}</div>`;
         return;
       }
 
-      for (const entry of entries) {
+      for (const entry of visible) {
         const row = document.createElement("button");
         row.type = "button";
         row.className = `fb-entry ${entry.is_dir ? "fb-dir" : "fb-file"}`;
-        row.dataset.path = entry.path;
-        row.dataset.isDir = entry.is_dir ? "1" : "0";
 
         const icon = entry.is_dir ? "📁" : "📄";
         const size =
@@ -2792,6 +2833,7 @@ class KapslApp {
           if (entry.is_dir) {
             this.browseTo(entry.path);
           } else {
+            // File selected — fill input and close.
             if (this.fileBrowserCallback) {
               this.fileBrowserCallback(entry.path);
             }
