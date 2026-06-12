@@ -11365,6 +11365,10 @@ async fn main() -> Result<(), DynError> {
     let runtime_samples = Arc::new(RwLock::new(RuntimeSamples::default()));
     let throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let generated_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let total_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let inter_model_relay_state = Arc::new(InterModelRelayState::from_env());
     if inter_model_relay_state.has_routes() {
         log::info!(
@@ -11695,6 +11699,8 @@ async fn main() -> Result<(), DynError> {
     let auto_scaler_api = auto_scaler.clone();
     let runtime_samples_clone = runtime_samples.clone();
     let throughput_samples_clone = throughput_samples.clone();
+    let generated_token_samples_clone = generated_token_samples.clone();
+    let total_token_samples_clone = total_token_samples.clone();
     let onnx_tuning_profile_for_api = onnx_tuning_profile.clone();
 
     let extensions_root = state_layout.extensions_root.clone();
@@ -11770,6 +11776,8 @@ async fn main() -> Result<(), DynError> {
         let replica_pools_for_list = replica_pools_clone.clone();
         let metrics_for_list = shared_metrics_clone.clone();
         let throughput_samples_for_list = throughput_samples_clone.clone();
+        let generated_token_samples_for_list = generated_token_samples_clone.clone();
+        let total_token_samples_for_list = total_token_samples_clone.clone();
         let extension_manager_for_api = extension_manager.clone();
         let running_connectors_for_api = running_connectors.clone();
         let rag_state_for_api = rag_state.clone();
@@ -11784,6 +11792,10 @@ async fn main() -> Result<(), DynError> {
                 memory_usage: usize,
                 gpu_utilization: f64,
                 throughput: f64,
+                prompt_tokens_total: u64,
+                generated_tokens_total: u64,
+                generated_tokens_per_sec: f64,
+                total_tokens_per_sec: f64,
                 healthy: bool,
             }
 
@@ -11792,6 +11804,8 @@ async fn main() -> Result<(), DynError> {
             let now = Instant::now();
             let mut seen_ids = HashSet::new();
             let mut throughput_samples = throughput_samples_for_list.write();
+            let mut generated_token_samples = generated_token_samples_for_list.write();
+            let mut total_token_samples = total_token_samples_for_list.write();
 
             for model in models {
                 seen_ids.insert(model.id);
@@ -11812,7 +11826,14 @@ async fn main() -> Result<(), DynError> {
                         .with_label_values(&[&model_id_str, &err_label])
                         .get();
 
-                let (queue_depth, healthy, engine_memory, engine_gpu_util) =
+                let (
+                    queue_depth,
+                    healthy,
+                    engine_memory,
+                    engine_gpu_util,
+                    prompt_tokens_total,
+                    generated_tokens_total,
+                ) =
                     if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
                         let metrics = pool.get_metrics();
                         (
@@ -11820,9 +11841,11 @@ async fn main() -> Result<(), DynError> {
                             pool.is_healthy(),
                             metrics.memory_usage,
                             metrics.gpu_utilization,
+                            metrics.prompt_tokens_total,
+                            metrics.generated_tokens_total,
                         )
                     } else {
-                        ((0, 0), true, 0, 0.0)
+                        ((0, 0), true, 0, 0.0, 0, 0)
                     };
 
                 // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
@@ -11830,6 +11853,18 @@ async fn main() -> Result<(), DynError> {
                 let memory_usage = engine_memory;
                 let gpu_utilization = engine_gpu_util;
                 let throughput = update_throughput(&mut throughput_samples, model.id, total, now);
+                let generated_tokens_per_sec = update_throughput(
+                    &mut generated_token_samples,
+                    model.id,
+                    generated_tokens_total,
+                    now,
+                );
+                let total_tokens_per_sec = update_throughput(
+                    &mut total_token_samples,
+                    model.id,
+                    prompt_tokens_total.saturating_add(generated_tokens_total),
+                    now,
+                );
 
                 statuses.push(ModelStatus {
                     info: model,
@@ -11839,11 +11874,17 @@ async fn main() -> Result<(), DynError> {
                     memory_usage,
                     gpu_utilization,
                     throughput,
+                    prompt_tokens_total,
+                    generated_tokens_total,
+                    generated_tokens_per_sec,
+                    total_tokens_per_sec,
                     healthy,
                 });
             }
 
             throughput_samples.retain(|id, _| seen_ids.contains(id));
+            generated_token_samples.retain(|id, _| seen_ids.contains(id));
+            total_token_samples.retain(|id, _| seen_ids.contains(id));
             warp::reply::json(&statuses)
         });
 
@@ -11851,6 +11892,8 @@ async fn main() -> Result<(), DynError> {
         let replica_pools_for_get = replica_pools_clone.clone();
         let metrics_for_get = shared_metrics_clone.clone();
         let throughput_samples_for_get = throughput_samples_clone.clone();
+        let generated_token_samples_for_get = generated_token_samples_clone.clone();
+        let total_token_samples_for_get = total_token_samples_clone.clone();
         let get_model =
             warp::path!("api" / "models" / u32)
                 .and(warp::get())
@@ -11867,6 +11910,10 @@ async fn main() -> Result<(), DynError> {
                         memory_usage: usize,
                         gpu_utilization: f64,
                         throughput: f64,
+                        prompt_tokens_total: u64,
+                        generated_tokens_total: u64,
+                        generated_tokens_per_sec: f64,
+                        total_tokens_per_sec: f64,
                         healthy: bool,
                     }
 
@@ -11895,7 +11942,14 @@ async fn main() -> Result<(), DynError> {
                                 .with_label_values(&[&model_id_str, &err_label])
                                 .get();
 
-                            let (queue_depth, healthy, engine_memory, engine_gpu_util) =
+                            let (
+                                queue_depth,
+                                healthy,
+                                engine_memory,
+                                engine_gpu_util,
+                                prompt_tokens_total,
+                                generated_tokens_total,
+                            ) =
                                 if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
                                     let metrics = pool.get_metrics();
                                     (
@@ -11903,9 +11957,11 @@ async fn main() -> Result<(), DynError> {
                                         pool.is_healthy(),
                                         metrics.memory_usage,
                                         metrics.gpu_utilization,
+                                        metrics.prompt_tokens_total,
+                                        metrics.generated_tokens_total,
                                     )
                                 } else {
-                                    ((0, 0), true, 0, 0.0)
+                                    ((0, 0), true, 0, 0.0, 0, 0)
                                 };
 
                             // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
@@ -11922,6 +11978,26 @@ async fn main() -> Result<(), DynError> {
                                     now,
                                 )
                             };
+                            let (generated_tokens_per_sec, total_tokens_per_sec) = {
+                                let now = Instant::now();
+                                let mut generated_token_samples =
+                                    generated_token_samples_for_get.write();
+                                let mut total_token_samples = total_token_samples_for_get.write();
+                                (
+                                    update_throughput(
+                                        &mut generated_token_samples,
+                                        model.id,
+                                        generated_tokens_total,
+                                        now,
+                                    ),
+                                    update_throughput(
+                                        &mut total_token_samples,
+                                        model.id,
+                                        prompt_tokens_total.saturating_add(generated_tokens_total),
+                                        now,
+                                    ),
+                                )
+                            };
 
                             let status = ModelDetailStatus {
                                 info: model,
@@ -11933,6 +12009,10 @@ async fn main() -> Result<(), DynError> {
                                 memory_usage,
                                 gpu_utilization,
                                 throughput,
+                                prompt_tokens_total,
+                                generated_tokens_total,
+                                generated_tokens_per_sec,
+                                total_tokens_per_sec,
                                 healthy,
                             };
 
@@ -14482,6 +14562,14 @@ async fn main() -> Result<(), DynError> {
                         .kv_cache_packed_layers
                         .with_label_values(&[&model_id_str])
                         .set(metrics.kv_cache_packed_layers as i64);
+                    shared_metrics_for_scaler
+                        .prompt_tokens_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.prompt_tokens_total as i64);
+                    shared_metrics_for_scaler
+                        .generated_tokens_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.generated_tokens_total as i64);
 
                     (high + low, healthy as u32, true, metrics.memory_usage)
                 } else {
