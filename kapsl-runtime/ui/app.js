@@ -591,22 +591,10 @@ class KapslApp {
 
   renderRecentPathsDatalist() {
     const dl = document.getElementById("model-path-suggestions");
-    const clearBtn = document.getElementById("clear-recent-paths-btn");
     if (!dl) return;
     dl.innerHTML = this.recentModelPaths
       .map((p) => `<option value="${this.escapeHtml(p)}">`)
       .join("");
-    if (clearBtn) {
-      const n = this.recentModelPaths.length;
-      clearBtn.textContent = n ? `Recent (${n}) ×` : "Recent (0)";
-      clearBtn.disabled = n === 0;
-    }
-  }
-
-  clearRecentPaths() {
-    this.recentModelPaths = [];
-    this.saveRecentPaths();
-    this.renderRecentPathsDatalist();
   }
 
   bindDashboardControls() {
@@ -618,10 +606,6 @@ class KapslApp {
     document
       .getElementById("start-model-clear")
       .addEventListener("click", () => this.clearStartModelForm());
-
-    document
-      .getElementById("clear-recent-paths-btn")
-      ?.addEventListener("click", () => this.clearRecentPaths());
 
     document
       .getElementById("browse-model-path-btn")
