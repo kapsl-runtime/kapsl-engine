@@ -167,6 +167,12 @@
                                                 required
                                             />
                                             <button
+                                                id="browse-model-path-btn"
+                                                class="btn btn-secondary"
+                                                type="button"
+                                                title="Browse server filesystem"
+                                            >Browse…</button>
+                                            <button
                                                 id="clear-recent-paths-btn"
                                                 class="btn btn-secondary"
                                                 type="button"
@@ -919,6 +925,25 @@
                     </section>
                 </div>
             </main>
+
+            <!-- File Browser Modal -->
+            <div id="file-browser-modal" class="modal">
+                <div class="modal-overlay" onclick="app.closeFileBrowser()"></div>
+                <div class="modal-content modal-content-sm">
+                    <div class="modal-header">
+                        <h2>Browse Model Files</h2>
+                        <button class="modal-close" onclick="app.closeFileBrowser()">×</button>
+                    </div>
+                    <div class="fb-path-bar">
+                        <span id="fb-current-path" class="fb-current-path">—</span>
+                    </div>
+                    <div id="fb-feedback" class="status-line"></div>
+                    <div id="fb-list" class="fb-list"></div>
+                    <div class="modal-footer">
+                        <button class="btn btn-secondary" onclick="app.closeFileBrowser()">Cancel</button>
+                    </div>
+                </div>
+            </div>
 
             <!-- Model Detail Modal -->
             <div id="model-modal" class="modal">

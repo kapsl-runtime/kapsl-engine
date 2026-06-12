@@ -45,6 +45,8 @@ class KapslApp {
     this.recentModelPaths = this.loadRecentPaths();
     // Id of the extension whose structured config panel is open.
     this.activeConfigExtensionId = null;
+    // File browser state
+    this.fileBrowserCallback = null;
     this.remoteArtifacts = { remote_url: "", repo: "", available_repos: [], models: [] };
     this.remoteArtifactsLoading = false;
     this.currentRemoteArtifactName = null;
@@ -620,6 +622,14 @@ class KapslApp {
     document
       .getElementById("clear-recent-paths-btn")
       ?.addEventListener("click", () => this.clearRecentPaths());
+
+    document
+      .getElementById("browse-model-path-btn")
+      ?.addEventListener("click", () =>
+        this.openFileBrowser((path) => {
+          document.getElementById("start-model-path").value = path;
+        }),
+      );
 
     this.renderRecentPathsDatalist();
 
@@ -2735,6 +2745,83 @@ class KapslApp {
         </div>
       </div>
     `;
+  }
+
+  // ── File browser ────────────────────────────────────────────────────────
+
+  openFileBrowser(callback, startPath = "") {
+    this.fileBrowserCallback = callback;
+    document.getElementById("file-browser-modal").classList.add("active");
+    this.browseTo(startPath);
+  }
+
+  closeFileBrowser() {
+    document.getElementById("file-browser-modal").classList.remove("active");
+    this.fileBrowserCallback = null;
+  }
+
+  async browseTo(path = "") {
+    const feedbackEl = document.getElementById("fb-feedback");
+    const listEl = document.getElementById("fb-list");
+    const pathEl = document.getElementById("fb-current-path");
+
+    listEl.innerHTML = '<div class="fb-loading">Loading…</div>';
+    feedbackEl.textContent = "";
+
+    const params = new URLSearchParams();
+    if (path) params.set("path", path);
+
+    try {
+      const result = await this.requestJson(
+        `/api/engine/browse${params.toString() ? `?${params}` : ""}`,
+      );
+      if (!result.ok) {
+        throw new Error(
+          result.data?.error || `Browse failed (HTTP ${result.status})`,
+        );
+      }
+
+      const { path: currentPath, entries } = result.data;
+      pathEl.textContent = currentPath || "/";
+      listEl.innerHTML = "";
+
+      if (!entries || entries.length === 0) {
+        listEl.innerHTML = '<div class="fb-empty">No model files found here.</div>';
+        return;
+      }
+
+      for (const entry of entries) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = `fb-entry ${entry.is_dir ? "fb-dir" : "fb-file"}`;
+        row.dataset.path = entry.path;
+        row.dataset.isDir = entry.is_dir ? "1" : "0";
+
+        const icon = entry.is_dir ? "📁" : "📄";
+        const size =
+          !entry.is_dir && entry.size !== undefined && entry.size !== null
+            ? ` <span class="fb-size">${this.formatBytes(entry.size)}</span>`
+            : "";
+        row.innerHTML = `<span class="fb-icon">${icon}</span><span class="fb-name">${this.escapeHtml(entry.name)}</span>${size}`;
+
+        row.addEventListener("click", () => {
+          if (entry.is_dir) {
+            this.browseTo(entry.path);
+          } else {
+            if (this.fileBrowserCallback) {
+              this.fileBrowserCallback(entry.path);
+            }
+            this.closeFileBrowser();
+          }
+        });
+
+        listEl.appendChild(row);
+      }
+    } catch (error) {
+      feedbackEl.textContent = error.message;
+      feedbackEl.classList.add("error");
+      listEl.innerHTML = "";
+    }
   }
 
   clearStartModelForm() {
