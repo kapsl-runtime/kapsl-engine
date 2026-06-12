@@ -595,7 +595,9 @@ class KapslApp {
       .map((p) => `<option value="${this.escapeHtml(p)}">`)
       .join("");
     if (clearBtn) {
-      clearBtn.style.display = this.recentModelPaths.length ? "" : "none";
+      const n = this.recentModelPaths.length;
+      clearBtn.textContent = n ? `Recent (${n}) ×` : "Recent (0)";
+      clearBtn.disabled = n === 0;
     }
   }
 
@@ -3050,9 +3052,11 @@ class KapslApp {
     const block = document.getElementById("engine-remote-result");
     if (!payload) {
       block.textContent = "";
+      block.style.display = "none";
       return;
     }
     block.textContent = JSON.stringify(payload, null, 2);
+    block.style.display = "";
   }
 
   async pullRemoteArtifact(reference) {
