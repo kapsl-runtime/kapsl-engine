@@ -14053,11 +14053,13 @@ async fn main() -> Result<(), DynError> {
         // Static file serving for web UI (from embedded assets)
         let index_route = warp::path::end().and(warp::get()).and_then(|| async {
             if let Some(content) = UiAssets::get("index.html") {
-                Ok::<_, warp::Rejection>(warp::reply::with_header(
-                    content.data.into_owned(),
-                    "content-type",
-                    "text/html; charset=utf-8",
-                ))
+                Ok::<_, warp::Rejection>(
+                    warp::http::Response::builder()
+                        .header("content-type", "text/html; charset=utf-8")
+                        .header("cache-control", "no-cache")
+                        .body(content.data.into_owned())
+                        .unwrap(),
+                )
             } else {
                 Err(warp::reject::not_found())
             }
@@ -14072,11 +14074,13 @@ async fn main() -> Result<(), DynError> {
                     let mime_type = mime_guess::from_path(filename)
                         .first_or_octet_stream()
                         .to_string();
-                    Ok::<_, warp::Rejection>(warp::reply::with_header(
-                        content.data.into_owned(),
-                        "content-type",
-                        mime_type,
-                    ))
+                    Ok::<_, warp::Rejection>(
+                        warp::http::Response::builder()
+                            .header("content-type", mime_type)
+                            .header("cache-control", "no-cache")
+                            .body(content.data.into_owned())
+                            .unwrap(),
+                    )
                 } else {
                     Err(warp::reject::not_found())
                 }
