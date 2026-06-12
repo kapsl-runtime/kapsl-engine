@@ -156,14 +156,25 @@
                                 <form id="start-model-form" class="form-grid">
                                     <label class="field">
                                         <span>Model Path</span>
-                                        <input
-                                            id="start-model-path"
-                                            class="input"
-                                            type="text"
-                                            placeholder="/path/to/model.aimod"
-                                            autocomplete="off"
-                                            required
-                                        />
+                                        <div class="path-picker-row">
+                                            <input
+                                                id="start-model-path"
+                                                class="input"
+                                                type="text"
+                                                list="model-path-suggestions"
+                                                placeholder="/path/to/model.aimod or model.gguf"
+                                                autocomplete="off"
+                                                required
+                                            />
+                                            <button
+                                                id="clear-recent-paths-btn"
+                                                class="btn btn-secondary"
+                                                type="button"
+                                                title="Clear recent paths"
+                                                style="display:none"
+                                            >Recent ×</button>
+                                        </div>
+                                        <datalist id="model-path-suggestions"></datalist>
                                     </label>
                                     <label class="field">
                                         <span>Model ID (optional)</span>
@@ -633,6 +644,8 @@
                                 class="status-line"
                             ></div>
                             <div id="extensions-list" class="stack"></div>
+                            <!-- Extension config modal rendered here by JS -->
+                            <div id="ext-config-modal" class="ext-config-modal" style="display:none"></div>
                         </section>
                     </section>
 

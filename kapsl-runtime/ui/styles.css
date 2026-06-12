@@ -992,6 +992,67 @@ code {
     box-shadow: 0 0 0 4px rgba(11, 107, 203, 0.12);
 }
 
+/* Path picker */
+.path-picker-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.path-picker-row .input {
+    flex: 1;
+}
+
+/* Chip variants */
+.chip-success {
+    background: rgba(19, 117, 71, 0.12);
+    border-color: rgba(19, 117, 71, 0.3);
+    color: var(--ok);
+}
+
+.chip-muted {
+    background: rgba(18, 18, 18, 0.06);
+    color: var(--text-3);
+}
+
+/* Structured extension config form */
+.ext-config-form {
+    margin-top: 12px;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+}
+
+.ext-config-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ext-config-label {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-3);
+}
+
+.ext-config-input {
+    font-size: 13px;
+}
+
+.ext-actions-config {
+    margin-top: 10px;
+}
+
+.ext-config-modal {
+    margin-top: 16px;
+    padding: 20px;
+    background: rgba(11, 107, 203, 0.04);
+    border: 1.5px solid rgba(11, 107, 203, 0.3);
+    border-radius: var(--radius-lg);
+}
+
 .access-grid {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
