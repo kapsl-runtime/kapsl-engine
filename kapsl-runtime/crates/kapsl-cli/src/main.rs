@@ -11796,6 +11796,11 @@ async fn main() -> Result<(), DynError> {
                 generated_tokens_total: u64,
                 generated_tokens_per_sec: f64,
                 total_tokens_per_sec: f64,
+                decode_steps_total: u64,
+                decode_tokens_evaluated_total: u64,
+                avg_tokens_evaluated_per_decode_step: f64,
+                kv_partial_reuse_hits_total: u64,
+                kv_partial_reuse_tokens_saved_total: u64,
                 healthy: bool,
             }
 
@@ -11833,6 +11838,10 @@ async fn main() -> Result<(), DynError> {
                     engine_gpu_util,
                     prompt_tokens_total,
                     generated_tokens_total,
+                    decode_steps_total,
+                    decode_tokens_evaluated_total,
+                    kv_partial_reuse_hits_total,
+                    kv_partial_reuse_tokens_saved_total,
                 ) =
                     if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
                         let metrics = pool.get_metrics();
@@ -11843,9 +11852,13 @@ async fn main() -> Result<(), DynError> {
                             metrics.gpu_utilization,
                             metrics.prompt_tokens_total,
                             metrics.generated_tokens_total,
+                            metrics.decode_steps_total,
+                            metrics.decode_tokens_evaluated_total,
+                            metrics.kv_partial_reuse_hits_total,
+                            metrics.kv_partial_reuse_tokens_saved_total,
                         )
                     } else {
-                        ((0, 0), true, 0, 0.0, 0, 0)
+                        ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0)
                     };
 
                 // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
@@ -11865,6 +11878,11 @@ async fn main() -> Result<(), DynError> {
                     prompt_tokens_total.saturating_add(generated_tokens_total),
                     now,
                 );
+                let avg_tokens_evaluated_per_decode_step = if decode_steps_total > 0 {
+                    decode_tokens_evaluated_total as f64 / decode_steps_total as f64
+                } else {
+                    0.0
+                };
 
                 statuses.push(ModelStatus {
                     info: model,
@@ -11878,6 +11896,11 @@ async fn main() -> Result<(), DynError> {
                     generated_tokens_total,
                     generated_tokens_per_sec,
                     total_tokens_per_sec,
+                    decode_steps_total,
+                    decode_tokens_evaluated_total,
+                    avg_tokens_evaluated_per_decode_step,
+                    kv_partial_reuse_hits_total,
+                    kv_partial_reuse_tokens_saved_total,
                     healthy,
                 });
             }
@@ -11914,6 +11937,11 @@ async fn main() -> Result<(), DynError> {
                         generated_tokens_total: u64,
                         generated_tokens_per_sec: f64,
                         total_tokens_per_sec: f64,
+                        decode_steps_total: u64,
+                        decode_tokens_evaluated_total: u64,
+                        avg_tokens_evaluated_per_decode_step: f64,
+                        kv_partial_reuse_hits_total: u64,
+                        kv_partial_reuse_tokens_saved_total: u64,
                         healthy: bool,
                     }
 
@@ -11949,6 +11977,10 @@ async fn main() -> Result<(), DynError> {
                                 engine_gpu_util,
                                 prompt_tokens_total,
                                 generated_tokens_total,
+                                decode_steps_total,
+                                decode_tokens_evaluated_total,
+                                kv_partial_reuse_hits_total,
+                                kv_partial_reuse_tokens_saved_total,
                             ) =
                                 if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
                                     let metrics = pool.get_metrics();
@@ -11959,9 +11991,13 @@ async fn main() -> Result<(), DynError> {
                                         metrics.gpu_utilization,
                                         metrics.prompt_tokens_total,
                                         metrics.generated_tokens_total,
+                                        metrics.decode_steps_total,
+                                        metrics.decode_tokens_evaluated_total,
+                                        metrics.kv_partial_reuse_hits_total,
+                                        metrics.kv_partial_reuse_tokens_saved_total,
                                     )
                                 } else {
-                                    ((0, 0), true, 0, 0.0, 0, 0)
+                                    ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0)
                                 };
 
                             // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
@@ -11998,6 +12034,13 @@ async fn main() -> Result<(), DynError> {
                                     ),
                                 )
                             };
+                            let avg_tokens_evaluated_per_decode_step =
+                                if decode_steps_total > 0 {
+                                    decode_tokens_evaluated_total as f64
+                                        / decode_steps_total as f64
+                                } else {
+                                    0.0
+                                };
 
                             let status = ModelDetailStatus {
                                 info: model,
@@ -12013,6 +12056,11 @@ async fn main() -> Result<(), DynError> {
                                 generated_tokens_total,
                                 generated_tokens_per_sec,
                                 total_tokens_per_sec,
+                                decode_steps_total,
+                                decode_tokens_evaluated_total,
+                                avg_tokens_evaluated_per_decode_step,
+                                kv_partial_reuse_hits_total,
+                                kv_partial_reuse_tokens_saved_total,
                                 healthy,
                             };
 
@@ -14570,6 +14618,22 @@ async fn main() -> Result<(), DynError> {
                         .generated_tokens_total
                         .with_label_values(&[&model_id_str])
                         .set(metrics.generated_tokens_total as i64);
+                    shared_metrics_for_scaler
+                        .decode_steps_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.decode_steps_total as i64);
+                    shared_metrics_for_scaler
+                        .decode_tokens_evaluated_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.decode_tokens_evaluated_total as i64);
+                    shared_metrics_for_scaler
+                        .kv_partial_reuse_hits_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.kv_partial_reuse_hits_total as i64);
+                    shared_metrics_for_scaler
+                        .kv_partial_reuse_tokens_saved_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
 
                     (high + low, healthy as u32, true, metrics.memory_usage)
                 } else {
