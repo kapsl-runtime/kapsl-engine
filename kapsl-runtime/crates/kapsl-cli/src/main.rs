@@ -295,9 +295,20 @@ impl SharedKvStateInner {
         (allocator, initial_cap, self.scheduler.clone(), engine_id, live_cap)
     }
 
+    /// Detach a single engine (e.g. after its `run_loop` task dies). Removes it
+    /// from the scheduler registry, drops its live KV cap, purges it from the
+    /// model→engine map, and rebalances remaining engines. Idempotent: a second
+    /// call for an already-detached engine is a no-op.
     fn detach_engine(&self, engine_id: u32) {
         self.scheduler.lock().deregister(engine_id);
         self.live_kv_caps.lock().remove(&engine_id);
+        {
+            let mut map = self.model_engine_ids.lock();
+            map.retain(|_, ids| {
+                ids.retain(|&id| id != engine_id);
+                !ids.is_empty()
+            });
+        }
         self.rebalance_kv_caps();
     }
 
@@ -10315,7 +10326,11 @@ fn load_model_blocking(
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap)
                 .with_global_scheduler(global_sched, sched_engine_id)
-                .with_live_kv_cap(live_cap);
+                .with_live_kv_cap(live_cap)
+                .with_on_engine_death({
+                    let sk = shared_kv.clone();
+                    std::sync::Arc::new(move |eid| sk.detach_engine(eid))
+                });
             tokio::runtime::Handle::current()
                 .block_on(backend.load(&model_file_path))
                 .map_err(|e| {
@@ -10698,7 +10713,11 @@ async fn load_model(
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap)
                 .with_global_scheduler(global_sched, sched_engine_id)
-                .with_live_kv_cap(live_cap);
+                .with_live_kv_cap(live_cap)
+                .with_on_engine_death({
+                    let sk = shared_kv.clone();
+                    std::sync::Arc::new(move |eid| sk.detach_engine(eid))
+                });
             backend.load(&model_file_path).await.map_err(|e| {
                 let err: Box<dyn std::error::Error + Send + Sync> =
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
@@ -11009,7 +11028,11 @@ async fn scale_up_model(
             .with_shared_pool(kv_pool)
             .with_kv_blocks_cap(kv_blocks_cap)
             .with_global_scheduler(global_sched, sched_engine_id)
-            .with_live_kv_cap(live_cap);
+            .with_live_kv_cap(live_cap)
+            .with_on_engine_death({
+                let sk = shared_kv.clone();
+                std::sync::Arc::new(move |eid| sk.detach_engine(eid))
+            });
         backend.load(&model_file_path).await.map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
