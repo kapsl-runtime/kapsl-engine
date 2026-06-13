@@ -113,9 +113,9 @@ struct SharedKvStateInner {
     /// Per-device shared KV block allocators (lazily created).
     pools: Mutex<HashMap<usize, SharedBlockAllocator>>,
     /// Cross-model token-budget coordinator (hard admission gate in Phase 2).
-    /// Wrapped in Arc<std::sync::Mutex> so it can be shared with LLMBackend
-    /// instances without pulling parking_lot into kapsl-llm.
-    scheduler: std::sync::Arc<std::sync::Mutex<GlobalKvScheduler>>,
+    /// Uses parking_lot::Mutex so a panic in one engine's thread cannot poison
+    /// the lock and propagate to all other engines.
+    scheduler: Arc<parking_lot::Mutex<GlobalKvScheduler>>,
     /// Monotonically increasing counter for stable engine IDs.
     next_engine_id: AtomicU32,
     /// model_id → engine_ids assigned by attach_engine (supports multiple replicas).
@@ -154,7 +154,7 @@ impl SharedKvStateInner {
         Arc::new(Self {
             device_bytes,
             pools: Mutex::new(HashMap::new()),
-            scheduler: std::sync::Arc::new(std::sync::Mutex::new(
+            scheduler: Arc::new(parking_lot::Mutex::new(
                 GlobalKvScheduler::new(estimated_kv_tokens.max(16_384)),
             )),
             next_engine_id: AtomicU32::new(1),
@@ -269,10 +269,10 @@ impl SharedKvStateInner {
         device_id: usize,
         model_id: u32,
         weight: u32,
-    ) -> (SharedBlockAllocator, usize, std::sync::Arc<std::sync::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
+    ) -> (SharedBlockAllocator, usize, Arc<parking_lot::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
-        self.scheduler.lock().unwrap().register(KvEngineHandle {
+        self.scheduler.lock().register(KvEngineHandle {
             engine_id,
             share_weight: weight.max(1),
             guaranteed_min_tokens: 0,
@@ -296,7 +296,7 @@ impl SharedKvStateInner {
     }
 
     fn detach_engine(&self, engine_id: u32) {
-        self.scheduler.lock().unwrap().deregister(engine_id);
+        self.scheduler.lock().deregister(engine_id);
         self.live_kv_caps.lock().remove(&engine_id);
         self.rebalance_kv_caps();
     }
@@ -304,7 +304,7 @@ impl SharedKvStateInner {
     /// Deregister all engines for a model (call on full model stop/remove).
     fn detach_engine_for_model(&self, model_id: u32) {
         if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
-            let mut sched = self.scheduler.lock().unwrap();
+            let mut sched = self.scheduler.lock();
             let mut caps  = self.live_kv_caps.lock();
             for id in ids {
                 sched.deregister(id);
@@ -323,7 +323,7 @@ impl SharedKvStateInner {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
 
-        let budgets = self.scheduler.lock().unwrap().allocate_budgets();
+        let budgets = self.scheduler.lock().allocate_budgets();
         if budgets.is_empty() { return; }
 
         let total_tokens: usize = budgets.iter().map(|b| b.max_tokens).sum::<usize>().max(1);
