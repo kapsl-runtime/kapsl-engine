@@ -2100,6 +2100,7 @@ dependencies = [
  "log",
  "ndarray",
  "ort",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

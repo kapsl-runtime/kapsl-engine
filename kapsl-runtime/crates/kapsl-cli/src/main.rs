@@ -113,9 +113,9 @@ struct SharedKvStateInner {
     /// Per-device shared KV block allocators (lazily created).
     pools: Mutex<HashMap<usize, SharedBlockAllocator>>,
     /// Cross-model token-budget coordinator (hard admission gate in Phase 2).
-    /// Wrapped in Arc<std::sync::Mutex> so it can be shared with LLMBackend
-    /// instances without pulling parking_lot into kapsl-llm.
-    scheduler: std::sync::Arc<std::sync::Mutex<GlobalKvScheduler>>,
+    /// Uses parking_lot::Mutex so a panic in one engine's thread cannot poison
+    /// the lock and propagate to all other engines.
+    scheduler: Arc<parking_lot::Mutex<GlobalKvScheduler>>,
     /// Monotonically increasing counter for stable engine IDs.
     next_engine_id: AtomicU32,
     /// model_id → engine_ids assigned by attach_engine (supports multiple replicas).
@@ -154,7 +154,7 @@ impl SharedKvStateInner {
         Arc::new(Self {
             device_bytes,
             pools: Mutex::new(HashMap::new()),
-            scheduler: std::sync::Arc::new(std::sync::Mutex::new(
+            scheduler: Arc::new(parking_lot::Mutex::new(
                 GlobalKvScheduler::new(estimated_kv_tokens.max(16_384)),
             )),
             next_engine_id: AtomicU32::new(1),
@@ -269,10 +269,10 @@ impl SharedKvStateInner {
         device_id: usize,
         model_id: u32,
         weight: u32,
-    ) -> (SharedBlockAllocator, usize, std::sync::Arc<std::sync::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
+    ) -> (SharedBlockAllocator, usize, Arc<parking_lot::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
-        self.scheduler.lock().unwrap().register(KvEngineHandle {
+        self.scheduler.lock().register(KvEngineHandle {
             engine_id,
             share_weight: weight.max(1),
             guaranteed_min_tokens: 0,
@@ -295,16 +295,27 @@ impl SharedKvStateInner {
         (allocator, initial_cap, self.scheduler.clone(), engine_id, live_cap)
     }
 
+    /// Detach a single engine (e.g. after its `run_loop` task dies). Removes it
+    /// from the scheduler registry, drops its live KV cap, purges it from the
+    /// model→engine map, and rebalances remaining engines. Idempotent: a second
+    /// call for an already-detached engine is a no-op.
     fn detach_engine(&self, engine_id: u32) {
-        self.scheduler.lock().unwrap().deregister(engine_id);
+        self.scheduler.lock().deregister(engine_id);
         self.live_kv_caps.lock().remove(&engine_id);
+        {
+            let mut map = self.model_engine_ids.lock();
+            map.retain(|_, ids| {
+                ids.retain(|&id| id != engine_id);
+                !ids.is_empty()
+            });
+        }
         self.rebalance_kv_caps();
     }
 
     /// Deregister all engines for a model (call on full model stop/remove).
     fn detach_engine_for_model(&self, model_id: u32) {
         if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
-            let mut sched = self.scheduler.lock().unwrap();
+            let mut sched = self.scheduler.lock();
             let mut caps  = self.live_kv_caps.lock();
             for id in ids {
                 sched.deregister(id);
@@ -323,7 +334,7 @@ impl SharedKvStateInner {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
 
-        let budgets = self.scheduler.lock().unwrap().allocate_budgets();
+        let budgets = self.scheduler.lock().allocate_budgets();
         if budgets.is_empty() { return; }
 
         let total_tokens: usize = budgets.iter().map(|b| b.max_tokens).sum::<usize>().max(1);
@@ -10315,7 +10326,11 @@ fn load_model_blocking(
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap)
                 .with_global_scheduler(global_sched, sched_engine_id)
-                .with_live_kv_cap(live_cap);
+                .with_live_kv_cap(live_cap)
+                .with_on_engine_death({
+                    let sk = shared_kv.clone();
+                    std::sync::Arc::new(move |eid| sk.detach_engine(eid))
+                });
             tokio::runtime::Handle::current()
                 .block_on(backend.load(&model_file_path))
                 .map_err(|e| {
@@ -10698,7 +10713,11 @@ async fn load_model(
                 .with_shared_pool(kv_pool)
                 .with_kv_blocks_cap(kv_blocks_cap)
                 .with_global_scheduler(global_sched, sched_engine_id)
-                .with_live_kv_cap(live_cap);
+                .with_live_kv_cap(live_cap)
+                .with_on_engine_death({
+                    let sk = shared_kv.clone();
+                    std::sync::Arc::new(move |eid| sk.detach_engine(eid))
+                });
             backend.load(&model_file_path).await.map_err(|e| {
                 let err: Box<dyn std::error::Error + Send + Sync> =
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
@@ -11009,7 +11028,11 @@ async fn scale_up_model(
             .with_shared_pool(kv_pool)
             .with_kv_blocks_cap(kv_blocks_cap)
             .with_global_scheduler(global_sched, sched_engine_id)
-            .with_live_kv_cap(live_cap);
+            .with_live_kv_cap(live_cap)
+            .with_on_engine_death({
+                let sk = shared_kv.clone();
+                std::sync::Arc::new(move |eid| sk.detach_engine(eid))
+            });
         backend.load(&model_file_path).await.map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
