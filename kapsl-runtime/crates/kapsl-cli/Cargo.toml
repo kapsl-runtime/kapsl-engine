@@ -11,6 +11,9 @@ gguf-native = ["kapsl-backends/gguf-native"]
 gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
 gguf-cuda-shared-kv = ["kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
 cuda = ["gguf-cuda"]
+# Run PyTorch-family models via an out-of-process Python sidecar (no native
+# libtorch dep). Models with manifest framework "pytorch" route to PyTorchBackend.
+pytorch = ["kapsl-backends/pytorch"]
 infer-adapter-echo = []
 
 [build-dependencies]
