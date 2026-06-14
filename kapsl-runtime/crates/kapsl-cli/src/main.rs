@@ -1094,6 +1094,7 @@ const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
 const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
 const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
 const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
+const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
 const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
@@ -8808,6 +8809,18 @@ fn resolve_isolate_process(manifest: &Manifest) -> bool {
     manifest_llm_flag(manifest, "isolate_process").unwrap_or(false)
 }
 
+/// Whether process isolation is *required* (fail-closed). When true, a model
+/// that requested isolation but whose worker cannot start fails to load instead
+/// of silently falling back to in-process — which would drop the isolation
+/// guarantee and rejoin the shared KV pool. Defaults to false for backward
+/// compatibility (silent fallback preserved, but logged prominently).
+fn resolve_isolate_process_strict(manifest: &Manifest) -> bool {
+    if let Some(env) = parse_env_bool(LLM_ISOLATE_PROCESS_STRICT_ENV) {
+        return env;
+    }
+    manifest_llm_flag(manifest, "isolate_process_strict").unwrap_or(false)
+}
+
 fn resolve_scheduler_tuning_for_framework(
     manifest: &Manifest,
     scheduler_max_micro_batch: usize,
@@ -10190,8 +10203,13 @@ fn load_model_blocking(
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
-        log::info!("✓ Process isolation enabled for Model ID {}", model_id);
+        log::info!(
+            "✓ Process isolation enabled for Model ID {} (strict={})",
+            model_id,
+            isolate_strict
+        );
     }
 
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
@@ -10576,8 +10594,13 @@ async fn load_model(
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
-        log::info!("✓ Process isolation enabled for Model ID {}", model_id);
+        log::info!(
+            "✓ Process isolation enabled for Model ID {} (strict={})",
+            model_id,
+            isolate_strict
+        );
     }
 
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
