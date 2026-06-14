@@ -9160,9 +9160,20 @@ fn select_mesh_devices(
             }
         }
     } else {
-        selected = device_info.devices.clone();
+        let best_provider = device_info.get_best_provider().to_ascii_lowercase();
+        selected = device_info
+            .devices
+            .iter()
+            .filter(|d| d.backend.to_string().to_ascii_lowercase() == best_provider)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            selected = device_info.devices.clone();
+        }
         if let Some(dev_id) = preferred_device_id {
-            selected.retain(|d| d.id == dev_id);
+            if best_provider != "cpu" {
+                selected.retain(|d| d.id == dev_id);
+            }
         }
     }
 
