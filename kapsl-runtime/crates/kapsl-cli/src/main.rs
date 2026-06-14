@@ -14634,6 +14634,10 @@ async fn main() -> Result<(), DynError> {
                         .with_label_values(&[&model_id_str])
                         .set(metrics.kv_cache_packed_layers as i64);
                     shared_metrics_for_scaler
+                        .kv_cache_cpu_offloaded_blocks
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
+                    shared_metrics_for_scaler
                         .prompt_tokens_total
                         .with_label_values(&[&model_id_str])
                         .set(metrics.prompt_tokens_total as i64);
