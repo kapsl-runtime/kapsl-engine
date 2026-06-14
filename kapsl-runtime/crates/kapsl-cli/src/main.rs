@@ -14657,6 +14657,10 @@ async fn main() -> Result<(), DynError> {
                         .kv_partial_reuse_tokens_saved_total
                         .with_label_values(&[&model_id_str])
                         .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
+                    shared_metrics_for_scaler
+                        .engine_health
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.engine_health as i64);
 
                     (high + low, healthy as u32, true, metrics.memory_usage)
                 } else {
