@@ -8,7 +8,7 @@
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link
-            href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+            href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
             rel="stylesheet"
         />
     </head>
@@ -59,6 +59,129 @@
         </div>
 
         <div id="app-shell" class="app-shell locked">
+            <!-- Sidebar Navigation -->
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-header">
+                    <div class="sidebar-brand">
+                        <div class="brand-mark" aria-hidden="true">K</div>
+                        <div>
+                            <div class="sidebar-brand-text">Kapsl</div>
+                            <div class="sidebar-brand-sub">Runtime Console</div>
+                        </div>
+                    </div>
+                    <button class="sidebar-toggle" id="sidebar-toggle-btn" aria-label="Toggle Sidebar" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="15 18 9 12 15 6"></polyline>
+                        </svg>
+                    </button>
+                </div>
+
+                <nav class="sidebar-nav" aria-label="Primary">
+                    <div class="sidebar-section-label">Navigation</div>
+                    <button
+                        class="nav-item sidebar-item active"
+                        type="button"
+                        data-view="dashboard"
+                    >
+                        <span class="sidebar-item-icon">
+                            <svg viewBox="0 0 24 24">
+                                <rect x="3" y="3" width="7" height="9" rx="1"></rect>
+                                <rect x="14" y="3" width="7" height="5" rx="1"></rect>
+                                <rect x="14" y="12" width="7" height="9" rx="1"></rect>
+                                <rect x="3" y="16" width="7" height="5" rx="1"></rect>
+                            </svg>
+                        </span>
+                        <span class="sidebar-item-label">Dashboard</span>
+                    </button>
+                    <button
+                        class="nav-item sidebar-item"
+                        type="button"
+                        data-view="system"
+                    >
+                        <span class="sidebar-item-icon">
+                            <svg viewBox="0 0 24 24">
+                                <line x1="18" y1="20" x2="18" y2="10"></line>
+                                <line x1="12" y1="20" x2="12" y2="4"></line>
+                                <line x1="6" y1="20" x2="6" y2="14"></line>
+                            </svg>
+                        </span>
+                        <span class="sidebar-item-label">System</span>
+                    </button>
+                    <button
+                        class="nav-item sidebar-item"
+                        type="button"
+                        data-view="extensions"
+                    >
+                        <span class="sidebar-item-icon">
+                            <svg viewBox="0 0 24 24">
+                                <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                                <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                                <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                            </svg>
+                        </span>
+                        <span class="sidebar-item-label">Extensions</span>
+                    </button>
+                    <button
+                        class="nav-item sidebar-item"
+                        type="button"
+                        data-view="access"
+                    >
+                        <span class="sidebar-item-icon">
+                            <svg viewBox="0 0 24 24">
+                                <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                            </svg>
+                        </span>
+                        <span class="sidebar-item-label">Access</span>
+                    </button>
+                </nav>
+
+                <div class="sidebar-footer">
+                    <div class="sidebar-session">
+                        <span class="sidebar-session-dot connected"></span>
+                        <span>Live Connection</span>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- Mobile Sidebar Overlay -->
+            <div class="sidebar-overlay" id="sidebar-overlay"></div>
+
+            <!-- Topbar -->
+            <div class="topbar">
+                <button class="topbar-mobile-toggle" id="topbar-mobile-toggle-btn" aria-label="Open navigation menu" type="button">
+                    <svg viewBox="0 0 24 24">
+                        <line x1="3" y1="12" x2="21" y2="12"></line>
+                        <line x1="3" y1="6" x2="21" y2="6"></line>
+                        <line x1="3" y1="18" x2="21" y2="18"></line>
+                    </svg>
+                </button>
+                <div class="topbar-title">Runtime Console</div>
+                <div class="topbar-stats">
+                    <div class="stat-chip">
+                        <span class="stat-chip-label">Status:</span>
+                        <span class="stat-chip-value" id="system-status">
+                            <span class="status-dot status-loading"></span>
+                            <span>Loading...</span>
+                        </span>
+                    </div>
+                    <div class="stat-chip">
+                        <span class="stat-chip-label">Models:</span>
+                        <span class="stat-chip-value" id="total-models">0</span>
+                    </div>
+                    <div class="stat-chip">
+                        <span class="stat-chip-label">Active:</span>
+                        <span class="stat-chip-value" id="total-active">0</span>
+                    </div>
+                    <div class="stat-chip">
+                        <span class="stat-chip-label">Session:</span>
+                        <span class="stat-chip-value" id="session-status">Locked</span>
+                        <span id="session-detail" style="display: none;"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Legacy Header kept for backward compat (hidden by CSS) -->
             <header class="header">
                 <div class="header-content">
                     <div class="brand">
@@ -103,25 +226,25 @@
                     <div class="header-stats">
                         <div class="stat-card">
                             <div class="stat-label">System Status</div>
-                            <div class="stat-value" id="system-status">
+                            <div class="stat-value" id="legacy-system-status">
                                 <span class="status-dot status-loading"></span>
                                 <span>Loading...</span>
                             </div>
                         </div>
                         <div class="stat-card">
                             <div class="stat-label">Total Models</div>
-                            <div class="stat-value" id="total-models">0</div>
+                            <div class="stat-value" id="legacy-total-models">0</div>
                         </div>
                         <div class="stat-card">
                             <div class="stat-label">Active Inferences</div>
-                            <div class="stat-value" id="total-active">0</div>
+                            <div class="stat-value" id="legacy-total-active">0</div>
                         </div>
                         <div class="stat-card">
                             <div class="stat-label">Session</div>
-                            <div class="stat-value" id="session-status">
+                            <div class="stat-value" id="legacy-session-status">
                                 Locked
                             </div>
-                            <div class="stat-meta" id="session-detail">
+                            <div class="stat-meta" id="legacy-session-detail">
                                 mode: locked
                             </div>
                         </div>
