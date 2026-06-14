@@ -10288,8 +10288,15 @@ fn load_model_blocking(
                 Ok(()) => Some(Arc::new(worker)),
                 Err(e) => {
                     worker.kill();
+                    if isolate_strict {
+                        return Err(format!(
+                            "Model {} requires process isolation but the worker was not ready: {}",
+                            model_id, e
+                        )
+                        .into());
+                    }
                     log::warn!(
-                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                         model_id,
                         e
                     );
@@ -10297,8 +10304,15 @@ fn load_model_blocking(
                 }
             },
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Model {} requires process isolation but the worker failed to spawn: {}",
+                        model_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     model_id,
                     e
                 );
@@ -10680,8 +10694,15 @@ async fn load_model(
                 Ok(()) => Some(Arc::new(worker)),
                 Err(e) => {
                     worker.kill();
+                    if isolate_strict {
+                        return Err(format!(
+                            "Model {} requires process isolation but the worker was not ready: {}",
+                            model_id, e
+                        )
+                        .into());
+                    }
                     log::warn!(
-                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                         model_id,
                         e
                     );
@@ -10689,8 +10710,15 @@ async fn load_model(
                 }
             },
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Model {} requires process isolation but the worker failed to spawn: {}",
+                        model_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     model_id,
                     e
                 );
@@ -10951,6 +10979,7 @@ async fn scale_up_model(
         })?;
 
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     let worker = if isolate_process {
         match spawn_worker_process(
             unique_id,
@@ -10969,8 +10998,15 @@ async fn scale_up_model(
                     Ok(()) => Some(worker),
                     Err(e) => {
                         worker.kill();
+                        if isolate_strict {
+                            return Err(format!(
+                                "Replica {} requires process isolation but the worker was not ready: {}",
+                                replica_id, e
+                            )
+                            .into());
+                        }
                         log::warn!(
-                            "Replica {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                            "Replica {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                             replica_id,
                             e
                         );
@@ -10979,8 +11015,15 @@ async fn scale_up_model(
                 }
             }
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Replica {} requires process isolation but the worker failed to spawn: {}",
+                        replica_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Replica {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Replica {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     replica_id,
                     e
                 );
