@@ -11,12 +11,6 @@ esaxx-rs = { path = "patches/esaxx-rs" }
 llama-cpp-2 = { path = "patches/llama-cpp-2" }
 [patch.crates-io]
 llama-cpp-sys-2 = { path = "patches/llama-cpp-2" }
-
-llama-cpp-2 = {
-  git = "https://github.com/kapsl-runtime/kapsl-sdk.git",
-  branch = "main",
-  package = "llama-cpp-2"
-}
 kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
 kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
 kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
