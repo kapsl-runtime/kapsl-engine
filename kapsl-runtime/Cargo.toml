@@ -8,7 +8,7 @@ resolver = "2"
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
 llama-cpp-sys-2 = { path = "https://github.com/kapsl-runtime/llama.cpp.git", branch = "master" }
-llama-cpp-2 = { path = "../../kapsl-sdk/patches/llama-cpp-2", branch = "master" }
+llama-cpp-2 = { path = "https://github.com/kapsl-runtime/llama.cpp.git", branch = "master" }
 kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
 kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
 kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
