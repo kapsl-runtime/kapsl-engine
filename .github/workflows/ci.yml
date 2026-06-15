@@ -34,6 +34,12 @@ jobs:
           toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
 
+      - name: Enable long paths on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
@@ -69,6 +75,12 @@ jobs:
         with:
           toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
+
+      - name: Enable long paths on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2

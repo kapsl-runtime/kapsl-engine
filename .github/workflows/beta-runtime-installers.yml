@@ -46,6 +46,12 @@ jobs:
             Add-Content -Path $env:GITHUB_PATH -Value $wixBin
           }
 
+      - name: Enable long paths on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+
       - name: Resolve beta version (Unix)
         if: runner.os != 'Windows'
         run: |
