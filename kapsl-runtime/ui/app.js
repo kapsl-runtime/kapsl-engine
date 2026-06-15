@@ -65,6 +65,7 @@ class KapslApp {
   init() {
     this.bindLoginControls();
     this.bindNavigation();
+    this.bindSidebar();
     this.bindDashboardControls();
     this.bindExtensionsControls();
     this.bindLegacyTokenControls();
@@ -506,10 +507,78 @@ class KapslApp {
         if (view) {
           this.setView(view);
         }
+        // Auto-close mobile sidebar if open
+        const sidebar = document.getElementById("sidebar");
+        const overlay = document.getElementById("sidebar-overlay");
+        if (sidebar && sidebar.classList.contains("mobile-open")) {
+          sidebar.classList.remove("mobile-open");
+          if (overlay) {
+            overlay.classList.remove("active");
+          }
+        }
       });
     }
 
     window.addEventListener("hashchange", () => this.applyInitialView());
+  }
+
+  bindSidebar() {
+    const sidebar = document.getElementById("sidebar");
+    const appShell = document.getElementById("app-shell");
+    const toggleBtn = document.getElementById("sidebar-toggle-btn");
+    const mobileToggleBtn = document.getElementById("topbar-mobile-toggle-btn");
+    const overlay = document.getElementById("sidebar-overlay");
+
+    if (!sidebar || !appShell) return;
+
+    // Load initial collapsed state
+    const isCollapsed = localStorage.getItem("kapsl_sidebar_collapsed") === "1";
+    if (isCollapsed) {
+      sidebar.classList.add("collapsed");
+      appShell.classList.add("sidebar-collapsed");
+      this.updateSidebarToggleIcon(true);
+    }
+
+    // Sidebar collapse/expand toggle
+    if (toggleBtn) {
+      toggleBtn.addEventListener("click", () => {
+        const collapsed = sidebar.classList.toggle("collapsed");
+        appShell.classList.toggle("sidebar-collapsed", collapsed);
+        localStorage.setItem("kapsl_sidebar_collapsed", collapsed ? "1" : "0");
+        this.updateSidebarToggleIcon(collapsed);
+      });
+    }
+
+    // Mobile sidebar toggle open
+    if (mobileToggleBtn) {
+      mobileToggleBtn.addEventListener("click", () => {
+        sidebar.classList.add("mobile-open");
+        if (overlay) {
+          overlay.classList.add("active");
+        }
+      });
+    }
+
+    // Mobile sidebar close via overlay
+    if (overlay) {
+      overlay.addEventListener("click", () => {
+        sidebar.classList.remove("mobile-open");
+        overlay.classList.remove("active");
+      });
+    }
+  }
+
+  updateSidebarToggleIcon(collapsed) {
+    const toggleBtn = document.getElementById("sidebar-toggle-btn");
+    if (!toggleBtn) return;
+    const svg = toggleBtn.querySelector("svg");
+    if (!svg) return;
+    
+    if (collapsed) {
+      svg.innerHTML = '<polyline points="9 18 15 12 9 6"></polyline>';
+    } else {
+      svg.innerHTML = '<polyline points="15 18 9 12 15 6"></polyline>';
+    }
   }
 
   applyInitialView() {
