@@ -1094,6 +1094,7 @@ const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
 const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
 const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
 const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
+const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
 const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
@@ -8808,6 +8809,18 @@ fn resolve_isolate_process(manifest: &Manifest) -> bool {
     manifest_llm_flag(manifest, "isolate_process").unwrap_or(false)
 }
 
+/// Whether process isolation is *required* (fail-closed). When true, a model
+/// that requested isolation but whose worker cannot start fails to load instead
+/// of silently falling back to in-process — which would drop the isolation
+/// guarantee and rejoin the shared KV pool. Defaults to false for backward
+/// compatibility (silent fallback preserved, but logged prominently).
+fn resolve_isolate_process_strict(manifest: &Manifest) -> bool {
+    if let Some(env) = parse_env_bool(LLM_ISOLATE_PROCESS_STRICT_ENV) {
+        return env;
+    }
+    manifest_llm_flag(manifest, "isolate_process_strict").unwrap_or(false)
+}
+
 fn resolve_scheduler_tuning_for_framework(
     manifest: &Manifest,
     scheduler_max_micro_batch: usize,
@@ -9621,9 +9634,31 @@ fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
     Some((avg_util, mem_bytes, mem_capacity_bytes))
 }
 
+/// Everything needed to (re)spawn an isolated worker child for a model, so the
+/// supervisor can restart a dead worker without re-deriving arguments.
+#[derive(Clone)]
+struct WorkerSpec {
+    model_id: u32,
+    model_path: PathBuf,
+    batch_size: usize,
+    scheduler_queue_size: usize,
+    scheduler_max_micro_batch: usize,
+    scheduler_queue_delay_ms: u64,
+    topology: String,
+    tp_degree: usize,
+    onnx_tuning: OnnxRuntimeTuning,
+}
+
 struct WorkerProcess {
     socket_path: String,
     child: Mutex<Child>,
+    /// Spec used to respawn this worker on death.
+    spec: WorkerSpec,
+    /// Set when the worker is intentionally torn down (kill/Drop) so the
+    /// supervisor stops and never resurrects a deliberately-stopped worker.
+    shutdown: AtomicBool,
+    /// Number of automatic restarts performed (bounds the restart budget).
+    restarts: AtomicU32,
 }
 
 impl WorkerProcess {
@@ -9632,10 +9667,29 @@ impl WorkerProcess {
     }
 
     fn kill(&self) {
+        // Mark shutdown first so the supervisor won't try to restart it.
+        self.shutdown.store(true, Ordering::Relaxed);
         let mut child = self.child.lock();
         if let Ok(None) = child.try_wait() {
             let _ = child.kill();
         }
+    }
+
+    /// Respawn the child process bound to the same socket path. The previous
+    /// (dead) child handle is replaced. Unix-only; no-op error elsewhere.
+    #[cfg(unix)]
+    fn restart_child(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if Path::new(&self.socket_path).exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+        let child = build_worker_command(&self.spec, &self.socket_path)?.spawn()?;
+        *self.child.lock() = child;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn restart_child(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("Isolated workers are only supported on unix platforms".into())
     }
 }
 
@@ -9643,6 +9697,71 @@ impl Drop for WorkerProcess {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// Supervise an isolated worker: restart it (bounded retries with backoff) if it
+/// dies unexpectedly, so an isolated model recovers from a crash instead of
+/// staying down. Exits when the worker is intentionally shut down. Returns the
+/// same `Arc` for convenience.
+fn start_worker_with_supervisor(worker: Arc<WorkerProcess>) -> Arc<WorkerProcess> {
+    const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+    const RESTART_BACKOFF: Duration = Duration::from_secs(2);
+    const MAX_RESTARTS: u32 = 5;
+    const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let w = worker.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+            if w.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            // Still alive — nothing to do.
+            let Some(status) = w.try_wait() else {
+                continue;
+            };
+            if w.restarts.load(Ordering::Relaxed) >= MAX_RESTARTS {
+                log::error!(
+                    "[worker-supervisor] model {} exited ({}); exceeded {} restarts, giving up",
+                    w.spec.model_id,
+                    status,
+                    MAX_RESTARTS
+                );
+                break;
+            }
+            let attempt = w.restarts.fetch_add(1, Ordering::Relaxed) + 1;
+            log::warn!(
+                "[worker-supervisor] model {} exited ({}); restarting (attempt {}/{})",
+                w.spec.model_id,
+                status,
+                attempt,
+                MAX_RESTARTS
+            );
+            tokio::time::sleep(RESTART_BACKOFF).await;
+            if w.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            match w.restart_child() {
+                Ok(()) => match wait_for_worker_ready_async(&w, READY_TIMEOUT).await {
+                    Ok(()) => log::info!(
+                        "[worker-supervisor] model {} restarted successfully",
+                        w.spec.model_id
+                    ),
+                    Err(e) => log::error!(
+                        "[worker-supervisor] model {} restarted but not ready: {}",
+                        w.spec.model_id,
+                        e
+                    ),
+                },
+                Err(e) => log::error!(
+                    "[worker-supervisor] model {} restart spawn failed: {}",
+                    w.spec.model_id,
+                    e
+                ),
+            }
+        }
+    });
+    worker
 }
 
 #[cfg(unix)]
@@ -9659,6 +9778,66 @@ fn socket_ready(_socket_path: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Build the `Command` that launches an isolated worker child for `spec`, bound
+/// to `socket_path`. Shared by initial spawn and supervisor restart.
+#[cfg(unix)]
+fn build_worker_command(
+    spec: &WorkerSpec,
+    socket_path: &str,
+) -> Result<Command, Box<dyn std::error::Error + Send + Sync>> {
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--worker")
+        .arg("--worker-model-id")
+        .arg(spec.model_id.to_string())
+        .arg("--model")
+        .arg(&spec.model_path)
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--transport")
+        .arg("socket")
+        .arg("--batch-size")
+        .arg(spec.batch_size.to_string())
+        .arg("--scheduler-queue-size")
+        .arg(spec.scheduler_queue_size.to_string())
+        .arg("--scheduler-max-micro-batch")
+        .arg(spec.scheduler_max_micro_batch.to_string())
+        .arg("--scheduler-queue-delay-ms")
+        .arg(spec.scheduler_queue_delay_ms.to_string())
+        .arg("--topology")
+        .arg(&spec.topology)
+        .arg("--tp-degree")
+        .arg(spec.tp_degree.to_string())
+        .env(LLM_ISOLATE_PROCESS_ENV, "0");
+    let onnx_tuning = &spec.onnx_tuning;
+    if let Some(value) = onnx_tuning.memory_pattern {
+        command.arg("--onnx-memory-pattern").arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.disable_cpu_mem_arena {
+        command
+            .arg("--onnx-disable-cpu-mem-arena")
+            .arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.session_buckets {
+        command.arg("--onnx-session-buckets").arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.bucket_dim_granularity {
+        command
+            .arg("--onnx-bucket-dim-granularity")
+            .arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.bucket_max_dims {
+        command.arg("--onnx-bucket-max-dims").arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.peak_concurrency_hint {
+        command
+            .arg("--onnx-peak-concurrency-hint")
+            .arg(value.to_string());
+    }
+    Ok(command)
+}
+
 fn spawn_worker_process(
     model_id: u32,
     model_path: &Path,
@@ -9670,19 +9849,21 @@ fn spawn_worker_process(
     tp_degree: usize,
     onnx_tuning: &OnnxRuntimeTuning,
 ) -> Result<WorkerProcess, Box<dyn std::error::Error + Send + Sync>> {
+    let spec = WorkerSpec {
+        model_id,
+        model_path: model_path.to_path_buf(),
+        batch_size,
+        scheduler_queue_size,
+        scheduler_max_micro_batch,
+        scheduler_queue_delay_ms,
+        topology: topology.to_string(),
+        tp_degree,
+        onnx_tuning: onnx_tuning.clone(),
+    };
+
     #[cfg(not(unix))]
     {
-        let _ = (
-            model_id,
-            model_path,
-            batch_size,
-            scheduler_queue_size,
-            scheduler_max_micro_batch,
-            scheduler_queue_delay_ms,
-            topology,
-            tp_degree,
-            onnx_tuning,
-        );
+        let _ = &spec;
         return Err("Isolated workers are only supported on unix platforms".into());
     }
 
@@ -9692,61 +9873,13 @@ fn spawn_worker_process(
         if Path::new(&socket_path).exists() {
             std::fs::remove_file(&socket_path)?;
         }
-
-        let exe = std::env::current_exe()?;
-        let mut command = Command::new(exe);
-        command
-            .arg("--worker")
-            .arg("--worker-model-id")
-            .arg(model_id.to_string())
-            .arg("--model")
-            .arg(model_path)
-            .arg("--socket")
-            .arg(&socket_path)
-            .arg("--transport")
-            .arg("socket")
-            .arg("--batch-size")
-            .arg(batch_size.to_string())
-            .arg("--scheduler-queue-size")
-            .arg(scheduler_queue_size.to_string())
-            .arg("--scheduler-max-micro-batch")
-            .arg(scheduler_max_micro_batch.to_string())
-            .arg("--scheduler-queue-delay-ms")
-            .arg(scheduler_queue_delay_ms.to_string())
-            .arg("--topology")
-            .arg(topology)
-            .arg("--tp-degree")
-            .arg(tp_degree.to_string())
-            .env(LLM_ISOLATE_PROCESS_ENV, "0");
-        if let Some(value) = onnx_tuning.memory_pattern {
-            command.arg("--onnx-memory-pattern").arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.disable_cpu_mem_arena {
-            command
-                .arg("--onnx-disable-cpu-mem-arena")
-                .arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.session_buckets {
-            command.arg("--onnx-session-buckets").arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.bucket_dim_granularity {
-            command
-                .arg("--onnx-bucket-dim-granularity")
-                .arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.bucket_max_dims {
-            command.arg("--onnx-bucket-max-dims").arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.peak_concurrency_hint {
-            command
-                .arg("--onnx-peak-concurrency-hint")
-                .arg(value.to_string());
-        }
-        let child = command.spawn()?;
-
+        let child = build_worker_command(&spec, &socket_path)?.spawn()?;
         Ok(WorkerProcess {
             socket_path,
             child: Mutex::new(child),
+            spec,
+            shutdown: AtomicBool::new(false),
+            restarts: AtomicU32::new(0),
         })
     }
 }
@@ -10190,8 +10323,13 @@ fn load_model_blocking(
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
-        log::info!("✓ Process isolation enabled for Model ID {}", model_id);
+        log::info!(
+            "✓ Process isolation enabled for Model ID {} (strict={})",
+            model_id,
+            isolate_strict
+        );
     }
 
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
@@ -10267,11 +10405,18 @@ fn load_model_blocking(
             &onnx_tuning,
         ) {
             Ok(worker) => match wait_for_worker_ready(&worker, Duration::from_secs(30)) {
-                Ok(()) => Some(Arc::new(worker)),
+                Ok(()) => Some(start_worker_with_supervisor(Arc::new(worker))),
                 Err(e) => {
                     worker.kill();
+                    if isolate_strict {
+                        return Err(format!(
+                            "Model {} requires process isolation but the worker was not ready: {}",
+                            model_id, e
+                        )
+                        .into());
+                    }
                     log::warn!(
-                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                         model_id,
                         e
                     );
@@ -10279,8 +10424,15 @@ fn load_model_blocking(
                 }
             },
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Model {} requires process isolation but the worker failed to spawn: {}",
+                        model_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     model_id,
                     e
                 );
@@ -10576,8 +10728,13 @@ async fn load_model(
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
-        log::info!("✓ Process isolation enabled for Model ID {}", model_id);
+        log::info!(
+            "✓ Process isolation enabled for Model ID {} (strict={})",
+            model_id,
+            isolate_strict
+        );
     }
 
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
@@ -10654,11 +10811,18 @@ async fn load_model(
         ) {
             Ok(worker) => match wait_for_worker_ready_async(&worker, Duration::from_secs(30)).await
             {
-                Ok(()) => Some(Arc::new(worker)),
+                Ok(()) => Some(start_worker_with_supervisor(Arc::new(worker))),
                 Err(e) => {
                     worker.kill();
+                    if isolate_strict {
+                        return Err(format!(
+                            "Model {} requires process isolation but the worker was not ready: {}",
+                            model_id, e
+                        )
+                        .into());
+                    }
                     log::warn!(
-                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                         model_id,
                         e
                     );
@@ -10666,8 +10830,15 @@ async fn load_model(
                 }
             },
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Model {} requires process isolation but the worker failed to spawn: {}",
+                        model_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     model_id,
                     e
                 );
@@ -10928,6 +11099,7 @@ async fn scale_up_model(
         })?;
 
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     let worker = if isolate_process {
         match spawn_worker_process(
             unique_id,
@@ -10943,11 +11115,18 @@ async fn scale_up_model(
             Ok(worker) => {
                 let worker = Arc::new(worker);
                 match wait_for_worker_ready_async(worker.as_ref(), Duration::from_secs(30)).await {
-                    Ok(()) => Some(worker),
+                    Ok(()) => Some(start_worker_with_supervisor(worker)),
                     Err(e) => {
                         worker.kill();
+                        if isolate_strict {
+                            return Err(format!(
+                                "Replica {} requires process isolation but the worker was not ready: {}",
+                                replica_id, e
+                            )
+                            .into());
+                        }
                         log::warn!(
-                            "Replica {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                            "Replica {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                             replica_id,
                             e
                         );
@@ -10956,8 +11135,15 @@ async fn scale_up_model(
                 }
             }
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Replica {} requires process isolation but the worker failed to spawn: {}",
+                        replica_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Replica {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Replica {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     replica_id,
                     e
                 );
