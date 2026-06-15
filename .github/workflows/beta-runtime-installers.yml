@@ -88,9 +88,6 @@ jobs:
           "KAPSL_NUMERIC_VERSION=$numericVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "KAPSL_DEB_VERSION=$debVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Fetch kapsl-sdk
-        run: git clone --depth 1 --branch develop --recurse-submodules --shallow-submodules https://github.com/kapsl-runtime/kapsl-sdk.git ../kapsl-sdk
-
       - name: Build kapsl
         if: runner.os != 'Windows'
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
