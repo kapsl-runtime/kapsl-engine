@@ -17,9 +17,9 @@ use kapsl_engine_api::{
     BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics, EngineModelInfo,
     InferenceRequest, TensorDtype,
 };
-use kapsl_hal::device::DeviceInfo;
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
+use kapsl_hal::device::DeviceInfo;
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_ipc::{
@@ -159,9 +159,9 @@ impl SharedKvStateInner {
         Arc::new(Self {
             device_bytes,
             pools: Mutex::new(HashMap::new()),
-            scheduler: Arc::new(parking_lot::Mutex::new(
-                GlobalKvScheduler::new(estimated_kv_tokens.max(16_384)),
-            )),
+            scheduler: Arc::new(parking_lot::Mutex::new(GlobalKvScheduler::new(
+                estimated_kv_tokens.max(16_384),
+            ))),
             next_engine_id: AtomicU32::new(1),
             model_engine_ids: Mutex::new(HashMap::new()),
             live_kv_caps: Mutex::new(HashMap::new()),
@@ -246,7 +246,9 @@ impl SharedKvStateInner {
 
         // Also register with the cross-device scheduler so session-level
         // admission and migration can see this pool.
-        self.cross_device_sched.lock().register_pool(device_id, handle.pool.clone());
+        self.cross_device_sched
+            .lock()
+            .register_pool(device_id, handle.pool.clone());
     }
 
     /// Return (or lazily create) the shared block allocator for `device_id`.
@@ -275,7 +277,13 @@ impl SharedKvStateInner {
         device_id: usize,
         model_id: u32,
         weight: u32,
-    ) -> (SharedBlockAllocator, usize, Arc<parking_lot::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
+    ) -> (
+        SharedBlockAllocator,
+        usize,
+        Arc<parking_lot::Mutex<GlobalKvScheduler>>,
+        u32,
+        Arc<AtomicUsize>,
+    ) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         self.scheduler.lock().register(KvEngineHandle {
@@ -284,7 +292,8 @@ impl SharedKvStateInner {
             guaranteed_min_tokens: 0,
             max_tokens: None,
         });
-        self.model_engine_ids.lock()
+        self.model_engine_ids
+            .lock()
             .entry(model_id)
             .or_default()
             .push(engine_id);
@@ -298,7 +307,13 @@ impl SharedKvStateInner {
         let live_cap = Arc::new(AtomicUsize::new(initial_cap));
         self.live_kv_caps.lock().insert(engine_id, live_cap.clone());
         self.rebalance_kv_caps();
-        (allocator, initial_cap, self.scheduler.clone(), engine_id, live_cap)
+        (
+            allocator,
+            initial_cap,
+            self.scheduler.clone(),
+            engine_id,
+            live_cap,
+        )
     }
 
     /// Detach a single engine (e.g. after its `run_loop` task dies). Removes it
@@ -322,7 +337,7 @@ impl SharedKvStateInner {
     fn detach_engine_for_model(&self, model_id: u32) {
         if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
             let mut sched = self.scheduler.lock();
-            let mut caps  = self.live_kv_caps.lock();
+            let mut caps = self.live_kv_caps.lock();
             for id in ids {
                 sched.deregister(id);
                 caps.remove(&id);
@@ -352,16 +367,22 @@ impl SharedKvStateInner {
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
 
         let budgets = self.scheduler.lock().allocate_budgets();
-        if budgets.is_empty() { return; }
+        if budgets.is_empty() {
+            return;
+        }
 
         let total_tokens: usize = budgets.iter().map(|b| b.max_tokens).sum::<usize>().max(1);
         let caps = self.live_kv_caps.lock();
 
         for budget in &budgets {
-            let Some(cap_atom) = caps.get(&budget.engine_id) else { continue };
+            let Some(cap_atom) = caps.get(&budget.engine_id) else {
+                continue;
+            };
             // Translate token fraction → block fraction using the device's
             // total block pool for this engine's device.
-            let device_id = self.model_engine_ids.lock()
+            let device_id = self
+                .model_engine_ids
+                .lock()
                 .values()
                 .find(|ids| ids.contains(&budget.engine_id))
                 .and_then(|_| {
@@ -370,10 +391,10 @@ impl SharedKvStateInner {
                     self.device_bytes.keys().next().copied()
                 })
                 .unwrap_or(0);
-            let total_bytes  = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+            let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
             let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
-            let new_cap = (total_blocks * budget.max_tokens / total_tokens)
-                .max(MIN_BLOCKS_PER_ENGINE);
+            let new_cap =
+                (total_blocks * budget.max_tokens / total_tokens).max(MIN_BLOCKS_PER_ENGINE);
             cap_atom.store(new_cap, Ordering::Relaxed);
         }
     }
@@ -396,7 +417,9 @@ impl SharedKvStateInner {
                         log::info!("[gpu-pool] model {} detached; pool now empty", model_id);
                         continue;
                     }
-                    let total_weight = state.members.iter()
+                    let total_weight = state
+                        .members
+                        .iter()
                         .map(|m| m.weight as usize)
                         .sum::<usize>()
                         .max(1);
@@ -404,17 +427,22 @@ impl SharedKvStateInner {
                     for member in &state.members {
                         let weighted_cap =
                             total_blocks.saturating_mul(member.weight as usize) / total_weight;
-                        member.cap.store(
-                            weighted_cap.max(MIN_BLOCKS_PER_ENGINE),
-                            Ordering::Relaxed,
-                        );
+                        member
+                            .cap
+                            .store(weighted_cap.max(MIN_BLOCKS_PER_ENGINE), Ordering::Relaxed);
                     }
                     log::info!(
                         "[gpu-pool] model {} detached; {} member(s) remaining, caps rebalanced: {}",
                         model_id,
                         state.members.len(),
-                        state.members.iter()
-                            .map(|m| format!("model={} cap={}", m.model_id, m.cap.load(Ordering::Relaxed)))
+                        state
+                            .members
+                            .iter()
+                            .map(|m| format!(
+                                "model={} cap={}",
+                                m.model_id,
+                                m.cap.load(Ordering::Relaxed)
+                            ))
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
@@ -12033,6 +12061,10 @@ async fn main() -> Result<(), DynError> {
                 avg_tokens_evaluated_per_decode_step: f64,
                 kv_partial_reuse_hits_total: u64,
                 kv_partial_reuse_tokens_saved_total: u64,
+                onnx_session_pool_total: usize,
+                onnx_session_pool_idle: usize,
+                onnx_session_pool_waits_total: u64,
+                onnx_session_pool_wait_seconds_total: f64,
                 healthy: bool,
             }
 
@@ -12074,24 +12106,31 @@ async fn main() -> Result<(), DynError> {
                     decode_tokens_evaluated_total,
                     kv_partial_reuse_hits_total,
                     kv_partial_reuse_tokens_saved_total,
-                ) =
-                    if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
-                        let metrics = pool.get_metrics();
-                        (
-                            pool.get_queue_depth(),
-                            pool.is_healthy(),
-                            metrics.memory_usage,
-                            metrics.gpu_utilization,
-                            metrics.prompt_tokens_total,
-                            metrics.generated_tokens_total,
-                            metrics.decode_steps_total,
-                            metrics.decode_tokens_evaluated_total,
-                            metrics.kv_partial_reuse_hits_total,
-                            metrics.kv_partial_reuse_tokens_saved_total,
-                        )
-                    } else {
-                        ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0)
-                    };
+                    onnx_session_pool_total,
+                    onnx_session_pool_idle,
+                    onnx_session_pool_waits_total,
+                    onnx_session_pool_wait_seconds_total,
+                ) = if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
+                    let metrics = pool.get_metrics();
+                    (
+                        pool.get_queue_depth(),
+                        pool.is_healthy(),
+                        metrics.memory_usage,
+                        metrics.gpu_utilization,
+                        metrics.prompt_tokens_total,
+                        metrics.generated_tokens_total,
+                        metrics.decode_steps_total,
+                        metrics.decode_tokens_evaluated_total,
+                        metrics.kv_partial_reuse_hits_total,
+                        metrics.kv_partial_reuse_tokens_saved_total,
+                        metrics.onnx_session_pool_total,
+                        metrics.onnx_session_pool_idle,
+                        metrics.onnx_session_pool_waits_total,
+                        metrics.onnx_session_pool_wait_seconds_total,
+                    )
+                } else {
+                    ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+                };
 
                 // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
                 // System-level RSS/GPU stats are exposed separately via GET /api/system/stats.
@@ -12133,6 +12172,10 @@ async fn main() -> Result<(), DynError> {
                     avg_tokens_evaluated_per_decode_step,
                     kv_partial_reuse_hits_total,
                     kv_partial_reuse_tokens_saved_total,
+                    onnx_session_pool_total,
+                    onnx_session_pool_idle,
+                    onnx_session_pool_waits_total,
+                    onnx_session_pool_wait_seconds_total,
                     healthy,
                 });
             }
@@ -12174,6 +12217,10 @@ async fn main() -> Result<(), DynError> {
                         avg_tokens_evaluated_per_decode_step: f64,
                         kv_partial_reuse_hits_total: u64,
                         kv_partial_reuse_tokens_saved_total: u64,
+                        onnx_session_pool_total: usize,
+                        onnx_session_pool_idle: usize,
+                        onnx_session_pool_waits_total: u64,
+                        onnx_session_pool_wait_seconds_total: f64,
                         healthy: bool,
                     }
 
@@ -12213,24 +12260,31 @@ async fn main() -> Result<(), DynError> {
                                 decode_tokens_evaluated_total,
                                 kv_partial_reuse_hits_total,
                                 kv_partial_reuse_tokens_saved_total,
-                            ) =
-                                if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
-                                    let metrics = pool.get_metrics();
-                                    (
-                                        pool.get_queue_depth(),
-                                        pool.is_healthy(),
-                                        metrics.memory_usage,
-                                        metrics.gpu_utilization,
-                                        metrics.prompt_tokens_total,
-                                        metrics.generated_tokens_total,
-                                        metrics.decode_steps_total,
-                                        metrics.decode_tokens_evaluated_total,
-                                        metrics.kv_partial_reuse_hits_total,
-                                        metrics.kv_partial_reuse_tokens_saved_total,
-                                    )
-                                } else {
-                                    ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0)
-                                };
+                                onnx_session_pool_total,
+                                onnx_session_pool_idle,
+                                onnx_session_pool_waits_total,
+                                onnx_session_pool_wait_seconds_total,
+                            ) = if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
+                                let metrics = pool.get_metrics();
+                                (
+                                    pool.get_queue_depth(),
+                                    pool.is_healthy(),
+                                    metrics.memory_usage,
+                                    metrics.gpu_utilization,
+                                    metrics.prompt_tokens_total,
+                                    metrics.generated_tokens_total,
+                                    metrics.decode_steps_total,
+                                    metrics.decode_tokens_evaluated_total,
+                                    metrics.kv_partial_reuse_hits_total,
+                                    metrics.kv_partial_reuse_tokens_saved_total,
+                                    metrics.onnx_session_pool_total,
+                                    metrics.onnx_session_pool_idle,
+                                    metrics.onnx_session_pool_waits_total,
+                                    metrics.onnx_session_pool_wait_seconds_total,
+                                )
+                            } else {
+                                ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+                            };
 
                             // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
                             // System-level RSS/GPU stats are exposed separately via GET /api/system/stats.
@@ -12266,13 +12320,11 @@ async fn main() -> Result<(), DynError> {
                                     ),
                                 )
                             };
-                            let avg_tokens_evaluated_per_decode_step =
-                                if decode_steps_total > 0 {
-                                    decode_tokens_evaluated_total as f64
-                                        / decode_steps_total as f64
-                                } else {
-                                    0.0
-                                };
+                            let avg_tokens_evaluated_per_decode_step = if decode_steps_total > 0 {
+                                decode_tokens_evaluated_total as f64 / decode_steps_total as f64
+                            } else {
+                                0.0
+                            };
 
                             let status = ModelDetailStatus {
                                 info: model,
@@ -12293,6 +12345,10 @@ async fn main() -> Result<(), DynError> {
                                 avg_tokens_evaluated_per_decode_step,
                                 kv_partial_reuse_hits_total,
                                 kv_partial_reuse_tokens_saved_total,
+                                onnx_session_pool_total,
+                                onnx_session_pool_idle,
+                                onnx_session_pool_waits_total,
+                                onnx_session_pool_wait_seconds_total,
                                 healthy,
                             };
 
@@ -12494,15 +12550,10 @@ async fn main() -> Result<(), DynError> {
                     error: String,
                 }
 
-                let requested = query
-                    .get("path")
-                    .map(|s| s.as_str())
-                    .unwrap_or("")
-                    .trim();
+                let requested = query.get("path").map(|s| s.as_str()).unwrap_or("").trim();
 
                 let dir = if requested.is_empty() {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+                    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
                 } else {
                     std::path::PathBuf::from(requested)
                 };
@@ -12580,11 +12631,19 @@ async fn main() -> Result<(), DynError> {
                             .and_then(|e| e.to_str())
                             .unwrap_or("")
                             .to_lowercase();
-                        if !matches!(ext.as_str(), "aimod" | "kapsl" | "gguf" | "onnx" | "bin" | "safetensors") {
+                        if !matches!(
+                            ext.as_str(),
+                            "aimod" | "kapsl" | "gguf" | "onnx" | "bin" | "safetensors"
+                        ) {
                             continue;
                         }
                     }
-                    entries.push(BrowseEntry { name, path, is_dir, size });
+                    entries.push(BrowseEntry {
+                        name,
+                        path,
+                        is_dir,
+                        size,
+                    });
                 }
 
                 warp::reply::with_status(
@@ -14874,6 +14933,22 @@ async fn main() -> Result<(), DynError> {
                         .engine_health
                         .with_label_values(&[&model_id_str])
                         .set(metrics.engine_health as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_total as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_idle
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_idle as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_waits_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_waits_total as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_wait_seconds_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_wait_seconds_total);
 
                     (high + low, healthy as u32, true, metrics.memory_usage)
                 } else {
