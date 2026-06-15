@@ -50,6 +50,8 @@ jobs:
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
 
 
@@ -92,4 +94,6 @@ jobs:
       - name: Test runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl

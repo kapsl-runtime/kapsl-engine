@@ -129,6 +129,7 @@ jobs:
         env:
           RUSTFLAGS: -C debuginfo=0 -C link-arg=/DEBUG:NONE
           CARGO_INCREMENTAL: "0"
+          INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
       - name: Package Debian installer (.deb)
