@@ -13589,7 +13589,7 @@ async fn main() -> Result<(), DynError> {
                 replica_pools_for_stop.write().remove(&model_id);
                 swap_map_for_stop.write().remove(&model_id);
                 shared_kv_for_stop.detach_engine_for_model(model_id);
-                #[cfg(feature = "gguf-native")]
+                #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
                 shared_kv_for_stop.detach_gpu_pool(model_id);
 
                 // Update status to Inactive
@@ -13655,7 +13655,7 @@ async fn main() -> Result<(), DynError> {
                 swap_map_for_remove.write().remove(&base_model_id);
                 model_paths_for_remove.write().remove(&base_model_id);
                 shared_kv_for_remove.detach_engine_for_model(base_model_id);
-                #[cfg(feature = "gguf-native")]
+                #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
                 shared_kv_for_remove.detach_gpu_pool(base_model_id);
 
                 for replica in replicas {
