@@ -66,7 +66,7 @@ use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
@@ -124,6 +124,11 @@ struct SharedKvStateInner {
     /// Updated by rebalance_kv_caps() on every engine attach / detach so that
     /// backends read the current fair-share cap without needing a restart.
     live_kv_caps: Mutex<HashMap<u32, Arc<AtomicUsize>>>,
+    /// Last `GlobalKvScheduler::health_epoch` we rebalanced KV caps for. The
+    /// periodic loop compares against the live epoch and rebalances when an
+    /// engine's health changes, reclaiming a degraded/dead engine's block quota
+    /// for healthy engines without waiting for a full detach.
+    last_health_epoch: AtomicU64,
     /// Per-device GPU pool registry for gguf-native/native backends.
     /// Stores compatible pools and their members so quota caps can be
     /// rebalanced by model priority.
@@ -160,6 +165,7 @@ impl SharedKvStateInner {
             next_engine_id: AtomicU32::new(1),
             model_engine_ids: Mutex::new(HashMap::new()),
             live_kv_caps: Mutex::new(HashMap::new()),
+            last_health_epoch: AtomicU64::new(0),
             #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
             gpu_pools: Mutex::new(HashMap::new()),
             #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
@@ -330,6 +336,17 @@ impl SharedKvStateInner {
     ///
     /// Called on every engine attach/detach so live caps track the current set
     /// of loaded models without requiring engine restarts.
+    /// Rebalance KV block caps if any engine's health changed since the last
+    /// rebalance. Cheap to call frequently: it only takes the scheduler lock to
+    /// read an integer and does real work (recomputing caps from the now
+    /// health-aware budgets) only on an actual health transition.
+    fn maybe_rebalance_for_health(&self) {
+        let epoch = self.scheduler.lock().health_epoch();
+        if self.last_health_epoch.swap(epoch, Ordering::Relaxed) != epoch {
+            self.rebalance_kv_caps();
+        }
+    }
+
     fn rebalance_kv_caps(&self) {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
@@ -11598,6 +11615,7 @@ async fn main() -> Result<(), DynError> {
     let has_cuda_for_sampler = device_info.has_cuda;
     let runtime_pressure_config_for_sampler = runtime_pressure_config.clone();
     let runtime_pressure_state_for_sampler = runtime_pressure_state.clone();
+    let shared_kv_for_rebalance = shared_kv.clone();
     tokio::spawn(async move {
         let pid = Pid::from_u32(std::process::id());
         let mut system = System::new();
@@ -11608,6 +11626,11 @@ async fn main() -> Result<(), DynError> {
 
         loop {
             interval.tick().await;
+
+            // Reclaim KV block quota from any engine whose health changed
+            // (e.g. tripped circuit breaker / stalled watchdog), redistributing
+            // it to healthy engines.
+            shared_kv_for_rebalance.maybe_rebalance_for_health();
 
             system.refresh_process(pid);
             let process_memory_bytes = system
