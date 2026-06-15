@@ -17,9 +17,9 @@ use kapsl_engine_api::{
     BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics, EngineModelInfo,
     InferenceRequest, TensorDtype,
 };
-use kapsl_hal::device::DeviceInfo;
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
+use kapsl_hal::device::DeviceInfo;
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_ipc::{
@@ -66,7 +66,7 @@ use std::io::{BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
@@ -124,6 +124,11 @@ struct SharedKvStateInner {
     /// Updated by rebalance_kv_caps() on every engine attach / detach so that
     /// backends read the current fair-share cap without needing a restart.
     live_kv_caps: Mutex<HashMap<u32, Arc<AtomicUsize>>>,
+    /// Last `GlobalKvScheduler::health_epoch` we rebalanced KV caps for. The
+    /// periodic loop compares against the live epoch and rebalances when an
+    /// engine's health changes, reclaiming a degraded/dead engine's block quota
+    /// for healthy engines without waiting for a full detach.
+    last_health_epoch: AtomicU64,
     /// Per-device GPU pool registry for gguf-native/native backends.
     /// Stores compatible pools and their members so quota caps can be
     /// rebalanced by model priority.
@@ -154,12 +159,13 @@ impl SharedKvStateInner {
         Arc::new(Self {
             device_bytes,
             pools: Mutex::new(HashMap::new()),
-            scheduler: Arc::new(parking_lot::Mutex::new(
-                GlobalKvScheduler::new(estimated_kv_tokens.max(16_384)),
-            )),
+            scheduler: Arc::new(parking_lot::Mutex::new(GlobalKvScheduler::new(
+                estimated_kv_tokens.max(16_384),
+            ))),
             next_engine_id: AtomicU32::new(1),
             model_engine_ids: Mutex::new(HashMap::new()),
             live_kv_caps: Mutex::new(HashMap::new()),
+            last_health_epoch: AtomicU64::new(0),
             #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
             gpu_pools: Mutex::new(HashMap::new()),
             #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
@@ -240,7 +246,9 @@ impl SharedKvStateInner {
 
         // Also register with the cross-device scheduler so session-level
         // admission and migration can see this pool.
-        self.cross_device_sched.lock().register_pool(device_id, handle.pool.clone());
+        self.cross_device_sched
+            .lock()
+            .register_pool(device_id, handle.pool.clone());
     }
 
     /// Return (or lazily create) the shared block allocator for `device_id`.
@@ -269,7 +277,13 @@ impl SharedKvStateInner {
         device_id: usize,
         model_id: u32,
         weight: u32,
-    ) -> (SharedBlockAllocator, usize, Arc<parking_lot::Mutex<GlobalKvScheduler>>, u32, Arc<AtomicUsize>) {
+    ) -> (
+        SharedBlockAllocator,
+        usize,
+        Arc<parking_lot::Mutex<GlobalKvScheduler>>,
+        u32,
+        Arc<AtomicUsize>,
+    ) {
         let allocator = self.get_or_create_pool(device_id);
         let engine_id = self.next_engine_id.fetch_add(1, Ordering::Relaxed);
         self.scheduler.lock().register(KvEngineHandle {
@@ -278,7 +292,8 @@ impl SharedKvStateInner {
             guaranteed_min_tokens: 0,
             max_tokens: None,
         });
-        self.model_engine_ids.lock()
+        self.model_engine_ids
+            .lock()
             .entry(model_id)
             .or_default()
             .push(engine_id);
@@ -292,7 +307,13 @@ impl SharedKvStateInner {
         let live_cap = Arc::new(AtomicUsize::new(initial_cap));
         self.live_kv_caps.lock().insert(engine_id, live_cap.clone());
         self.rebalance_kv_caps();
-        (allocator, initial_cap, self.scheduler.clone(), engine_id, live_cap)
+        (
+            allocator,
+            initial_cap,
+            self.scheduler.clone(),
+            engine_id,
+            live_cap,
+        )
     }
 
     /// Detach a single engine (e.g. after its `run_loop` task dies). Removes it
@@ -316,7 +337,7 @@ impl SharedKvStateInner {
     fn detach_engine_for_model(&self, model_id: u32) {
         if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
             let mut sched = self.scheduler.lock();
-            let mut caps  = self.live_kv_caps.lock();
+            let mut caps = self.live_kv_caps.lock();
             for id in ids {
                 sched.deregister(id);
                 caps.remove(&id);
@@ -330,21 +351,38 @@ impl SharedKvStateInner {
     ///
     /// Called on every engine attach/detach so live caps track the current set
     /// of loaded models without requiring engine restarts.
+    /// Rebalance KV block caps if any engine's health changed since the last
+    /// rebalance. Cheap to call frequently: it only takes the scheduler lock to
+    /// read an integer and does real work (recomputing caps from the now
+    /// health-aware budgets) only on an actual health transition.
+    fn maybe_rebalance_for_health(&self) {
+        let epoch = self.scheduler.lock().health_epoch();
+        if self.last_health_epoch.swap(epoch, Ordering::Relaxed) != epoch {
+            self.rebalance_kv_caps();
+        }
+    }
+
     fn rebalance_kv_caps(&self) {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
 
         let budgets = self.scheduler.lock().allocate_budgets();
-        if budgets.is_empty() { return; }
+        if budgets.is_empty() {
+            return;
+        }
 
         let total_tokens: usize = budgets.iter().map(|b| b.max_tokens).sum::<usize>().max(1);
         let caps = self.live_kv_caps.lock();
 
         for budget in &budgets {
-            let Some(cap_atom) = caps.get(&budget.engine_id) else { continue };
+            let Some(cap_atom) = caps.get(&budget.engine_id) else {
+                continue;
+            };
             // Translate token fraction → block fraction using the device's
             // total block pool for this engine's device.
-            let device_id = self.model_engine_ids.lock()
+            let device_id = self
+                .model_engine_ids
+                .lock()
                 .values()
                 .find(|ids| ids.contains(&budget.engine_id))
                 .and_then(|_| {
@@ -353,10 +391,10 @@ impl SharedKvStateInner {
                     self.device_bytes.keys().next().copied()
                 })
                 .unwrap_or(0);
-            let total_bytes  = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+            let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
             let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
-            let new_cap = (total_blocks * budget.max_tokens / total_tokens)
-                .max(MIN_BLOCKS_PER_ENGINE);
+            let new_cap =
+                (total_blocks * budget.max_tokens / total_tokens).max(MIN_BLOCKS_PER_ENGINE);
             cap_atom.store(new_cap, Ordering::Relaxed);
         }
     }
@@ -379,7 +417,9 @@ impl SharedKvStateInner {
                         log::info!("[gpu-pool] model {} detached; pool now empty", model_id);
                         continue;
                     }
-                    let total_weight = state.members.iter()
+                    let total_weight = state
+                        .members
+                        .iter()
                         .map(|m| m.weight as usize)
                         .sum::<usize>()
                         .max(1);
@@ -387,17 +427,22 @@ impl SharedKvStateInner {
                     for member in &state.members {
                         let weighted_cap =
                             total_blocks.saturating_mul(member.weight as usize) / total_weight;
-                        member.cap.store(
-                            weighted_cap.max(MIN_BLOCKS_PER_ENGINE),
-                            Ordering::Relaxed,
-                        );
+                        member
+                            .cap
+                            .store(weighted_cap.max(MIN_BLOCKS_PER_ENGINE), Ordering::Relaxed);
                     }
                     log::info!(
                         "[gpu-pool] model {} detached; {} member(s) remaining, caps rebalanced: {}",
                         model_id,
                         state.members.len(),
-                        state.members.iter()
-                            .map(|m| format!("model={} cap={}", m.model_id, m.cap.load(Ordering::Relaxed)))
+                        state
+                            .members
+                            .iter()
+                            .map(|m| format!(
+                                "model={} cap={}",
+                                m.model_id,
+                                m.cap.load(Ordering::Relaxed)
+                            ))
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
@@ -1094,6 +1139,7 @@ const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
 const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
 const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
 const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
+const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
 const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
@@ -8808,6 +8854,18 @@ fn resolve_isolate_process(manifest: &Manifest) -> bool {
     manifest_llm_flag(manifest, "isolate_process").unwrap_or(false)
 }
 
+/// Whether process isolation is *required* (fail-closed). When true, a model
+/// that requested isolation but whose worker cannot start fails to load instead
+/// of silently falling back to in-process — which would drop the isolation
+/// guarantee and rejoin the shared KV pool. Defaults to false for backward
+/// compatibility (silent fallback preserved, but logged prominently).
+fn resolve_isolate_process_strict(manifest: &Manifest) -> bool {
+    if let Some(env) = parse_env_bool(LLM_ISOLATE_PROCESS_STRICT_ENV) {
+        return env;
+    }
+    manifest_llm_flag(manifest, "isolate_process_strict").unwrap_or(false)
+}
+
 fn resolve_scheduler_tuning_for_framework(
     manifest: &Manifest,
     scheduler_max_micro_batch: usize,
@@ -9160,9 +9218,20 @@ fn select_mesh_devices(
             }
         }
     } else {
-        selected = device_info.devices.clone();
+        let best_provider = device_info.get_best_provider().to_ascii_lowercase();
+        selected = device_info
+            .devices
+            .iter()
+            .filter(|d| d.backend.to_string().to_ascii_lowercase() == best_provider)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            selected = device_info.devices.clone();
+        }
         if let Some(dev_id) = preferred_device_id {
-            selected.retain(|d| d.id == dev_id);
+            if best_provider != "cpu" {
+                selected.retain(|d| d.id == dev_id);
+            }
         }
     }
 
@@ -9621,9 +9690,31 @@ fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
     Some((avg_util, mem_bytes, mem_capacity_bytes))
 }
 
+/// Everything needed to (re)spawn an isolated worker child for a model, so the
+/// supervisor can restart a dead worker without re-deriving arguments.
+#[derive(Clone)]
+struct WorkerSpec {
+    model_id: u32,
+    model_path: PathBuf,
+    batch_size: usize,
+    scheduler_queue_size: usize,
+    scheduler_max_micro_batch: usize,
+    scheduler_queue_delay_ms: u64,
+    topology: String,
+    tp_degree: usize,
+    onnx_tuning: OnnxRuntimeTuning,
+}
+
 struct WorkerProcess {
     socket_path: String,
     child: Mutex<Child>,
+    /// Spec used to respawn this worker on death.
+    spec: WorkerSpec,
+    /// Set when the worker is intentionally torn down (kill/Drop) so the
+    /// supervisor stops and never resurrects a deliberately-stopped worker.
+    shutdown: AtomicBool,
+    /// Number of automatic restarts performed (bounds the restart budget).
+    restarts: AtomicU32,
 }
 
 impl WorkerProcess {
@@ -9632,10 +9723,29 @@ impl WorkerProcess {
     }
 
     fn kill(&self) {
+        // Mark shutdown first so the supervisor won't try to restart it.
+        self.shutdown.store(true, Ordering::Relaxed);
         let mut child = self.child.lock();
         if let Ok(None) = child.try_wait() {
             let _ = child.kill();
         }
+    }
+
+    /// Respawn the child process bound to the same socket path. The previous
+    /// (dead) child handle is replaced. Unix-only; no-op error elsewhere.
+    #[cfg(unix)]
+    fn restart_child(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if Path::new(&self.socket_path).exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+        let child = build_worker_command(&self.spec, &self.socket_path)?.spawn()?;
+        *self.child.lock() = child;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn restart_child(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("Isolated workers are only supported on unix platforms".into())
     }
 }
 
@@ -9643,6 +9753,71 @@ impl Drop for WorkerProcess {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+/// Supervise an isolated worker: restart it (bounded retries with backoff) if it
+/// dies unexpectedly, so an isolated model recovers from a crash instead of
+/// staying down. Exits when the worker is intentionally shut down. Returns the
+/// same `Arc` for convenience.
+fn start_worker_with_supervisor(worker: Arc<WorkerProcess>) -> Arc<WorkerProcess> {
+    const CHECK_INTERVAL: Duration = Duration::from_secs(2);
+    const RESTART_BACKOFF: Duration = Duration::from_secs(2);
+    const MAX_RESTARTS: u32 = 5;
+    const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let w = worker.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+            if w.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            // Still alive — nothing to do.
+            let Some(status) = w.try_wait() else {
+                continue;
+            };
+            if w.restarts.load(Ordering::Relaxed) >= MAX_RESTARTS {
+                log::error!(
+                    "[worker-supervisor] model {} exited ({}); exceeded {} restarts, giving up",
+                    w.spec.model_id,
+                    status,
+                    MAX_RESTARTS
+                );
+                break;
+            }
+            let attempt = w.restarts.fetch_add(1, Ordering::Relaxed) + 1;
+            log::warn!(
+                "[worker-supervisor] model {} exited ({}); restarting (attempt {}/{})",
+                w.spec.model_id,
+                status,
+                attempt,
+                MAX_RESTARTS
+            );
+            tokio::time::sleep(RESTART_BACKOFF).await;
+            if w.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            match w.restart_child() {
+                Ok(()) => match wait_for_worker_ready_async(&w, READY_TIMEOUT).await {
+                    Ok(()) => log::info!(
+                        "[worker-supervisor] model {} restarted successfully",
+                        w.spec.model_id
+                    ),
+                    Err(e) => log::error!(
+                        "[worker-supervisor] model {} restarted but not ready: {}",
+                        w.spec.model_id,
+                        e
+                    ),
+                },
+                Err(e) => log::error!(
+                    "[worker-supervisor] model {} restart spawn failed: {}",
+                    w.spec.model_id,
+                    e
+                ),
+            }
+        }
+    });
+    worker
 }
 
 #[cfg(unix)]
@@ -9659,6 +9834,66 @@ fn socket_ready(_socket_path: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Build the `Command` that launches an isolated worker child for `spec`, bound
+/// to `socket_path`. Shared by initial spawn and supervisor restart.
+#[cfg(unix)]
+fn build_worker_command(
+    spec: &WorkerSpec,
+    socket_path: &str,
+) -> Result<Command, Box<dyn std::error::Error + Send + Sync>> {
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--worker")
+        .arg("--worker-model-id")
+        .arg(spec.model_id.to_string())
+        .arg("--model")
+        .arg(&spec.model_path)
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--transport")
+        .arg("socket")
+        .arg("--batch-size")
+        .arg(spec.batch_size.to_string())
+        .arg("--scheduler-queue-size")
+        .arg(spec.scheduler_queue_size.to_string())
+        .arg("--scheduler-max-micro-batch")
+        .arg(spec.scheduler_max_micro_batch.to_string())
+        .arg("--scheduler-queue-delay-ms")
+        .arg(spec.scheduler_queue_delay_ms.to_string())
+        .arg("--topology")
+        .arg(&spec.topology)
+        .arg("--tp-degree")
+        .arg(spec.tp_degree.to_string())
+        .env(LLM_ISOLATE_PROCESS_ENV, "0");
+    let onnx_tuning = &spec.onnx_tuning;
+    if let Some(value) = onnx_tuning.memory_pattern {
+        command.arg("--onnx-memory-pattern").arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.disable_cpu_mem_arena {
+        command
+            .arg("--onnx-disable-cpu-mem-arena")
+            .arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.session_buckets {
+        command.arg("--onnx-session-buckets").arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.bucket_dim_granularity {
+        command
+            .arg("--onnx-bucket-dim-granularity")
+            .arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.bucket_max_dims {
+        command.arg("--onnx-bucket-max-dims").arg(value.to_string());
+    }
+    if let Some(value) = onnx_tuning.peak_concurrency_hint {
+        command
+            .arg("--onnx-peak-concurrency-hint")
+            .arg(value.to_string());
+    }
+    Ok(command)
+}
+
 fn spawn_worker_process(
     model_id: u32,
     model_path: &Path,
@@ -9670,19 +9905,21 @@ fn spawn_worker_process(
     tp_degree: usize,
     onnx_tuning: &OnnxRuntimeTuning,
 ) -> Result<WorkerProcess, Box<dyn std::error::Error + Send + Sync>> {
+    let spec = WorkerSpec {
+        model_id,
+        model_path: model_path.to_path_buf(),
+        batch_size,
+        scheduler_queue_size,
+        scheduler_max_micro_batch,
+        scheduler_queue_delay_ms,
+        topology: topology.to_string(),
+        tp_degree,
+        onnx_tuning: onnx_tuning.clone(),
+    };
+
     #[cfg(not(unix))]
     {
-        let _ = (
-            model_id,
-            model_path,
-            batch_size,
-            scheduler_queue_size,
-            scheduler_max_micro_batch,
-            scheduler_queue_delay_ms,
-            topology,
-            tp_degree,
-            onnx_tuning,
-        );
+        let _ = &spec;
         return Err("Isolated workers are only supported on unix platforms".into());
     }
 
@@ -9692,61 +9929,13 @@ fn spawn_worker_process(
         if Path::new(&socket_path).exists() {
             std::fs::remove_file(&socket_path)?;
         }
-
-        let exe = std::env::current_exe()?;
-        let mut command = Command::new(exe);
-        command
-            .arg("--worker")
-            .arg("--worker-model-id")
-            .arg(model_id.to_string())
-            .arg("--model")
-            .arg(model_path)
-            .arg("--socket")
-            .arg(&socket_path)
-            .arg("--transport")
-            .arg("socket")
-            .arg("--batch-size")
-            .arg(batch_size.to_string())
-            .arg("--scheduler-queue-size")
-            .arg(scheduler_queue_size.to_string())
-            .arg("--scheduler-max-micro-batch")
-            .arg(scheduler_max_micro_batch.to_string())
-            .arg("--scheduler-queue-delay-ms")
-            .arg(scheduler_queue_delay_ms.to_string())
-            .arg("--topology")
-            .arg(topology)
-            .arg("--tp-degree")
-            .arg(tp_degree.to_string())
-            .env(LLM_ISOLATE_PROCESS_ENV, "0");
-        if let Some(value) = onnx_tuning.memory_pattern {
-            command.arg("--onnx-memory-pattern").arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.disable_cpu_mem_arena {
-            command
-                .arg("--onnx-disable-cpu-mem-arena")
-                .arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.session_buckets {
-            command.arg("--onnx-session-buckets").arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.bucket_dim_granularity {
-            command
-                .arg("--onnx-bucket-dim-granularity")
-                .arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.bucket_max_dims {
-            command.arg("--onnx-bucket-max-dims").arg(value.to_string());
-        }
-        if let Some(value) = onnx_tuning.peak_concurrency_hint {
-            command
-                .arg("--onnx-peak-concurrency-hint")
-                .arg(value.to_string());
-        }
-        let child = command.spawn()?;
-
+        let child = build_worker_command(&spec, &socket_path)?.spawn()?;
         Ok(WorkerProcess {
             socket_path,
             child: Mutex::new(child),
+            spec,
+            shutdown: AtomicBool::new(false),
+            restarts: AtomicU32::new(0),
         })
     }
 }
@@ -10190,8 +10379,13 @@ fn load_model_blocking(
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
-        log::info!("✓ Process isolation enabled for Model ID {}", model_id);
+        log::info!(
+            "✓ Process isolation enabled for Model ID {} (strict={})",
+            model_id,
+            isolate_strict
+        );
     }
 
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
@@ -10267,11 +10461,18 @@ fn load_model_blocking(
             &onnx_tuning,
         ) {
             Ok(worker) => match wait_for_worker_ready(&worker, Duration::from_secs(30)) {
-                Ok(()) => Some(Arc::new(worker)),
+                Ok(()) => Some(start_worker_with_supervisor(Arc::new(worker))),
                 Err(e) => {
                     worker.kill();
+                    if isolate_strict {
+                        return Err(format!(
+                            "Model {} requires process isolation but the worker was not ready: {}",
+                            model_id, e
+                        )
+                        .into());
+                    }
                     log::warn!(
-                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                         model_id,
                         e
                     );
@@ -10279,8 +10480,15 @@ fn load_model_blocking(
                 }
             },
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Model {} requires process isolation but the worker failed to spawn: {}",
+                        model_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     model_id,
                     e
                 );
@@ -10576,8 +10784,13 @@ async fn load_model(
 
     let model_file_path = loader.get_model_path();
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
-        log::info!("✓ Process isolation enabled for Model ID {}", model_id);
+        log::info!(
+            "✓ Process isolation enabled for Model ID {} (strict={})",
+            model_id,
+            isolate_strict
+        );
     }
 
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
@@ -10654,11 +10867,18 @@ async fn load_model(
         ) {
             Ok(worker) => match wait_for_worker_ready_async(&worker, Duration::from_secs(30)).await
             {
-                Ok(()) => Some(Arc::new(worker)),
+                Ok(()) => Some(start_worker_with_supervisor(Arc::new(worker))),
                 Err(e) => {
                     worker.kill();
+                    if isolate_strict {
+                        return Err(format!(
+                            "Model {} requires process isolation but the worker was not ready: {}",
+                            model_id, e
+                        )
+                        .into());
+                    }
                     log::warn!(
-                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                        "Model {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                         model_id,
                         e
                     );
@@ -10666,8 +10886,15 @@ async fn load_model(
                 }
             },
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Model {} requires process isolation but the worker failed to spawn: {}",
+                        model_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Model {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     model_id,
                     e
                 );
@@ -10928,6 +11155,7 @@ async fn scale_up_model(
         })?;
 
     let isolate_process = resolve_isolate_process(&loader.manifest);
+    let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     let worker = if isolate_process {
         match spawn_worker_process(
             unique_id,
@@ -10943,11 +11171,18 @@ async fn scale_up_model(
             Ok(worker) => {
                 let worker = Arc::new(worker);
                 match wait_for_worker_ready_async(worker.as_ref(), Duration::from_secs(30)).await {
-                    Ok(()) => Some(worker),
+                    Ok(()) => Some(start_worker_with_supervisor(worker)),
                     Err(e) => {
                         worker.kill();
+                        if isolate_strict {
+                            return Err(format!(
+                                "Replica {} requires process isolation but the worker was not ready: {}",
+                                replica_id, e
+                            )
+                            .into());
+                        }
                         log::warn!(
-                            "Replica {} requested process isolation, but worker was not ready; falling back to in-process load: {}",
+                            "Replica {} requested process isolation, but worker was not ready; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                             replica_id,
                             e
                         );
@@ -10956,8 +11191,15 @@ async fn scale_up_model(
                 }
             }
             Err(e) => {
+                if isolate_strict {
+                    return Err(format!(
+                        "Replica {} requires process isolation but the worker failed to spawn: {}",
+                        replica_id, e
+                    )
+                    .into());
+                }
                 log::warn!(
-                    "Replica {} requested process isolation, but worker spawn failed; falling back to in-process load: {}",
+                    "Replica {} requested process isolation, but worker spawn failed; falling back to in-process load (ISOLATION GUARANTEE DROPPED): {}",
                     replica_id,
                     e
                 );
@@ -11412,6 +11654,7 @@ async fn main() -> Result<(), DynError> {
     let has_cuda_for_sampler = device_info.has_cuda;
     let runtime_pressure_config_for_sampler = runtime_pressure_config.clone();
     let runtime_pressure_state_for_sampler = runtime_pressure_state.clone();
+    let shared_kv_for_rebalance = shared_kv.clone();
     tokio::spawn(async move {
         let pid = Pid::from_u32(std::process::id());
         let mut system = System::new();
@@ -11422,6 +11665,11 @@ async fn main() -> Result<(), DynError> {
 
         loop {
             interval.tick().await;
+
+            // Reclaim KV block quota from any engine whose health changed
+            // (e.g. tripped circuit breaker / stalled watchdog), redistributing
+            // it to healthy engines.
+            shared_kv_for_rebalance.maybe_rebalance_for_health();
 
             system.refresh_process(pid);
             let process_memory_bytes = system
@@ -11824,6 +12072,10 @@ async fn main() -> Result<(), DynError> {
                 avg_tokens_evaluated_per_decode_step: f64,
                 kv_partial_reuse_hits_total: u64,
                 kv_partial_reuse_tokens_saved_total: u64,
+                onnx_session_pool_total: usize,
+                onnx_session_pool_idle: usize,
+                onnx_session_pool_waits_total: u64,
+                onnx_session_pool_wait_seconds_total: f64,
                 healthy: bool,
             }
 
@@ -11865,24 +12117,31 @@ async fn main() -> Result<(), DynError> {
                     decode_tokens_evaluated_total,
                     kv_partial_reuse_hits_total,
                     kv_partial_reuse_tokens_saved_total,
-                ) =
-                    if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
-                        let metrics = pool.get_metrics();
-                        (
-                            pool.get_queue_depth(),
-                            pool.is_healthy(),
-                            metrics.memory_usage,
-                            metrics.gpu_utilization,
-                            metrics.prompt_tokens_total,
-                            metrics.generated_tokens_total,
-                            metrics.decode_steps_total,
-                            metrics.decode_tokens_evaluated_total,
-                            metrics.kv_partial_reuse_hits_total,
-                            metrics.kv_partial_reuse_tokens_saved_total,
-                        )
-                    } else {
-                        ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0)
-                    };
+                    onnx_session_pool_total,
+                    onnx_session_pool_idle,
+                    onnx_session_pool_waits_total,
+                    onnx_session_pool_wait_seconds_total,
+                ) = if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
+                    let metrics = pool.get_metrics();
+                    (
+                        pool.get_queue_depth(),
+                        pool.is_healthy(),
+                        metrics.memory_usage,
+                        metrics.gpu_utilization,
+                        metrics.prompt_tokens_total,
+                        metrics.generated_tokens_total,
+                        metrics.decode_steps_total,
+                        metrics.decode_tokens_evaluated_total,
+                        metrics.kv_partial_reuse_hits_total,
+                        metrics.kv_partial_reuse_tokens_saved_total,
+                        metrics.onnx_session_pool_total,
+                        metrics.onnx_session_pool_idle,
+                        metrics.onnx_session_pool_waits_total,
+                        metrics.onnx_session_pool_wait_seconds_total,
+                    )
+                } else {
+                    ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+                };
 
                 // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
                 // System-level RSS/GPU stats are exposed separately via GET /api/system/stats.
@@ -11924,6 +12183,10 @@ async fn main() -> Result<(), DynError> {
                     avg_tokens_evaluated_per_decode_step,
                     kv_partial_reuse_hits_total,
                     kv_partial_reuse_tokens_saved_total,
+                    onnx_session_pool_total,
+                    onnx_session_pool_idle,
+                    onnx_session_pool_waits_total,
+                    onnx_session_pool_wait_seconds_total,
                     healthy,
                 });
             }
@@ -11965,6 +12228,10 @@ async fn main() -> Result<(), DynError> {
                         avg_tokens_evaluated_per_decode_step: f64,
                         kv_partial_reuse_hits_total: u64,
                         kv_partial_reuse_tokens_saved_total: u64,
+                        onnx_session_pool_total: usize,
+                        onnx_session_pool_idle: usize,
+                        onnx_session_pool_waits_total: u64,
+                        onnx_session_pool_wait_seconds_total: f64,
                         healthy: bool,
                     }
 
@@ -12004,24 +12271,31 @@ async fn main() -> Result<(), DynError> {
                                 decode_tokens_evaluated_total,
                                 kv_partial_reuse_hits_total,
                                 kv_partial_reuse_tokens_saved_total,
-                            ) =
-                                if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
-                                    let metrics = pool.get_metrics();
-                                    (
-                                        pool.get_queue_depth(),
-                                        pool.is_healthy(),
-                                        metrics.memory_usage,
-                                        metrics.gpu_utilization,
-                                        metrics.prompt_tokens_total,
-                                        metrics.generated_tokens_total,
-                                        metrics.decode_steps_total,
-                                        metrics.decode_tokens_evaluated_total,
-                                        metrics.kv_partial_reuse_hits_total,
-                                        metrics.kv_partial_reuse_tokens_saved_total,
-                                    )
-                                } else {
-                                    ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0)
-                                };
+                                onnx_session_pool_total,
+                                onnx_session_pool_idle,
+                                onnx_session_pool_waits_total,
+                                onnx_session_pool_wait_seconds_total,
+                            ) = if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
+                                let metrics = pool.get_metrics();
+                                (
+                                    pool.get_queue_depth(),
+                                    pool.is_healthy(),
+                                    metrics.memory_usage,
+                                    metrics.gpu_utilization,
+                                    metrics.prompt_tokens_total,
+                                    metrics.generated_tokens_total,
+                                    metrics.decode_steps_total,
+                                    metrics.decode_tokens_evaluated_total,
+                                    metrics.kv_partial_reuse_hits_total,
+                                    metrics.kv_partial_reuse_tokens_saved_total,
+                                    metrics.onnx_session_pool_total,
+                                    metrics.onnx_session_pool_idle,
+                                    metrics.onnx_session_pool_waits_total,
+                                    metrics.onnx_session_pool_wait_seconds_total,
+                                )
+                            } else {
+                                ((0, 0), true, 0, 0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0)
+                            };
 
                             // `memory_usage` and `gpu_utilization` are engine-reported metrics only.
                             // System-level RSS/GPU stats are exposed separately via GET /api/system/stats.
@@ -12057,13 +12331,11 @@ async fn main() -> Result<(), DynError> {
                                     ),
                                 )
                             };
-                            let avg_tokens_evaluated_per_decode_step =
-                                if decode_steps_total > 0 {
-                                    decode_tokens_evaluated_total as f64
-                                        / decode_steps_total as f64
-                                } else {
-                                    0.0
-                                };
+                            let avg_tokens_evaluated_per_decode_step = if decode_steps_total > 0 {
+                                decode_tokens_evaluated_total as f64 / decode_steps_total as f64
+                            } else {
+                                0.0
+                            };
 
                             let status = ModelDetailStatus {
                                 info: model,
@@ -12084,6 +12356,10 @@ async fn main() -> Result<(), DynError> {
                                 avg_tokens_evaluated_per_decode_step,
                                 kv_partial_reuse_hits_total,
                                 kv_partial_reuse_tokens_saved_total,
+                                onnx_session_pool_total,
+                                onnx_session_pool_idle,
+                                onnx_session_pool_waits_total,
+                                onnx_session_pool_wait_seconds_total,
                                 healthy,
                             };
 
@@ -12285,15 +12561,10 @@ async fn main() -> Result<(), DynError> {
                     error: String,
                 }
 
-                let requested = query
-                    .get("path")
-                    .map(|s| s.as_str())
-                    .unwrap_or("")
-                    .trim();
+                let requested = query.get("path").map(|s| s.as_str()).unwrap_or("").trim();
 
                 let dir = if requested.is_empty() {
-                    dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+                    dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
                 } else {
                     std::path::PathBuf::from(requested)
                 };
@@ -12371,11 +12642,19 @@ async fn main() -> Result<(), DynError> {
                             .and_then(|e| e.to_str())
                             .unwrap_or("")
                             .to_lowercase();
-                        if !matches!(ext.as_str(), "aimod" | "kapsl" | "gguf" | "onnx" | "bin" | "safetensors") {
+                        if !matches!(
+                            ext.as_str(),
+                            "aimod" | "kapsl" | "gguf" | "onnx" | "bin" | "safetensors"
+                        ) {
                             continue;
                         }
                     }
-                    entries.push(BrowseEntry { name, path, is_dir, size });
+                    entries.push(BrowseEntry {
+                        name,
+                        path,
+                        is_dir,
+                        size,
+                    });
                 }
 
                 warp::reply::with_status(
@@ -13403,7 +13682,7 @@ async fn main() -> Result<(), DynError> {
                 replica_pools_for_stop.write().remove(&model_id);
                 swap_map_for_stop.write().remove(&model_id);
                 shared_kv_for_stop.detach_engine_for_model(model_id);
-                #[cfg(feature = "gguf-native")]
+                #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
                 shared_kv_for_stop.detach_gpu_pool(model_id);
 
                 // Update status to Inactive
@@ -13469,7 +13748,7 @@ async fn main() -> Result<(), DynError> {
                 swap_map_for_remove.write().remove(&base_model_id);
                 model_paths_for_remove.write().remove(&base_model_id);
                 shared_kv_for_remove.detach_engine_for_model(base_model_id);
-                #[cfg(feature = "gguf-native")]
+                #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
                 shared_kv_for_remove.detach_gpu_pool(base_model_id);
 
                 for replica in replicas {
@@ -14634,6 +14913,10 @@ async fn main() -> Result<(), DynError> {
                         .with_label_values(&[&model_id_str])
                         .set(metrics.kv_cache_packed_layers as i64);
                     shared_metrics_for_scaler
+                        .kv_cache_cpu_offloaded_blocks
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
+                    shared_metrics_for_scaler
                         .prompt_tokens_total
                         .with_label_values(&[&model_id_str])
                         .set(metrics.prompt_tokens_total as i64);
@@ -14657,6 +14940,26 @@ async fn main() -> Result<(), DynError> {
                         .kv_partial_reuse_tokens_saved_total
                         .with_label_values(&[&model_id_str])
                         .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
+                    shared_metrics_for_scaler
+                        .engine_health
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.engine_health as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_total as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_idle
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_idle as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_waits_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_waits_total as i64);
+                    shared_metrics_for_scaler
+                        .onnx_session_pool_wait_seconds_total
+                        .with_label_values(&[&model_id_str])
+                        .set(metrics.onnx_session_pool_wait_seconds_total);
 
                     (high + low, healthy as u32, true, metrics.memory_usage)
                 } else {
