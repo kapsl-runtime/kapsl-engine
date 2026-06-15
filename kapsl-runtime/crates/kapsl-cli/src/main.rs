@@ -2619,21 +2619,170 @@ fn parse_runtime_args_and_matches(argv: &[String]) -> Result<(Args, ArgMatches),
     Ok((args, matches))
 }
 
+// ─── ANSI helpers (no external deps) ────────────────────────────────────────
+
+fn cli_color_enabled() -> bool {
+    // Respect NO_COLOR / TERM=dumb; fall back to stderr being a tty.
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").as_deref() == Ok("dumb") {
+        return false;
+    }
+    // Use atty-free check: if stderr fd 2 is a character device we assume tty.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stderr().as_raw_fd();
+        unsafe { libc_isatty(fd) }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(unix)]
+fn libc_isatty(fd: i32) -> bool {
+    extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(fd) != 0 }
+}
+
+struct Ansi {
+    enabled: bool,
+}
+
+impl Ansi {
+    fn new() -> Self {
+        Self { enabled: cli_color_enabled() }
+    }
+
+    fn teal<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[38;5;43m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn green<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[32m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn red<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[31m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn yellow<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[33m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn dim<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[2m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn bold<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[1m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+}
+
+fn print_startup_banner() {
+    let a = Ansi::new();
+    let version = env!("CARGO_PKG_VERSION");
+    eprintln!();
+    eprintln!(
+        "  {}  {}",
+        a.teal("▌ Kapsl Runtime"),
+        a.dim(&format!("v{}", version))
+    );
+    eprintln!("  {}", a.dim("─────────────────────────────────────"));
+}
+
+fn print_startup_ready(
+    elapsed_ms: u128,
+    serving_endpoint: &str,
+    http_ip: &str,
+    http_port: u16,
+) {
+    let a = Ansi::new();
+    let url_base = format!("http://{}:{}", http_ip, http_port);
+
+    eprintln!();
+    eprintln!(
+        "  {} {}  {}",
+        a.green("✓"),
+        a.bold("Ready"),
+        a.dim(&format!("(started in {}ms)", elapsed_ms))
+    );
+    eprintln!();
+
+    let rows: &[(&str, String)] = &[
+        ("Inference", serving_endpoint.to_string()),
+        ("API",       format!("{}/api", url_base)),
+        ("Dashboard", url_base.clone()),
+        ("Metrics",   format!("{}/metrics", url_base)),
+    ];
+
+    let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    for (label, url) in rows {
+        eprintln!(
+            "  {}  {:label_w$}  {}",
+            a.teal("→"),
+            a.dim(label),
+            a.teal(&url),
+            label_w = label_w,
+        );
+    }
+    eprintln!();
+}
+
+// ─── Spinner ─────────────────────────────────────────────────────────────────
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 fn run_with_loading<T, F>(label: &str, action: F) -> Result<T, DynError>
 where
     F: FnOnce() -> Result<T, DynError>,
 {
+    let a = Ansi::new();
     let running = Arc::new(AtomicBool::new(true));
     let spinner_running = Arc::clone(&running);
     let spinner_label = label.to_string();
+    let colors_on = a.enabled;
 
     let spinner_handle = std::thread::spawn(move || {
-        let frames = ['|', '/', '-', '\\'];
         let mut idx = 0usize;
         while spinner_running.load(Ordering::Relaxed) {
-            eprint!("\r{} {}", spinner_label, frames[idx % frames.len()]);
+            let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
+            if colors_on {
+                eprint!("\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ", frame, spinner_label);
+            } else {
+                eprint!("\r  {}  {}   ", frame, spinner_label);
+            }
             let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(120));
+            std::thread::sleep(Duration::from_millis(80));
             idx = idx.wrapping_add(1);
         }
     });
@@ -2644,9 +2793,9 @@ where
     let _ = spinner_handle.join();
 
     if result.is_ok() {
-        eprintln!("\r{} done", label);
+        eprintln!("\r  {}  {}   ", a.green("✓"), label);
     } else {
-        eprintln!("\r{} failed", label);
+        eprintln!("\r  {}  {}   ", a.red("✗"), label);
     }
 
     result
@@ -2656,17 +2805,23 @@ async fn run_with_loading_async<T, E, Fut>(label: &str, future: Fut) -> Result<T
 where
     Fut: Future<Output = Result<T, E>>,
 {
+    let a = Ansi::new();
     let running = Arc::new(AtomicBool::new(true));
     let spinner_running = Arc::clone(&running);
     let spinner_label = label.to_string();
+    let colors_on = a.enabled;
 
     let spinner_handle = std::thread::spawn(move || {
-        let frames = ['|', '/', '-', '\\'];
         let mut idx = 0usize;
         while spinner_running.load(Ordering::Relaxed) {
-            eprint!("\r{} {}", spinner_label, frames[idx % frames.len()]);
+            let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
+            if colors_on {
+                eprint!("\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ", frame, spinner_label);
+            } else {
+                eprint!("\r  {}  {}   ", frame, spinner_label);
+            }
             let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(120));
+            std::thread::sleep(Duration::from_millis(80));
             idx = idx.wrapping_add(1);
         }
     });
@@ -2677,9 +2832,9 @@ where
     let _ = spinner_handle.join();
 
     if result.is_ok() {
-        eprintln!("\r{} done", label);
+        eprintln!("\r  {}  {}   ", a.green("✓"), label);
     } else {
-        eprintln!("\r{} failed", label);
+        eprintln!("\r  {}  {}   ", a.red("✗"), label);
     }
 
     result
@@ -2703,17 +2858,19 @@ fn format_human_bytes(bytes: u64) -> String {
 }
 
 fn print_build_summary(kapsl_path: &str) {
+    let a = Ansi::new();
     let display_name = Path::new(kapsl_path)
         .file_name()
         .and_then(|v| v.to_str())
         .unwrap_or(kapsl_path);
     match fs::metadata(kapsl_path) {
-        Ok(metadata) => println!(
-            "✓ Built {} ({})",
+        Ok(metadata) => eprintln!(
+            "  {}  {} {}",
+            a.green("✓"),
             display_name,
-            format_human_bytes(metadata.len())
+            a.dim(&format!("({})", format_human_bytes(metadata.len())))
         ),
-        Err(_) => println!("✓ Built {}", display_name),
+        Err(_) => eprintln!("  {}  {}", a.green("✓"), display_name),
     }
 }
 
@@ -2747,17 +2904,18 @@ fn print_transfer_summary(
     elapsed: Duration,
     path_or_target: &str,
 ) {
+    let a = Ansi::new();
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let bytes_per_sec = (bytes as f64 / elapsed_secs).round() as u64;
     eprintln!(
-        "✓ {} {} via {} in {} ({}/s)",
+        "  {}  {} {}  {}  {}",
+        a.green("✓"),
         action,
         format_human_bytes(bytes),
-        transfer_backend_label(remote_url),
-        format_elapsed(elapsed),
-        format_human_bytes(bytes_per_sec),
+        a.dim(&format!("via {}", transfer_backend_label(remote_url))),
+        a.dim(&format!("in {} ({}/s)", format_elapsed(elapsed), format_human_bytes(bytes_per_sec))),
     );
-    eprintln!("  {}", path_or_target);
+    eprintln!("     {}", a.teal(path_or_target));
 }
 
 fn discover_kapsl_in_current_dir() -> Result<PathBuf, String> {
@@ -11502,6 +11660,7 @@ async fn main() -> Result<(), DynError> {
         );
     }
 
+    print_startup_banner();
     log::info!("🚀 Starting kapsl-runtime...\n");
     log::info!(
         "Performance profile: {} (batch_size={}, transport={}, scheduler_queue_size={}, scheduler_max_micro_batch={}, scheduler_queue_delay_ms={})",
@@ -15127,22 +15286,11 @@ async fn main() -> Result<(), DynError> {
     };
 
     let startup_elapsed_ms = startup_started_at.elapsed().as_millis();
-    println!("✓ Runtime started in {}ms", startup_elapsed_ms);
-    println!("→ Serving on {}", serving_endpoint);
-    println!(
-        "→ HTTP API on http://{}:{}/api",
-        http_bound_addr.ip(),
-        http_bound_addr.port()
-    );
-    println!(
-        "→ Dashboard on http://{}:{}",
-        http_bound_addr.ip(),
-        http_bound_addr.port()
-    );
-    println!(
-        "→ Metrics on http://{}:{}/metrics",
-        http_bound_addr.ip(),
-        http_bound_addr.port()
+    print_startup_ready(
+        startup_elapsed_ms,
+        &serving_endpoint,
+        &http_bound_addr.ip().to_string(),
+        http_bound_addr.port(),
     );
 
     server
