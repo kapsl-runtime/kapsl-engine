@@ -193,8 +193,10 @@ body.auth-locked {
 }
 
 /* ─── App Shell: Sidebar + Top-bar + Main ──────────────────────────────── */
+/* Sidebar is position:fixed, so the shell is block-flow: the sticky topbar
+ * and main-content stack vertically and clear the sidebar via margin-left. */
 .app-shell {
-    display: flex;
+    display: block;
     min-height: 100vh;
 }
 
