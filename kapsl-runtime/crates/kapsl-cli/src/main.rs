@@ -469,33 +469,68 @@ impl SharedKvStateInner {
     }
 }
 
+fn kapsl_help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects};
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .literal(AnsiColor::BrightCyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
+        .invalid(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .valid(AnsiColor::Green.on_default())
+}
+
 const CLI_AFTER_HELP: &str = "\
 Examples:
-  kapsl run --model models/mnist/mnist.aimod
-  kapsl add-model --model models/mnist/mnist.aimod
+  # Start the runtime with one model
+  kapsl run --model models/gpt2/gpt2.aimod
+
+  # Load an extra model into an already-running runtime (no restart)
+  kapsl add-model --model models/llama/llama.aimod
+
+  # Multi-GPU load-balancing across two runtime instances
   kapsl control --runtime gpu0=http://127.0.0.1:9095 --runtime gpu1=http://127.0.0.1:9096
+
+  # Package a model directory or single file
   kapsl build ./models/gpt-llm
-  kapsl build --model ./model.onnx --output ./model.aimod
   kapsl build ./model.onnx --output ./model.aimod
-  kapsl build   (from inside a model context directory)
-  kapsl push acme/mnist:prod ./model.aimod
-  kapsl push acme/mnist:prod   (from inside a directory with a single .aimod)
-  kapsl push acme/mnist:prod ./model.aimod --remote-url oci://ghcr.io
-  kapsl pull acme/mnist:prod --destination-dir ./models
+
+  # Push / pull packages to/from a remote registry
+  kapsl push acme/gpt2:prod ./model.aimod
+  kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io
+  kapsl pull acme/gpt2:prod --destination-dir ./models
+
+  # Authenticate (opens browser; use --device-code for SSH/headless)
   kapsl login
+  kapsl login --device-code
+
+Environment variables:
+  KAPSL_API_TOKEN          Shared fallback bearer token for /api routes
+  KAPSL_API_TOKEN_READER   Read-only API token
+  KAPSL_API_TOKEN_WRITER   Writer API token
+  KAPSL_API_TOKEN_ADMIN    Admin API token
+  KAPSL_REMOTE_URL         Default remote registry URL
+  KAPSL_REMOTE_TOKEN       Bearer token for push/pull
+  KAPSL_SHM_SIZE_MB        Shared-memory pool size (MiB) for shm/hybrid transport
 
 Compatibility:
-  kapsl --model models/mnist/mnist.aimod
-    (equivalent to `kapsl run --model models/mnist/mnist.aimod`)";
+  kapsl --model models/gpt2/gpt2.aimod
+    (equivalent to `kapsl run --model models/gpt2/gpt2.aimod`)";
 
 #[derive(Parser, Debug)]
 #[command(
     name = "kapsl",
     author,
     version,
-    about = "Kapsl runtime and packaging CLI",
-    long_about = "Run model packages, build new packages, and sync packages with a remote backend.",
-    after_help = CLI_AFTER_HELP
+    about = "Run, package, and distribute AI models",
+    long_about = "Kapsl is a high-performance AI inference runtime and packaging tool.\n\
+                  \n\
+                  Use `kapsl run` to serve one or more model packages, `kapsl build` to\n\
+                  create a portable .aimod package from an ONNX or GGUF model, and\n\
+                  `kapsl push`/`pull` to sync packages with a remote registry.",
+    after_help = CLI_AFTER_HELP,
+    styles(kapsl_help_styles()),
 )]
 struct Cli {
     #[command(subcommand)]
@@ -507,86 +542,102 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum KapslCommand {
-    /// Run the Kapsl runtime server
+    /// Start the inference server and load one or more model packages
     Run(Args),
-    /// Run multi-runtime control loop (cross-port weights + scaling policy orchestration)
+    /// Continuously balance load and scale replicas across multiple runtimes
     Control(ControlCommandArgs),
-    /// Build a .aimod model package from a source model file
+    /// Package a model file or directory into a portable .aimod archive
     Build(BuildCommandArgs),
-    /// Push a .aimod package to the configured remote backend
+    /// Upload a .aimod package to a remote registry
     Push(PushCommandArgs),
-    /// Pull a .aimod package from the configured remote backend
+    /// Download a .aimod package from a remote registry
     Pull(PullCommandArgs),
-    /// Authenticate with a remote backend and save token locally
+    /// Log in to a remote registry and save credentials locally
     Login(LoginCommandArgs),
-    /// Add a model to an already-running runtime without restarting
+    /// Hot-load a model into an already-running runtime (no restart required)
     AddModel(AddModelCommandArgs),
 }
 
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Run Options")]
 struct Args {
-    /// Path to .aimod package(s)
+    /// Path to one or more .aimod model packages to load at startup (repeatable)
     #[arg(short, long)]
     model: Vec<PathBuf>,
 
-    /// Transport mode: socket, tcp, shm, hybrid, or auto
+    /// IPC transport used between the runtime and clients.
+    /// socket — Unix domain socket (lowest latency, same host only).
+    /// tcp    — TCP socket (cross-host).
+    /// shm    — Shared memory (highest throughput, same host only).
+    /// hybrid — shm for local clients, tcp for remote.
+    /// auto   — picks the best available transport automatically.
     #[arg(long, default_value = "socket")]
     transport: String,
 
-    /// Path to unix socket (for socket mode)
+    /// Unix socket path (used when --transport=socket)
     #[cfg_attr(unix, arg(short, long, default_value = "/tmp/kapsl.sock"))]
     #[cfg_attr(windows, arg(short, long, default_value = r"\\.\pipe\kapsl"))]
     socket: String,
 
-    /// Bind address for TCP server
+    /// Bind address for the TCP inference server (used when --transport=tcp|hybrid|auto)
     #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
-    /// TCP port for network transport
+    /// TCP port for the inference server
     #[arg(long, default_value_t = 9096)]
     port: u16,
 
-    /// Max batch size
+    /// Maximum number of requests combined into a single inference batch
     #[arg(long, default_value_t = 4)]
     batch_size: usize,
 
-    /// Max queue depth per scheduler priority queue / worker
+    /// Maximum number of pending requests held in each scheduler priority queue
     #[arg(long, default_value_t = 256)]
     scheduler_queue_size: usize,
 
-    /// Max requests to aggregate into a throughput micro-batch
+    /// Maximum requests combined into a throughput micro-batch before dispatch
     #[arg(long, default_value_t = 4)]
     scheduler_max_micro_batch: usize,
 
-    /// Target queue delay in ms before dispatching throughput micro-batches
+    /// How long (ms) the scheduler waits to accumulate a full micro-batch before flushing early
     #[arg(long, default_value_t = 2)]
     scheduler_queue_delay_ms: u64,
 
-    /// Runtime performance profile that tunes defaults when related flags are not explicitly set.
-    /// Defaults to "auto" which selects parameters based on model size and system resources.
+    /// Preset that tunes batch size, transport, and scheduler settings together.
+    /// Individual flags (--batch-size etc.) override the preset when specified.
+    /// auto       — chooses settings based on detected model size and hardware.
+    /// standard   — conservative defaults suitable for most workloads.
+    /// balanced   — moderate batching with a mix of latency and throughput.
+    /// throughput — aggressive batching optimised for maximum tokens/second.
+    /// latency    — batch-size 1, socket transport, minimal queue delay.
     #[arg(long, value_enum, default_value_t = PerformanceProfile::Auto)]
     performance_profile: PerformanceProfile,
 
-    /// Metrics server port
+    /// Port for the HTTP API, dashboard, and Prometheus metrics server
     #[arg(long, default_value_t = 9095)]
     metrics_port: u16,
 
-    /// Bind address for HTTP API/UI/metrics server
+    /// Bind address for the HTTP API / dashboard / metrics server.
+    /// Defaults to loopback; set to 0.0.0.0 only behind a TLS reverse proxy
+    /// and with KAPSL_ALLOW_INSECURE_HTTP=1.
     #[arg(long, default_value = "127.0.0.1")]
     http_bind: String,
 
-    /// Root directory for runtime state (rag-data, extensions, extensions-config, auth-store.json).
-    /// When set, overrides KAPSL_RAG_STORAGE_ROOT, KAPSL_EXTENSIONS_ROOT, KAPSL_EXT_CONFIG_ROOT,
-    /// and KAPSL_AUTH_STORE_PATH.
+    /// Root directory for persistent runtime state (RAG data, extensions, auth store).
+    /// Overrides KAPSL_RAG_STORAGE_ROOT, KAPSL_EXTENSIONS_ROOT, KAPSL_EXT_CONFIG_ROOT,
+    /// and KAPSL_AUTH_STORE_PATH when set.
     #[arg(long, value_name = "DIR")]
     state_dir: Option<PathBuf>,
 
-    /// Mesh topology (data-parallel, tensor-parallel, pipeline-parallel, mixed)
+    /// Multi-device parallelism topology for loaded models.
+    /// data-parallel     — each device holds a full model replica (default).
+    /// tensor-parallel   — model weights are split across --tp-degree devices.
+    /// pipeline-parallel — model layers are distributed across devices.
+    /// mixed             — combines tensor and pipeline parallelism.
     #[arg(long, default_value = "data-parallel")]
     topology: String,
 
-    /// Tensor parallelism degree (number of devices per TP group)
+    /// Number of devices per tensor-parallel group (used when --topology=tensor-parallel or mixed)
     #[arg(long, default_value_t = 1)]
     tp_degree: usize,
 
@@ -598,46 +649,54 @@ struct Args {
     #[arg(long, hide = true)]
     worker_model_id: Option<u32>,
 
-    /// Global ONNX Runtime memory-pattern setting for all ONNX models (true/false).
+    /// Enable ONNX Runtime memory-pattern optimisation for all ONNX models.
+    /// Pre-allocates fixed-shape output buffers to reduce per-call overhead.
+    /// Disable if your models have dynamic output shapes.
     #[arg(long, value_name = "BOOL")]
     onnx_memory_pattern: Option<bool>,
 
-    /// Global ONNX Runtime CPU arena toggle for all ONNX models (true/false).
+    /// Disable the ONNX Runtime CPU memory arena for all ONNX models.
+    /// The arena pre-allocates a large block and sub-allocates from it; disabling
+    /// can reduce peak RSS at the cost of more frequent allocator calls.
     #[arg(long, value_name = "BOOL")]
     onnx_disable_cpu_mem_arena: Option<bool>,
 
-    /// Global ONNX Runtime session bucket count for shape-bucketed session reuse.
+    /// Number of shape buckets for session reuse across requests with varying input sizes.
+    /// Higher values reduce recompilation but increase memory usage.
     #[arg(long, value_name = "N")]
     onnx_session_buckets: Option<usize>,
 
-    /// Global ONNX Runtime non-batch dimension bucket granularity.
+    /// Rounding granularity (in elements) applied to non-batch dimensions when bucketing.
+    /// Larger values create fewer buckets with more padding.
     #[arg(long, value_name = "N")]
     onnx_bucket_dim_granularity: Option<usize>,
 
-    /// Global ONNX Runtime number of leading dims used for bucket keys.
+    /// Number of leading input dimensions included in the bucket key (beyond batch).
     #[arg(long, value_name = "N")]
     onnx_bucket_max_dims: Option<usize>,
 
-    /// Global peak-concurrency hint exported in ONNX model metadata.
+    /// Expected peak concurrent requests for this model, exported in metadata.
+    /// Used by clients to size their own thread pools.
     #[arg(long, value_name = "N")]
     onnx_peak_concurrency_hint: Option<u32>,
 
-    /// Shared memory pool size in MiB for shm/hybrid/auto transports.
-    /// Also read from KAPSL_SHM_SIZE_MB. Default: 256 MiB.
-    #[arg(long, value_name = "MIB")]
+    /// Shared-memory pool size in MiB for shm/hybrid/auto transports (env: KAPSL_SHM_SIZE_MB)
+    #[arg(long, value_name = "MIB", default_value = "256")]
     shm_size_mb: Option<usize>,
 
-    /// Per-model ONNX tuning override.
-    /// Format: `<model_id|*>:k=v[,k=v...]`
+    /// Per-model ONNX tuning overrides. Repeat the flag for each model.
+    /// Format: `<model_id|*>:key=value[,key=value...]`
+    /// Use `*` to apply to all ONNX models.
     /// Keys: memory_pattern, disable_cpu_mem_arena, session_buckets,
-    /// bucket_dim_granularity, bucket_max_dims, peak_concurrency.
+    ///       bucket_dim_granularity, bucket_max_dims, peak_concurrency
+    /// Example: --onnx-model-tuning 1:memory_pattern=false,session_buckets=8
     #[arg(long, value_name = "SPEC")]
     onnx_model_tuning: Vec<String>,
 
-    /// TurboQuant KV-cache compression bit-width (2, 3, or 4).
-    /// 3-bit gives ~2.7× memory reduction with minimal quality loss.
-    /// When unset or 0, KV entries are stored uncompressed in FP16.
-    /// Can also be set via KAPSL_LLM_KV_COMPRESSION_BITS.
+    /// KV-cache compression bit-width for LLM models: 2, 3, or 4 bits.
+    /// 3-bit reduces KV memory by ~2.7× with minimal quality loss.
+    /// Omit or set to 0 to keep KV entries in full FP16 (no compression).
+    /// Also configurable via KAPSL_LLM_KV_COMPRESSION_BITS.
     #[arg(long, value_name = "BITS")]
     kv_compression_bits: Option<u8>,
 }
@@ -803,31 +862,32 @@ fn build_onnx_tuning_profile(args: &Args) -> Result<OnnxTuningProfile, String> {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Build Options")]
 struct BuildCommandArgs {
-    /// Build context directory (Docker-style) or a model file path (for example ./models/gpt-llm or ./model.onnx)
+    /// Build context: a model directory (containing kapsl.yaml) or a bare model file (.onnx, .gguf).
+    /// When omitted, the current directory is used as the context.
     #[arg(value_name = "CONTEXT")]
     context: Option<PathBuf>,
 
-    /// Source model file path (for example, model.onnx or model.gguf)
+    /// Explicit path to the source model file — use when the file lives outside the context directory
     #[arg(long, value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Output .aimod package path
+    /// Output path for the generated .aimod package (defaults to <project_name>.aimod in the context)
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
 
-    /// Optional project name override
+    /// Override the project name embedded in the package (defaults to the directory or file name)
     #[arg(long)]
     project_name: Option<String>,
 
-    /// Optional framework override
+    /// Override the framework tag embedded in the package (e.g. onnx, gguf, pytorch)
     #[arg(long)]
     framework: Option<String>,
 
-    /// Optional version override
+    /// Override the version string embedded in the package
     #[arg(long)]
     version: Option<String>,
 
-    /// Optional JSON object string for metadata
+    /// Arbitrary JSON object merged into the package manifest metadata
     #[arg(long, value_name = "JSON")]
     metadata_json: Option<String>,
 }
@@ -835,23 +895,24 @@ struct BuildCommandArgs {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Push Options")]
 struct PushCommandArgs {
-    /// Push target in the format <repo_name>/<model>:<label>
+    /// Destination in the registry. Format: <repo>/<model>:<label>  (e.g. acme/gpt2:prod)
     #[arg(value_name = "TARGET")]
     target: String,
 
-    /// Package path to push (defaults to the only `.aimod` in the current directory)
+    /// Path to the .aimod package to upload (defaults to the only .aimod in the current directory)
     #[arg(value_name = "KAPSL")]
     kapsl: Option<PathBuf>,
 
-    /// Package path to push
+    /// Explicit package path (alternative to the positional argument)
     #[arg(long, alias = "kapsl-path", value_name = "PATH")]
     model: Option<PathBuf>,
 
-    /// Override remote URL for this upload
+    /// Remote registry URL — overrides KAPSL_REMOTE_URL for this call.
+    /// Use an oci:// prefix to push to an OCI-compatible registry (e.g. oci://ghcr.io).
     #[arg(long, value_name = "URL")]
     remote_url: Option<String>,
 
-    /// Bearer token for authenticated remote backends (also read from KAPSL_REMOTE_TOKEN)
+    /// Bearer token for the remote registry (env: KAPSL_REMOTE_TOKEN)
     #[arg(long, value_name = "TOKEN")]
     remote_token: Option<String>,
 }
@@ -866,27 +927,28 @@ struct PushCommandArgs {
     )
 )]
 struct PullCommandArgs {
-    /// Pull target in the format <repo_name>/<model>:<label>
+    /// Package to download. Format: <repo>/<model>:<label>  (e.g. acme/gpt2:prod)
     #[arg(value_name = "TARGET")]
     target: Option<String>,
 
-    /// Pull target in the format <repo_name>/<model>:<label>
+    /// Package to download (alternative to the positional argument)
     #[arg(long, alias = "target-ref", value_name = "TARGET")]
     model: Option<String>,
 
-    /// Optional OCI digest reference when using an `oci://` remote (e.g. `sha256:<digest>` or `@sha256:<digest>`)
+    /// Pin to a specific OCI content digest when using an oci:// remote.
+    /// Accepts sha256:<hex> or @sha256:<hex>.
     #[arg(long = "ref", value_name = "REF")]
     reference: Option<String>,
 
-    /// Destination directory for the downloaded package
+    /// Directory where the downloaded .aimod file will be saved (defaults to current directory)
     #[arg(long, value_name = "DIR")]
     destination_dir: Option<PathBuf>,
 
-    /// Override remote URL for this download
+    /// Remote registry URL — overrides KAPSL_REMOTE_URL for this call
     #[arg(long, value_name = "URL")]
     remote_url: Option<String>,
 
-    /// Bearer token for authenticated remote backends (also read from KAPSL_REMOTE_TOKEN)
+    /// Bearer token for the remote registry (env: KAPSL_REMOTE_TOKEN)
     #[arg(long, value_name = "TOKEN")]
     remote_token: Option<String>,
 }
@@ -930,35 +992,35 @@ struct LoginCommandArgs {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Add-Model Options")]
 struct AddModelCommandArgs {
-    /// Path(s) to .aimod package(s) to add (repeat for each model)
+    /// Path to a .aimod package to load. Repeat to add multiple models in one call.
     #[arg(short, long, required = true, value_name = "PATH")]
     model: Vec<PathBuf>,
 
-    /// HTTP API port of the running runtime (default 9095)
+    /// HTTP port of the running runtime's API server
     #[arg(long, default_value_t = 9095, value_name = "PORT")]
     http_port: u16,
 
-    /// HTTP bind address of the running runtime
+    /// Hostname or IP of the running runtime's API server
     #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
     http_host: String,
 
-    /// Full HTTP base URL of the running runtime (overrides --http-host and --http-port)
+    /// Full base URL of the running runtime (overrides --http-host / --http-port)
     #[arg(long, value_name = "URL")]
     http_url: Option<String>,
 
-    /// Bearer token for authenticated runtimes
+    /// Bearer token if the runtime has API authentication enabled
     #[arg(long, value_name = "TOKEN")]
     auth_token: Option<String>,
 
-    /// Mesh topology for the added model(s) (data-parallel, tensor-parallel, pipeline-parallel, mixed)
+    /// Parallelism topology for the new model(s) — same values as `kapsl run --topology`
     #[arg(long, default_value = "data-parallel", value_name = "TOPOLOGY")]
     topology: String,
 
-    /// Tensor parallelism degree for the added model(s)
+    /// Tensor-parallel device count for the new model(s)
     #[arg(long, default_value_t = 1, value_name = "N")]
     tp_degree: usize,
 
-    /// Per-request timeout in milliseconds when contacting the runtime API
+    /// HTTP request timeout (ms) for the load call — large models may take longer to respond
     #[arg(long, default_value_t = 30000, value_name = "MS")]
     timeout_ms: u64,
 }
@@ -991,83 +1053,89 @@ enum RuntimeGroupProfile {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Control Options")]
 struct ControlCommandArgs {
-    /// Runtime endpoint definition as NAME=URL (repeat for each runtime)
+    /// Register a runtime endpoint. Repeat for each instance.
+    /// Format: NAME=http://HOST:PORT (e.g. gpu0=http://127.0.0.1:9095)
     #[arg(long = "runtime", value_name = "NAME=URL", required = true)]
     runtimes: Vec<String>,
 
-    /// Runtime profile override as NAME=latency|balanced|throughput
+    /// Override the performance profile for a specific runtime.
+    /// Format: NAME=latency|balanced|throughput
     #[arg(long = "runtime-profile", value_name = "NAME=PROFILE")]
     runtime_profiles: Vec<String>,
 
-    /// Runtime token override as NAME=TOKEN
+    /// Set a bearer token for a specific runtime.
+    /// Format: NAME=TOKEN (takes precedence over --auth-token for that runtime)
     #[arg(long = "runtime-token", value_name = "NAME=TOKEN")]
     runtime_tokens: Vec<String>,
 
-    /// Shared bearer token for all runtimes that don't define --runtime-token
+    /// Shared bearer token applied to all runtimes that have no --runtime-token
     #[arg(long = "auth-token", value_name = "TOKEN")]
     auth_token: Option<String>,
 
-    /// Memory budget override per runtime as NAME=BYTES
+    /// Cap the VRAM budget used for scoring a specific runtime.
+    /// Format: NAME=BYTES (e.g. gpu0=17179869184 for 16 GiB)
     #[arg(long = "memory-budget-bytes", value_name = "NAME=BYTES")]
     memory_budget_bytes: Vec<String>,
 
-    /// Poll interval in seconds
+    /// How often (seconds) to poll runtime metrics and recompute weights
     #[arg(long, default_value_t = 5)]
     interval_seconds: u64,
 
-    /// Per-request timeout in milliseconds for runtime API polling/update calls
+    /// Per-call HTTP timeout (ms) for polling and weight-update requests
     #[arg(long, default_value_t = 1500)]
     timeout_ms: u64,
 
-    /// Queue depth target for score normalization
+    /// Queue depth considered "normal" when computing the pressure score.
+    /// Queues deeper than this start to penalise the runtime's weight.
     #[arg(long, default_value_t = 10)]
     queue_target: usize,
 
-    /// Score threshold above which runtime weight decreases
+    /// Pressure score above which the runtime loses weight each cycle (0.0–1.0)
     #[arg(long, default_value_t = 0.85)]
     high_pressure_score: f64,
 
-    /// Score threshold below which runtime weight increases
+    /// Pressure score below which the runtime gains weight each cycle (0.0–1.0)
     #[arg(long, default_value_t = 0.45)]
     low_pressure_score: f64,
 
-    /// GPU hot threshold (0.0-1.0)
+    /// GPU utilisation fraction (0.0–1.0) above which the runtime is considered hot
     #[arg(long, default_value_t = 0.92)]
     hot_gpu_utilization: f64,
 
-    /// Memory hot threshold (0.0-1.0; requires --memory-budget-bytes)
+    /// Memory utilisation fraction (0.0–1.0) above which the runtime is considered hot.
+    /// Only active when --memory-budget-bytes is provided for the runtime.
     #[arg(long, default_value_t = 0.90)]
     hot_memory_utilization: f64,
 
-    /// Sustained overload window before extra traffic shedding
+    /// Seconds a runtime must remain overloaded before an extra weight penalty is applied
     #[arg(long, default_value_t = 30)]
     overload_window_seconds: u64,
 
-    /// Sustained hot window before extra traffic shedding
+    /// Seconds a runtime must remain hot before an extra weight penalty is applied
     #[arg(long, default_value_t = 20)]
     hot_window_seconds: u64,
 
-    /// Hold runtime at zero weight after health/API failure
+    /// Seconds a runtime stays at weight 0 after a health-check or API failure
     #[arg(long, default_value_t = 30)]
     unhealthy_hold_seconds: u64,
 
-    /// Max proportional weight move per cycle
+    /// Maximum fractional weight change applied per control cycle (0.0–1.0)
     #[arg(long, default_value_t = 0.10)]
     weight_step: f64,
 
-    /// Minimum non-zero weight for eligible runtimes
+    /// Minimum weight assigned to eligible runtimes — prevents them from reaching zero under normal load
     #[arg(long, default_value_t = 0.05)]
     weight_floor: f64,
 
-    /// Extra weight cut when overload/hot windows are exceeded
+    /// Additional weight fraction removed when the overload or hot window is exceeded
     #[arg(long, default_value_t = 0.20)]
     overload_shift_fraction: f64,
 
-    /// Don't POST scaling policy updates; only compute scores/weights
+    /// Compute and log scores/weights without posting any updates to the runtimes
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    /// Output file for computed weights and telemetry snapshot
+    /// JSON file where each cycle's computed weights and telemetry snapshot are written
     #[arg(
         long,
         value_name = "PATH",
@@ -1078,11 +1146,15 @@ struct ControlCommandArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum PerformanceProfile {
-    /// Automatically select parameters based on model size and system resources (default)
+    /// Detect model size and hardware at startup and choose the best preset automatically
     Auto,
+    /// Conservative defaults — a safe starting point for unknown workloads
     Standard,
+    /// Moderate batching with a balance between throughput and response latency
     Balanced,
+    /// Aggressive batching and larger queues optimised for maximum tokens/second
     Throughput,
+    /// Batch size 1, socket transport, zero queue delay — minimises time-to-first-token
     Latency,
 }
 
@@ -2619,21 +2691,170 @@ fn parse_runtime_args_and_matches(argv: &[String]) -> Result<(Args, ArgMatches),
     Ok((args, matches))
 }
 
+// ─── ANSI helpers (no external deps) ────────────────────────────────────────
+
+fn cli_color_enabled() -> bool {
+    // Respect NO_COLOR / TERM=dumb; fall back to stderr being a tty.
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").as_deref() == Ok("dumb") {
+        return false;
+    }
+    // Use atty-free check: if stderr fd 2 is a character device we assume tty.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stderr().as_raw_fd();
+        unsafe { libc_isatty(fd) }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(unix)]
+fn libc_isatty(fd: i32) -> bool {
+    extern "C" {
+        fn isatty(fd: i32) -> i32;
+    }
+    unsafe { isatty(fd) != 0 }
+}
+
+struct Ansi {
+    enabled: bool,
+}
+
+impl Ansi {
+    fn new() -> Self {
+        Self { enabled: cli_color_enabled() }
+    }
+
+    fn teal<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[38;5;43m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn green<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[32m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn red<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[31m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn yellow<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[33m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn dim<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[2m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+
+    fn bold<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        if self.enabled {
+            format!("\x1b[1m{}\x1b[0m", s).into()
+        } else {
+            s.into()
+        }
+    }
+}
+
+fn print_startup_banner() {
+    let a = Ansi::new();
+    let version = env!("CARGO_PKG_VERSION");
+    eprintln!();
+    eprintln!(
+        "  {}  {}",
+        a.teal("▌ Kapsl Runtime"),
+        a.dim(&format!("v{}", version))
+    );
+    eprintln!("  {}", a.dim("─────────────────────────────────────"));
+}
+
+fn print_startup_ready(
+    elapsed_ms: u128,
+    serving_endpoint: &str,
+    http_ip: &str,
+    http_port: u16,
+) {
+    let a = Ansi::new();
+    let url_base = format!("http://{}:{}", http_ip, http_port);
+
+    eprintln!();
+    eprintln!(
+        "  {} {}  {}",
+        a.green("✓"),
+        a.bold("Ready"),
+        a.dim(&format!("(started in {}ms)", elapsed_ms))
+    );
+    eprintln!();
+
+    let rows: &[(&str, String)] = &[
+        ("Inference", serving_endpoint.to_string()),
+        ("API",       format!("{}/api", url_base)),
+        ("Dashboard", url_base.clone()),
+        ("Metrics",   format!("{}/metrics", url_base)),
+    ];
+
+    let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    for (label, url) in rows {
+        eprintln!(
+            "  {}  {:label_w$}  {}",
+            a.teal("→"),
+            a.dim(label),
+            a.teal(&url),
+            label_w = label_w,
+        );
+    }
+    eprintln!();
+}
+
+// ─── Spinner ─────────────────────────────────────────────────────────────────
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 fn run_with_loading<T, F>(label: &str, action: F) -> Result<T, DynError>
 where
     F: FnOnce() -> Result<T, DynError>,
 {
+    let a = Ansi::new();
     let running = Arc::new(AtomicBool::new(true));
     let spinner_running = Arc::clone(&running);
     let spinner_label = label.to_string();
+    let colors_on = a.enabled;
 
     let spinner_handle = std::thread::spawn(move || {
-        let frames = ['|', '/', '-', '\\'];
         let mut idx = 0usize;
         while spinner_running.load(Ordering::Relaxed) {
-            eprint!("\r{} {}", spinner_label, frames[idx % frames.len()]);
+            let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
+            if colors_on {
+                eprint!("\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ", frame, spinner_label);
+            } else {
+                eprint!("\r  {}  {}   ", frame, spinner_label);
+            }
             let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(120));
+            std::thread::sleep(Duration::from_millis(80));
             idx = idx.wrapping_add(1);
         }
     });
@@ -2644,9 +2865,9 @@ where
     let _ = spinner_handle.join();
 
     if result.is_ok() {
-        eprintln!("\r{} done", label);
+        eprintln!("\r  {}  {}   ", a.green("✓"), label);
     } else {
-        eprintln!("\r{} failed", label);
+        eprintln!("\r  {}  {}   ", a.red("✗"), label);
     }
 
     result
@@ -2656,17 +2877,23 @@ async fn run_with_loading_async<T, E, Fut>(label: &str, future: Fut) -> Result<T
 where
     Fut: Future<Output = Result<T, E>>,
 {
+    let a = Ansi::new();
     let running = Arc::new(AtomicBool::new(true));
     let spinner_running = Arc::clone(&running);
     let spinner_label = label.to_string();
+    let colors_on = a.enabled;
 
     let spinner_handle = std::thread::spawn(move || {
-        let frames = ['|', '/', '-', '\\'];
         let mut idx = 0usize;
         while spinner_running.load(Ordering::Relaxed) {
-            eprint!("\r{} {}", spinner_label, frames[idx % frames.len()]);
+            let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
+            if colors_on {
+                eprint!("\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ", frame, spinner_label);
+            } else {
+                eprint!("\r  {}  {}   ", frame, spinner_label);
+            }
             let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(120));
+            std::thread::sleep(Duration::from_millis(80));
             idx = idx.wrapping_add(1);
         }
     });
@@ -2677,9 +2904,9 @@ where
     let _ = spinner_handle.join();
 
     if result.is_ok() {
-        eprintln!("\r{} done", label);
+        eprintln!("\r  {}  {}   ", a.green("✓"), label);
     } else {
-        eprintln!("\r{} failed", label);
+        eprintln!("\r  {}  {}   ", a.red("✗"), label);
     }
 
     result
@@ -2703,17 +2930,19 @@ fn format_human_bytes(bytes: u64) -> String {
 }
 
 fn print_build_summary(kapsl_path: &str) {
+    let a = Ansi::new();
     let display_name = Path::new(kapsl_path)
         .file_name()
         .and_then(|v| v.to_str())
         .unwrap_or(kapsl_path);
     match fs::metadata(kapsl_path) {
-        Ok(metadata) => println!(
-            "✓ Built {} ({})",
+        Ok(metadata) => eprintln!(
+            "  {}  {} {}",
+            a.green("✓"),
             display_name,
-            format_human_bytes(metadata.len())
+            a.dim(&format!("({})", format_human_bytes(metadata.len())))
         ),
-        Err(_) => println!("✓ Built {}", display_name),
+        Err(_) => eprintln!("  {}  {}", a.green("✓"), display_name),
     }
 }
 
@@ -2747,17 +2976,18 @@ fn print_transfer_summary(
     elapsed: Duration,
     path_or_target: &str,
 ) {
+    let a = Ansi::new();
     let elapsed_secs = elapsed.as_secs_f64().max(0.001);
     let bytes_per_sec = (bytes as f64 / elapsed_secs).round() as u64;
     eprintln!(
-        "✓ {} {} via {} in {} ({}/s)",
+        "  {}  {} {}  {}  {}",
+        a.green("✓"),
         action,
         format_human_bytes(bytes),
-        transfer_backend_label(remote_url),
-        format_elapsed(elapsed),
-        format_human_bytes(bytes_per_sec),
+        a.dim(&format!("via {}", transfer_backend_label(remote_url))),
+        a.dim(&format!("in {} ({}/s)", format_elapsed(elapsed), format_human_bytes(bytes_per_sec))),
     );
-    eprintln!("  {}", path_or_target);
+    eprintln!("     {}", a.teal(path_or_target));
 }
 
 fn discover_kapsl_in_current_dir() -> Result<PathBuf, String> {
@@ -2897,11 +3127,6 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
             }
         }
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
-    );
     print_build_summary(&response.kapsl_path);
     Ok(())
 }
@@ -2937,11 +3162,6 @@ fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError> {
         response.bytes_uploaded,
         started_at.elapsed(),
         &response.artifact_url,
-    );
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
     );
     Ok(())
 }
@@ -2979,11 +3199,6 @@ fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError> {
         started_at.elapsed(),
         &response.kapsl_path,
     );
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
-    );
     Ok(())
 }
 
@@ -3012,11 +3227,29 @@ fn execute_login_command(args: LoginCommandArgs) -> Result<(), DynError> {
     }
     .map_err(dyn_error_from_message)?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
+    let a = Ansi::new();
+    eprintln!();
+    eprintln!(
+        "  {}  {}",
+        a.green("✓"),
+        a.bold("Authenticated successfully")
     );
+    eprintln!(
+        "     {}  {}",
+        a.dim("Provider"),
+        response.provider
+    );
+    eprintln!(
+        "     {}    {}",
+        a.dim("Remote"),
+        a.teal(&response.remote_url)
+    );
+    eprintln!(
+        "     {}    {}",
+        a.dim("Token"),
+        a.dim(&response.token_store_path)
+    );
+    eprintln!();
 
     Ok(())
 }
@@ -3042,12 +3275,22 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
 
     let start_url = format!("{}/api/models/start", base_url);
 
+    let a = Ansi::new();
     let mut any_error = false;
     for model_path in &args.model {
+        let display = model_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| model_path.to_str().unwrap_or("?"));
+
         let absolute_path = match model_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("error: model path {:?} is invalid: {}", model_path, e);
+                eprintln!(
+                    "  {}  {}  {}",
+                    a.red("✗"),
+                    display,
+                    a.dim(&format!("({})", e))
+                );
                 any_error = true;
                 continue;
             }
@@ -3075,16 +3318,25 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
                     .body_mut()
                     .read_to_string()
                     .unwrap_or_else(|_| String::new());
-                match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(json) => println!("{}", serde_json::to_string_pretty(&json).unwrap_or(body)),
-                    Err(_) => println!("{}", body),
-                }
+                // Extract model_id from JSON if present for a nicer summary line.
+                let model_id = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|json| json.get("model_id").and_then(|v| v.as_u64()))
+                    .map(|id| format!(" (id={})", id))
+                    .unwrap_or_default();
+                eprintln!(
+                    "  {}  {}{}",
+                    a.green("✓"),
+                    display,
+                    a.dim(&model_id)
+                );
             }
             Err(e) => {
                 eprintln!(
-                    "error: failed to add model {:?}: {}",
-                    model_path,
-                    format_remote_http_error(e)
+                    "  {}  {}  {}",
+                    a.red("✗"),
+                    display,
+                    a.dim(&format!("({})", format_remote_http_error(e)))
                 );
                 any_error = true;
             }
@@ -5077,12 +5329,14 @@ fn perform_browser_login_flow(
         percent_encode_query_component(&callback_url)
     );
 
+    let a = Ansi::new();
     if no_browser {
-        println!("Open this URL to sign in:\n{}", login_url);
+        eprintln!("  {}  {}", a.dim("Sign in at:"), a.teal(&login_url));
     } else if !open_browser(&login_url) {
-        println!(
-            "Could not open a browser automatically. Open this URL to sign in:\n{}",
-            login_url
+        eprintln!(
+            "  {}  {}",
+            a.dim("Browser could not open. Sign in at:"),
+            a.teal(&login_url)
         );
     }
 
@@ -5180,24 +5434,29 @@ fn perform_device_code_login_flow(
         return Err("Remote backend returned an empty user_code.".to_string());
     }
 
+    let a = Ansi::new();
     if let Some(complete_url) = start.verification_uri_complete.as_deref() {
         let trimmed = complete_url.trim();
         if !trimmed.is_empty() {
             if no_browser {
-                println!("Open this URL to authorize this login:\n{}", trimmed);
+                eprintln!("  {}  {}", a.dim("Authorize at:"), a.teal(trimmed));
             } else if !open_browser(trimmed) {
-                println!(
-                    "Could not open a browser automatically. Open this URL to authorize this login:\n{}",
-                    trimmed
+                eprintln!(
+                    "  {}  {}",
+                    a.dim("Browser could not open. Authorize at:"),
+                    a.teal(trimmed)
                 );
             }
         }
     }
-    println!(
-        "If prompted, open {} and enter code: {}",
-        verification_uri, user_code
+    eprintln!(
+        "  {}  {}  {}  {}",
+        a.dim("Enter code"),
+        a.bold(&user_code),
+        a.dim("at"),
+        a.teal(&verification_uri)
     );
-    println!("Waiting for authorization approval...");
+    eprintln!("  {}", a.dim("Waiting for authorization approval..."));
 
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
@@ -5335,9 +5594,11 @@ fn maybe_auto_login_for_remote(
         return Ok(false);
     }
 
-    println!(
-        "Remote backend requires authentication. Starting browser login for {} ...",
-        remote_url
+    let a = Ansi::new();
+    eprintln!(
+        "  {}  {}",
+        a.dim("Authenticating with"),
+        a.teal(remote_url)
     );
     let browser_login = perform_browser_login_flow(
         remote_url,
@@ -5811,7 +6072,7 @@ fn push_kapsl_to_http_remote(
 
     // Try presigned URL flow first.
     if let Some(presigned) = request_presigned_upload_url(artifact_url, authorization_header)? {
-        eprintln!("Uploading via presigned URL ({} bytes)...", file_size.len());
+        eprintln!("  {}", Ansi::new().dim(&format!("Uploading {} bytes...", file_size.len())));
         let file = File::open(source_path).map_err(|e| RemoteHttpRequestError {
             status_code: None,
             message: format!(
@@ -6032,7 +6293,7 @@ fn pull_kapsl_from_http_remote(
     // Try presigned URL flow first.
     if let Some(download_url) = request_presigned_download_url(artifact_url, authorization_header)?
     {
-        eprintln!("Downloading via presigned URL...");
+        eprintln!("  {}", Ansi::new().dim("Downloading..."));
         // No auth header needed — the SAS token is in the URL.
         return download_to_file(&download_url, output_path, None);
     }
@@ -11502,6 +11763,7 @@ async fn main() -> Result<(), DynError> {
         );
     }
 
+    print_startup_banner();
     log::info!("🚀 Starting kapsl-runtime...\n");
     log::info!(
         "Performance profile: {} (batch_size={}, transport={}, scheduler_queue_size={}, scheduler_max_micro_batch={}, scheduler_queue_delay_ms={})",
@@ -15127,22 +15389,11 @@ async fn main() -> Result<(), DynError> {
     };
 
     let startup_elapsed_ms = startup_started_at.elapsed().as_millis();
-    println!("✓ Runtime started in {}ms", startup_elapsed_ms);
-    println!("→ Serving on {}", serving_endpoint);
-    println!(
-        "→ HTTP API on http://{}:{}/api",
-        http_bound_addr.ip(),
-        http_bound_addr.port()
-    );
-    println!(
-        "→ Dashboard on http://{}:{}",
-        http_bound_addr.ip(),
-        http_bound_addr.port()
-    );
-    println!(
-        "→ Metrics on http://{}:{}/metrics",
-        http_bound_addr.ip(),
-        http_bound_addr.port()
+    print_startup_ready(
+        startup_elapsed_ms,
+        &serving_endpoint,
+        &http_bound_addr.ip().to_string(),
+        http_bound_addr.port(),
     );
 
     server
