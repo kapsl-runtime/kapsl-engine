@@ -481,42 +481,76 @@ fn kapsl_help_styles() -> clap::builder::Styles {
         .valid(AnsiColor::Green.on_default())
 }
 
-const CLI_AFTER_HELP: &str = "\
-Examples:
-  # Start the runtime with one model
-  kapsl run --model models/gpt2/gpt2.aimod
+fn cli_after_help() -> String {
+    use std::fmt::Write as _;
+    let a = Ansi::new();
+    let header = |s: &str| a.bold(&a.teal(s)).into_owned();
+    let cmd = |s: &str| a.bold(s).into_owned();
+    let comment = |s: &str| a.dim(s).into_owned();
 
-  # Load an extra model into an already-running runtime (no restart)
-  kapsl add-model --model models/llama/llama.aimod
-
-  # Multi-GPU load-balancing across two runtime instances
-  kapsl control --runtime gpu0=http://127.0.0.1:9095 --runtime gpu1=http://127.0.0.1:9096
-
-  # Package a model directory or single file
-  kapsl build ./models/gpt-llm
-  kapsl build ./model.onnx --output ./model.aimod
-
-  # Push / pull packages to/from a remote registry
-  kapsl push acme/gpt2:prod ./model.aimod
-  kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io
-  kapsl pull acme/gpt2:prod --destination-dir ./models
-
-  # Authenticate (opens browser; use --device-code for SSH/headless)
-  kapsl login
-  kapsl login --device-code
-
-Environment variables:
-  KAPSL_API_TOKEN          Shared fallback bearer token for /api routes
-  KAPSL_API_TOKEN_READER   Read-only API token
-  KAPSL_API_TOKEN_WRITER   Writer API token
-  KAPSL_API_TOKEN_ADMIN    Admin API token
-  KAPSL_REMOTE_URL         Default remote registry URL
-  KAPSL_REMOTE_TOKEN       Bearer token for push/pull
-  KAPSL_SHM_SIZE_MB        Shared-memory pool size (MiB) for shm/hybrid transport
-
-Compatibility:
-  kapsl --model models/gpt2/gpt2.aimod
-    (equivalent to `kapsl run --model models/gpt2/gpt2.aimod`)";
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", header("Examples:"));
+    let _ = writeln!(out, "  {}", comment("# Start the runtime with one model"));
+    let _ = writeln!(out, "  {}", cmd("kapsl run --model models/gpt2/gpt2.aimod"));
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {}",
+        comment("# Load an extra model into an already-running runtime (no restart)")
+    );
+    let _ = writeln!(out, "  {}", cmd("kapsl add-model --model models/llama/llama.aimod"));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  {}", comment("# Multi-GPU load-balancing across two runtime instances"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        cmd("kapsl control --runtime gpu0=http://127.0.0.1:9095 --runtime gpu1=http://127.0.0.1:9096")
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  {}", comment("# Package a model directory or single file"));
+    let _ = writeln!(out, "  {}", cmd("kapsl build ./models/gpt-llm"));
+    let _ = writeln!(out, "  {}", cmd("kapsl build ./model.onnx --output ./model.aimod"));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "  {}", comment("# Push / pull packages to/from a remote registry"));
+    let _ = writeln!(out, "  {}", cmd("kapsl push acme/gpt2:prod ./model.aimod"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        cmd("kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io")
+    );
+    let _ = writeln!(out, "  {}", cmd("kapsl pull acme/gpt2:prod --destination-dir ./models"));
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {}",
+        comment("# Authenticate (opens browser; use --device-code for SSH/headless)")
+    );
+    let _ = writeln!(out, "  {}", cmd("kapsl login"));
+    let _ = writeln!(out, "  {}", cmd("kapsl login --device-code"));
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", header("Environment variables:"));
+    for (name, desc) in [
+        ("KAPSL_API_TOKEN", "Shared fallback bearer token for /api routes"),
+        ("KAPSL_API_TOKEN_READER", "Read-only API token"),
+        ("KAPSL_API_TOKEN_WRITER", "Writer API token"),
+        ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),
+        ("KAPSL_REMOTE_URL", "Default remote registry URL"),
+        ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
+        ("KAPSL_SHM_SIZE_MB", "Shared-memory pool size (MiB) for shm/hybrid transport"),
+    ] {
+        let padded = format!("{:<26}", name);
+        let _ = writeln!(out, "  {}{}", a.teal(&padded), a.dim(desc));
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", header("Compatibility:"));
+    let _ = writeln!(out, "  {}", cmd("kapsl --model models/gpt2/gpt2.aimod"));
+    let _ = write!(
+        out,
+        "    {}",
+        comment("(equivalent to `kapsl run --model models/gpt2/gpt2.aimod`)")
+    );
+    out
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -529,7 +563,7 @@ Compatibility:
                   Use `kapsl run` to serve one or more model packages, `kapsl build` to\n\
                   create a portable .aimod package from an ONNX or GGUF model, and\n\
                   `kapsl push`/`pull` to sync packages with a remote registry.",
-    after_help = CLI_AFTER_HELP,
+    after_help = cli_after_help(),
     styles(kapsl_help_styles()),
 )]
 struct Cli {
