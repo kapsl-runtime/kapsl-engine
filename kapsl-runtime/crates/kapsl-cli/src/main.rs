@@ -4989,6 +4989,9 @@ runtime:
             version: "1.0.0".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             model_file: "model.onnx".to_string(),
+            format: None,
+            model_type: None,
+            task: None,
             metadata: Some(metadata),
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
             cron_jobs: Vec::new(),
@@ -5009,6 +5012,9 @@ runtime:
             version: "1.0.0".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             model_file: "model.onnx".to_string(),
+            format: None,
+            model_type: None,
+            task: None,
             metadata: None,
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
             cron_jobs: Vec::new(),
@@ -5042,6 +5048,9 @@ llm:
             version: "1.0.0".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             model_file: "model.onnx".to_string(),
+            format: None,
+            model_type: None,
+            task: None,
             metadata: Some(metadata),
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
             cron_jobs: Vec::new(),
@@ -5067,6 +5076,9 @@ llm:
             version: "1.0.0".to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             model_file: "model.onnx".to_string(),
+            format: None,
+            model_type: None,
+            task: None,
             metadata: None,
             hardware_requirements: kapsl_core::HardwareRequirements::default(),
             cron_jobs: Vec::new(),
@@ -7550,6 +7562,13 @@ fn create_kapsl_package(
 
     let mut hardware_requirements = kapsl_core::HardwareRequirements::default();
 
+    // Orthogonal model axes (format / model_type / task). Populated explicitly in
+    // the interactive flow; left None otherwise so the loader infers them from
+    // `framework`. See kapsl_core::EngineKind.
+    let mut format_axis: Option<String> = None;
+    let mut model_type_axis: Option<String> = None;
+    let mut task_axis: Option<String> = None;
+
     // The model file's directory is where we persist a generated metadata.json so
     // a subsequent build can be reproduced without re-prompting.
     let source_metadata_path = model_path
@@ -7567,8 +7586,23 @@ fn create_kapsl_package(
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
         project_name = prompt_non_empty_with_default(&mut reader, "Project name", &project_name)?;
-        framework =
-            prompt_select_with_default(&mut reader, "Framework", FRAMEWORK_OPTIONS, &framework)?;
+        let format = prompt_select_with_default(
+            &mut reader,
+            "Format",
+            FORMAT_OPTIONS,
+            infer_format_from_model_path(&model_path),
+        )?;
+        let model_type = prompt_select_with_default(
+            &mut reader,
+            "Model type",
+            MODEL_TYPE_OPTIONS,
+            default_model_type_for_format(&format),
+        )?;
+        let task = prompt_task_for_model_type(&mut reader, &model_type)?;
+        framework = legacy_framework_for(&format, &model_type, &task);
+        format_axis = Some(format);
+        model_type_axis = Some(model_type);
+        task_axis = Some(task);
         version = prompt_non_empty_with_default(&mut reader, "Version", &version)?;
         hardware_requirements.preferred_provider = prompt_provider_with_default(
             &mut reader,
@@ -7619,10 +7653,14 @@ fn create_kapsl_package(
             version: version.clone(),
             created_at: created_at.to_string(),
             model_file: model_file_name.clone(),
+            format: format_axis,
+            model_type: model_type_axis,
+            task: task_axis,
             metadata,
             hardware_requirements,
             cron_jobs: Vec::new(),
         };
+        EngineKind::validate(&manifest)?;
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
@@ -7874,13 +7912,99 @@ fn prompt_non_empty_with_default(
 }
 
 /// (value, description) pairs shown in the interactive selection menus.
-const FRAMEWORK_OPTIONS: &[(&str, &str)] = &[
-    ("onnx", "ONNX model"),
+const FORMAT_OPTIONS: &[(&str, &str)] = &[
+    ("onnx", "ONNX graph"),
     ("gguf", "GGUF file — tokenizer embedded in the file"),
-    ("llm", "ONNX LLM export — requires a tokenizer.json"),
-    ("pytorch", "PyTorch (.pt / .safetensors)"),
-    ("tensorflow", "TensorFlow (.pb)"),
+    ("safetensors", "safetensors weights (custom kernels)"),
 ];
+const MODEL_TYPE_OPTIONS: &[(&str, &str)] = &[
+    ("causal-lm", "autoregressive LLM (text generation)"),
+    ("embedding", "embedding / encoder model"),
+    ("seq-classifier", "sequence classifier"),
+    ("seq2seq", "encoder-decoder (seq2seq)"),
+    ("opaque", "raw graph — run as-is, tensors in/out"),
+];
+const TASK_OPTIONS_CAUSAL_LM: &[(&str, &str)] = &[
+    ("generate", "autoregressive text generation"),
+    ("embed", "embeddings from hidden states"),
+    ("forward", "raw forward pass"),
+];
+const TASK_OPTIONS_SEQ2SEQ: &[(&str, &str)] =
+    &[("generate", "sequence generation"), ("forward", "raw forward pass")];
+
+/// Model file format inferred from a model path's extension, constrained to the
+/// known `format` vocabulary (`onnx`/`gguf`/`safetensors`).
+fn infer_format_from_model_path(model_path: &Path) -> &'static str {
+    match model_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "gguf" => "gguf",
+        "safetensors" => "safetensors",
+        _ => "onnx",
+    }
+}
+
+/// Default model type for a format when the user hasn't said otherwise.
+fn default_model_type_for_format(format: &str) -> &'static str {
+    match format {
+        "gguf" => "causal-lm",
+        _ => "opaque",
+    }
+}
+
+/// Default serving task for a model type.
+fn default_task_for_model_type(model_type: &str) -> &'static str {
+    match model_type {
+        "causal-lm" => "generate",
+        "embedding" => "embed",
+        "seq-classifier" => "classify",
+        "seq2seq" => "generate",
+        _ => "forward",
+    }
+}
+
+/// The selectable tasks for a model type. A single-element slice means the task
+/// is fixed and is not prompted for.
+fn task_options_for_model_type(model_type: &str) -> &'static [(&'static str, &'static str)] {
+    match model_type {
+        "causal-lm" => TASK_OPTIONS_CAUSAL_LM,
+        "seq2seq" => TASK_OPTIONS_SEQ2SEQ,
+        "embedding" => &[("embed", "embeddings")],
+        "seq-classifier" => &[("classify", "classification")],
+        _ => &[("forward", "raw forward pass")],
+    }
+}
+
+/// Legacy `framework` value equivalent to a `(format, model_type, task)` triple,
+/// kept so packages stay loadable by readers that predate the split.
+fn legacy_framework_for(format: &str, _model_type: &str, task: &str) -> String {
+    match format {
+        "gguf" => "gguf",
+        "safetensors" => "safetensors",
+        "onnx" if task == "generate" => "llm",
+        _ => "onnx",
+    }
+    .to_string()
+}
+
+/// Prompt for the serving task, skipping the prompt when the model type allows
+/// only one task.
+fn prompt_task_for_model_type(
+    reader: &mut impl BufRead,
+    model_type: &str,
+) -> Result<String, String> {
+    let options = task_options_for_model_type(model_type);
+    let default = default_task_for_model_type(model_type);
+    if options.len() <= 1 {
+        return Ok(default.to_string());
+    }
+    prompt_select_with_default(reader, "Task", options, default)
+}
+
 const PROVIDER_OPTIONS: &[(&str, &str)] = &[
     ("cpu", "CPU execution"),
     ("cuda", "NVIDIA GPU (CUDA)"),
@@ -8389,6 +8513,12 @@ fn create_kapsl_package_from_context(
 
     let mut hardware_requirements = hardware_requirements_from_manifest.unwrap_or_default();
 
+    // Orthogonal model axes; populated in the interactive flow, else None so the
+    // loader infers them from `framework`. See kapsl_core::EngineKind.
+    let mut format_axis: Option<String> = None;
+    let mut model_type_axis: Option<String> = None;
+    let mut task_axis: Option<String> = None;
+
     if should_create_source_metadata && interactive_metadata_setup {
         let a = Ansi::new();
         eprintln!(
@@ -8410,12 +8540,24 @@ fn create_kapsl_package_from_context(
             .to_string_lossy()
             .to_string();
 
-        if framework_override.is_none() {
-            framework = infer_framework_from_model_path(&model_path);
-        }
         project_name = prompt_non_empty_with_default(&mut reader, "Project name", &project_name)?;
-        framework =
-            prompt_select_with_default(&mut reader, "Framework", FRAMEWORK_OPTIONS, &framework)?;
+        let format = prompt_select_with_default(
+            &mut reader,
+            "Format",
+            FORMAT_OPTIONS,
+            infer_format_from_model_path(&model_path),
+        )?;
+        let model_type = prompt_select_with_default(
+            &mut reader,
+            "Model type",
+            MODEL_TYPE_OPTIONS,
+            default_model_type_for_format(&format),
+        )?;
+        let task = prompt_task_for_model_type(&mut reader, &model_type)?;
+        framework = legacy_framework_for(&format, &model_type, &task);
+        format_axis = Some(format);
+        model_type_axis = Some(model_type);
+        task_axis = Some(task);
         version = prompt_non_empty_with_default(&mut reader, "Version", &version)?;
         hardware_requirements.preferred_provider = prompt_provider_with_default(
             &mut reader,
@@ -8492,10 +8634,14 @@ fn create_kapsl_package_from_context(
             version: version.clone(),
             created_at,
             model_file,
+            format: format_axis,
+            model_type: model_type_axis,
+            task: task_axis,
             metadata: metadata_value,
             hardware_requirements,
             cron_jobs: Vec::new(),
         };
+        EngineKind::validate(&manifest)?;
 
         let output_file = File::create(&output_path).map_err(|e| {
             format!(
