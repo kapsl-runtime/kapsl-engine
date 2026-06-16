@@ -2255,6 +2255,8 @@ struct PackageKapslResponse {
     project_name: String,
     framework: String,
     version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2714,6 +2716,18 @@ fn cli_color_enabled() -> bool {
     }
 }
 
+fn cli_stdin_is_tty() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        libc_isatty(std::io::stdin().as_raw_fd())
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[cfg(unix)]
 fn libc_isatty(fd: i32) -> bool {
     extern "C" {
@@ -2929,7 +2943,7 @@ fn format_human_bytes(bytes: u64) -> String {
     }
 }
 
-fn print_build_summary(kapsl_path: &str) {
+fn print_build_summary(kapsl_path: &str, metadata_path: Option<&str>) {
     let a = Ansi::new();
     let display_name = Path::new(kapsl_path)
         .file_name()
@@ -2943,6 +2957,44 @@ fn print_build_summary(kapsl_path: &str) {
             a.dim(&format!("({})", format_human_bytes(metadata.len())))
         ),
         Err(_) => eprintln!("  {}  {}", a.green("✓"), display_name),
+    }
+    if let Some(metadata_path) = metadata_path {
+        eprintln!("  {}  created {}", a.green("✓"), metadata_path);
+    }
+}
+
+fn context_metadata_missing(context_path: &Path) -> bool {
+    context_path.is_dir() && !context_path.join("metadata.json").exists()
+}
+
+fn execute_context_build(
+    context_path: &Path,
+    model_override: Option<&Path>,
+    output_override: Option<&Path>,
+    project_name_override: Option<&str>,
+    framework_override: Option<&str>,
+    version_override: Option<&str>,
+    metadata_override: Option<&serde_json::Value>,
+) -> Result<PackageKapslResponse, DynError> {
+    let interactive_metadata_setup = cli_stdin_is_tty() && context_metadata_missing(context_path);
+    let build = || {
+        create_kapsl_package_from_context(
+            context_path,
+            model_override,
+            output_override,
+            project_name_override,
+            framework_override,
+            version_override,
+            metadata_override,
+            interactive_metadata_setup,
+        )
+        .map_err(dyn_error_from_message)
+    };
+
+    if interactive_metadata_setup {
+        build()
+    } else {
+        run_with_loading("Building package", build)
     }
 }
 
@@ -3050,18 +3102,15 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
     let response = match args.context.as_ref() {
         Some(context_or_model_path) => {
             if context_or_model_path.is_dir() {
-                run_with_loading("Building package", || {
-                    create_kapsl_package_from_context(
-                        context_or_model_path,
-                        args.model.as_deref(),
-                        args.output.as_deref(),
-                        args.project_name.as_deref(),
-                        args.framework.as_deref(),
-                        args.version.as_deref(),
-                        metadata.as_ref(),
-                    )
-                    .map_err(dyn_error_from_message)
-                })?
+                execute_context_build(
+                    context_or_model_path,
+                    args.model.as_deref(),
+                    args.output.as_deref(),
+                    args.project_name.as_deref(),
+                    args.framework.as_deref(),
+                    args.version.as_deref(),
+                    metadata.as_ref(),
+                )?
             } else if looks_like_model_file_path(context_or_model_path)
                 || context_or_model_path.is_file()
             {
@@ -3082,18 +3131,15 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     create_kapsl_package(&request).map_err(dyn_error_from_message)
                 })?
             } else {
-                run_with_loading("Building package", || {
-                    create_kapsl_package_from_context(
-                        context_or_model_path,
-                        args.model.as_deref(),
-                        args.output.as_deref(),
-                        args.project_name.as_deref(),
-                        args.framework.as_deref(),
-                        args.version.as_deref(),
-                        metadata.as_ref(),
-                    )
-                    .map_err(dyn_error_from_message)
-                })?
+                execute_context_build(
+                    context_or_model_path,
+                    args.model.as_deref(),
+                    args.output.as_deref(),
+                    args.project_name.as_deref(),
+                    args.framework.as_deref(),
+                    args.version.as_deref(),
+                    metadata.as_ref(),
+                )?
             }
         }
         None => {
@@ -3112,22 +3158,19 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
             } else {
                 // Docker-style default: `kapsl build` means "build from the current directory".
                 let context_dir = PathBuf::from(".");
-                run_with_loading("Building package", || {
-                    create_kapsl_package_from_context(
-                        &context_dir,
-                        None,
-                        args.output.as_deref(),
-                        args.project_name.as_deref(),
-                        args.framework.as_deref(),
-                        args.version.as_deref(),
-                        metadata.as_ref(),
-                    )
-                    .map_err(dyn_error_from_message)
-                })?
+                execute_context_build(
+                    &context_dir,
+                    None,
+                    args.output.as_deref(),
+                    args.project_name.as_deref(),
+                    args.framework.as_deref(),
+                    args.version.as_deref(),
+                    metadata.as_ref(),
+                )?
             }
         }
     };
-    print_build_summary(&response.kapsl_path);
+    print_build_summary(&response.kapsl_path, response.metadata_path.as_deref());
     Ok(())
 }
 
@@ -7507,6 +7550,7 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
         project_name,
         framework,
         version,
+        metadata_path: None,
     })
 }
 
@@ -7624,6 +7668,92 @@ fn parse_context_manifest(context_dir: &Path) -> Result<ContextManifest, String>
         hardware_requirements,
         metadata,
     ))
+}
+
+fn create_source_metadata_if_missing(
+    metadata_path: &Path,
+    manifest_bytes: &[u8],
+) -> Result<Option<PathBuf>, String> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(metadata_path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to create {}: {}",
+                metadata_path.display(),
+                error
+            ));
+        }
+    };
+    file.write_all(manifest_bytes).map_err(|e| {
+        format!(
+            "Failed to write generated metadata.json {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })?;
+    Ok(Some(metadata_path.to_path_buf()))
+}
+
+fn prompt_with_default(label: &str, default: &str) -> Result<String, String> {
+    let a = Ansi::new();
+    eprint!("{} {} {}: ", a.teal("?"), label, a.dim(&format!("({})", default)));
+    std::io::stderr()
+        .flush()
+        .map_err(|e| format!("Failed to flush prompt: {}", e))?;
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("Failed to read prompt input: {}", e))?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn prompt_non_empty_with_default(label: &str, default: &str) -> Result<String, String> {
+    loop {
+        let value = prompt_with_default(label, default)?;
+        if !value.trim().is_empty() {
+            return Ok(value.trim().to_string());
+        }
+        eprintln!("  {}", Ansi::new().red("Value cannot be empty."));
+    }
+}
+
+fn prompt_provider_with_default(default: Option<&str>) -> Result<Option<String>, String> {
+    let default = default
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("cpu");
+    let value = prompt_non_empty_with_default("Preferred provider", default)?;
+    Ok(Some(value))
+}
+
+fn prompt_model_file_with_default(context_dir: &Path, default: &str) -> Result<PathBuf, String> {
+    loop {
+        let value = prompt_non_empty_with_default("Model file", default)?;
+        let candidate = context_dir.join(&value);
+        if candidate.exists() && candidate.is_file() {
+            let canonical = candidate.canonicalize().map_err(|e| {
+                format!("Failed to resolve model file path {}: {}", candidate.display(), e)
+            })?;
+            if canonical.starts_with(context_dir) {
+                return Ok(canonical);
+            }
+        }
+        eprintln!(
+            "  {}",
+            Ansi::new().red("Model file must exist inside the build context.")
+        );
+    }
 }
 
 fn normalize_output_path_for_context(
@@ -7895,6 +8025,7 @@ fn create_kapsl_package_from_context(
     framework_override: Option<&str>,
     version_override: Option<&str>,
     metadata_override: Option<&serde_json::Value>,
+    interactive_metadata_setup: bool,
 ) -> Result<PackageKapslResponse, String> {
     let context_input = PathBuf::from(context_path);
     if !context_input.exists() {
@@ -7917,6 +8048,9 @@ fn create_kapsl_package_from_context(
         )
     })?;
 
+    let source_metadata_path = context_dir.join("metadata.json");
+    let should_create_source_metadata = !source_metadata_path.exists();
+
     let (
         project_name_from_manifest,
         framework_from_manifest,
@@ -7926,7 +8060,7 @@ fn create_kapsl_package_from_context(
         metadata_from_manifest,
     ) = parse_context_manifest(&context_dir)?;
 
-    let model_path = if let Some(model_path) = model_override {
+    let mut model_path = if let Some(model_path) = model_override {
         let candidate = if model_path.is_absolute() {
             model_path.to_path_buf()
         } else {
@@ -7971,7 +8105,7 @@ fn create_kapsl_package_from_context(
         ));
     }
 
-    let model_file = model_path
+    let mut model_file = model_path
         .strip_prefix(&context_dir)
         .map_err(|e| {
             format!(
@@ -7983,7 +8117,7 @@ fn create_kapsl_package_from_context(
         .to_string_lossy()
         .to_string();
 
-    let project_name = project_name_override
+    let mut project_name = project_name_override
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
@@ -7996,19 +8130,51 @@ fn create_kapsl_package_from_context(
         })
         .unwrap_or_else(|| "kapsl-model".to_string());
 
-    let framework = framework_override
+    let mut framework = framework_override
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .or(framework_from_manifest)
         .unwrap_or_else(|| infer_framework_from_model_path(&model_path));
 
-    let version = version_override
+    let mut version = version_override
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string)
         .or(version_from_manifest)
         .unwrap_or_else(|| "1.0.0".to_string());
+
+    let mut hardware_requirements = hardware_requirements_from_manifest.unwrap_or_default();
+
+    if should_create_source_metadata && interactive_metadata_setup {
+        let a = Ansi::new();
+        eprintln!(
+            "{}",
+            a.bold("No metadata.json found. Let's create one for this model.")
+        );
+        model_path = prompt_model_file_with_default(&context_dir, &model_file)?;
+        model_file = model_path
+            .strip_prefix(&context_dir)
+            .map_err(|e| {
+                format!(
+                    "Failed to compute model path relative to context {}: {}",
+                    model_path.display(),
+                    e
+                )
+            })?
+            .to_string_lossy()
+            .to_string();
+
+        if framework_override.is_none() {
+            framework = infer_framework_from_model_path(&model_path);
+        }
+        project_name = prompt_non_empty_with_default("Project name", &project_name)?;
+        framework = prompt_non_empty_with_default("Framework", &framework)?;
+        version = prompt_non_empty_with_default("Version", &version)?;
+        hardware_requirements.preferred_provider =
+            prompt_provider_with_default(hardware_requirements.preferred_provider.as_deref())?;
+        eprintln!();
+    }
 
     let output_path =
         normalize_output_path_for_context(&context_dir, output_override, &project_name);
@@ -8078,7 +8244,7 @@ fn create_kapsl_package_from_context(
         created_at,
         model_file,
         metadata: metadata_value,
-        hardware_requirements: hardware_requirements_from_manifest.unwrap_or_default(),
+        hardware_requirements,
         cron_jobs: Vec::new(),
     };
 
@@ -8120,6 +8286,12 @@ fn create_kapsl_package_from_context(
         .flush()
         .map_err(|e| format!("Failed to flush output package: {}", e))?;
 
+    let created_metadata_path = if should_create_source_metadata {
+        create_source_metadata_if_missing(&source_metadata_path, &manifest_bytes)?
+    } else {
+        None
+    };
+
     let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
     Ok(PackageKapslResponse {
         status: "ok".to_string(),
@@ -8127,6 +8299,7 @@ fn create_kapsl_package_from_context(
         project_name,
         framework,
         version,
+        metadata_path: created_metadata_path.map(|path| path.to_string_lossy().to_string()),
     })
 }
 
@@ -8411,6 +8584,74 @@ fn resolve_runtime_state_layout(args: &Args) -> RuntimeStateLayout {
             extensions_config_root,
             auth_store_path: resolve_auth_store_path(),
         }
+    }
+}
+
+#[cfg(test)]
+mod packaging_tests {
+    use super::*;
+
+    #[test]
+    fn test_context_build_creates_source_metadata_when_missing() {
+        let temp_dir = TempDirGuard::new("kapsl-build-metadata").expect("temp dir");
+        let context_dir = temp_dir.path();
+        fs::write(context_dir.join("model.onnx"), b"dummy model").expect("model file");
+
+        let response =
+            create_kapsl_package_from_context(context_dir, None, None, None, None, None, None)
+                .expect("context package");
+
+        let metadata_path = context_dir.join("metadata.json");
+        let response_metadata_path = PathBuf::from(
+            response
+                .metadata_path
+                .as_deref()
+                .expect("created metadata path"),
+        );
+        assert_eq!(
+            response_metadata_path
+                .canonicalize()
+                .expect("response path"),
+            metadata_path.canonicalize().expect("metadata path")
+        );
+        assert!(metadata_path.exists());
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&metadata_path).expect("metadata"))
+                .expect("valid metadata json");
+        assert_eq!(manifest["model_file"], "model.onnx");
+        assert_eq!(manifest["framework"], "onnx");
+        assert_eq!(manifest["version"], "1.0.0");
+    }
+
+    #[test]
+    fn test_context_build_does_not_overwrite_existing_source_metadata() {
+        let temp_dir = TempDirGuard::new("kapsl-build-existing-metadata").expect("temp dir");
+        let context_dir = temp_dir.path();
+        fs::write(context_dir.join("model.onnx"), b"dummy model").expect("model file");
+        let existing_metadata = r#"{
+  "project_name": "existing-project",
+  "framework": "onnx",
+  "version": "2.0.0",
+  "model_file": "model.onnx",
+  "metadata": {
+    "owner": "test"
+  }
+}"#;
+        let metadata_path = context_dir.join("metadata.json");
+        fs::write(&metadata_path, existing_metadata).expect("metadata file");
+
+        let response =
+            create_kapsl_package_from_context(context_dir, None, None, None, None, None, None)
+                .expect("context package");
+
+        assert_eq!(response.metadata_path, None);
+        assert_eq!(
+            fs::read_to_string(&metadata_path).expect("metadata"),
+            existing_metadata
+        );
+        assert_eq!(response.project_name, "existing-project");
+        assert_eq!(response.version, "2.0.0");
     }
 }
 
