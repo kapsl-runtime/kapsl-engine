@@ -6,7 +6,7 @@ fn main() {
             .file("compat_glibc.c")
             .compile("compat_glibc");
     }
-    
+
     // On Windows, provide a posix_memalign shim for llama-cpp-sys-2
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         cc::Build::new()

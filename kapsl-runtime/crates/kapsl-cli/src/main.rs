@@ -62,7 +62,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{BufWriter, Cursor, Read, Write};
+use std::io::{BufRead, BufWriter, Cursor, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -498,27 +498,51 @@ fn cli_after_help() -> String {
         "  {}",
         comment("# Load an extra model into an already-running runtime (no restart)")
     );
-    let _ = writeln!(out, "  {}", cmd("kapsl add-model --model models/llama/llama.aimod"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        cmd("kapsl add-model --model models/llama/llama.aimod")
+    );
     let _ = writeln!(out);
-    let _ = writeln!(out, "  {}", comment("# Multi-GPU load-balancing across two runtime instances"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        comment("# Multi-GPU load-balancing across two runtime instances")
+    );
     let _ = writeln!(
         out,
         "  {}",
         cmd("kapsl control --runtime gpu0=http://127.0.0.1:9095 --runtime gpu1=http://127.0.0.1:9096")
     );
     let _ = writeln!(out);
-    let _ = writeln!(out, "  {}", comment("# Package a model directory or single file"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        comment("# Package a model directory or single file")
+    );
     let _ = writeln!(out, "  {}", cmd("kapsl build ./models/gpt-llm"));
-    let _ = writeln!(out, "  {}", cmd("kapsl build ./model.onnx --output ./model.aimod"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        cmd("kapsl build ./model.onnx --output ./model.aimod")
+    );
     let _ = writeln!(out);
-    let _ = writeln!(out, "  {}", comment("# Push / pull packages to/from a remote registry"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        comment("# Push / pull packages to/from a remote registry")
+    );
     let _ = writeln!(out, "  {}", cmd("kapsl push acme/gpt2:prod ./model.aimod"));
     let _ = writeln!(
         out,
         "  {}",
         cmd("kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io")
     );
-    let _ = writeln!(out, "  {}", cmd("kapsl pull acme/gpt2:prod --destination-dir ./models"));
+    let _ = writeln!(
+        out,
+        "  {}",
+        cmd("kapsl pull acme/gpt2:prod --destination-dir ./models")
+    );
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -530,13 +554,19 @@ fn cli_after_help() -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "{}", header("Environment variables:"));
     for (name, desc) in [
-        ("KAPSL_API_TOKEN", "Shared fallback bearer token for /api routes"),
+        (
+            "KAPSL_API_TOKEN",
+            "Shared fallback bearer token for /api routes",
+        ),
         ("KAPSL_API_TOKEN_READER", "Read-only API token"),
         ("KAPSL_API_TOKEN_WRITER", "Writer API token"),
         ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),
         ("KAPSL_REMOTE_URL", "Default remote registry URL"),
         ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
-        ("KAPSL_SHM_SIZE_MB", "Shared-memory pool size (MiB) for shm/hybrid transport"),
+        (
+            "KAPSL_SHM_SIZE_MB",
+            "Shared-memory pool size (MiB) for shm/hybrid transport",
+        ),
     ] {
         let padded = format!("{:<26}", name);
         let _ = writeln!(out, "  {}{}", a.teal(&padded), a.dim(desc));
@@ -2776,7 +2806,9 @@ struct Ansi {
 
 impl Ansi {
     fn new() -> Self {
-        Self { enabled: cli_color_enabled() }
+        Self {
+            enabled: cli_color_enabled(),
+        }
     }
 
     fn teal<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
@@ -2840,12 +2872,7 @@ fn print_startup_banner() {
     eprintln!("  {}", a.dim("─────────────────────────────────────"));
 }
 
-fn print_startup_ready(
-    elapsed_ms: u128,
-    serving_endpoint: &str,
-    http_ip: &str,
-    http_port: u16,
-) {
+fn print_startup_ready(elapsed_ms: u128, serving_endpoint: &str, http_ip: &str, http_port: u16) {
     let a = Ansi::new();
     let url_base = format!("http://{}:{}", http_ip, http_port);
 
@@ -2860,9 +2887,9 @@ fn print_startup_ready(
 
     let rows: &[(&str, String)] = &[
         ("Inference", serving_endpoint.to_string()),
-        ("API",       format!("{}/api", url_base)),
+        ("API", format!("{}/api", url_base)),
         ("Dashboard", url_base.clone()),
-        ("Metrics",   format!("{}/metrics", url_base)),
+        ("Metrics", format!("{}/metrics", url_base)),
     ];
 
     let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
@@ -2882,9 +2909,9 @@ fn print_startup_ready(
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn run_with_loading<T, F>(label: &str, action: F) -> Result<T, DynError>
+fn run_with_loading<T, E, F>(label: &str, action: F) -> Result<T, E>
 where
-    F: FnOnce() -> Result<T, DynError>,
+    F: FnOnce() -> Result<T, E>,
 {
     let a = Ansi::new();
     let running = Arc::new(AtomicBool::new(true));
@@ -2897,7 +2924,10 @@ where
         while spinner_running.load(Ordering::Relaxed) {
             let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
             if colors_on {
-                eprint!("\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ", frame, spinner_label);
+                eprint!(
+                    "\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ",
+                    frame, spinner_label
+                );
             } else {
                 eprint!("\r  {}  {}   ", frame, spinner_label);
             }
@@ -2936,7 +2966,10 @@ where
         while spinner_running.load(Ordering::Relaxed) {
             let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
             if colors_on {
-                eprint!("\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ", frame, spinner_label);
+                eprint!(
+                    "\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ",
+                    frame, spinner_label
+                );
             } else {
                 eprint!("\r  {}  {}   ", frame, spinner_label);
             }
@@ -3032,6 +3065,30 @@ fn execute_context_build(
     }
 }
 
+fn model_file_metadata_missing(model_path: &Path) -> bool {
+    let metadata_dir = match model_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    !metadata_dir.join("metadata.json").exists()
+}
+
+fn execute_model_file_build(
+    request: &PackageKapslRequest,
+) -> Result<PackageKapslResponse, DynError> {
+    let model_path = PathBuf::from(request.model_path.trim());
+    let interactive_metadata_setup = cli_stdin_is_tty() && model_file_metadata_missing(&model_path);
+    let build = || {
+        create_kapsl_package(request, interactive_metadata_setup).map_err(dyn_error_from_message)
+    };
+
+    if interactive_metadata_setup {
+        build()
+    } else {
+        run_with_loading("Building package", build)
+    }
+}
+
 fn format_elapsed(duration: Duration) -> String {
     let secs = duration.as_secs_f64();
     if secs < 1.0 {
@@ -3071,7 +3128,11 @@ fn print_transfer_summary(
         action,
         format_human_bytes(bytes),
         a.dim(&format!("via {}", transfer_backend_label(remote_url))),
-        a.dim(&format!("in {} ({}/s)", format_elapsed(elapsed), format_human_bytes(bytes_per_sec))),
+        a.dim(&format!(
+            "in {} ({}/s)",
+            format_elapsed(elapsed),
+            format_human_bytes(bytes_per_sec)
+        )),
     );
     eprintln!("     {}", a.teal(path_or_target));
 }
@@ -3161,9 +3222,7 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     version: args.version.clone(),
                     metadata: metadata.clone(),
                 };
-                run_with_loading("Building package", || {
-                    create_kapsl_package(&request).map_err(dyn_error_from_message)
-                })?
+                execute_model_file_build(&request)?
             } else {
                 execute_context_build(
                     context_or_model_path,
@@ -3186,9 +3245,7 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     version: args.version,
                     metadata,
                 };
-                run_with_loading("Building package", || {
-                    create_kapsl_package(&request).map_err(dyn_error_from_message)
-                })?
+                execute_model_file_build(&request)?
             } else {
                 // Docker-style default: `kapsl build` means "build from the current directory".
                 let context_dir = PathBuf::from(".");
@@ -3311,11 +3368,7 @@ fn execute_login_command(args: LoginCommandArgs) -> Result<(), DynError> {
         a.green("✓"),
         a.bold("Authenticated successfully")
     );
-    eprintln!(
-        "     {}  {}",
-        a.dim("Provider"),
-        response.provider
-    );
+    eprintln!("     {}  {}", a.dim("Provider"), response.provider);
     eprintln!(
         "     {}    {}",
         a.dim("Remote"),
@@ -3355,7 +3408,8 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
     let a = Ansi::new();
     let mut any_error = false;
     for model_path in &args.model {
-        let display = model_path.file_name()
+        let display = model_path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or_else(|| model_path.to_str().unwrap_or("?"));
 
@@ -3401,12 +3455,7 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
                     .and_then(|json| json.get("model_id").and_then(|v| v.as_u64()))
                     .map(|id| format!(" (id={})", id))
                     .unwrap_or_default();
-                eprintln!(
-                    "  {}  {}{}",
-                    a.green("✓"),
-                    display,
-                    a.dim(&model_id)
-                );
+                eprintln!("  {}  {}{}", a.green("✓"), display, a.dim(&model_id));
             }
             Err(e) => {
                 eprintln!(
@@ -5672,11 +5721,7 @@ fn maybe_auto_login_for_remote(
     }
 
     let a = Ansi::new();
-    eprintln!(
-        "  {}  {}",
-        a.dim("Authenticating with"),
-        a.teal(remote_url)
-    );
+    eprintln!("  {}  {}", a.dim("Authenticating with"), a.teal(remote_url));
     let browser_login = perform_browser_login_flow(
         remote_url,
         OAuthProvider::GitHub,
@@ -6149,7 +6194,10 @@ fn push_kapsl_to_http_remote(
 
     // Try presigned URL flow first.
     if let Some(presigned) = request_presigned_upload_url(artifact_url, authorization_header)? {
-        eprintln!("  {}", Ansi::new().dim(&format!("Uploading {} bytes...", file_size.len())));
+        eprintln!(
+            "  {}",
+            Ansi::new().dim(&format!("Uploading {} bytes...", file_size.len()))
+        );
         let file = File::open(source_path).map_err(|e| RemoteHttpRequestError {
             status_code: None,
             message: format!(
@@ -7435,7 +7483,10 @@ fn append_tar_bytes_entry<W: Write>(
         .map_err(|e| format!("Failed to append {} to archive: {}", entry_path, e))
 }
 
-fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslResponse, String> {
+fn create_kapsl_package(
+    request: &PackageKapslRequest,
+    interactive_metadata_setup: bool,
+) -> Result<PackageKapslResponse, String> {
     let input_model_path = PathBuf::from(request.model_path.trim());
     if !input_model_path.exists() {
         return Err(format!(
@@ -7465,7 +7516,7 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
         .ok_or_else(|| format!("Invalid model filename: {}", model_path.display()))?
         .to_string();
 
-    let project_name = request
+    let mut project_name = request
         .project_name
         .as_ref()
         .map(|name| name.trim())
@@ -7479,7 +7530,7 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
         })
         .unwrap_or_else(|| "kapsl-model".to_string());
 
-    let framework = request
+    let mut framework = request
         .framework
         .as_ref()
         .map(|framework| framework.trim())
@@ -7487,7 +7538,7 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
         .map(str::to_string)
         .unwrap_or_else(|| infer_framework_from_model_path(&model_path));
 
-    let version = request
+    let mut version = request
         .version
         .as_ref()
         .map(|version| version.trim())
@@ -7495,97 +7546,142 @@ fn create_kapsl_package(request: &PackageKapslRequest) -> Result<PackageKapslRes
         .map(str::to_string)
         .unwrap_or_else(|| "1.0.0".to_string());
 
-    let mut output_path = request
-        .output_path
-        .as_ref()
-        .map(|path| PathBuf::from(path.trim()))
-        .unwrap_or_else(|| PathBuf::from(format!("{}.aimod", project_name)));
+    let mut hardware_requirements = kapsl_core::HardwareRequirements::default();
 
-    if output_path.extension().and_then(|ext| ext.to_str()) != Some("aimod") {
-        output_path.set_extension("aimod");
+    // The model file's directory is where we persist a generated metadata.json so
+    // a subsequent build can be reproduced without re-prompting.
+    let source_metadata_path = model_path
+        .parent()
+        .map(|parent| parent.join("metadata.json"))
+        .unwrap_or_else(|| PathBuf::from("metadata.json"));
+    let should_create_source_metadata = !source_metadata_path.exists();
+
+    if should_create_source_metadata && interactive_metadata_setup {
+        let a = Ansi::new();
+        eprintln!(
+            "{}",
+            a.bold("No metadata.json found. Let's create one for this model.")
+        );
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        project_name = prompt_non_empty_with_default(&mut reader, "Project name", &project_name)?;
+        framework =
+            prompt_select_with_default(&mut reader, "Framework", FRAMEWORK_OPTIONS, &framework)?;
+        version = prompt_non_empty_with_default(&mut reader, "Version", &version)?;
+        hardware_requirements.preferred_provider = prompt_provider_with_default(
+            &mut reader,
+            hardware_requirements.preferred_provider.as_deref(),
+        )?;
+        eprintln!();
     }
 
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create parent directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
+    let package = move || -> Result<PackageKapslResponse, String> {
+        let mut output_path = request
+            .output_path
+            .as_ref()
+            .map(|path| PathBuf::from(path.trim()))
+            .unwrap_or_else(|| PathBuf::from(format!("{}.aimod", project_name)));
+
+        if output_path.extension().and_then(|ext| ext.to_str()) != Some("aimod") {
+            output_path.set_extension("aimod");
         }
+
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create parent directory {}: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+        }
+
+        let created_at = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("System clock error: {}", e))?
+            .as_secs();
+
+        let metadata = match request.metadata.as_ref() {
+            Some(metadata) => Some(
+                serde_yaml::to_value(metadata)
+                    .map_err(|e| format!("Failed to convert metadata payload: {}", e))?,
+            ),
+            None => None,
+        };
+
+        let manifest = Manifest {
+            project_name: project_name.clone(),
+            framework: framework.clone(),
+            version: version.clone(),
+            created_at: created_at.to_string(),
+            model_file: model_file_name.clone(),
+            metadata,
+            hardware_requirements,
+            cron_jobs: Vec::new(),
+        };
+
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
+        let output_file = File::create(&output_path).map_err(|e| {
+            format!(
+                "Failed to create output package {}: {}",
+                output_path.display(),
+                e
+            )
+        })?;
+        // Model weights are binary float data — nearly incompressible. Use level 1
+        // (fast) instead of the default level 6 to avoid burning CPU for no gain.
+        // The 8 MiB BufWriter reduces syscall overhead from one call per 32 KiB
+        // GzEncoder output chunk to one call per 8 MiB.
+        let encoder = GzEncoder::new(
+            BufWriter::with_capacity(8 << 20, output_file),
+            Compression::fast(),
+        );
+        let mut archive = Builder::new(encoder);
+
+        append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
+
+        archive
+            .append_path_with_name(&model_path, &model_file_name)
+            .map_err(|e| format!("Failed to add model file to archive: {}", e))?;
+
+        let encoder = archive
+            .into_inner()
+            .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
+        let mut buf_writer = encoder
+            .finish()
+            .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
+        buf_writer
+            .flush()
+            .map_err(|e| format!("Failed to flush output package: {}", e))?;
+
+        let created_metadata_path = if should_create_source_metadata {
+            create_source_metadata_if_missing(&source_metadata_path, &manifest_bytes)?
+        } else {
+            None
+        };
+
+        let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
+
+        Ok(PackageKapslResponse {
+            status: "ok".to_string(),
+            kapsl_path: absolute_output_path.to_string_lossy().to_string(),
+            project_name,
+            framework,
+            version,
+            metadata_path: created_metadata_path.map(|path| path.to_string_lossy().to_string()),
+        })
+    };
+
+    // When prompting was shown above, the caller suppressed its spinner so the
+    // prompts stayed legible. Drive the spinner here, around the actual packaging.
+    if interactive_metadata_setup {
+        run_with_loading("Building package", package)
+    } else {
+        package()
     }
-
-    let created_at = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("System clock error: {}", e))?
-        .as_secs();
-
-    let metadata = match request.metadata.as_ref() {
-        Some(metadata) => Some(
-            serde_yaml::to_value(metadata)
-                .map_err(|e| format!("Failed to convert metadata payload: {}", e))?,
-        ),
-        None => None,
-    };
-
-    let manifest = Manifest {
-        project_name: project_name.clone(),
-        framework: framework.clone(),
-        version: version.clone(),
-        created_at: created_at.to_string(),
-        model_file: model_file_name.clone(),
-        metadata,
-        hardware_requirements: kapsl_core::HardwareRequirements::default(),
-        cron_jobs: Vec::new(),
-    };
-
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
-    let output_file = File::create(&output_path).map_err(|e| {
-        format!(
-            "Failed to create output package {}: {}",
-            output_path.display(),
-            e
-        )
-    })?;
-    // Model weights are binary float data — nearly incompressible. Use level 1
-    // (fast) instead of the default level 6 to avoid burning CPU for no gain.
-    // The 8 MiB BufWriter reduces syscall overhead from one call per 32 KiB
-    // GzEncoder output chunk to one call per 8 MiB.
-    let encoder = GzEncoder::new(
-        BufWriter::with_capacity(8 << 20, output_file),
-        Compression::fast(),
-    );
-    let mut archive = Builder::new(encoder);
-
-    append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
-
-    archive
-        .append_path_with_name(&model_path, &model_file_name)
-        .map_err(|e| format!("Failed to add model file to archive: {}", e))?;
-
-    let encoder = archive
-        .into_inner()
-        .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
-    let mut buf_writer = encoder
-        .finish()
-        .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
-    buf_writer
-        .flush()
-        .map_err(|e| format!("Failed to flush output package: {}", e))?;
-
-    let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
-
-    Ok(PackageKapslResponse {
-        status: "ok".to_string(),
-        kapsl_path: absolute_output_path.to_string_lossy().to_string(),
-        project_name,
-        framework,
-        version,
-        metadata_path: None,
-    })
 }
 
 fn find_model_file_in_context(context_dir: &Path) -> Result<PathBuf, String> {
@@ -7733,15 +7829,24 @@ fn create_source_metadata_if_missing(
     Ok(Some(metadata_path.to_path_buf()))
 }
 
-fn prompt_with_default(label: &str, default: &str) -> Result<String, String> {
+fn prompt_with_default(
+    reader: &mut impl BufRead,
+    label: &str,
+    default: &str,
+) -> Result<String, String> {
     let a = Ansi::new();
-    eprint!("{} {} {}: ", a.teal("?"), label, a.dim(&format!("({})", default)));
+    eprint!(
+        "{} {} {}: ",
+        a.teal("?"),
+        label,
+        a.dim(&format!("({})", default))
+    );
     std::io::stderr()
         .flush()
         .map_err(|e| format!("Failed to flush prompt: {}", e))?;
 
     let mut input = String::new();
-    std::io::stdin()
+    reader
         .read_line(&mut input)
         .map_err(|e| format!("Failed to read prompt input: {}", e))?;
     let trimmed = input.trim();
@@ -7752,9 +7857,13 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String, String> {
     }
 }
 
-fn prompt_non_empty_with_default(label: &str, default: &str) -> Result<String, String> {
+fn prompt_non_empty_with_default(
+    reader: &mut impl BufRead,
+    label: &str,
+    default: &str,
+) -> Result<String, String> {
     loop {
-        let value = prompt_with_default(label, default)?;
+        let value = prompt_with_default(reader, label, default)?;
         if !value.trim().is_empty() {
             return Ok(value.trim().to_string());
         }
@@ -7762,22 +7871,120 @@ fn prompt_non_empty_with_default(label: &str, default: &str) -> Result<String, S
     }
 }
 
-fn prompt_provider_with_default(default: Option<&str>) -> Result<Option<String>, String> {
+/// (value, description) pairs shown in the interactive selection menus.
+const FRAMEWORK_OPTIONS: &[(&str, &str)] = &[
+    ("onnx", "ONNX model"),
+    ("gguf", "GGUF file — tokenizer embedded in the file"),
+    ("llm", "ONNX LLM export — requires a tokenizer.json"),
+    ("pytorch", "PyTorch (.pt / .safetensors)"),
+    ("tensorflow", "TensorFlow (.pb)"),
+];
+const PROVIDER_OPTIONS: &[(&str, &str)] = &[
+    ("cpu", "CPU execution"),
+    ("cuda", "NVIDIA GPU (CUDA)"),
+    ("tensorrt", "NVIDIA TensorRT"),
+    ("coreml", "Apple CoreML / Metal"),
+    ("rocm", "AMD GPU (ROCm)"),
+    ("directml", "Windows DirectML"),
+];
+
+/// Prompt the user to pick one of `options` (each a `(value, description)` pair).
+/// Accepts the option's number or its value (case-insensitive); an empty line
+/// keeps `default`. Re-prompts on an invalid choice so the returned value is
+/// always one of `options`.
+fn prompt_select_with_default(
+    reader: &mut impl BufRead,
+    label: &str,
+    options: &[(&str, &str)],
+    default: &str,
+) -> Result<String, String> {
+    let a = Ansi::new();
+    let default_index = options
+        .iter()
+        .position(|(value, _)| value.eq_ignore_ascii_case(default));
+    let name_width = options
+        .iter()
+        .map(|(value, _)| value.len())
+        .max()
+        .unwrap_or(0);
+
+    eprintln!("{} {}:", a.teal("?"), label);
+    for (index, (value, description)) in options.iter().enumerate() {
+        let suffix = if Some(index) == default_index {
+            " (default)"
+        } else {
+            ""
+        };
+        eprintln!(
+            "    {}) {:<width$}  {}",
+            index + 1,
+            value,
+            a.dim(&format!("{}{}", description, suffix)),
+            width = name_width
+        );
+    }
+
+    loop {
+        eprint!("  {} {}: ", a.teal("›"), a.dim(&format!("[{}]", default)));
+        std::io::stderr()
+            .flush()
+            .map_err(|e| format!("Failed to flush prompt: {}", e))?;
+
+        let mut input = String::new();
+        reader
+            .read_line(&mut input)
+            .map_err(|e| format!("Failed to read prompt input: {}", e))?;
+        let trimmed = input.trim();
+
+        if trimmed.is_empty() {
+            return Ok(default.to_string());
+        }
+        if let Ok(choice) = trimmed.parse::<usize>() {
+            if choice >= 1 && choice <= options.len() {
+                return Ok(options[choice - 1].0.to_string());
+            }
+        }
+        if let Some((value, _)) = options
+            .iter()
+            .find(|(value, _)| value.eq_ignore_ascii_case(trimmed))
+        {
+            return Ok(value.to_string());
+        }
+        eprintln!(
+            "  {}",
+            a.red("Enter a number from the list or one of the option names.")
+        );
+    }
+}
+
+fn prompt_provider_with_default(
+    reader: &mut impl BufRead,
+    default: Option<&str>,
+) -> Result<Option<String>, String> {
     let default = default
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("cpu");
-    let value = prompt_non_empty_with_default("Preferred provider", default)?;
+    let value =
+        prompt_select_with_default(reader, "Preferred provider", PROVIDER_OPTIONS, default)?;
     Ok(Some(value))
 }
 
-fn prompt_model_file_with_default(context_dir: &Path, default: &str) -> Result<PathBuf, String> {
+fn prompt_model_file_with_default(
+    reader: &mut impl BufRead,
+    context_dir: &Path,
+    default: &str,
+) -> Result<PathBuf, String> {
     loop {
-        let value = prompt_non_empty_with_default("Model file", default)?;
+        let value = prompt_non_empty_with_default(reader, "Model file", default)?;
         let candidate = context_dir.join(&value);
         if candidate.exists() && candidate.is_file() {
             let canonical = candidate.canonicalize().map_err(|e| {
-                format!("Failed to resolve model file path {}: {}", candidate.display(), e)
+                format!(
+                    "Failed to resolve model file path {}: {}",
+                    candidate.display(),
+                    e
+                )
             })?;
             if canonical.starts_with(context_dir) {
                 return Ok(canonical);
@@ -8186,7 +8393,9 @@ fn create_kapsl_package_from_context(
             "{}",
             a.bold("No metadata.json found. Let's create one for this model.")
         );
-        model_path = prompt_model_file_with_default(&context_dir, &model_file)?;
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        model_path = prompt_model_file_with_default(&mut reader, &context_dir, &model_file)?;
         model_file = model_path
             .strip_prefix(&context_dir)
             .map_err(|e| {
@@ -8202,139 +8411,151 @@ fn create_kapsl_package_from_context(
         if framework_override.is_none() {
             framework = infer_framework_from_model_path(&model_path);
         }
-        project_name = prompt_non_empty_with_default("Project name", &project_name)?;
-        framework = prompt_non_empty_with_default("Framework", &framework)?;
-        version = prompt_non_empty_with_default("Version", &version)?;
-        hardware_requirements.preferred_provider =
-            prompt_provider_with_default(hardware_requirements.preferred_provider.as_deref())?;
+        project_name = prompt_non_empty_with_default(&mut reader, "Project name", &project_name)?;
+        framework =
+            prompt_select_with_default(&mut reader, "Framework", FRAMEWORK_OPTIONS, &framework)?;
+        version = prompt_non_empty_with_default(&mut reader, "Version", &version)?;
+        hardware_requirements.preferred_provider = prompt_provider_with_default(
+            &mut reader,
+            hardware_requirements.preferred_provider.as_deref(),
+        )?;
         eprintln!();
     }
 
-    let output_path =
-        normalize_output_path_for_context(&context_dir, output_override, &project_name);
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!(
-                    "Failed to create parent directory {}: {}",
-                    parent.display(),
-                    e
-                )
-            })?;
-        }
-    }
-
-    let created_at = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("System clock error: {}", e))?
-        .as_secs()
-        .to_string();
-
-    let metadata_value = metadata_override
-        .cloned()
-        .or(metadata_from_manifest)
-        .map(|value| {
-            serde_yaml::to_value(value)
-                .map_err(|e| format!("Failed to convert metadata payload: {}", e))
-        })
-        .transpose()?;
-
-    let primary_model_ext = model_path
-        .extension()
-        .and_then(|v| v.to_str())
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-
-    let mut referenced_files = HashSet::new();
-    referenced_files.insert(PathBuf::from(&model_file));
-    if let Some(metadata) = metadata_value.as_ref() {
-        collect_existing_file_references_from_metadata(
-            &context_dir,
-            metadata,
-            &mut referenced_files,
-        );
-    }
-
-    let mut keep_primary_model_files: HashSet<PathBuf> = HashSet::new();
-    if !primary_model_ext.is_empty() {
-        for rel in &referenced_files {
-            let ext = rel
-                .extension()
-                .and_then(|v| v.to_str())
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            if !ext.is_empty() && ext == primary_model_ext {
-                keep_primary_model_files.insert(rel.to_path_buf());
+    let package = move || -> Result<PackageKapslResponse, String> {
+        let output_path =
+            normalize_output_path_for_context(&context_dir, output_override, &project_name);
+        if let Some(parent) = output_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create parent directory {}: {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
             }
         }
-    }
 
-    let manifest = Manifest {
-        project_name: project_name.clone(),
-        framework: framework.clone(),
-        version: version.clone(),
-        created_at,
-        model_file,
-        metadata: metadata_value,
-        hardware_requirements,
-        cron_jobs: Vec::new(),
+        let created_at = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("System clock error: {}", e))?
+            .as_secs()
+            .to_string();
+
+        let metadata_value = metadata_override
+            .cloned()
+            .or(metadata_from_manifest)
+            .map(|value| {
+                serde_yaml::to_value(value)
+                    .map_err(|e| format!("Failed to convert metadata payload: {}", e))
+            })
+            .transpose()?;
+
+        let primary_model_ext = model_path
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+
+        let mut referenced_files = HashSet::new();
+        referenced_files.insert(PathBuf::from(&model_file));
+        if let Some(metadata) = metadata_value.as_ref() {
+            collect_existing_file_references_from_metadata(
+                &context_dir,
+                metadata,
+                &mut referenced_files,
+            );
+        }
+
+        let mut keep_primary_model_files: HashSet<PathBuf> = HashSet::new();
+        if !primary_model_ext.is_empty() {
+            for rel in &referenced_files {
+                let ext = rel
+                    .extension()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if !ext.is_empty() && ext == primary_model_ext {
+                    keep_primary_model_files.insert(rel.to_path_buf());
+                }
+            }
+        }
+
+        let manifest = Manifest {
+            project_name: project_name.clone(),
+            framework: framework.clone(),
+            version: version.clone(),
+            created_at,
+            model_file,
+            metadata: metadata_value,
+            hardware_requirements,
+            cron_jobs: Vec::new(),
+        };
+
+        let output_file = File::create(&output_path).map_err(|e| {
+            format!(
+                "Failed to create output package {}: {}",
+                output_path.display(),
+                e
+            )
+        })?;
+        let encoder = GzEncoder::new(
+            BufWriter::with_capacity(8 << 20, output_file),
+            Compression::fast(),
+        );
+        let mut archive = Builder::new(encoder);
+
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
+        append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
+
+        for (absolute, relative) in collect_context_files(
+            &context_dir,
+            &output_path,
+            &primary_model_ext,
+            &keep_primary_model_files,
+        )? {
+            archive
+                .append_path_with_name(&absolute, &relative)
+                .map_err(|e| format!("Failed to add {} to archive: {}", relative.display(), e))?;
+        }
+
+        let encoder = archive
+            .into_inner()
+            .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
+        let mut buf_writer = encoder
+            .finish()
+            .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
+        buf_writer
+            .flush()
+            .map_err(|e| format!("Failed to flush output package: {}", e))?;
+
+        let created_metadata_path = if should_create_source_metadata {
+            create_source_metadata_if_missing(&source_metadata_path, &manifest_bytes)?
+        } else {
+            None
+        };
+
+        let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
+        Ok(PackageKapslResponse {
+            status: "ok".to_string(),
+            kapsl_path: absolute_output_path.to_string_lossy().to_string(),
+            project_name,
+            framework,
+            version,
+            metadata_path: created_metadata_path.map(|path| path.to_string_lossy().to_string()),
+        })
     };
 
-    let output_file = File::create(&output_path).map_err(|e| {
-        format!(
-            "Failed to create output package {}: {}",
-            output_path.display(),
-            e
-        )
-    })?;
-    let encoder = GzEncoder::new(
-        BufWriter::with_capacity(8 << 20, output_file),
-        Compression::fast(),
-    );
-    let mut archive = Builder::new(encoder);
-
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-        .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
-    append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
-
-    for (absolute, relative) in collect_context_files(
-        &context_dir,
-        &output_path,
-        &primary_model_ext,
-        &keep_primary_model_files,
-    )? {
-        archive
-            .append_path_with_name(&absolute, &relative)
-            .map_err(|e| format!("Failed to add {} to archive: {}", relative.display(), e))?;
-    }
-
-    let encoder = archive
-        .into_inner()
-        .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
-    let mut buf_writer = encoder
-        .finish()
-        .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
-    buf_writer
-        .flush()
-        .map_err(|e| format!("Failed to flush output package: {}", e))?;
-
-    let created_metadata_path = if should_create_source_metadata {
-        create_source_metadata_if_missing(&source_metadata_path, &manifest_bytes)?
+    // Prompts (above) ran without a spinner; show it here for the packaging work.
+    if interactive_metadata_setup {
+        run_with_loading("Building package", package)
     } else {
-        None
-    };
-
-    let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
-    Ok(PackageKapslResponse {
-        status: "ok".to_string(),
-        kapsl_path: absolute_output_path.to_string_lossy().to_string(),
-        project_name,
-        framework,
-        version,
-        metadata_path: created_metadata_path.map(|path| path.to_string_lossy().to_string()),
-    })
+        package()
+    }
 }
 
 fn push_kapsl_to_placeholder_remote(
@@ -8631,9 +8852,17 @@ mod packaging_tests {
         let context_dir = temp_dir.path();
         fs::write(context_dir.join("model.onnx"), b"dummy model").expect("model file");
 
-        let response =
-            create_kapsl_package_from_context(context_dir, None, None, None, None, None, None)
-                .expect("context package");
+        let response = create_kapsl_package_from_context(
+            context_dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("context package");
 
         let metadata_path = context_dir.join("metadata.json");
         let response_metadata_path = PathBuf::from(
@@ -8675,9 +8904,17 @@ mod packaging_tests {
         let metadata_path = context_dir.join("metadata.json");
         fs::write(&metadata_path, existing_metadata).expect("metadata file");
 
-        let response =
-            create_kapsl_package_from_context(context_dir, None, None, None, None, None, None)
-                .expect("context package");
+        let response = create_kapsl_package_from_context(
+            context_dir,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("context package");
 
         assert_eq!(response.metadata_path, None);
         assert_eq!(
@@ -8686,6 +8923,62 @@ mod packaging_tests {
         );
         assert_eq!(response.project_name, "existing-project");
         assert_eq!(response.version, "2.0.0");
+    }
+
+    #[test]
+    fn test_prompt_with_default_falls_back_on_empty_input() {
+        let mut reader = Cursor::new(b"\n".to_vec());
+        let value = prompt_with_default(&mut reader, "Version", "1.0.0").expect("prompt");
+        assert_eq!(value, "1.0.0");
+    }
+
+    #[test]
+    fn test_prompt_with_default_trims_provided_value() {
+        let mut reader = Cursor::new(b"  custom-name  \n".to_vec());
+        let value =
+            prompt_with_default(&mut reader, "Project name", "kapsl-model").expect("prompt");
+        assert_eq!(value, "custom-name");
+    }
+
+    #[test]
+    fn test_prompt_non_empty_retries_until_value_provided() {
+        // First line is whitespace-only (rejected), second line is accepted.
+        let mut reader = Cursor::new(b"   \nactual-framework\n".to_vec());
+        let value = prompt_non_empty_with_default(&mut reader, "Framework", "").expect("prompt");
+        assert_eq!(value, "actual-framework");
+    }
+
+    #[test]
+    fn test_prompt_provider_defaults_to_cpu_on_empty_input() {
+        let mut reader = Cursor::new(b"\n".to_vec());
+        let value = prompt_provider_with_default(&mut reader, None).expect("prompt");
+        assert_eq!(value.as_deref(), Some("cpu"));
+    }
+
+    #[test]
+    fn test_prompt_provider_uses_existing_default_on_empty_input() {
+        let mut reader = Cursor::new(b"\n".to_vec());
+        let value = prompt_provider_with_default(&mut reader, Some("cuda")).expect("prompt");
+        assert_eq!(value.as_deref(), Some("cuda"));
+    }
+
+    #[test]
+    fn test_prompt_model_file_rejects_missing_then_accepts_existing() {
+        let temp_dir = TempDirGuard::new("kapsl-prompt-model-file").expect("temp dir");
+        let context_dir = temp_dir.path();
+        fs::write(context_dir.join("model.onnx"), b"dummy model").expect("model file");
+
+        // First line points at a non-existent file (rejected), second is valid.
+        let mut reader = Cursor::new(b"missing.onnx\nmodel.onnx\n".to_vec());
+        let resolved =
+            prompt_model_file_with_default(&mut reader, context_dir, "model.onnx").expect("prompt");
+        assert_eq!(
+            resolved.canonicalize().expect("resolved"),
+            context_dir
+                .join("model.onnx")
+                .canonicalize()
+                .expect("model")
+        );
     }
 }
 
@@ -12993,7 +13286,7 @@ async fn main() -> Result<(), DynError> {
                     error: String,
                 }
 
-                match create_kapsl_package(&request) {
+                match create_kapsl_package(&request, false) {
                     Ok(response) => {
                         warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
                     }
