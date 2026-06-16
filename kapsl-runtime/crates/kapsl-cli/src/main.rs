@@ -7886,9 +7886,15 @@ fn prompt_with_default(
         .map_err(|e| format!("Failed to flush prompt: {}", e))?;
 
     let mut input = String::new();
-    reader
+    let bytes = reader
         .read_line(&mut input)
         .map_err(|e| format!("Failed to read prompt input: {}", e))?;
+    // read_line returns 0 only at end of input. Treat that as an abort rather
+    // than as "use the default", so a closed stdin (or Ctrl-D) can never spin a
+    // retry loop forever.
+    if bytes == 0 {
+        return Err("unexpected end of input while reading prompt".to_string());
+    }
     let trimmed = input.trim();
     if trimmed.is_empty() {
         Ok(default.to_string())
@@ -8101,6 +8107,12 @@ fn prompt_model_file_with_default(
     context_dir: &Path,
     default: &str,
 ) -> Result<PathBuf, String> {
+    // Compare against the canonicalized context dir: `canonicalize()` below
+    // resolves symlinks (e.g. macOS /var -> /private/var), so the bound must be
+    // resolved too or every valid in-context file is wrongly rejected.
+    let context_canonical = context_dir
+        .canonicalize()
+        .unwrap_or_else(|_| context_dir.to_path_buf());
     loop {
         let value = prompt_non_empty_with_default(reader, "Model file", default)?;
         let candidate = context_dir.join(&value);
@@ -8112,7 +8124,7 @@ fn prompt_model_file_with_default(
                     e
                 )
             })?;
-            if canonical.starts_with(context_dir) {
+            if canonical.starts_with(&context_canonical) {
                 return Ok(canonical);
             }
         }
@@ -9127,6 +9139,20 @@ mod packaging_tests {
                 .canonicalize()
                 .expect("model")
         );
+    }
+
+    #[test]
+    fn test_prompt_aborts_on_end_of_input_instead_of_looping() {
+        // Regression: an exhausted reader (or Ctrl-D) must abort, never spin a
+        // retry loop forever. Only invalid input is provided, then EOF.
+        let temp_dir = TempDirGuard::new("kapsl-prompt-eof").expect("temp dir");
+        let context_dir = temp_dir.path();
+        let mut reader = Cursor::new(b"does-not-exist.onnx\n".to_vec());
+        let result = prompt_model_file_with_default(&mut reader, context_dir, "also-missing.onnx");
+        assert!(result.is_err(), "EOF after invalid input must error, not hang");
+
+        let mut reader = Cursor::new(Vec::new());
+        assert!(prompt_with_default(&mut reader, "Anything", "default").is_err());
     }
 }
 
