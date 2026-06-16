@@ -12,7 +12,9 @@ use futures::{stream, StreamExt};
 use infer_adapter::{default_request_adapter_registry, parse_inference_request_with_registry};
 use kapsl_backends::{BackendFactory, OnnxRuntimeTuning};
 use kapsl_core::loader::Manifest;
-use kapsl_core::{AutoScaler, ModelInfo, ModelRegistry, ModelStatus, PackageLoader, ScalingPolicy};
+use kapsl_core::{
+    AutoScaler, EngineKind, ModelInfo, ModelRegistry, ModelStatus, PackageLoader, ScalingPolicy,
+};
 use kapsl_engine_api::{
     BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics, EngineModelInfo,
     InferenceRequest, TensorDtype,
@@ -9166,7 +9168,7 @@ fn resolve_scheduler_tuning_for_framework(
     scheduler_max_micro_batch: usize,
     scheduler_queue_delay_ms: u64,
 ) -> (usize, u64) {
-    if !manifest.framework.eq_ignore_ascii_case("llm") {
+    if !EngineKind::resolve(manifest).is_onnx_generate() {
         return (scheduler_max_micro_batch, scheduler_queue_delay_ms);
     }
 
@@ -9198,7 +9200,7 @@ fn resolve_scheduler_tuning_for_framework(
 }
 
 fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
-    if !manifest.framework.eq_ignore_ascii_case("llm") {
+    if !EngineKind::resolve(manifest).is_onnx_generate() {
         return;
     }
     if std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_some()
@@ -9337,7 +9339,8 @@ fn resolve_effective_topology_choice(
     let requested = requested_topology.trim().to_ascii_lowercase();
     let requested_degree = requested_tp_degree.max(1);
     let pipeline_stage_count = pipeline_stages.map(|stages| stages.len()).unwrap_or(0);
-    let pipeline_ready = manifest.framework == "llm" && pipeline_stage_count > 0;
+    let pipeline_ready =
+        EngineKind::resolve(manifest).is_onnx_generate() && pipeline_stage_count > 0;
 
     match requested.as_str() {
         "pipeline" | "pipeline-parallel" => {
@@ -10874,7 +10877,7 @@ fn load_model_blocking(
                 let provider = device.backend.to_string();
 
                 #[cfg(feature = "gguf-native")]
-                if loader.manifest.framework == "gguf" {
+                if EngineKind::resolve(&loader.manifest).is_gguf() {
                     let existing_handle = shared_kv.get_gpu_pool(device.id);
                     let mut b =
                         BackendFactory::create_gguf_native(device.id as i32, existing_handle)?;
@@ -10905,7 +10908,7 @@ fn load_model_blocking(
                 }
 
                 #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-                if loader.manifest.framework == "gguf" {
+                if EngineKind::resolve(&loader.manifest).is_gguf() {
                     let existing_handle = shared_kv.get_gpu_pool(device.id);
                     let mut b = BackendFactory::create_gguf_cuda_shared_kv(
                         device.id as i32,
@@ -11278,7 +11281,7 @@ async fn load_model(
                 let provider = device.backend.to_string();
 
                 #[cfg(feature = "gguf-native")]
-                if loader.manifest.framework == "gguf" {
+                if EngineKind::resolve(&loader.manifest).is_gguf() {
                     let existing_handle = shared_kv.get_gpu_pool(device.id);
                     let mut b =
                         BackendFactory::create_gguf_native(device.id as i32, existing_handle)?;
@@ -11587,7 +11590,7 @@ async fn scale_up_model(
         #[allow(unused_labels)]
         'engine: {
             #[cfg(feature = "gguf-native")]
-            if loader.manifest.framework == "gguf" {
+            if EngineKind::resolve(&loader.manifest).is_gguf() {
                 let device_id =
                     loader.manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
                 let existing_handle = shared_kv.get_gpu_pool(device_id);
