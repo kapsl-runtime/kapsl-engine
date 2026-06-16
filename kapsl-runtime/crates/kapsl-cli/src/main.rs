@@ -469,6 +469,18 @@ impl SharedKvStateInner {
     }
 }
 
+fn kapsl_help_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects};
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .literal(AnsiColor::BrightCyan.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Cyan.on_default())
+        .error(AnsiColor::Red.on_default() | Effects::BOLD)
+        .invalid(AnsiColor::Yellow.on_default() | Effects::BOLD)
+        .valid(AnsiColor::Green.on_default())
+}
+
 const CLI_AFTER_HELP: &str = "\
 Examples:
   # Start the runtime with one model
@@ -517,7 +529,8 @@ Compatibility:
                   Use `kapsl run` to serve one or more model packages, `kapsl build` to\n\
                   create a portable .aimod package from an ONNX or GGUF model, and\n\
                   `kapsl push`/`pull` to sync packages with a remote registry.",
-    after_help = CLI_AFTER_HELP
+    after_help = CLI_AFTER_HELP,
+    styles(kapsl_help_styles()),
 )]
 struct Cli {
     #[command(subcommand)]
@@ -3114,11 +3127,6 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
             }
         }
     };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
-    );
     print_build_summary(&response.kapsl_path);
     Ok(())
 }
@@ -3154,11 +3162,6 @@ fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError> {
         response.bytes_uploaded,
         started_at.elapsed(),
         &response.artifact_url,
-    );
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
     );
     Ok(())
 }
@@ -3196,11 +3199,6 @@ fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError> {
         started_at.elapsed(),
         &response.kapsl_path,
     );
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
-    );
     Ok(())
 }
 
@@ -3229,11 +3227,29 @@ fn execute_login_command(args: LoginCommandArgs) -> Result<(), DynError> {
     }
     .map_err(dyn_error_from_message)?;
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&response)
-            .map_err(|e| dyn_error_from_message(format!("Failed to encode response: {}", e)))?
+    let a = Ansi::new();
+    eprintln!();
+    eprintln!(
+        "  {}  {}",
+        a.green("✓"),
+        a.bold("Authenticated successfully")
     );
+    eprintln!(
+        "     {}  {}",
+        a.dim("Provider"),
+        response.provider
+    );
+    eprintln!(
+        "     {}    {}",
+        a.dim("Remote"),
+        a.teal(&response.remote_url)
+    );
+    eprintln!(
+        "     {}    {}",
+        a.dim("Token"),
+        a.dim(&response.token_store_path)
+    );
+    eprintln!();
 
     Ok(())
 }
@@ -3259,12 +3275,22 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
 
     let start_url = format!("{}/api/models/start", base_url);
 
+    let a = Ansi::new();
     let mut any_error = false;
     for model_path in &args.model {
+        let display = model_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| model_path.to_str().unwrap_or("?"));
+
         let absolute_path = match model_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("error: model path {:?} is invalid: {}", model_path, e);
+                eprintln!(
+                    "  {}  {}  {}",
+                    a.red("✗"),
+                    display,
+                    a.dim(&format!("({})", e))
+                );
                 any_error = true;
                 continue;
             }
@@ -3292,16 +3318,25 @@ fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> 
                     .body_mut()
                     .read_to_string()
                     .unwrap_or_else(|_| String::new());
-                match serde_json::from_str::<serde_json::Value>(&body) {
-                    Ok(json) => println!("{}", serde_json::to_string_pretty(&json).unwrap_or(body)),
-                    Err(_) => println!("{}", body),
-                }
+                // Extract model_id from JSON if present for a nicer summary line.
+                let model_id = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|json| json.get("model_id").and_then(|v| v.as_u64()))
+                    .map(|id| format!(" (id={})", id))
+                    .unwrap_or_default();
+                eprintln!(
+                    "  {}  {}{}",
+                    a.green("✓"),
+                    display,
+                    a.dim(&model_id)
+                );
             }
             Err(e) => {
                 eprintln!(
-                    "error: failed to add model {:?}: {}",
-                    model_path,
-                    format_remote_http_error(e)
+                    "  {}  {}  {}",
+                    a.red("✗"),
+                    display,
+                    a.dim(&format!("({})", format_remote_http_error(e)))
                 );
                 any_error = true;
             }
@@ -5294,12 +5329,14 @@ fn perform_browser_login_flow(
         percent_encode_query_component(&callback_url)
     );
 
+    let a = Ansi::new();
     if no_browser {
-        println!("Open this URL to sign in:\n{}", login_url);
+        eprintln!("  {}  {}", a.dim("Sign in at:"), a.teal(&login_url));
     } else if !open_browser(&login_url) {
-        println!(
-            "Could not open a browser automatically. Open this URL to sign in:\n{}",
-            login_url
+        eprintln!(
+            "  {}  {}",
+            a.dim("Browser could not open. Sign in at:"),
+            a.teal(&login_url)
         );
     }
 
@@ -5397,24 +5434,29 @@ fn perform_device_code_login_flow(
         return Err("Remote backend returned an empty user_code.".to_string());
     }
 
+    let a = Ansi::new();
     if let Some(complete_url) = start.verification_uri_complete.as_deref() {
         let trimmed = complete_url.trim();
         if !trimmed.is_empty() {
             if no_browser {
-                println!("Open this URL to authorize this login:\n{}", trimmed);
+                eprintln!("  {}  {}", a.dim("Authorize at:"), a.teal(trimmed));
             } else if !open_browser(trimmed) {
-                println!(
-                    "Could not open a browser automatically. Open this URL to authorize this login:\n{}",
-                    trimmed
+                eprintln!(
+                    "  {}  {}",
+                    a.dim("Browser could not open. Authorize at:"),
+                    a.teal(trimmed)
                 );
             }
         }
     }
-    println!(
-        "If prompted, open {} and enter code: {}",
-        verification_uri, user_code
+    eprintln!(
+        "  {}  {}  {}  {}",
+        a.dim("Enter code"),
+        a.bold(&user_code),
+        a.dim("at"),
+        a.teal(&verification_uri)
     );
-    println!("Waiting for authorization approval...");
+    eprintln!("  {}", a.dim("Waiting for authorization approval..."));
 
     let started_at = Instant::now();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
@@ -5552,9 +5594,11 @@ fn maybe_auto_login_for_remote(
         return Ok(false);
     }
 
-    println!(
-        "Remote backend requires authentication. Starting browser login for {} ...",
-        remote_url
+    let a = Ansi::new();
+    eprintln!(
+        "  {}  {}",
+        a.dim("Authenticating with"),
+        a.teal(remote_url)
     );
     let browser_login = perform_browser_login_flow(
         remote_url,
@@ -6028,7 +6072,7 @@ fn push_kapsl_to_http_remote(
 
     // Try presigned URL flow first.
     if let Some(presigned) = request_presigned_upload_url(artifact_url, authorization_header)? {
-        eprintln!("Uploading via presigned URL ({} bytes)...", file_size.len());
+        eprintln!("  {}", Ansi::new().dim(&format!("Uploading {} bytes...", file_size.len())));
         let file = File::open(source_path).map_err(|e| RemoteHttpRequestError {
             status_code: None,
             message: format!(
@@ -6249,7 +6293,7 @@ fn pull_kapsl_from_http_remote(
     // Try presigned URL flow first.
     if let Some(download_url) = request_presigned_download_url(artifact_url, authorization_header)?
     {
-        eprintln!("Downloading via presigned URL...");
+        eprintln!("  {}", Ansi::new().dim("Downloading..."));
         // No auth header needed — the SAS token is in the URL.
         return download_to_file(&download_url, output_path, None);
     }
