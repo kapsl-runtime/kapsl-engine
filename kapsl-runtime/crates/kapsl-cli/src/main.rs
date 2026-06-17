@@ -10072,7 +10072,7 @@ fn resolve_scheduler_tuning_for_framework(
 }
 
 fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
-    if !EngineKind::resolve(manifest).is_onnx_generate() {
+    if !EngineKind::resolve(manifest).is_gguf() {
         return;
     }
     if std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_some()
@@ -10084,11 +10084,70 @@ fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
     let target = batch_size.max(1);
     std::env::set_var(GGUF_TARGET_CONCURRENCY_ENV, target.to_string());
     log::info!(
-        "Framework=llm: setting {}={} from runtime batch_size. Set {} to override GGUF context reservation.",
+        "Framework=gguf: setting {}={} from runtime batch_size. Set {} to override GGUF context reservation.",
         GGUF_TARGET_CONCURRENCY_ENV,
         target,
         GGUF_MAX_CONCURRENT_ENV
     );
+}
+
+#[cfg(test)]
+mod gguf_auto_sizing_tests {
+    use super::*;
+    use kapsl_core::HardwareRequirements;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_manifest(framework: &str) -> Manifest {
+        Manifest {
+            project_name: "test".to_string(),
+            framework: framework.to_string(),
+            version: "1.0.0".to_string(),
+            created_at: "0".to_string(),
+            model_file: match framework {
+                "gguf" => "model.gguf".to_string(),
+                "llm" => "model.onnx".to_string(),
+                _ => "model.bin".to_string(),
+            },
+            format: None,
+            model_type: None,
+            task: None,
+            metadata: None,
+            hardware_requirements: HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exports_batch_size_hint_for_gguf_models() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+
+        export_gguf_auto_sizing_hint(&test_manifest("gguf"), 3);
+
+        assert_eq!(
+            std::env::var(GGUF_TARGET_CONCURRENCY_ENV).ok().as_deref(),
+            Some("3")
+        );
+
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+    }
+
+    #[test]
+    fn does_not_export_batch_size_hint_for_onnx_generate_models() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+
+        export_gguf_auto_sizing_hint(&test_manifest("llm"), 3);
+
+        assert!(std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_none());
+    }
 }
 
 fn parse_priority_weight_override(raw: &str, model_id: u32) -> Option<u32> {
