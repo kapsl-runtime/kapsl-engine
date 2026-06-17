@@ -945,9 +945,22 @@ struct BuildCommandArgs {
     #[arg(long)]
     project_name: Option<String>,
 
-    /// Override the framework tag embedded in the package (e.g. onnx, gguf, pytorch)
+    /// Deprecated: legacy combined framework tag (e.g. onnx, gguf, llm). Prefer
+    /// --format / --model-type / --task.
     #[arg(long)]
     framework: Option<String>,
+
+    /// Model file format / loader: onnx, gguf, safetensors
+    #[arg(long)]
+    format: Option<String>,
+
+    /// Model capability class: causal-lm, embedding, seq-classifier, seq2seq, opaque
+    #[arg(long = "model-type")]
+    model_type: Option<String>,
+
+    /// Serving operation: generate, embed, classify, rerank, forward
+    #[arg(long)]
+    task: Option<String>,
 
     /// Override the version string embedded in the package
     #[arg(long)]
@@ -2310,6 +2323,12 @@ struct PackageKapslRequest {
     output_path: Option<String>,
     project_name: Option<String>,
     framework: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    model_type: Option<String>,
+    #[serde(default)]
+    task: Option<String>,
     version: Option<String>,
     metadata: Option<serde_json::Value>,
 }
@@ -3044,6 +3063,7 @@ fn execute_context_build(
     framework_override: Option<&str>,
     version_override: Option<&str>,
     metadata_override: Option<&serde_json::Value>,
+    axes: AxisOverrides,
 ) -> Result<PackageKapslResponse, DynError> {
     let interactive_metadata_setup = cli_stdin_is_tty() && context_metadata_missing(context_path);
     let build = || {
@@ -3055,6 +3075,7 @@ fn execute_context_build(
             framework_override,
             version_override,
             metadata_override,
+            axes,
             interactive_metadata_setup,
         )
         .map_err(dyn_error_from_message)
@@ -3207,6 +3228,11 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     args.framework.as_deref(),
                     args.version.as_deref(),
                     metadata.as_ref(),
+                    AxisOverrides {
+                        format: args.format.as_deref(),
+                        model_type: args.model_type.as_deref(),
+                        task: args.task.as_deref(),
+                    },
                 )?
             } else if looks_like_model_file_path(context_or_model_path)
                 || context_or_model_path.is_file()
@@ -3221,6 +3247,9 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     output_path: args.output.map(|p| p.to_string_lossy().to_string()),
                     project_name: args.project_name.clone(),
                     framework: args.framework.clone(),
+                    format: args.format.clone(),
+                    model_type: args.model_type.clone(),
+                    task: args.task.clone(),
                     version: args.version.clone(),
                     metadata: metadata.clone(),
                 };
@@ -3234,6 +3263,11 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     args.framework.as_deref(),
                     args.version.as_deref(),
                     metadata.as_ref(),
+                    AxisOverrides {
+                        format: args.format.as_deref(),
+                        model_type: args.model_type.as_deref(),
+                        task: args.task.as_deref(),
+                    },
                 )?
             }
         }
@@ -3244,6 +3278,9 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     output_path: args.output.map(|p| p.to_string_lossy().to_string()),
                     project_name: args.project_name,
                     framework: args.framework,
+                    format: args.format,
+                    model_type: args.model_type,
+                    task: args.task,
                     version: args.version,
                     metadata,
                 };
@@ -3259,6 +3296,11 @@ fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynError> {
                     args.framework.as_deref(),
                     args.version.as_deref(),
                     metadata.as_ref(),
+                    AxisOverrides {
+                        format: args.format.as_deref(),
+                        model_type: args.model_type.as_deref(),
+                        task: args.task.as_deref(),
+                    },
                 )?
             }
         }
@@ -7562,12 +7604,27 @@ fn create_kapsl_package(
 
     let mut hardware_requirements = kapsl_core::HardwareRequirements::default();
 
-    // Orthogonal model axes (format / model_type / task). Populated explicitly in
-    // the interactive flow; left None otherwise so the loader infers them from
-    // `framework`. See kapsl_core::EngineKind.
+    // Orthogonal model axes (format / model_type / task). Populated from CLI
+    // overrides and/or the interactive flow; left None otherwise so the loader
+    // infers them from `framework`. See kapsl_core::EngineKind.
     let mut format_axis: Option<String> = None;
     let mut model_type_axis: Option<String> = None;
     let mut task_axis: Option<String> = None;
+
+    // Non-interactive: --format / --model-type / --task fill the axes (and a
+    // consistent legacy `framework`) without prompting.
+    let axes = AxisOverrides {
+        format: request.format.as_deref(),
+        model_type: request.model_type.as_deref(),
+        task: request.task.as_deref(),
+    };
+    if axes.any() {
+        let (fmt, mt, tk, fw) = resolve_axis_triple(infer_format_from_model_path(&model_path), axes);
+        framework = fw;
+        format_axis = Some(fmt);
+        model_type_axis = Some(mt);
+        task_axis = Some(tk);
+    }
 
     // The model file's directory is where we persist a generated metadata.json so
     // a subsequent build can be reproduced without re-prompting.
@@ -7586,19 +7643,21 @@ fn create_kapsl_package(
         let stdin = std::io::stdin();
         let mut reader = stdin.lock();
         project_name = prompt_non_empty_with_default(&mut reader, "Project name", &project_name)?;
-        let format = prompt_select_with_default(
-            &mut reader,
-            "Format",
-            FORMAT_OPTIONS,
-            infer_format_from_model_path(&model_path),
-        )?;
+        let format_default = format_axis
+            .as_deref()
+            .unwrap_or_else(|| infer_format_from_model_path(&model_path));
+        let format =
+            prompt_select_with_default(&mut reader, "Format", FORMAT_OPTIONS, format_default)?;
+        let model_type_default = model_type_axis
+            .as_deref()
+            .unwrap_or_else(|| default_model_type_for_format(&format));
         let model_type = prompt_select_with_default(
             &mut reader,
             "Model type",
             MODEL_TYPE_OPTIONS,
-            default_model_type_for_format(&format),
+            model_type_default,
         )?;
-        let task = prompt_task_for_model_type(&mut reader, &model_type)?;
+        let task = prompt_task_for_model_type(&mut reader, &model_type, task_axis.as_deref())?;
         framework = legacy_framework_for(&format, &model_type, &task);
         format_axis = Some(format);
         model_type_axis = Some(model_type);
@@ -7997,14 +8056,62 @@ fn legacy_framework_for(format: &str, _model_type: &str, task: &str) -> String {
     .to_string()
 }
 
+/// CLI overrides for the orthogonal model axes (`--format` / `--model-type` /
+/// `--task`).
+#[derive(Default, Clone, Copy)]
+struct AxisOverrides<'a> {
+    format: Option<&'a str>,
+    model_type: Option<&'a str>,
+    task: Option<&'a str>,
+}
+
+impl AxisOverrides<'_> {
+    fn any(&self) -> bool {
+        self.format.is_some() || self.model_type.is_some() || self.task.is_some()
+    }
+}
+
+/// Resolve the full `(format, model_type, task, framework)` from optional axis
+/// overrides, filling unspecified axes with format-derived defaults. The legacy
+/// `framework` is derived to stay consistent with the chosen axes.
+fn resolve_axis_triple(
+    default_format: &str,
+    axes: AxisOverrides,
+) -> (String, String, String, String) {
+    let pick = |o: Option<&str>| o.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let format = pick(axes.format).unwrap_or_else(|| default_format.to_string());
+    let task_hint = pick(axes.task);
+    // When only a task is given, infer the model type it implies so e.g.
+    // `--task embed` alone is a coherent (embedding, embed) pair rather than
+    // (opaque, embed).
+    let model_type = pick(axes.model_type).unwrap_or_else(|| {
+        match task_hint.as_deref() {
+            Some("embed") => "embedding",
+            Some("classify") => "seq-classifier",
+            Some("generate") => "causal-lm",
+            _ => default_model_type_for_format(&format),
+        }
+        .to_string()
+    });
+    let task = task_hint.unwrap_or_else(|| default_task_for_model_type(&model_type).to_string());
+    let framework = legacy_framework_for(&format, &model_type, &task);
+    (format, model_type, task, framework)
+}
+
 /// Prompt for the serving task, skipping the prompt when the model type allows
 /// only one task.
 fn prompt_task_for_model_type(
     reader: &mut impl BufRead,
     model_type: &str,
+    preferred: Option<&str>,
 ) -> Result<String, String> {
     let options = task_options_for_model_type(model_type);
-    let default = default_task_for_model_type(model_type);
+    // Use a preferred task (e.g. from --task) as the default when it's valid for
+    // this model type, else the model type's natural default.
+    let default = preferred
+        .map(str::trim)
+        .filter(|p| options.iter().any(|(v, _)| v.eq_ignore_ascii_case(p)))
+        .unwrap_or_else(|| default_task_for_model_type(model_type));
     if options.len() <= 1 {
         return Ok(default.to_string());
     }
@@ -8404,6 +8511,7 @@ fn create_kapsl_package_from_context(
     framework_override: Option<&str>,
     version_override: Option<&str>,
     metadata_override: Option<&serde_json::Value>,
+    axes: AxisOverrides,
     interactive_metadata_setup: bool,
 ) -> Result<PackageKapslResponse, String> {
     let context_input = PathBuf::from(context_path);
@@ -8525,11 +8633,20 @@ fn create_kapsl_package_from_context(
 
     let mut hardware_requirements = hardware_requirements_from_manifest.unwrap_or_default();
 
-    // Orthogonal model axes; populated in the interactive flow, else None so the
-    // loader infers them from `framework`. See kapsl_core::EngineKind.
+    // Orthogonal model axes; populated from CLI overrides and/or the interactive
+    // flow, else None so the loader infers them from `framework`.
     let mut format_axis: Option<String> = None;
     let mut model_type_axis: Option<String> = None;
     let mut task_axis: Option<String> = None;
+
+    // Non-interactive: --format / --model-type / --task fill the axes.
+    if axes.any() {
+        let (fmt, mt, tk, fw) = resolve_axis_triple(infer_format_from_model_path(&model_path), axes);
+        framework = fw;
+        format_axis = Some(fmt);
+        model_type_axis = Some(mt);
+        task_axis = Some(tk);
+    }
 
     if should_create_source_metadata && interactive_metadata_setup {
         let a = Ansi::new();
@@ -8553,19 +8670,21 @@ fn create_kapsl_package_from_context(
             .to_string();
 
         project_name = prompt_non_empty_with_default(&mut reader, "Project name", &project_name)?;
-        let format = prompt_select_with_default(
-            &mut reader,
-            "Format",
-            FORMAT_OPTIONS,
-            infer_format_from_model_path(&model_path),
-        )?;
+        let format_default = format_axis
+            .as_deref()
+            .unwrap_or_else(|| infer_format_from_model_path(&model_path));
+        let format =
+            prompt_select_with_default(&mut reader, "Format", FORMAT_OPTIONS, format_default)?;
+        let model_type_default = model_type_axis
+            .as_deref()
+            .unwrap_or_else(|| default_model_type_for_format(&format));
         let model_type = prompt_select_with_default(
             &mut reader,
             "Model type",
             MODEL_TYPE_OPTIONS,
-            default_model_type_for_format(&format),
+            model_type_default,
         )?;
-        let task = prompt_task_for_model_type(&mut reader, &model_type)?;
+        let task = prompt_task_for_model_type(&mut reader, &model_type, task_axis.as_deref())?;
         framework = legacy_framework_for(&format, &model_type, &task);
         format_axis = Some(format);
         model_type_axis = Some(model_type);
@@ -9020,6 +9139,7 @@ mod packaging_tests {
             None,
             None,
             None,
+            AxisOverrides::default(),
             false,
         )
         .expect("context package");
@@ -9072,6 +9192,7 @@ mod packaging_tests {
             None,
             None,
             None,
+            AxisOverrides::default(),
             false,
         )
         .expect("context package");
@@ -9153,6 +9274,51 @@ mod packaging_tests {
 
         let mut reader = Cursor::new(Vec::new());
         assert!(prompt_with_default(&mut reader, "Anything", "default").is_err());
+    }
+
+    #[test]
+    fn test_resolve_axis_triple_fills_defaults_and_legacy_framework() {
+        let ax = |f: Option<&'static str>, m: Option<&'static str>, t: Option<&'static str>| {
+            AxisOverrides {
+                format: f,
+                model_type: m,
+                task: t,
+            }
+        };
+
+        // --format gguf alone -> causal-lm / generate, legacy framework "gguf".
+        assert_eq!(
+            resolve_axis_triple("onnx", ax(Some("gguf"), None, None)),
+            (
+                "gguf".into(),
+                "causal-lm".into(),
+                "generate".into(),
+                "gguf".into()
+            )
+        );
+
+        // --task embed alone -> model type inferred as embedding (coherent pair).
+        assert_eq!(
+            resolve_axis_triple("onnx", ax(None, None, Some("embed"))),
+            (
+                "onnx".into(),
+                "embedding".into(),
+                "embed".into(),
+                "onnx".into()
+            )
+        );
+
+        // onnx + generate -> legacy framework "llm".
+        assert_eq!(
+            resolve_axis_triple("onnx", ax(Some("onnx"), Some("causal-lm"), Some("generate"))).3,
+            "llm"
+        );
+
+        // No overrides -> falls back to the inferred default format.
+        assert_eq!(
+            resolve_axis_triple("gguf", AxisOverrides::default()).0,
+            "gguf"
+        );
     }
 }
 
