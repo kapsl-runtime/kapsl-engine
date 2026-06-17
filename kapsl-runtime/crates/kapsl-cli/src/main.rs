@@ -1256,6 +1256,7 @@ struct AppliedPerformanceTuning {
     scheduler_queue_size: Option<usize>,
     scheduler_max_micro_batch: Option<usize>,
     scheduler_queue_delay_ms: Option<u64>,
+    gguf_prefill_chunk_size: Option<usize>,
     media_preprocess: Option<String>,
     rust_log: Option<String>,
     /// Populated when Auto profile is used; emitted after env_logger::init().
@@ -1294,6 +1295,7 @@ const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
 const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
+const GGUF_PREFILL_CHUNK_SIZE_ENV: &str = "KAPSL_GGUF_PREFILL_CHUNK_SIZE";
 const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
 const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
 const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
@@ -2563,7 +2565,63 @@ struct AutoTunedPolicy {
     scheduler_max_micro_batch: usize,
     scheduler_queue_delay_ms: u64,
     scheduler_queue_size: usize,
+    gguf_prefill_chunk_size: Option<usize>,
     rationale: String,
+}
+
+fn largest_model_size_mb(model_paths: &[PathBuf]) -> u64 {
+    model_paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .max()
+        .map(|b| b / (1024 * 1024))
+        .unwrap_or(0)
+}
+
+fn available_ram_gb() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.available_memory() / (1024 * 1024 * 1024)
+}
+
+fn logical_cpu_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn auto_tuned_gguf_prefill_chunk_size(
+    model_size_mb: u64,
+    available_ram_gb: u64,
+    cpu_cores: usize,
+    batch_size: usize,
+) -> Option<usize> {
+    if model_size_mb == 0 {
+        return None;
+    }
+
+    let mut chunk = if model_size_mb < 2_000 {
+        512
+    } else if model_size_mb < 8_000 {
+        256
+    } else {
+        128
+    };
+
+    if available_ram_gb > 0 && available_ram_gb < 8 {
+        chunk = (chunk / 2).max(64);
+    }
+    if available_ram_gb > 0 && available_ram_gb < 4 {
+        chunk = (chunk / 2).max(32);
+    }
+    if cpu_cores <= 2 {
+        chunk = (chunk / 2).max(32);
+    }
+    if batch_size <= 1 {
+        chunk = chunk.min(128);
+    }
+
+    Some(chunk)
 }
 
 /// Derive scheduler parameters from model file size and available system resources.
@@ -2572,24 +2630,13 @@ struct AutoTunedPolicy {
 /// Falls back to safe defaults if model paths can't be stat'd.
 fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
     // Largest model file size in MB — proxy for parameter count / memory footprint
-    let model_size_mb: u64 = model_paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .max()
-        .map(|b| b / (1024 * 1024))
-        .unwrap_or(0);
+    let model_size_mb = largest_model_size_mb(model_paths);
 
     // Available (not total) system RAM in GB
-    let available_ram_gb: u64 = {
-        let mut sys = System::new();
-        sys.refresh_memory();
-        sys.available_memory() / (1024 * 1024 * 1024)
-    };
+    let available_ram_gb = available_ram_gb();
 
     // Logical CPU cores
-    let cpu_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cpu_cores = logical_cpu_cores();
 
     // Base policy from model file size
     let (mut batch_size, mut micro_batch, delay_ms, mut queue_size, size_tier) =
@@ -2602,6 +2649,7 @@ fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
                 scheduler_max_micro_batch: 4,
                 scheduler_queue_delay_ms: 2,
                 scheduler_queue_size: 256,
+                gguf_prefill_chunk_size: None,
                 rationale: format!(
                     "model={}MB (unknown), ram_avail={}GB, cpu_cores={}, conservative-defaults",
                     model_size_mb, available_ram_gb, cpu_cores
@@ -2632,11 +2680,18 @@ fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
         notes.push_str(&format!(", low-cpu (cores={})", cpu_cores));
     }
 
+    let gguf_prefill_chunk_size =
+        auto_tuned_gguf_prefill_chunk_size(model_size_mb, available_ram_gb, cpu_cores, batch_size);
+    if let Some(chunk) = gguf_prefill_chunk_size {
+        notes.push_str(&format!(", gguf_prefill_chunk={}", chunk));
+    }
+
     AutoTunedPolicy {
         batch_size,
         scheduler_max_micro_batch: micro_batch,
         scheduler_queue_delay_ms: delay_ms,
         scheduler_queue_size: queue_size,
+        gguf_prefill_chunk_size,
         rationale: format!(
             "model={}MB ({}), ram_avail={}GB, cpu_cores={}{}",
             model_size_mb, size_tier, available_ram_gb, cpu_cores, notes
@@ -2677,13 +2732,20 @@ fn apply_performance_profile(args: &mut Args, matches: &ArgMatches) -> AppliedPe
                 args.scheduler_queue_delay_ms = policy.scheduler_queue_delay_ms;
                 tuning.scheduler_queue_delay_ms = Some(args.scheduler_queue_delay_ms);
             }
+            if std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV).is_none() {
+                if let Some(chunk_size) = policy.gguf_prefill_chunk_size {
+                    std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, chunk_size.to_string());
+                    tuning.gguf_prefill_chunk_size = Some(chunk_size);
+                }
+            }
             // Defer the log: env_logger is not yet initialized at this call site.
             tuning.auto_tune_rationale = Some(format!(
-                "batch={}, micro_batch={}, delay={}ms, queue_size={} | {}",
+                "batch={}, micro_batch={}, delay={}ms, queue_size={}, gguf_prefill_chunk={:?} | {}",
                 args.batch_size,
                 args.scheduler_max_micro_batch,
                 args.scheduler_queue_delay_ms,
                 args.scheduler_queue_size,
+                tuning.gguf_prefill_chunk_size,
                 policy.rationale,
             ));
         }
@@ -4886,6 +4948,59 @@ mod security_tests {
         assert_eq!(args.performance_profile, PerformanceProfile::Auto);
         assert_eq!(args.batch_size, 1); // user explicit value preserved
         assert_eq!(tuning.batch_size, None); // not overridden by auto-tune
+    }
+
+    #[test]
+    fn test_auto_tuned_gguf_prefill_chunk_sizes_large_low_memory_model() {
+        assert_eq!(auto_tuned_gguf_prefill_chunk_size(9_000, 5, 8, 1), Some(64));
+        assert_eq!(
+            auto_tuned_gguf_prefill_chunk_size(3_000, 16, 8, 4),
+            Some(256)
+        );
+        assert_eq!(auto_tuned_gguf_prefill_chunk_size(0, 16, 8, 4), None);
+    }
+
+    #[test]
+    fn test_auto_profile_exports_gguf_prefill_chunk_when_model_size_known() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+
+        let old_value = std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+
+        let model_path = std::env::temp_dir().join(format!(
+            "kapsl-gguf-prefill-autotune-{}-{}.gguf",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        let file = File::create(&model_path).expect("create sparse test model");
+        file.set_len(9 * 1024 * 1024 * 1024)
+            .expect("size sparse test model");
+        drop(file);
+
+        let (_args, tuning) = parse_and_tune(&[
+            "kapsl",
+            "--model",
+            model_path.to_str().expect("utf8 temp path"),
+        ]);
+
+        let tuned = tuning
+            .gguf_prefill_chunk_size
+            .expect("known model size should tune GGUF prefill chunk");
+        let expected = tuned.to_string();
+        assert_eq!(
+            std::env::var(GGUF_PREFILL_CHUNK_SIZE_ENV)
+                .ok()
+                .as_deref(),
+            Some(expected.as_str())
+        );
+
+        let _ = fs::remove_file(&model_path);
+        if let Some(value) = old_value {
+            std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, value);
+        } else {
+            std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        }
     }
 
     #[test]
@@ -12747,16 +12862,18 @@ async fn main() -> Result<(), DynError> {
         || applied_tuning.scheduler_queue_size.is_some()
         || applied_tuning.scheduler_max_micro_batch.is_some()
         || applied_tuning.scheduler_queue_delay_ms.is_some()
+        || applied_tuning.gguf_prefill_chunk_size.is_some()
         || applied_tuning.media_preprocess.is_some()
         || applied_tuning.rust_log.is_some()
     {
         log::info!(
-            "Applied performance tuning overrides from profile: batch_size={:?}, transport={:?}, scheduler_queue_size={:?}, scheduler_max_micro_batch={:?}, scheduler_queue_delay_ms={:?}, media_preprocess={:?}, rust_log={:?}",
+            "Applied performance tuning overrides from profile: batch_size={:?}, transport={:?}, scheduler_queue_size={:?}, scheduler_max_micro_batch={:?}, scheduler_queue_delay_ms={:?}, gguf_prefill_chunk_size={:?}, media_preprocess={:?}, rust_log={:?}",
             applied_tuning.batch_size,
             applied_tuning.transport,
             applied_tuning.scheduler_queue_size,
             applied_tuning.scheduler_max_micro_batch,
             applied_tuning.scheduler_queue_delay_ms,
+            applied_tuning.gguf_prefill_chunk_size,
             applied_tuning.media_preprocess,
             applied_tuning.rust_log
         );
