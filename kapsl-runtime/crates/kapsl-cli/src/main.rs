@@ -2578,10 +2578,10 @@ fn largest_model_size_mb(model_paths: &[PathBuf]) -> u64 {
         .unwrap_or(0)
 }
 
-fn available_ram_gb() -> u64 {
+fn available_ram_mb() -> u64 {
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.available_memory() / (1024 * 1024 * 1024)
+    sys.available_memory() / (1024 * 1024)
 }
 
 fn logical_cpu_cores() -> usize {
@@ -2590,36 +2590,43 @@ fn logical_cpu_cores() -> usize {
         .unwrap_or(1)
 }
 
+fn round_down_power_of_two(value: u64) -> u64 {
+    if value <= 1 {
+        return 1;
+    }
+    1_u64 << (u64::BITS - 1 - value.leading_zeros())
+}
+
 fn auto_tuned_gguf_prefill_chunk_size(
     model_size_mb: u64,
-    available_ram_gb: u64,
-    cpu_cores: usize,
+    available_ram_mb: u64,
     batch_size: usize,
 ) -> Option<usize> {
     if model_size_mb == 0 {
         return None;
     }
 
-    let mut chunk = if model_size_mb < 2_000 {
-        512
-    } else if model_size_mb < 8_000 {
-        256
-    } else {
+    const MIN_CHUNK: usize = 32;
+    const MAX_CHUNK: usize = 512;
+
+    let estimated_loaded_model_mb = model_size_mb.saturating_mul(5) / 4;
+    let runtime_guard_mb = 1024;
+    let model_headroom_mb =
+        available_ram_mb.saturating_sub(estimated_loaded_model_mb + runtime_guard_mb);
+
+    let scratch_budget_mb = if model_headroom_mb > 0 {
+        (model_headroom_mb / 2).min(available_ram_mb / 4).max(128)
+    } else if available_ram_mb > 0 && available_ram_mb < estimated_loaded_model_mb {
         128
+    } else {
+        available_ram_mb / 8
     };
 
-    if available_ram_gb > 0 && available_ram_gb < 8 {
-        chunk = (chunk / 2).max(64);
-    }
-    if available_ram_gb > 0 && available_ram_gb < 4 {
-        chunk = (chunk / 2).max(32);
-    }
-    if cpu_cores <= 2 {
-        chunk = (chunk / 2).max(32);
-    }
-    if batch_size <= 1 {
-        chunk = chunk.min(128);
-    }
+    let estimated_scratch_per_token_mb = (model_size_mb / 256).clamp(4, 64);
+    let concurrency_divisor = ((batch_size.max(1) + 1) / 2).clamp(1, 4) as u64;
+    let raw_chunk = (scratch_budget_mb / concurrency_divisor) / estimated_scratch_per_token_mb;
+    let clamped_raw = raw_chunk.max(MIN_CHUNK as u64).min(MAX_CHUNK as u64);
+    let chunk = round_down_power_of_two(clamped_raw).max(MIN_CHUNK as u64) as usize;
 
     Some(chunk)
 }
@@ -2633,7 +2640,8 @@ fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
     let model_size_mb = largest_model_size_mb(model_paths);
 
     // Available (not total) system RAM in GB
-    let available_ram_gb = available_ram_gb();
+    let available_ram_mb = available_ram_mb();
+    let available_ram_gb = available_ram_mb / 1024;
 
     // Logical CPU cores
     let cpu_cores = logical_cpu_cores();
@@ -2681,7 +2689,7 @@ fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
     }
 
     let gguf_prefill_chunk_size =
-        auto_tuned_gguf_prefill_chunk_size(model_size_mb, available_ram_gb, cpu_cores, batch_size);
+        auto_tuned_gguf_prefill_chunk_size(model_size_mb, available_ram_mb, batch_size);
     if let Some(chunk) = gguf_prefill_chunk_size {
         notes.push_str(&format!(", gguf_prefill_chunk={}", chunk));
     }
@@ -4951,19 +4959,29 @@ mod security_tests {
     }
 
     #[test]
-    fn test_auto_tuned_gguf_prefill_chunk_sizes_large_low_memory_model() {
-        assert_eq!(auto_tuned_gguf_prefill_chunk_size(9_000, 5, 8, 1), Some(64));
+    fn test_auto_tuned_gguf_prefill_chunk_uses_memory_headroom() {
         assert_eq!(
-            auto_tuned_gguf_prefill_chunk_size(3_000, 16, 8, 4),
-            Some(256)
+            auto_tuned_gguf_prefill_chunk_size(9_000, 5 * 1024, 1),
+            Some(32)
         );
-        assert_eq!(auto_tuned_gguf_prefill_chunk_size(0, 16, 8, 4), None);
+        assert_eq!(
+            auto_tuned_gguf_prefill_chunk_size(3_000, 16 * 1024, 4),
+            Some(128)
+        );
+        assert_eq!(
+            auto_tuned_gguf_prefill_chunk_size(500, 64 * 1024, 1),
+            Some(512)
+        );
+        assert_eq!(auto_tuned_gguf_prefill_chunk_size(0, 16 * 1024, 4), None);
     }
 
     #[test]
     fn test_auto_profile_exports_gguf_prefill_chunk_when_model_size_known() {
         static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
 
         let old_value = std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV);
         std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
@@ -4989,9 +5007,7 @@ mod security_tests {
             .expect("known model size should tune GGUF prefill chunk");
         let expected = tuned.to_string();
         assert_eq!(
-            std::env::var(GGUF_PREFILL_CHUNK_SIZE_ENV)
-                .ok()
-                .as_deref(),
+            std::env::var(GGUF_PREFILL_CHUNK_SIZE_ENV).ok().as_deref(),
             Some(expected.as_str())
         );
 
@@ -10186,10 +10202,42 @@ fn resolve_scheduler_tuning_for_framework(
     (resolved_micro_batch, resolved_queue_delay_ms)
 }
 
-fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
+fn maybe_export_gguf_prefill_chunk_hint(model_file_path: Option<&Path>, batch_size: usize) {
+    if std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV).is_some() {
+        return;
+    }
+
+    let Some(model_file_path) = model_file_path else {
+        return;
+    };
+    let model_size_mb = largest_model_size_mb(&[model_file_path.to_path_buf()]);
+    let available_ram_mb = available_ram_mb();
+    let Some(chunk_size) =
+        auto_tuned_gguf_prefill_chunk_size(model_size_mb, available_ram_mb, batch_size)
+    else {
+        return;
+    };
+
+    std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, chunk_size.to_string());
+    log::info!(
+        "Framework=gguf: setting {}={} from model_size={}MB and available_ram={}MB. Set {} to override GGUF prefill sizing.",
+        GGUF_PREFILL_CHUNK_SIZE_ENV,
+        chunk_size,
+        model_size_mb,
+        available_ram_mb,
+        GGUF_PREFILL_CHUNK_SIZE_ENV
+    );
+}
+
+fn export_gguf_auto_sizing_hint(
+    manifest: &Manifest,
+    batch_size: usize,
+    model_file_path: Option<&Path>,
+) {
     if !EngineKind::resolve(manifest).is_gguf() {
         return;
     }
+    maybe_export_gguf_prefill_chunk_hint(model_file_path, batch_size);
     if std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_some()
         || std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_some()
     {
@@ -10243,7 +10291,7 @@ mod gguf_auto_sizing_tests {
         std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
         std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
 
-        export_gguf_auto_sizing_hint(&test_manifest("gguf"), 3);
+        export_gguf_auto_sizing_hint(&test_manifest("gguf"), 3, None);
 
         assert_eq!(
             std::env::var(GGUF_TARGET_CONCURRENCY_ENV).ok().as_deref(),
@@ -10259,9 +10307,40 @@ mod gguf_auto_sizing_tests {
         std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
         std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
 
-        export_gguf_auto_sizing_hint(&test_manifest("llm"), 3);
+        export_gguf_auto_sizing_hint(&test_manifest("llm"), 3, None);
 
         assert!(std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_none());
+    }
+
+    #[test]
+    fn exports_prefill_hint_from_resolved_gguf_model_path() {
+        let _guard = env_lock().lock().unwrap();
+        let old_prefill = std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+
+        let model_path = std::env::temp_dir().join(format!(
+            "kapsl-gguf-resolved-prefill-{}-{}.gguf",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        let file = File::create(&model_path).expect("create sparse test model");
+        file.set_len(3 * 1024 * 1024 * 1024)
+            .expect("size sparse test model");
+        drop(file);
+
+        export_gguf_auto_sizing_hint(&test_manifest("gguf"), 4, Some(model_path.as_path()));
+
+        assert!(std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV).is_some());
+
+        let _ = fs::remove_file(&model_path);
+        if let Some(value) = old_prefill {
+            std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, value);
+        } else {
+            std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        }
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
     }
 }
 
@@ -11719,9 +11798,13 @@ fn load_model_blocking(
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
     log::info!("  Priority weight: {}", priority_weight);
-    export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
+    export_gguf_auto_sizing_hint(
+        &loader.manifest,
+        batch_size,
+        Some(model_file_path.as_path()),
+    );
     let isolate_process = resolve_isolate_process(&loader.manifest);
     let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
@@ -12124,9 +12207,13 @@ async fn load_model(
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
     log::info!("  Priority weight: {}", priority_weight);
-    export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
+    export_gguf_auto_sizing_hint(
+        &loader.manifest,
+        batch_size,
+        Some(model_file_path.as_path()),
+    );
     let isolate_process = resolve_isolate_process(&loader.manifest);
     let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
