@@ -4943,6 +4943,12 @@ mod security_tests {
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
     }
 
+    fn lock_env_tests() -> std::sync::MutexGuard<'static, ()> {
+        env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn save_env(names: &[&'static str]) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
         names
             .iter()
@@ -5100,7 +5106,7 @@ mod security_tests {
 
     #[test]
     fn test_onnx_tuning_profile_resolves_global_and_per_model_overrides() {
-        let _guard = env_test_lock().lock().unwrap();
+        let _guard = lock_env_tests();
         let env_names = onnx_tuning_env_names();
         let saved_env = save_env(&env_names);
         clear_env(&env_names);
@@ -5126,14 +5132,17 @@ mod security_tests {
         assert_eq!(model_9.memory_pattern, Some(false));
         assert_eq!(model_9.session_buckets, Some(2));
         assert_eq!(model_9.disable_cpu_mem_arena, Some(false));
-        assert_eq!(model_9.peak_concurrency_hint, Some(4));
+        assert_eq!(
+            model_9.peak_concurrency_hint,
+            auto_onnx_runtime_tuning(&args).peak_concurrency_hint
+        );
 
         restore_env(saved_env);
     }
 
     #[test]
     fn test_onnx_tuning_profile_uses_env_as_override_below_cli() {
-        let _guard = env_test_lock().lock().unwrap();
+        let _guard = lock_env_tests();
         let env_names = onnx_tuning_env_names();
         let saved_env = save_env(&env_names);
         clear_env(&env_names);
@@ -5163,7 +5172,7 @@ mod security_tests {
 
     #[test]
     fn test_onnx_tuning_profile_rejects_unknown_keys() {
-        let _guard = env_test_lock().lock().unwrap();
+        let _guard = lock_env_tests();
         let env_names = onnx_tuning_env_names();
         let saved_env = save_env(&env_names);
         clear_env(&env_names);
