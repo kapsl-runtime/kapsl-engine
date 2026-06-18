@@ -2,9 +2,7 @@ use base64::engine::general_purpose::{
     STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
 };
 use base64::Engine as _;
-use clap::{
-    parser::ValueSource, ArgGroup, ArgMatches, FromArgMatches, Parser, Subcommand, ValueEnum,
-};
+use clap::{parser::ValueSource, ArgGroup, ArgMatches, FromArgMatches, Parser};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -57,8 +55,6 @@ use prometheus::Registry;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -73,47 +69,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, System};
 use tar::{Archive, Builder};
 use tokio::sync::Mutex as AsyncMutex;
-use warp::{Filter, Reply};
+use warp::Filter;
 
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
-
-mod app_support;
-mod auth;
-mod autoscaler;
-mod cli;
-mod constants;
-mod control;
-mod extensions;
+mod app;
+mod features;
 mod http;
-mod infer_adapter;
-mod model_runtime;
-mod packaging;
-mod rag;
-mod runtime_config;
-mod runtime_monitor;
-mod runtime_support;
-mod runtime_tuning;
-mod shared_kv;
-mod worker;
+mod runtime;
 
-use app_support::*;
-use auth::*;
-use autoscaler::*;
-use cli::*;
-use constants::*;
-use control::*;
-use extensions::*;
+use app::*;
+use features::*;
 use http::*;
-use model_runtime::*;
-use packaging::*;
-use rag::*;
-use runtime_config::*;
-use runtime_monitor::*;
-use runtime_support::*;
-use runtime_tuning::*;
-use shared_kv::*;
-use worker::*;
+use runtime::*;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;

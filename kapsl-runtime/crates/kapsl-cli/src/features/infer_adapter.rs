@@ -940,5 +940,5 @@ fn frames_to_tensor_packet(
 }
 
 #[cfg(test)]
-#[path = "tests/infer_adapter_tests.rs"]
+#[path = "../tests/infer_adapter_tests.rs"]
 mod tests;
