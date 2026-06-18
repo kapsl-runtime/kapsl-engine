@@ -748,9 +748,9 @@ fn test_effective_topology_choice_uses_pipeline_metadata_stage_count() {
         r#"
 llm:
   pipeline:
-stages:
-  - stage0.onnx
-  - stage1.onnx
+    stages:
+      - stage0.onnx
+      - stage1.onnx
 "#,
     )
     .expect("parse yaml");
@@ -768,6 +768,10 @@ stages:
         cron_jobs: Vec::new(),
     };
     let stages = manifest_llm_pipeline_stages(&manifest);
+    assert_eq!(
+        stages.as_deref(),
+        Some(&["stage0.onnx".to_string(), "stage1.onnx".to_string()][..])
+    );
 
     let choice =
         resolve_effective_topology_choice(&manifest, "pipeline-parallel", 8, stages.as_deref());
