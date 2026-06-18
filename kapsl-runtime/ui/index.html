@@ -782,7 +782,7 @@
                         <div class="section-header access-section-header">
                             <div class="section-title">
                                 <h2>Access Control</h2>
-                                <p>Users, API keys, and legacy role tokens.</p>
+                                <p>Users, API keys, and scoped access.</p>
                             </div>
                             <button
                                 class="btn btn-secondary"
@@ -859,60 +859,12 @@
                             </section>
 
                             <section class="access-panel">
-                                <h3>Legacy Role Tokens</h3>
-                                <p class="access-help">
-                                    Compatibility tokens for reader/writer/admin
-                                    roles.
-                                </p>
-                                <form id="legacy-tokens-form" class="stack">
-                                    <input
-                                        id="legacy-reader-token"
-                                        class="access-input"
-                                        type="password"
-                                        placeholder="reader token"
-                                    />
-                                    <input
-                                        id="legacy-writer-token"
-                                        class="access-input"
-                                        type="password"
-                                        placeholder="writer token"
-                                    />
-                                    <input
-                                        id="legacy-admin-token"
-                                        class="access-input"
-                                        type="password"
-                                        placeholder="admin token"
-                                    />
-                                    <div class="access-inline-form">
-                                        <button
-                                            class="btn btn-primary"
-                                            id="legacy-save-btn"
-                                            type="submit"
-                                        >
-                                            Save Tokens
-                                        </button>
-                                        <button
-                                            class="btn btn-secondary"
-                                            id="legacy-refresh-btn"
-                                            type="button"
-                                        >
-                                            Reload
-                                        </button>
-                                    </div>
-                                </form>
-                                <div
-                                    id="legacy-feedback"
-                                    class="access-status-line"
-                                ></div>
+                                <h3>Role Summary</h3>
+                                <div id="access-roles" class="roles-grid"></div>
                             </section>
                         </div>
 
                         <div class="access-grid">
-                            <section class="access-panel">
-                                <h3>Role Summary</h3>
-                                <div id="access-roles" class="roles-grid"></div>
-                            </section>
-
                             <section class="access-panel">
                                 <h3>Users</h3>
                                 <form
@@ -976,9 +928,7 @@
                                     </table>
                                 </div>
                             </section>
-                        </div>
 
-                        <div class="access-grid">
                             <section class="access-panel">
                                 <h3>API Keys</h3>
                                 <div
