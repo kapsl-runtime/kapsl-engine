@@ -1,13 +1,24 @@
 # kapsl-runtime
 
-A high-performance AI model runtime environment written in Rust.
+The Rust workspace for the `kapsl` runtime binary.
 
 For full runtime documentation, see `FULL_DOCUMENTATION.md`.
 
 ## Prerequisites
 
-- Rust 1.75+
+- Rust 1.92.0
 - (Optional) CUDA Toolkit for NVIDIA GPU support
+
+## Layout
+
+- `Cargo.toml`: runtime workspace manifest
+- `crates/kapsl-cli/`: CLI, server orchestration, HTTP API, auth, metrics, RAG wiring, and runtime entry point
+- `docs/`: runtime API and operations docs
+- `ui/`: embedded web dashboard assets
+- `patches/`: active third-party patches used by this workspace
+
+Shared Rust crates such as `kapsl-core`, `kapsl-backends`, `kapsl-llm`,
+`kapsl-scheduler`, `kapsl-ipc`, and `kapsl-shm` live in `kapsl-sdk`.
 
 ## Building
 
@@ -30,45 +41,21 @@ Installers are produced for Linux/macOS/Windows (`.deb`, `.pkg`, `.msi`) with SH
 
 ## Quick Start
 
-### 1. Generate a Sample Package
+### 1. Run the Runtime
 
-We provide a helper script to download a sample ONNX model (MNIST) and package it correctly.
-
-```bash
-chmod +x scripts/packages/mnist/create_package.sh
-./scripts/packages/mnist/create_package.sh
-```
-
-This will download the MNIST model and create `models/mnist/mnist.aimod`.
-
-Note: all package creation scripts live under `scripts/packages/*/create_package.sh`.
-
-### 2. Run the Runtime
-
-Execute the CLI with the model package:
+Execute the CLI with an `.aimod` model package:
 
 ```bash
-cargo run -p kapsl -- --model models/mnist/mnist.aimod
+cargo run -p kapsl -- --model /path/to/model.aimod
 ```
 
 You can also specify a custom socket path for the IPC server:
 
 ```bash
-cargo run -p kapsl -- --model models/mnist/mnist.aimod --socket /tmp/kapsl.sock
+cargo run -p kapsl -- --model /path/to/model.aimod --socket /tmp/kapsl.sock
 ```
 
-### 3. Run Lightweight HTTP Benchmark
-
-Use the benchmark script to measure infer latency and throughput against `/api/models/:id/infer`.
-
-```bash
-# From kapsl-runtime/
-python3 scripts/benchmark_http_infer.py --model-id 0 --requests 100 --warmup 10
-```
-
-Output includes `p50`, `p95`, and `throughput` (`req/s`).
-
-### 4. Run Cross-Port Control Loop
+### 2. Run Cross-Port Control Loop
 
 Use the built-in control command to orchestrate model groups running on different runtime ports.
 It polls health/model/system stats, computes pressure-based routing weights, and applies per-model

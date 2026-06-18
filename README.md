@@ -4,13 +4,29 @@
 
 This repo owns the `kapsl` runtime CLI and local inference server.
 
-Shared Rust libraries are maintained in [`kapsl-sdk`](https://github.com/kapsl-runtime/kapsl-sdk). This repo consumes those shared crates as Git dependencies.
+Shared Rust libraries are maintained in [`kapsl-sdk`](https://github.com/kapsl-runtime/kapsl-sdk).
+The runtime binary depends on those crates through normal Cargo dependencies.
 
 ## Repository Layout
 
 - `kapsl-runtime/`: main Rust workspace for the runtime binary
+- `kapsl-runtime/crates/kapsl-cli/`: `kapsl` CLI, server orchestration, HTTP API, and runtime entry point
+- `kapsl-runtime/ui/`: embedded web dashboard assets
+- `kapsl-runtime/docs/`: runtime-specific user and API docs
+- `kapsl-runtime/patches/`: active third-party crate patches used only by this workspace
 - `docker/`: Dockerfiles for CPU and CUDA images
 - `docs/`: runtime-specific documentation
+
+## Architecture Boundary
+
+`kapsl-engine` should stay thin around product runtime concerns:
+
+- CLI commands, installer/runtime packaging, and runtime process startup
+- HTTP API, embedded dashboard, auth, metrics, and operational control loops
+- Wiring shared SDK crates into a runnable local inference server
+
+Reusable Rust libraries, client bindings, transports, schedulers, backend abstractions,
+RAG primitives, and Python packaging belong in `kapsl-sdk`.
 
 ## Requirements
 
@@ -37,6 +53,9 @@ Run workspace checks:
 ```bash
 cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace
 ```
+
+When developing `kapsl-engine` and `kapsl-sdk` together, prefer a local Cargo
+override in your own checkout instead of committing local paths to this repo.
 
 ## Release Flow
 

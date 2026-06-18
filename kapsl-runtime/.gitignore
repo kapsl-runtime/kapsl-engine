@@ -2,3 +2,6 @@ target/*
 target-linux-*
 models/*
 .venv
+.DS_Store
+build-*.log
+rag-data/
