@@ -908,6 +908,17 @@ body.auth-locked {
     cursor: not-allowed;
 }
 
+.btn:disabled,
+.btn:disabled:hover {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+    background: var(--surface-2);
+    color: var(--text-3);
+    border-color: var(--border);
+}
+
 /* ─── Misc ─────────────────────────────────────────────────────────────── */
 .notice {
     font-size: 12px;
