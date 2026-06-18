@@ -12578,6 +12578,55 @@ async fn scale_down_model(
     Ok(())
 }
 
+fn force_stop_model_before_remove(
+    base_model_id: u32,
+    replicas: &[ModelInfo],
+    model_registry: &ModelRegistry,
+    replica_pools: &ReplicaPools,
+    swap_map: &Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>>,
+    shared_kv: &SharedKvState,
+) {
+    for replica in replicas {
+        if let Err(e) = model_registry.set_status(replica.id, ModelStatus::Stopping) {
+            log::warn!(
+                "Failed to set model {} replica {} to Stopping before remove: {}",
+                base_model_id,
+                replica.replica_id,
+                e
+            );
+        }
+    }
+
+    if let Some(pool) = replica_pools.read().get(&base_model_id).cloned() {
+        for replica in replicas {
+            if !pool.remove_replica(replica.replica_id) {
+                log::debug!(
+                    "Replica {} for model {} was not present in the pool during remove",
+                    replica.replica_id,
+                    base_model_id
+                );
+            }
+        }
+    }
+
+    replica_pools.write().remove(&base_model_id);
+    swap_map.write().remove(&base_model_id);
+    shared_kv.detach_engine_for_model(base_model_id);
+    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
+    shared_kv.detach_gpu_pool(base_model_id);
+
+    for replica in replicas {
+        if let Err(e) = model_registry.set_status(replica.id, ModelStatus::Inactive) {
+            log::warn!(
+                "Failed to set model {} replica {} to Inactive before remove: {}",
+                base_model_id,
+                replica.replica_id,
+                e
+            );
+        }
+    }
+}
+
 const MEMORY_HEADROOM_FRACTION: f64 = 0.80;
 
 fn cap_scale_up_target_by_memory_headroom(
@@ -14911,16 +14960,15 @@ async fn main() -> Result<(), DynError> {
                 let base_model_id = model_info.base_model_id;
                 let replicas = model_registry_for_remove.list_replicas(base_model_id);
 
-                for replica in &replicas {
-                    let _ = model_registry_for_remove.set_status(replica.id, ModelStatus::Stopping);
-                }
-
-                replica_pools_for_remove.write().remove(&base_model_id);
-                swap_map_for_remove.write().remove(&base_model_id);
+                force_stop_model_before_remove(
+                    base_model_id,
+                    &replicas,
+                    &model_registry_for_remove,
+                    &replica_pools_for_remove,
+                    &swap_map_for_remove,
+                    &shared_kv_for_remove,
+                );
                 model_paths_for_remove.write().remove(&base_model_id);
-                shared_kv_for_remove.detach_engine_for_model(base_model_id);
-                #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-                shared_kv_for_remove.detach_gpu_pool(base_model_id);
 
                 for replica in replicas {
                     model_registry_for_remove.unregister(replica.id);

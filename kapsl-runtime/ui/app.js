@@ -2750,6 +2750,10 @@ class KapslApp {
     } else {
       startStopButton = `<button class="btn btn-disabled" type="button" disabled>${this.escapeHtml(statusText)}</button>`;
     }
+    const removeButton =
+      status === "inactive"
+        ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation(); app.removeModel(${model.id})">Remove</button>`
+        : `<button class="btn btn-disabled" type="button" disabled title="Stop the model before removing it">Remove</button>`;
 
     return `
       <div class="model-card" onclick="app.showModelDetail(${model.id})">
@@ -2805,7 +2809,7 @@ class KapslApp {
         <div class="model-actions">
           <button class="btn btn-secondary" type="button" onclick="event.stopPropagation(); app.showModelDetail(${model.id})">Details</button>
           ${startStopButton}
-          <button class="btn btn-danger" type="button" onclick="event.stopPropagation(); app.removeModel(${model.id})">Remove</button>
+          ${removeButton}
         </div>
       </div>
     `;
@@ -3561,6 +3565,15 @@ class KapslApp {
   }
 
   async removeModel(modelId) {
+    const model = (Array.isArray(this.modelsData) ? this.modelsData : []).find(
+      (candidate) => candidate.id === modelId,
+    );
+    if (!model || String(model.status || "").toLowerCase() !== "inactive") {
+      alert("Stop the model before removing it.");
+      this.fetchData();
+      return;
+    }
+
     if (
       !confirm(
         `Remove model ${modelId}? This unregisters the model and all replicas.`,
@@ -3698,6 +3711,10 @@ class KapslApp {
     } else {
       startStopButton = `<button class="btn btn-disabled" type="button" disabled>${this.escapeHtml(statusText)}</button>`;
     }
+    const removeButton =
+      status === "inactive"
+        ? `<button class="btn btn-danger" type="button" onclick="app.removeModel(${model.id})">Remove</button>`
+        : `<button class="btn btn-disabled" type="button" disabled title="Stop the model before removing it">Remove</button>`;
 
     modalBody.innerHTML = `
       <div class="modal-section">
@@ -3709,7 +3726,7 @@ class KapslApp {
           </div>
           <div class="modal-actions-buttons">
             ${startStopButton}
-            <button class="btn btn-danger" type="button" onclick="app.removeModel(${model.id})">Remove</button>
+            ${removeButton}
           </div>
         </div>
       </div>
