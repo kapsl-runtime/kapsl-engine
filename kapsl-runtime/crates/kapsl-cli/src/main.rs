@@ -862,6 +862,59 @@ fn apply_onnx_tuning_pair(
     Ok(())
 }
 
+fn parse_env_bool_override(name: &str) -> Result<Option<bool>, String> {
+    optional_env_var(name)
+        .map(|value| parse_bool_literal(&value))
+        .transpose()
+}
+
+fn parse_env_usize_override(name: &str) -> Result<Option<usize>, String> {
+    optional_env_var(name)
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map(|parsed| parsed.max(1))
+                .map_err(|e| format!("invalid {} '{}': {}", name, value, e))
+        })
+        .transpose()
+}
+
+fn parse_env_u32_override(name: &str) -> Result<Option<u32>, String> {
+    optional_env_var(name)
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map(|parsed| parsed.max(1))
+                .map_err(|e| format!("invalid {} '{}': {}", name, value, e))
+        })
+        .transpose()
+}
+
+fn auto_onnx_runtime_tuning(args: &Args) -> OnnxRuntimeTuning {
+    let batch_size = args.batch_size.max(1);
+    let session_pool = batch_size.min(logical_cpu_cores().max(1)).clamp(1, 4);
+    let session_buckets = batch_size.max(4).min(8);
+    OnnxRuntimeTuning {
+        memory_pattern: Some(true),
+        disable_cpu_mem_arena: Some(false),
+        session_buckets: Some(session_buckets),
+        bucket_dim_granularity: Some(64),
+        bucket_max_dims: Some(4),
+        peak_concurrency_hint: Some(session_pool as u32),
+    }
+}
+
+fn env_onnx_runtime_tuning() -> Result<OnnxRuntimeTuning, String> {
+    Ok(OnnxRuntimeTuning {
+        memory_pattern: parse_env_bool_override(ORT_MEMORY_PATTERN_ENV)?,
+        disable_cpu_mem_arena: parse_env_bool_override(ORT_DISABLE_CPU_MEM_ARENA_ENV)?,
+        session_buckets: parse_env_usize_override(ORT_SESSION_BUCKETS_ENV)?,
+        bucket_dim_granularity: parse_env_usize_override(ORT_BUCKET_DIM_GRANULARITY_ENV)?,
+        bucket_max_dims: parse_env_usize_override(ORT_BUCKET_MAX_DIMS_ENV)?,
+        peak_concurrency_hint: parse_env_u32_override(MODEL_PEAK_CONCURRENCY_ENV)?,
+    })
+}
+
 fn parse_onnx_model_tuning_spec(spec: &str) -> Result<(Option<u32>, OnnxRuntimeTuning), String> {
     let (selector_raw, config_raw) = spec.split_once(':').ok_or_else(|| {
         format!(
@@ -897,16 +950,21 @@ fn parse_onnx_model_tuning_spec(spec: &str) -> Result<(Option<u32>, OnnxRuntimeT
 
 fn build_onnx_tuning_profile(args: &Args) -> Result<OnnxTuningProfile, String> {
     let mut profile = OnnxTuningProfile {
-        global: OnnxRuntimeTuning {
-            memory_pattern: args.onnx_memory_pattern,
-            disable_cpu_mem_arena: args.onnx_disable_cpu_mem_arena,
-            session_buckets: args.onnx_session_buckets,
-            bucket_dim_granularity: args.onnx_bucket_dim_granularity,
-            bucket_max_dims: args.onnx_bucket_max_dims,
-            peak_concurrency_hint: args.onnx_peak_concurrency_hint,
-        },
+        global: auto_onnx_runtime_tuning(args),
         per_model: HashMap::new(),
     };
+
+    let env_tuning = env_onnx_runtime_tuning()?;
+    profile.global = merge_onnx_runtime_tuning(&profile.global, &env_tuning);
+    let cli_tuning = OnnxRuntimeTuning {
+        memory_pattern: args.onnx_memory_pattern,
+        disable_cpu_mem_arena: args.onnx_disable_cpu_mem_arena,
+        session_buckets: args.onnx_session_buckets,
+        bucket_dim_granularity: args.onnx_bucket_dim_granularity,
+        bucket_max_dims: args.onnx_bucket_max_dims,
+        peak_concurrency_hint: args.onnx_peak_concurrency_hint,
+    };
+    profile.global = merge_onnx_runtime_tuning(&profile.global, &cli_tuning);
 
     for spec in &args.onnx_model_tuning {
         let (model_id, tuning) = parse_onnx_model_tuning_spec(spec)?;
@@ -1294,6 +1352,13 @@ const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
 const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
 const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
+const GGUF_PREFILL_CHUNK_SIZE_ENV: &str = "KAPSL_GGUF_PREFILL_CHUNK_SIZE";
+const ORT_MEMORY_PATTERN_ENV: &str = "KAPSL_ORT_MEMORY_PATTERN";
+const ORT_DISABLE_CPU_MEM_ARENA_ENV: &str = "KAPSL_ORT_DISABLE_CPU_MEM_ARENA";
+const ORT_SESSION_BUCKETS_ENV: &str = "KAPSL_ORT_SESSION_BUCKETS";
+const ORT_BUCKET_DIM_GRANULARITY_ENV: &str = "KAPSL_ORT_BUCKET_DIM_GRANULARITY";
+const ORT_BUCKET_MAX_DIMS_ENV: &str = "KAPSL_ORT_BUCKET_MAX_DIMS";
+const MODEL_PEAK_CONCURRENCY_ENV: &str = "KAPSL_MODEL_PEAK_CONCURRENCY";
 const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
 const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
 const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
@@ -2566,30 +2631,82 @@ struct AutoTunedPolicy {
     rationale: String,
 }
 
+fn largest_model_size_mb(model_paths: &[PathBuf]) -> u64 {
+    model_paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .max()
+        .map(|b| b / (1024 * 1024))
+        .unwrap_or(0)
+}
+
+fn available_ram_mb() -> u64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.available_memory() / (1024 * 1024)
+}
+
+fn logical_cpu_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+fn round_down_power_of_two(value: u64) -> u64 {
+    if value <= 1 {
+        return 1;
+    }
+    1_u64 << (u64::BITS - 1 - value.leading_zeros())
+}
+
+fn auto_tuned_gguf_prefill_chunk_size(
+    model_size_mb: u64,
+    available_ram_mb: u64,
+    batch_size: usize,
+) -> Option<usize> {
+    if model_size_mb == 0 {
+        return None;
+    }
+
+    const MIN_CHUNK: usize = 32;
+    const MAX_CHUNK: usize = 512;
+
+    let estimated_loaded_model_mb = model_size_mb.saturating_mul(5) / 4;
+    let runtime_guard_mb = 1024;
+    let model_headroom_mb =
+        available_ram_mb.saturating_sub(estimated_loaded_model_mb + runtime_guard_mb);
+
+    let scratch_budget_mb = if model_headroom_mb > 0 {
+        (model_headroom_mb / 2).min(available_ram_mb / 4).max(128)
+    } else if available_ram_mb > 0 && available_ram_mb < estimated_loaded_model_mb {
+        128
+    } else {
+        available_ram_mb / 8
+    };
+
+    let estimated_scratch_per_token_mb = (model_size_mb / 256).clamp(4, 64);
+    let concurrency_divisor = ((batch_size.max(1) + 1) / 2).clamp(1, 4) as u64;
+    let raw_chunk = (scratch_budget_mb / concurrency_divisor) / estimated_scratch_per_token_mb;
+    let clamped_raw = raw_chunk.max(MIN_CHUNK as u64).min(MAX_CHUNK as u64);
+    let chunk = round_down_power_of_two(clamped_raw).max(MIN_CHUNK as u64) as usize;
+
+    Some(chunk)
+}
+
 /// Derive scheduler parameters from model file size and available system resources.
 ///
 /// When multiple models are loaded, sizes based on the largest (conservative).
 /// Falls back to safe defaults if model paths can't be stat'd.
 fn auto_tune_policy(model_paths: &[PathBuf]) -> AutoTunedPolicy {
     // Largest model file size in MB — proxy for parameter count / memory footprint
-    let model_size_mb: u64 = model_paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .max()
-        .map(|b| b / (1024 * 1024))
-        .unwrap_or(0);
+    let model_size_mb = largest_model_size_mb(model_paths);
 
     // Available (not total) system RAM in GB
-    let available_ram_gb: u64 = {
-        let mut sys = System::new();
-        sys.refresh_memory();
-        sys.available_memory() / (1024 * 1024 * 1024)
-    };
+    let available_ram_mb = available_ram_mb();
+    let available_ram_gb = available_ram_mb / 1024;
 
     // Logical CPU cores
-    let cpu_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cpu_cores = logical_cpu_cores();
 
     // Base policy from model file size
     let (mut batch_size, mut micro_batch, delay_ms, mut queue_size, size_tier) =
@@ -4810,6 +4927,51 @@ mod security_tests {
         (args, tuning)
     }
 
+    fn onnx_tuning_env_names() -> [&'static str; 6] {
+        [
+            ORT_MEMORY_PATTERN_ENV,
+            ORT_DISABLE_CPU_MEM_ARENA_ENV,
+            ORT_SESSION_BUCKETS_ENV,
+            ORT_BUCKET_DIM_GRANULARITY_ENV,
+            ORT_BUCKET_MAX_DIMS_ENV,
+            MODEL_PEAK_CONCURRENCY_ENV,
+        ]
+    }
+
+    fn env_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn lock_env_tests() -> std::sync::MutexGuard<'static, ()> {
+        env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn save_env(names: &[&'static str]) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        names
+            .iter()
+            .map(|name| (*name, std::env::var_os(*name)))
+            .collect()
+    }
+
+    fn restore_env(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (name, value) in saved {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    fn clear_env(names: &[&str]) {
+        for name in names {
+            std::env::remove_var(name);
+        }
+    }
+
     #[test]
     fn test_throughput_profile_tunes_defaults() {
         let (args, tuning) = parse_and_tune(&["kapsl", "--performance-profile", "throughput"]);
@@ -4889,7 +5051,66 @@ mod security_tests {
     }
 
     #[test]
+    fn test_auto_tuned_gguf_prefill_chunk_uses_memory_headroom() {
+        assert_eq!(
+            auto_tuned_gguf_prefill_chunk_size(9_000, 5 * 1024, 1),
+            Some(32)
+        );
+        assert_eq!(
+            auto_tuned_gguf_prefill_chunk_size(3_000, 16 * 1024, 4),
+            Some(128)
+        );
+        assert_eq!(
+            auto_tuned_gguf_prefill_chunk_size(500, 64 * 1024, 1),
+            Some(512)
+        );
+        assert_eq!(auto_tuned_gguf_prefill_chunk_size(0, 16 * 1024, 4), None);
+    }
+
+    #[test]
+    fn test_auto_profile_does_not_export_gguf_prefill_chunk_before_model_resolution() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let old_prefill = std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+
+        let model_path = std::env::temp_dir().join(format!(
+            "kapsl-gguf-prefill-autotune-{}-{}.gguf",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        let file = File::create(&model_path).expect("create sparse test model");
+        file.set_len(9 * 1024 * 1024 * 1024)
+            .expect("size sparse test model");
+        drop(file);
+
+        let (_args, _tuning) = parse_and_tune(&[
+            "kapsl",
+            "--model",
+            model_path.to_str().expect("utf8 temp path"),
+        ]);
+
+        assert!(std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV).is_none());
+
+        let _ = fs::remove_file(&model_path);
+        if let Some(value) = old_prefill {
+            std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, value);
+        } else {
+            std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        }
+    }
+
+    #[test]
     fn test_onnx_tuning_profile_resolves_global_and_per_model_overrides() {
+        let _guard = lock_env_tests();
+        let env_names = onnx_tuning_env_names();
+        let saved_env = save_env(&env_names);
+        clear_env(&env_names);
+
         let (args, _) = parse_and_tune(&[
             "kapsl",
             "--onnx-memory-pattern",
@@ -4910,15 +5131,57 @@ mod security_tests {
         let model_9 = profile.resolve(9);
         assert_eq!(model_9.memory_pattern, Some(false));
         assert_eq!(model_9.session_buckets, Some(2));
-        assert_eq!(model_9.disable_cpu_mem_arena, None);
-        assert_eq!(model_9.peak_concurrency_hint, None);
+        assert_eq!(model_9.disable_cpu_mem_arena, Some(false));
+        assert_eq!(
+            model_9.peak_concurrency_hint,
+            auto_onnx_runtime_tuning(&args).peak_concurrency_hint
+        );
+
+        restore_env(saved_env);
+    }
+
+    #[test]
+    fn test_onnx_tuning_profile_uses_env_as_override_below_cli() {
+        let _guard = lock_env_tests();
+        let env_names = onnx_tuning_env_names();
+        let saved_env = save_env(&env_names);
+        clear_env(&env_names);
+        std::env::set_var(ORT_MEMORY_PATTERN_ENV, "false");
+        std::env::set_var(ORT_SESSION_BUCKETS_ENV, "6");
+        std::env::set_var(MODEL_PEAK_CONCURRENCY_ENV, "3");
+
+        let (args, _) = parse_and_tune(&[
+            "kapsl",
+            "--onnx-session-buckets",
+            "2",
+            "--onnx-model-tuning",
+            "7:peak_concurrency=8",
+        ]);
+
+        let profile = build_onnx_tuning_profile(&args).expect("valid ONNX tuning profile");
+        let model_9 = profile.resolve(9);
+        assert_eq!(model_9.memory_pattern, Some(false));
+        assert_eq!(model_9.session_buckets, Some(2));
+        assert_eq!(model_9.peak_concurrency_hint, Some(3));
+
+        let model_7 = profile.resolve(7);
+        assert_eq!(model_7.peak_concurrency_hint, Some(8));
+
+        restore_env(saved_env);
     }
 
     #[test]
     fn test_onnx_tuning_profile_rejects_unknown_keys() {
+        let _guard = lock_env_tests();
+        let env_names = onnx_tuning_env_names();
+        let saved_env = save_env(&env_names);
+        clear_env(&env_names);
+
         let (args, _) = parse_and_tune(&["kapsl", "--onnx-model-tuning", "3:not_a_real_key=1"]);
         let err = build_onnx_tuning_profile(&args).expect_err("unknown key should fail");
         assert!(err.contains("unknown ONNX tuning key"));
+
+        restore_env(saved_env);
     }
 
     #[test]
@@ -7619,7 +7882,8 @@ fn create_kapsl_package(
         task: request.task.as_deref(),
     };
     if axes.any() {
-        let (fmt, mt, tk, fw) = resolve_axis_triple(infer_format_from_model_path(&model_path), axes);
+        let (fmt, mt, tk, fw) =
+            resolve_axis_triple(infer_format_from_model_path(&model_path), axes);
         framework = fw;
         format_axis = Some(fmt);
         model_type_axis = Some(mt);
@@ -7994,8 +8258,10 @@ const TASK_OPTIONS_CAUSAL_LM: &[(&str, &str)] = &[
     ("embed", "embeddings from hidden states"),
     ("forward", "raw forward pass"),
 ];
-const TASK_OPTIONS_SEQ2SEQ: &[(&str, &str)] =
-    &[("generate", "sequence generation"), ("forward", "raw forward pass")];
+const TASK_OPTIONS_SEQ2SEQ: &[(&str, &str)] = &[
+    ("generate", "sequence generation"),
+    ("forward", "raw forward pass"),
+];
 
 /// Model file format inferred from a model path's extension, constrained to the
 /// known `format` vocabulary (`onnx`/`gguf`/`safetensors`).
@@ -8078,7 +8344,11 @@ fn resolve_axis_triple(
     default_format: &str,
     axes: AxisOverrides,
 ) -> (String, String, String, String) {
-    let pick = |o: Option<&str>| o.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let pick = |o: Option<&str>| {
+        o.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     let format = pick(axes.format).unwrap_or_else(|| default_format.to_string());
     let task_hint = pick(axes.task);
     // When only a task is given, infer the model type it implies so e.g.
@@ -8641,7 +8911,8 @@ fn create_kapsl_package_from_context(
 
     // Non-interactive: --format / --model-type / --task fill the axes.
     if axes.any() {
-        let (fmt, mt, tk, fw) = resolve_axis_triple(infer_format_from_model_path(&model_path), axes);
+        let (fmt, mt, tk, fw) =
+            resolve_axis_triple(infer_format_from_model_path(&model_path), axes);
         framework = fw;
         format_axis = Some(fmt);
         model_type_axis = Some(mt);
@@ -9270,7 +9541,10 @@ mod packaging_tests {
         let context_dir = temp_dir.path();
         let mut reader = Cursor::new(b"does-not-exist.onnx\n".to_vec());
         let result = prompt_model_file_with_default(&mut reader, context_dir, "also-missing.onnx");
-        assert!(result.is_err(), "EOF after invalid input must error, not hang");
+        assert!(
+            result.is_err(),
+            "EOF after invalid input must error, not hang"
+        );
 
         let mut reader = Cursor::new(Vec::new());
         assert!(prompt_with_default(&mut reader, "Anything", "default").is_err());
@@ -9310,7 +9584,11 @@ mod packaging_tests {
 
         // onnx + generate -> legacy framework "llm".
         assert_eq!(
-            resolve_axis_triple("onnx", ax(Some("onnx"), Some("causal-lm"), Some("generate"))).3,
+            resolve_axis_triple(
+                "onnx",
+                ax(Some("onnx"), Some("causal-lm"), Some("generate"))
+            )
+            .3,
             "llm"
         );
 
@@ -10020,7 +10298,16 @@ fn resolve_isolate_process(manifest: &Manifest) -> bool {
     if let Some(env) = parse_env_bool(LLM_ISOLATE_PROCESS_ENV) {
         return env;
     }
-    manifest_llm_flag(manifest, "isolate_process").unwrap_or(false)
+    if manifest_llm_flag(manifest, "isolate_process_strict").unwrap_or(false) {
+        return true;
+    }
+    if manifest_llm_flag(manifest, "isolate_process").unwrap_or(false) {
+        log::info!(
+            "metadata.llm.isolate_process=true is advisory; running in-process by default. Set {}=1 or metadata.llm.isolate_process_strict=true to force worker isolation.",
+            LLM_ISOLATE_PROCESS_ENV
+        );
+    }
+    false
 }
 
 /// Whether process isolation is *required* (fail-closed). When true, a model
@@ -10071,24 +10358,221 @@ fn resolve_scheduler_tuning_for_framework(
     (resolved_micro_batch, resolved_queue_delay_ms)
 }
 
-fn export_gguf_auto_sizing_hint(manifest: &Manifest, batch_size: usize) {
-    if !EngineKind::resolve(manifest).is_onnx_generate() {
+fn maybe_export_gguf_prefill_chunk_hint(model_file_path: Option<&Path>, batch_size: usize) {
+    if std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV).is_some() {
+        log::info!(
+            "Framework=gguf: using explicit {} override.",
+            GGUF_PREFILL_CHUNK_SIZE_ENV
+        );
         return;
     }
+
+    let Some(model_file_path) = model_file_path else {
+        return;
+    };
+    let model_size_mb = largest_model_size_mb(&[model_file_path.to_path_buf()]);
+    let available_ram_mb = available_ram_mb();
+    let Some(chunk_size) =
+        auto_tuned_gguf_prefill_chunk_size(model_size_mb, available_ram_mb, batch_size)
+    else {
+        return;
+    };
+
+    std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, chunk_size.to_string());
+    log::info!(
+        "Framework=gguf: setting {}={} from model_size={}MB and available_ram={}MB.",
+        GGUF_PREFILL_CHUNK_SIZE_ENV,
+        chunk_size,
+        model_size_mb,
+        available_ram_mb
+    );
+}
+
+fn export_gguf_auto_sizing_hint(
+    manifest: &Manifest,
+    batch_size: usize,
+    model_file_path: Option<&Path>,
+) {
+    if !EngineKind::resolve(manifest).is_gguf() {
+        return;
+    }
+    maybe_export_gguf_prefill_chunk_hint(model_file_path, batch_size);
+
     if std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_some()
         || std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_some()
     {
+        log::info!(
+            "Framework=gguf: using explicit {} / {} concurrency override.",
+            GGUF_MAX_CONCURRENT_ENV,
+            GGUF_TARGET_CONCURRENCY_ENV
+        );
         return;
     }
 
     let target = batch_size.max(1);
     std::env::set_var(GGUF_TARGET_CONCURRENCY_ENV, target.to_string());
     log::info!(
-        "Framework=llm: setting {}={} from runtime batch_size. Set {} to override GGUF context reservation.",
+        "Framework=gguf: setting {}={} from runtime batch_size.",
         GGUF_TARGET_CONCURRENCY_ENV,
-        target,
-        GGUF_MAX_CONCURRENT_ENV
+        target
     );
+}
+
+#[cfg(test)]
+mod gguf_auto_sizing_tests {
+    use super::*;
+    use kapsl_core::HardwareRequirements;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_manifest(framework: &str) -> Manifest {
+        Manifest {
+            project_name: "test".to_string(),
+            framework: framework.to_string(),
+            version: "1.0.0".to_string(),
+            created_at: "0".to_string(),
+            model_file: match framework {
+                "gguf" => "model.gguf".to_string(),
+                "llm" => "model.onnx".to_string(),
+                _ => "model.bin".to_string(),
+            },
+            format: None,
+            model_type: None,
+            task: None,
+            metadata: None,
+            hardware_requirements: HardwareRequirements::default(),
+            cron_jobs: Vec::new(),
+        }
+    }
+
+    fn test_manifest_with_llm_metadata(metadata: &str) -> Manifest {
+        let mut manifest = test_manifest("llm");
+        manifest.metadata = Some(serde_yaml::from_str(metadata).expect("valid metadata"));
+        manifest
+    }
+
+    #[test]
+    fn exports_batch_size_hint_for_gguf_models() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+
+        export_gguf_auto_sizing_hint(&test_manifest("gguf"), 3, None);
+
+        assert!(std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_none());
+        assert_eq!(
+            std::env::var(GGUF_TARGET_CONCURRENCY_ENV).ok().as_deref(),
+            Some("3")
+        );
+
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+    }
+
+    #[test]
+    fn does_not_export_batch_size_hint_for_onnx_generate_models() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+
+        export_gguf_auto_sizing_hint(&test_manifest("llm"), 3, None);
+
+        assert!(std::env::var_os(GGUF_MAX_CONCURRENT_ENV).is_none());
+        assert!(std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_none());
+    }
+
+    #[test]
+    fn gguf_auto_sizing_respects_manual_env_values() {
+        let _guard = env_lock().lock().unwrap();
+        let old_prefill = std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        let old_max = std::env::var_os(GGUF_MAX_CONCURRENT_ENV);
+        let old_target = std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV);
+        std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+        std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, "999");
+        std::env::set_var(GGUF_MAX_CONCURRENT_ENV, "99");
+        std::env::set_var(GGUF_TARGET_CONCURRENCY_ENV, "99");
+
+        let model_path = std::env::temp_dir().join(format!(
+            "kapsl-gguf-resolved-prefill-{}-{}.gguf",
+            std::process::id(),
+            now_unix_seconds()
+        ));
+        let file = File::create(&model_path).expect("create sparse test model");
+        file.set_len(3 * 1024 * 1024 * 1024)
+            .expect("size sparse test model");
+        drop(file);
+
+        export_gguf_auto_sizing_hint(&test_manifest("gguf"), 4, Some(model_path.as_path()));
+
+        assert_eq!(
+            std::env::var(GGUF_PREFILL_CHUNK_SIZE_ENV).ok().as_deref(),
+            Some("999")
+        );
+        assert_eq!(
+            std::env::var(GGUF_MAX_CONCURRENT_ENV).ok().as_deref(),
+            Some("99")
+        );
+        assert_eq!(
+            std::env::var(GGUF_TARGET_CONCURRENCY_ENV).ok().as_deref(),
+            Some("99")
+        );
+
+        let _ = fs::remove_file(&model_path);
+        if let Some(value) = old_prefill {
+            std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, value);
+        } else {
+            std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+        }
+        if let Some(value) = old_max {
+            std::env::set_var(GGUF_MAX_CONCURRENT_ENV, value);
+        } else {
+            std::env::remove_var(GGUF_MAX_CONCURRENT_ENV);
+        }
+        if let Some(value) = old_target {
+            std::env::set_var(GGUF_TARGET_CONCURRENCY_ENV, value);
+        } else {
+            std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+        }
+    }
+
+    #[test]
+    fn llm_isolation_metadata_is_advisory_unless_strict_or_env_forces_it() {
+        let _guard = env_lock().lock().unwrap();
+        let old_isolate = std::env::var_os(LLM_ISOLATE_PROCESS_ENV);
+        let old_strict = std::env::var_os(LLM_ISOLATE_PROCESS_STRICT_ENV);
+        std::env::remove_var(LLM_ISOLATE_PROCESS_ENV);
+        std::env::remove_var(LLM_ISOLATE_PROCESS_STRICT_ENV);
+
+        let advisory = test_manifest_with_llm_metadata("llm:\n  isolate_process: true\n");
+        assert!(!resolve_isolate_process(&advisory));
+
+        let strict = test_manifest_with_llm_metadata(
+            "llm:\n  isolate_process: true\n  isolate_process_strict: true\n",
+        );
+        assert!(resolve_isolate_process(&strict));
+
+        std::env::set_var(LLM_ISOLATE_PROCESS_ENV, "1");
+        assert!(resolve_isolate_process(&advisory));
+        std::env::set_var(LLM_ISOLATE_PROCESS_ENV, "0");
+        assert!(!resolve_isolate_process(&strict));
+
+        if let Some(value) = old_isolate {
+            std::env::set_var(LLM_ISOLATE_PROCESS_ENV, value);
+        } else {
+            std::env::remove_var(LLM_ISOLATE_PROCESS_ENV);
+        }
+        if let Some(value) = old_strict {
+            std::env::set_var(LLM_ISOLATE_PROCESS_STRICT_ENV, value);
+        } else {
+            std::env::remove_var(LLM_ISOLATE_PROCESS_STRICT_ENV);
+        }
+    }
 }
 
 fn parse_priority_weight_override(raw: &str, model_id: u32) -> Option<u32> {
@@ -11545,9 +12029,13 @@ fn load_model_blocking(
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
     log::info!("  Priority weight: {}", priority_weight);
-    export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
+    export_gguf_auto_sizing_hint(
+        &loader.manifest,
+        batch_size,
+        Some(model_file_path.as_path()),
+    );
     let isolate_process = resolve_isolate_process(&loader.manifest);
     let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
@@ -11950,9 +12438,13 @@ async fn load_model(
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
     log::info!("  Priority weight: {}", priority_weight);
-    export_gguf_auto_sizing_hint(&loader.manifest, batch_size);
 
     let model_file_path = loader.get_model_path();
+    export_gguf_auto_sizing_hint(
+        &loader.manifest,
+        batch_size,
+        Some(model_file_path.as_path()),
+    );
     let isolate_process = resolve_isolate_process(&loader.manifest);
     let isolate_strict = resolve_isolate_process_strict(&loader.manifest);
     if isolate_process {
