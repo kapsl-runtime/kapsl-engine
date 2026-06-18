@@ -81,7 +81,9 @@ use std::os::unix::net::UnixStream;
 
 mod app_support;
 mod auth;
+mod autoscaler;
 mod cli;
+mod constants;
 mod control;
 mod extensions;
 mod infer_adapter;
@@ -90,13 +92,16 @@ mod packaging;
 mod rag;
 mod runtime_config;
 mod runtime_monitor;
+mod runtime_support;
 mod runtime_tuning;
 mod shared_kv;
 mod worker;
 
 use app_support::*;
 use auth::*;
+use autoscaler::*;
 use cli::*;
+use constants::*;
 use control::*;
 use extensions::*;
 use model_runtime::*;
@@ -104,6 +109,7 @@ use packaging::*;
 use rag::*;
 use runtime_config::*;
 use runtime_monitor::*;
+use runtime_support::*;
 use runtime_tuning::*;
 use shared_kv::*;
 use worker::*;
@@ -115,326 +121,8 @@ struct UiAssets;
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;
 
-const DEFAULT_REMOTE_URL: &str = "https://api.kapsl.net/v1";
-const REMOTE_PLACEHOLDER_URL: &str = "https://placeholder-kapsl-registry.example.com/v1";
-const REMOTE_PLACEHOLDER_DIR: &str = ".kapsl-remote-placeholder";
-const EXTENSION_MARKETPLACE_URL: &str = "https://api.kapsl.net/api/v1/extensions/marketplace";
-const API_TOKEN_ENV: &str = "KAPSL_API_TOKEN";
-const API_READER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_READER";
-const API_WRITER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_WRITER";
-const API_ADMIN_TOKEN_ENV: &str = "KAPSL_API_TOKEN_ADMIN";
-const AUTH_STORE_PATH_ENV: &str = "KAPSL_AUTH_STORE_PATH";
-const DEFAULT_AUTH_STORE_FILENAME: &str = "auth-store.json";
-const LOG_SENSITIVE_IDS_ENV: &str = "KAPSL_LOG_SENSITIVE_IDS";
-const RAG_STORAGE_ROOT_ENV: &str = "KAPSL_RAG_STORAGE_ROOT";
-const REMOTE_URL_ENV: &str = "KAPSL_REMOTE_URL";
-const REMOTE_TOKEN_ENV: &str = "KAPSL_REMOTE_TOKEN";
-const REMOTE_TOKEN_STORE_PATH_ENV: &str = "KAPSL_REMOTE_TOKEN_STORE_PATH";
-const REMOTE_PLACEHOLDER_URL_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_URL";
-const REMOTE_PLACEHOLDER_DIR_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_DIR";
-const EXTENSION_MARKETPLACE_URL_ENV: &str = "KAPSL_EXTENSION_MARKETPLACE_URL";
-const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
-const OCI_REMOTE_PREFIX: &str = "oci://";
-const KAPSL_OCI_ARTIFACT_TYPE: &str = "application/vnd.kapsl.aimod.v1";
-const KAPSL_OCI_LAYER_TYPE: &str = "application/vnd.kapsl.aimod.v1";
-const KAPSL_OCI_CONFIG_TYPE: &str = "application/vnd.kapsl.aimod.config.v1+json";
-const OCI_PRECOMPUTE_SHA256_ENV: &str = "KAPSL_OCI_PRECOMPUTE_SHA256";
-const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
-const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
-const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
-const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
-const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
-const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
-const GGUF_MAX_CONCURRENT_ENV: &str = "KAPSL_GGUF_MAX_CONCURRENT";
-const GGUF_TARGET_CONCURRENCY_ENV: &str = "KAPSL_GGUF_TARGET_CONCURRENCY";
-const GGUF_PREFILL_CHUNK_SIZE_ENV: &str = "KAPSL_GGUF_PREFILL_CHUNK_SIZE";
-const ORT_MEMORY_PATTERN_ENV: &str = "KAPSL_ORT_MEMORY_PATTERN";
-const ORT_DISABLE_CPU_MEM_ARENA_ENV: &str = "KAPSL_ORT_DISABLE_CPU_MEM_ARENA";
-const ORT_SESSION_BUCKETS_ENV: &str = "KAPSL_ORT_SESSION_BUCKETS";
-const ORT_BUCKET_DIM_GRANULARITY_ENV: &str = "KAPSL_ORT_BUCKET_DIM_GRANULARITY";
-const ORT_BUCKET_MAX_DIMS_ENV: &str = "KAPSL_ORT_BUCKET_MAX_DIMS";
-const MODEL_PEAK_CONCURRENCY_ENV: &str = "KAPSL_MODEL_PEAK_CONCURRENCY";
-const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
-const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
-const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
-const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
-const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
-const SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV: &str = "KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY";
-const LEGACY_SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV: &str = "KAPSL_LITE_INGRESS_BACKPRESSURE";
-const INTER_MODEL_ROUTES_ENV: &str = "KAPSL_INTER_MODEL_ROUTES";
-const LEGACY_INTER_MODEL_ROUTES_ENV: &str = "KAPSL_LITE_INTER_MODEL_ROUTES";
-const INTER_MODEL_RELAY_MIN_INTERVAL_MS_ENV: &str = "KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS";
-const LEGACY_INTER_MODEL_RELAY_MIN_INTERVAL_MS_ENV: &str =
-    "KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS";
-const INTER_MODEL_RELAY_SESSION_PREFIX: &str = "relay/";
-const DEFAULT_INTER_MODEL_RELAY_MIN_INTERVAL_MS: u64 = 2000;
-const PRESSURE_MEMORY_CONSERVE_PCT_ENV: &str = "KAPSL_SERVER_PRESSURE_MEMORY_CONSERVE_PCT";
-const PRESSURE_MEMORY_EMERGENCY_PCT_ENV: &str = "KAPSL_SERVER_PRESSURE_MEMORY_EMERGENCY_PCT";
-const PRESSURE_GPU_UTIL_CONSERVE_PCT_ENV: &str = "KAPSL_SERVER_PRESSURE_GPU_UTIL_CONSERVE_PCT";
-const PRESSURE_GPU_UTIL_EMERGENCY_PCT_ENV: &str = "KAPSL_SERVER_PRESSURE_GPU_UTIL_EMERGENCY_PCT";
-const PRESSURE_GPU_MEM_CONSERVE_PCT_ENV: &str = "KAPSL_SERVER_PRESSURE_GPU_MEM_CONSERVE_PCT";
-const PRESSURE_GPU_MEM_EMERGENCY_PCT_ENV: &str = "KAPSL_SERVER_PRESSURE_GPU_MEM_EMERGENCY_PCT";
-const PRESSURE_CONSERVE_MAX_TOKENS_ENV: &str = "KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS";
-const PRESSURE_EMERGENCY_MAX_TOKENS_ENV: &str = "KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS";
-
-fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> {
-    if args.model.is_empty() {
-        return Err(dyn_error_from_message(
-            "At least one --model PATH is required.",
-        ));
-    }
-
-    let base_url = match &args.http_url {
-        Some(url) => url.trim_end_matches('/').to_string(),
-        None => format!("http://{}:{}", args.http_host, args.http_port),
-    };
-
-    let timeout = std::time::Duration::from_millis(args.timeout_ms.max(1));
-    let agent_config = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .timeout_per_call(Some(timeout))
-        .build();
-    let agent: ureq::Agent = agent_config.into();
-
-    let start_url = format!("{}/api/models/start", base_url);
-
-    let a = Ansi::new();
-    let mut any_error = false;
-    for model_path in &args.model {
-        let display = model_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_else(|| model_path.to_str().unwrap_or("?"));
-
-        let absolute_path = match model_path.canonicalize() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!(
-                    "  {}  {}  {}",
-                    a.red("✗"),
-                    display,
-                    a.dim(&format!("({})", e))
-                );
-                any_error = true;
-                continue;
-            }
-        };
-
-        let payload = serde_json::json!({
-            "model_path": absolute_path.to_string_lossy(),
-            "topology": args.topology,
-            "tp_degree": args.tp_degree,
-        });
-
-        let payload_str = serde_json::to_string(&payload)
-            .map_err(|e| dyn_error_from_message(format!("Failed to serialize request: {}", e)))?;
-
-        let mut request = agent
-            .post(&start_url)
-            .header("Content-Type", "application/json");
-        if let Some(token) = &args.auth_token {
-            request = request.header("Authorization", &format!("Bearer {}", token));
-        }
-
-        match request.send(payload_str) {
-            Ok(mut response) => {
-                let body = response
-                    .body_mut()
-                    .read_to_string()
-                    .unwrap_or_else(|_| String::new());
-                // Extract model_id from JSON if present for a nicer summary line.
-                let model_id = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|json| json.get("model_id").and_then(|v| v.as_u64()))
-                    .map(|id| format!(" (id={})", id))
-                    .unwrap_or_default();
-                eprintln!("  {}  {}{}", a.green("✓"), display, a.dim(&model_id));
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {}  {}  {}",
-                    a.red("✗"),
-                    display,
-                    a.dim(&format!("({})", format_remote_http_error(e)))
-                );
-                any_error = true;
-            }
-        }
-    }
-
-    if any_error {
-        Err(dyn_error_from_message(
-            "One or more models could not be added.",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    optional_env_var(name)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn provider_policy() -> String {
-    optional_env_var(PROVIDER_POLICY_ENV)
-        .unwrap_or_else(|| "fastest".to_string())
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn parse_bind_ip(raw: &str, fallback: IpAddr, field_name: &str) -> IpAddr {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return fallback;
-    }
-    match trimmed.parse::<IpAddr>() {
-        Ok(addr) => addr,
-        Err(error) => {
-            log::warn!(
-                "Invalid {} value `{}`: {}. Falling back to {}",
-                field_name,
-                trimmed,
-                error,
-                fallback
-            );
-            fallback
-        }
-    }
-}
-
-fn preflight_http_bind(http_bind: IpAddr, port: u16) -> Result<(), DynError> {
-    use std::net::{SocketAddr, TcpListener};
-
-    let addr = SocketAddr::new(http_bind, port);
-    match TcpListener::bind(addr) {
-        Ok(listener) => {
-            drop(listener);
-            Ok(())
-        }
-        Err(error) => {
-            let mut message = format!("Failed to bind HTTP API on {}: {}", addr, error);
-            if matches!(error.kind(), std::io::ErrorKind::AddrInUse) {
-                message.push_str(
-                    ". Another process is already using this port. Stop the other runtime or pick a different port with --metrics-port.",
-                );
-            }
-            Err(message.into())
-        }
-    }
-}
-
-#[cfg(unix)]
-fn preflight_ipc_socket(socket_path: &str) -> Result<(), DynError> {
-    use std::os::unix::net::UnixStream;
-    use std::path::Path;
-
-    if !Path::new(socket_path).exists() {
-        return Ok(());
-    }
-
-    if UnixStream::connect(socket_path).is_ok() {
-        return Err(format!(
-            "IPC socket path {} is already in use. Stop the other runtime or choose a different path with --socket.",
-            socket_path
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn preflight_ipc_socket(_socket_path: &str) -> Result<(), DynError> {
-    Ok(())
-}
-
-fn redact_identifier_for_logs(raw: &str, expose_sensitive: bool) -> String {
-    if expose_sensitive || raw == "-" || raw.is_empty() {
-        return raw.to_string();
-    }
-    let prefix: String = raw.chars().take(4).collect();
-    format!("{}...[redacted]", prefix)
-}
-
-fn reply_into_response<R: Reply>(reply: R) -> warp::reply::Response {
-    reply.into_response()
-}
-
-fn status_code_for_engine_error(error: &EngineError) -> warp::http::StatusCode {
-    use warp::http::StatusCode;
-
-    match error {
-        EngineError::InvalidInput { .. } => StatusCode::BAD_REQUEST,
-        EngineError::ModelNotLoaded => StatusCode::SERVICE_UNAVAILABLE,
-        EngineError::Overloaded { .. } | EngineError::ResourceExhausted { .. } => {
-            StatusCode::TOO_MANY_REQUESTS
-        }
-        EngineError::TimeoutError { .. } => StatusCode::GATEWAY_TIMEOUT,
-        EngineError::Cancelled { .. } => StatusCode::REQUEST_TIMEOUT,
-        EngineError::Backend { .. }
-        | EngineError::ModelLoadError { .. }
-        | EngineError::InferenceError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-fn inferred_batch_size(shape: &[i64]) -> usize {
-    shape
-        .first()
-        .copied()
-        .filter(|dim| *dim > 0)
-        .map(|dim| dim as usize)
-        .unwrap_or(1)
-}
-
-fn scheduler_priority_for_request(request: &InferenceRequest) -> kapsl_scheduler::Priority {
-    let scheduler_metadata = SchedulerRequestMetadata {
-        priority: request
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.priority)
-            .unwrap_or(1),
-        sla_deadline: request
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.timeout_ms),
-        batch_size: inferred_batch_size(&request.input.shape),
-        input_size_bytes: Some(request.input.data.len()),
-        estimated_flops: None,
-    };
-
-    determine_priority(&scheduler_metadata)
-}
-
 #[cfg(test)]
-#[path = "tests/security_tests.rs"]
-mod security_tests;
-
-#[cfg(test)]
-#[path = "tests/inter_model_relay_tests.rs"]
-mod inter_model_relay_tests;
-
-#[cfg(test)]
-#[path = "tests/oci_remote_tests.rs"]
-mod oci_remote_tests;
-
-#[cfg(test)]
-#[path = "tests/packaging_tests.rs"]
-mod packaging_tests;
-
-#[cfg(test)]
-#[path = "tests/state_layout_tests.rs"]
-mod state_layout_tests;
-
-#[cfg(test)]
-#[path = "tests/gguf_auto_sizing_tests.rs"]
-mod gguf_auto_sizing_tests;
+mod tests;
 
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
@@ -3811,307 +3499,24 @@ async fn main() -> Result<(), DynError> {
         }
     });
 
-    // Spawn auto-scaler background task
-    let auto_scaler_clone = auto_scaler.clone();
-    let model_registry_for_scaler = model_registry.clone();
-    let replica_pools_for_scaler = replica_pools.clone();
-    let swap_map_for_scaler = swap_map_for_autoscaler.clone();
-    let model_paths_for_scaler = model_paths.clone();
-    let device_info_for_scaler = device_info.clone();
-    let unique_id_counter_for_scaler = unique_id_counter.clone();
-    let shared_metrics_for_scaler = shared_metrics.clone();
-    let shared_kv_for_scaler = shared_kv_for_autoscaler;
-    let batch_size_for_scaler = args.batch_size;
-    let scheduler_queue_size_for_scaler = args.scheduler_queue_size;
-    let scheduler_max_micro_batch_for_scaler = args.scheduler_max_micro_batch;
-    let scheduler_queue_delay_ms_for_scaler = args.scheduler_queue_delay_ms;
-    let topology_for_scaler = args.topology.clone();
-    let tp_degree_for_scaler = args.tp_degree;
-    let onnx_tuning_profile_for_scaler = onnx_tuning_profile.clone();
-
-    tokio::spawn(async move {
-        use std::time::Duration;
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        let mut last_check = std::time::Instant::now();
-
-        loop {
-            interval.tick().await;
-            let elapsed = last_check.elapsed();
-            last_check = std::time::Instant::now();
-
-            // Check each model for scaling needs
-            for model_info in model_registry_for_scaler.list() {
-                let base_model_id = model_info.base_model_id;
-
-                // Only process primary models (not replicas)
-                if model_info.replica_id != 0 {
-                    continue;
-                }
-
-                let current_replicas =
-                    model_registry_for_scaler.count_active_replicas(base_model_id) as u32;
-
-                // Calculate pool state and update metrics.
-                let (
-                    total_queue_depth,
-                    healthy_replicas,
-                    metrics_available,
-                    total_model_memory_bytes,
-                ) = if let Some(pool) = replica_pools_for_scaler.read().get(&base_model_id) {
-                    let (high, low) = pool.get_queue_depth();
-                    let healthy = pool.get_healthy_replica_count();
-                    let metrics = pool.get_metrics();
-
-                    // Update pool metrics
-                    let model_id_str = base_model_id.to_string();
-                    shared_metrics_for_scaler
-                        .pool_active_replicas
-                        .with_label_values(&[&model_id_str])
-                        .set(current_replicas as i64);
-                    shared_metrics_for_scaler
-                        .pool_queue_depth_high
-                        .with_label_values(&[&model_id_str])
-                        .set(high as i64);
-                    shared_metrics_for_scaler
-                        .pool_queue_depth_low
-                        .with_label_values(&[&model_id_str])
-                        .set(low as i64);
-                    shared_metrics_for_scaler
-                        .pool_healthy_replicas
-                        .with_label_values(&[&model_id_str])
-                        .set(healthy as i64);
-
-                    shared_metrics_for_scaler
-                        .kv_cache_bytes_used
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_bytes_used as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_bytes_capacity
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_bytes_capacity as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_blocks_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_blocks_total as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_blocks_free
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_blocks_free as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_sequences
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_sequences as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_evicted_blocks
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_evicted_blocks as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_evicted_sequences
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_evicted_sequences as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_packed_layers
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_packed_layers as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_cpu_offloaded_blocks
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
-                    shared_metrics_for_scaler
-                        .prompt_tokens_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.prompt_tokens_total as i64);
-                    shared_metrics_for_scaler
-                        .generated_tokens_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.generated_tokens_total as i64);
-                    shared_metrics_for_scaler
-                        .decode_steps_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.decode_steps_total as i64);
-                    shared_metrics_for_scaler
-                        .decode_tokens_evaluated_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.decode_tokens_evaluated_total as i64);
-                    shared_metrics_for_scaler
-                        .kv_partial_reuse_hits_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_partial_reuse_hits_total as i64);
-                    shared_metrics_for_scaler
-                        .kv_partial_reuse_tokens_saved_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
-                    shared_metrics_for_scaler
-                        .engine_health
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.engine_health as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_total as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_idle
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_idle as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_waits_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_waits_total as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_wait_seconds_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_wait_seconds_total);
-
-                    (high + low, healthy as u32, true, metrics.memory_usage)
-                } else {
-                    (0, 0, false, 0)
-                };
-
-                // Check for scale-up
-                let should_scale_up = auto_scaler_clone.write().should_scale_up(
-                    base_model_id,
-                    current_replicas,
-                    healthy_replicas,
-                    total_queue_depth,
-                    elapsed,
-                    metrics_available,
-                );
-
-                if let Some(target_replicas) = should_scale_up {
-                    let onnx_tuning = onnx_tuning_profile_for_scaler.resolve(base_model_id);
-                    let capped_target = cap_scale_up_target_by_memory_headroom(
-                        current_replicas,
-                        target_replicas,
-                        total_model_memory_bytes,
-                        device_info_for_scaler.total_memory,
-                    );
-                    if capped_target < target_replicas {
-                        log::warn!(
-                            "Auto-scaler: Capping model {} scale-up target {} -> {} due to memory headroom",
-                            base_model_id,
-                            target_replicas,
-                            capped_target
-                        );
-                    }
-
-                    if capped_target <= current_replicas {
-                        continue;
-                    }
-
-                    let replicas_to_add = capped_target.saturating_sub(current_replicas);
-                    log::info!(
-                        "Auto-scaler: Model {} queue depth {} exceeds threshold, scaling from {} to {} replicas",
-                        base_model_id, total_queue_depth, current_replicas, capped_target
-                    );
-
-                    for _ in 0..replicas_to_add {
-                        let model_path =
-                            if let Some(path) = model_paths_for_scaler.read().get(&base_model_id) {
-                                path.clone()
-                            } else {
-                                continue;
-                            };
-
-                        // Get existing replica IDs to avoid collision
-                        let replicas = model_registry_for_scaler.list_replicas(base_model_id);
-                        let existing_replica_ids: Vec<u32> =
-                            replicas.iter().map(|r| r.replica_id).collect();
-
-                        let next_replica_id = auto_scaler_clone
-                            .read()
-                            .get_next_replica_id(base_model_id, &existing_replica_ids);
-                        let unique_id = unique_id_counter_for_scaler.fetch_add(1, Ordering::SeqCst);
-
-                        match scale_up_model(
-                            base_model_id,
-                            next_replica_id,
-                            unique_id,
-                            &model_path,
-                            &device_info_for_scaler,
-                            shared_kv_for_scaler.clone(),
-                            batch_size_for_scaler,
-                            scheduler_queue_size_for_scaler,
-                            scheduler_max_micro_batch_for_scaler,
-                            scheduler_queue_delay_ms_for_scaler,
-                            topology_for_scaler.as_str(),
-                            tp_degree_for_scaler,
-                            &model_registry_for_scaler,
-                            &shared_metrics_for_scaler,
-                            onnx_tuning.clone(),
-                        )
-                        .await
-                        {
-                            Ok((scheduler, handle)) => {
-                                // Add new replica to the pool
-                                // Clone the pool to avoid holding the lock across await
-                                let pool =
-                                    replica_pools_for_scaler.read().get(&base_model_id).cloned();
-                                if let Some(pool) = pool {
-                                    pool.add_replica(next_replica_id, scheduler);
-                                }
-                                // Register engine handle for hot-swap
-                                swap_map_for_scaler
-                                    .write()
-                                    .entry(base_model_id)
-                                    .or_default()
-                                    .push(handle);
-                            }
-                            Err(e) => {
-                                log::error!("Failed to scale up model {}: {}", base_model_id, e);
-                            }
-                        }
-                    }
-
-                    // Do not evaluate scale-down in the same cycle after scale-up.
-                    continue;
-                }
-
-                // Check for scale-down
-                let should_scale_down = auto_scaler_clone.write().should_scale_down(
-                    base_model_id,
-                    current_replicas,
-                    healthy_replicas,
-                    total_queue_depth,
-                    elapsed,
-                    metrics_available,
-                );
-
-                if let Some(target_replicas) = should_scale_down {
-                    let replicas_to_remove = current_replicas.saturating_sub(target_replicas);
-                    log::info!(
-                        "Auto-scaler: Model {} queue depth {} below threshold, scaling from {} to {} replicas",
-                        base_model_id, total_queue_depth, current_replicas, target_replicas
-                    );
-
-                    // Remove replicas (highest replica_id first)
-                    let replicas = model_registry_for_scaler.list_replicas(base_model_id);
-                    let mut replica_ids: Vec<_> = replicas
-                        .iter()
-                        .filter(|r| r.replica_id > 0 && r.status == ModelStatus::Active)
-                        .map(|r| (r.replica_id, r.id))
-                        .collect();
-                    replica_ids.sort_by(|a, b| b.0.cmp(&a.0)); // Sort descending
-
-                    for (replica_id, unique_id) in
-                        replica_ids.iter().take(replicas_to_remove as usize)
-                    {
-                        if let Err(e) = scale_down_model(
-                            base_model_id,
-                            *replica_id,
-                            *unique_id,
-                            &model_registry_for_scaler,
-                            &replica_pools_for_scaler,
-                        )
-                        .await
-                        {
-                            log::error!("Failed to scale down model {}: {}", base_model_id, e);
-                        }
-                    }
-                }
-            }
-        }
+    spawn_auto_scaler_task(AutoScalerTaskConfig {
+        auto_scaler: auto_scaler.clone(),
+        model_registry: model_registry.clone(),
+        replica_pools: replica_pools.clone(),
+        swap_map: swap_map_for_autoscaler.clone(),
+        model_paths: model_paths.clone(),
+        device_info: device_info.clone(),
+        unique_id_counter: unique_id_counter.clone(),
+        shared_metrics: shared_metrics.clone(),
+        shared_kv: shared_kv_for_autoscaler,
+        batch_size: args.batch_size,
+        scheduler_queue_size: args.scheduler_queue_size,
+        scheduler_max_micro_batch: args.scheduler_max_micro_batch,
+        scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
+        topology: args.topology.clone(),
+        tp_degree: args.tp_degree,
+        onnx_tuning_profile: onnx_tuning_profile.clone(),
     });
-
     let http_bound_addr = match tokio::time::timeout(Duration::from_secs(10), http_ready_rx).await {
         Ok(Ok(Ok(addr))) => addr,
         Ok(Ok(Err(message))) => return Err(message.into()),

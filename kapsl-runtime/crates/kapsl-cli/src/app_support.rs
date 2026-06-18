@@ -33,7 +33,7 @@ pub(crate) fn cli_color_enabled() -> bool {
     {
         use std::os::unix::io::AsRawFd;
         let fd = std::io::stderr().as_raw_fd();
-        unsafe { libc_isatty(fd) }
+        libc_isatty(fd)
     }
     #[cfg(not(unix))]
     {
@@ -91,14 +91,6 @@ impl Ansi {
     pub(crate) fn red<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
         if self.enabled {
             format!("\x1b[31m{}\x1b[0m", s).into()
-        } else {
-            s.into()
-        }
-    }
-
-    pub(crate) fn yellow<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
-        if self.enabled {
-            format!("\x1b[33m{}\x1b[0m", s).into()
         } else {
             s.into()
         }
