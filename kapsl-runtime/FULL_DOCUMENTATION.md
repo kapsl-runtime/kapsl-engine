@@ -14,7 +14,7 @@ Core capabilities:
 - Expose HTTP API, web UI, and Prometheus metrics.
 - Build, push, and pull `.aimod` packages.
 - Support extension-driven RAG ingestion and retrieval.
-- Provide Python bindings (`kapsl_runtime`) for socket, SHM, and hybrid clients.
+- Work with the `kapsl-sdk` Python package for socket, SHM, and hybrid clients.
 
 ## 2. Repository Layout
 
@@ -22,27 +22,30 @@ Top-level runtime paths:
 
 - `kapsl-runtime/Cargo.toml`: workspace manifest.
 - `kapsl-runtime/crates/kapsl-cli`: `kapsl` CLI and HTTP server.
-- `kapsl-runtime/crates/kapsl-core`: package loader, model registry, scaling policy types.
-- `kapsl-runtime/crates/kapsl-engine-api`: shared engine/request/response types.
-- `kapsl-runtime/crates/kapsl-backends`: backend selection and provider factory.
-- `kapsl-runtime/crates/kapsl-scheduler`: scheduler queues and priority routing.
-- `kapsl-runtime/crates/kapsl-ipc`: socket/TCP protocol server.
-- `kapsl-runtime/crates/kapsl-shm`: shared memory transport primitives.
-- `kapsl-runtime/crates/kapsl-transport`: common transport abstractions.
-- `kapsl-runtime/crates/kapsl-pyo3`: Python extension module (`kapsl_runtime`).
-- `kapsl-runtime/crates/kapsl-llm`: LLM backend and RAG prompt composition.
-- `kapsl-runtime/crates/kapsl-rag`: extension runtime, doc store, vector store.
-- `kapsl-runtime/crates/kapsl-rag-sdk`: connector manifest/protocol types.
-- `kapsl-runtime/scripts`: tests, validation, and helper scripts.
-- `kapsl-runtime/scripts/packages`: package creation scripts for sample models.
 - `kapsl-runtime/ui`: web dashboard static files.
+- `kapsl-runtime/docs`: runtime-specific documentation.
+- `kapsl-runtime/patches`: active third-party patches used by this workspace.
+
+Shared Rust crates live in the separate `kapsl-sdk` repository:
+
+- `kapsl-core`: package loader, model registry, scaling policy types.
+- `kapsl-engine-api`: shared engine/request/response types.
+- `kapsl-backends`: backend selection and provider factory.
+- `kapsl-scheduler`: scheduler queues and priority routing.
+- `kapsl-ipc`: socket/TCP protocol server.
+- `kapsl-shm`: shared memory transport primitives.
+- `kapsl-transport`: common transport abstractions.
+- `kapsl-pyo3`: Python extension package (`kapsl_sdk`).
+- `kapsl-llm`: LLM backend and RAG prompt composition.
+- `kapsl-rag`: extension runtime, doc store, vector store.
+- `kapsl-rag-sdk`: connector manifest/protocol types.
 
 ## 3. Build and Run
 
 ### 3.1 Prerequisites
 
-- Rust 1.75+.
-- Python 3.8+ (for helper scripts and PyO3 builds).
+- Rust 1.92.0.
+- Python 3.9+ for the SDK Python package.
 - Optional GPU/runtime dependencies depending on provider:
   - CUDA/TensorRT (NVIDIA),
   - CoreML/Metal (macOS),
@@ -60,16 +63,10 @@ cargo build --release
 
 ### 3.3 Quick Start
 
-Create sample package:
-
-```bash
-./scripts/packages/mnist/create_package.sh
-```
-
 Run runtime:
 
 ```bash
-cargo run -p kapsl -- --model models/mnist/mnist.aimod
+cargo run -p kapsl -- --model /path/to/model.aimod
 ```
 
 Defaults:
@@ -599,45 +596,18 @@ RAG local storage defaults:
 - deletes/upserts into doc store + vector store
 - returns counts (`upserted_docs`, `deleted_docs`, `chunks_upserted`, `next_cursor`, etc.)
 
-## 11. Python Bindings (`kapsl_runtime`)
+## 11. Python Client
 
-Module: `kapsl_runtime` (built from `crates/kapsl-pyo3`).
+The Python package is owned by the separate `kapsl-sdk` repository and is
+exported as `kapsl_sdk`.
 
-Classes:
+Client classes:
 
-- `KapslClient(endpoint: str | None = None, *, protocol: str | None = None, host: str | None = None, port: int | None = None, socket_path: str | None = None, pipe_name: str | None = None, max_pool_size: int = 8)`
-  - explicit protocol values: `socket`, `tcp`, `pipe`
-  - defaults when omitted:
-    - no args: local socket/pipe (`/tmp/kapsl.sock` on Unix, `\\.\pipe\kapsl` on Windows)
-    - `protocol="tcp"` with no host/port: `127.0.0.1:9096`
-    - host-only or port-only (without endpoint): missing part is defaulted (`127.0.0.1` or `9096`)
-    - `protocol="pipe"` with no `pipe_name`/`endpoint` (Windows): `\\.\pipe\kapsl`
-  - endpoint examples (backward compatible):
-    - Unix socket path: `/tmp/kapsl.sock`
-    - Explicit Unix URI: `unix:///tmp/kapsl.sock`
-    - TCP endpoint: `tcp://127.0.0.1:9096`
-    - Windows named pipe: `\\.\pipe\kapsl` or `pipe://kapsl`
-  - explicit protocol examples:
-    - `KapslClient(protocol="tcp", host="127.0.0.1", port=9096)`
-    - `KapslClient(protocol="socket", socket_path="/tmp/kapsl.sock")`
-  - `infer(model_id, shape, dtype, data) -> bytes`
-  - `infer_stream(model_id, shape, dtype, data) -> iterator[bytes]`
-  - `protocol() -> str` (resolved protocol)
-  - `endpoint() -> str` (resolved endpoint URI)
-- `KapslShmClient(shm_name: str)`
-  - `infer(shape, dtype, data) -> bytes`
-- `KapslHybridClient(shm_name: str, socket_path: str)`
-  - `infer(shape, dtype, data) -> bytes`
+- `KapslClient`
+- `KapslShmClient`
+- `KapslHybridClient`
 
-Build (example):
-
-```bash
-cd crates/kapsl-pyo3
-python3 -m venv .venv
-source .venv/bin/activate
-pip install maturin
-maturin develop --release
-```
+See `kapsl-sdk/docs` for installation, API reference, and Python examples.
 
 ## 12. Environment Variables
 
@@ -776,14 +746,15 @@ curl -X POST http://127.0.0.1:9095/api/engine/package \
 
 ## 15. Testing and Benchmarks
 
-Useful scripts:
+Run runtime checks from `kapsl-runtime/`:
 
-- `scripts/benchmark_http_infer.py`: lightweight HTTP infer latency/throughput benchmark.
-- `scripts/validate_all_features.py`: API/metrics/dashboard validation script.
-- `scripts/test_deployment.py`: deployment-oriented smoke tests.
-- `scripts/test_inference_llama_gpt.py`: LLM inference script.
-- `benchmarks/benchmark_production.sh`: multi-client production scenario benchmark.
-- `benchmarks/*.py`: additional transport and client benchmark experiments.
+```bash
+cargo test --workspace
+cargo check --workspace
+```
+
+Benchmark harnesses live outside this runtime repository in the benchmark
+workspace.
 
 ### kapsl vs vLLM Qwen benchmark
 
