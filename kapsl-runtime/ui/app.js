@@ -68,7 +68,6 @@ class KapslApp {
     this.bindSidebar();
     this.bindDashboardControls();
     this.bindExtensionsControls();
-    this.bindLegacyTokenControls();
     this.bindAccessControls();
     this.updateTokenStatus();
     this.updateSessionStatus();
@@ -87,7 +86,6 @@ class KapslApp {
       const now = Date.now();
       if (now - this.lastAccessRefreshAt >= this.accessRefreshIntervalMs) {
         await this.refreshAccessData({ silent: true });
-        await this.refreshLegacyTokens({ silent: true });
       }
       if (now - this.lastHardwareRefreshAt >= this.hardwareRefreshIntervalMs) {
         await this.refreshHardwareData({ silent: true });
@@ -370,7 +368,6 @@ class KapslApp {
       await this.fetchData();
       await Promise.all([
         this.refreshHardwareData({ silent: true }),
-        this.refreshLegacyTokens({ silent: true }),
         this.refreshAccessData({ silent: true }),
         this.refreshExtensionsData({ silent: true }),
         this.refreshRemoteArtifacts({ silent: true }),
@@ -755,17 +752,6 @@ class KapslApp {
       .addEventListener("click", (event) =>
         this.handleExtensionsListClick(event),
       );
-  }
-
-  bindLegacyTokenControls() {
-    document
-      .getElementById("legacy-tokens-form")
-      .addEventListener("submit", (event) =>
-        this.handleLegacyTokensSave(event),
-      );
-    document
-      .getElementById("legacy-refresh-btn")
-      .addEventListener("click", () => this.refreshLegacyTokens());
   }
 
   bindAccessControls() {
@@ -2052,91 +2038,6 @@ class KapslApp {
       );
     } catch (error) {
       this.setAccessFeedback("extensions-feedback", error.message, true);
-    }
-  }
-
-  async refreshLegacyTokens({ silent = false } = {}) {
-    if (!this.isAuthenticated) {
-      return;
-    }
-    try {
-      const result = await this.requestJson("/api/auth/roles");
-      if (!result.ok) {
-        if (result.status === 401 || result.status === 403) {
-          document.getElementById("legacy-reader-token").value = "";
-          document.getElementById("legacy-writer-token").value = "";
-          document.getElementById("legacy-admin-token").value = "";
-          if (!silent) {
-            this.setAccessFeedback(
-              "legacy-feedback",
-              "Admin access required to view legacy role tokens.",
-              true,
-            );
-          }
-          return;
-        }
-        throw new Error(
-          result.data?.error ||
-            `Legacy role tokens API error (HTTP ${result.status})`,
-        );
-      }
-
-      const cfg = result.data || {};
-      document.getElementById("legacy-reader-token").value =
-        cfg.reader_token || "";
-      document.getElementById("legacy-writer-token").value =
-        cfg.writer_token || "";
-      document.getElementById("legacy-admin-token").value =
-        cfg.admin_token || "";
-
-      if (!silent) {
-        this.setAccessFeedback(
-          "legacy-feedback",
-          "Loaded legacy tokens.",
-          false,
-        );
-      }
-    } catch (error) {
-      console.error("Error refreshing legacy tokens:", error);
-      if (!silent) {
-        this.setAccessFeedback("legacy-feedback", error.message, true);
-      }
-    }
-  }
-
-  async handleLegacyTokensSave(event) {
-    event.preventDefault();
-
-    const payload = {
-      reader_token:
-        document.getElementById("legacy-reader-token").value.trim() || null,
-      writer_token:
-        document.getElementById("legacy-writer-token").value.trim() || null,
-      admin_token:
-        document.getElementById("legacy-admin-token").value.trim() || null,
-    };
-
-    try {
-      const result = await this.requestJson("/api/auth/roles", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!result.ok) {
-        throw new Error(
-          result.data?.error ||
-            `Save legacy tokens failed (HTTP ${result.status})`,
-        );
-      }
-
-      this.setAccessFeedback(
-        "legacy-feedback",
-        "Legacy tokens updated.",
-        false,
-      );
-      await this.refreshLegacyTokens({ silent: true });
-    } catch (error) {
-      this.setAccessFeedback("legacy-feedback", error.message, true);
     }
   }
 

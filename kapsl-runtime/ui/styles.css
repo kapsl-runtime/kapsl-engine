@@ -839,10 +839,6 @@ body.auth-locked {
     gap: 12px;
 }
 
-#legacy-tokens-form {
-    margin-top: 12px;
-}
-
 /* ─── Buttons ──────────────────────────────────────────────────────────── */
 .btn,
 .btn-control {
