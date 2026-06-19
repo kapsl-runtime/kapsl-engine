@@ -2,6 +2,9 @@
 members = [
     "crates/kapsl-cli",
 ]
+exclude = [
+    "patches/esaxx-rs",
+]
 
 resolver = "2"
 
