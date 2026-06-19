@@ -1419,6 +1419,24 @@ code {
     min-width: 200px;
 }
 
+#create-key-form #new-key-name {
+    flex: 1 1 160px;
+}
+
+#create-key-form #new-key-scopes {
+    flex: 2 1 300px;
+    min-width: min(100%, 300px);
+}
+
+#create-key-form #new-key-expiry {
+    flex: 1 1 220px;
+    min-width: min(100%, 220px);
+}
+
+#create-key-form .btn {
+    flex: 0 0 auto;
+}
+
 .access-status-line {
     margin-top: 12px;
     font-size: 13px;
