@@ -144,6 +144,53 @@ pub(crate) struct ThroughputSample {
     pub(crate) throughput: f64,
 }
 
+/// Maximum number of recent latency observations retained per model.
+pub(crate) const LATENCY_WINDOW_CAPACITY: usize = 256;
+
+/// Bounded ring of recent end-to-end inference latencies (milliseconds) for a
+/// single model. Surfaced as avg/p99 on `GET /api/models` so the enterprise
+/// autoscaler can scale workers on latency SLOs, not just queue depth.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LatencyWindow {
+    samples: std::collections::VecDeque<f64>,
+}
+
+impl LatencyWindow {
+    pub(crate) fn record(&mut self, latency_ms: f64) {
+        if !latency_ms.is_finite() || latency_ms < 0.0 {
+            return;
+        }
+        if self.samples.len() >= LATENCY_WINDOW_CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(latency_ms);
+    }
+
+    pub(crate) fn average_ms(&self) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        self.samples.iter().sum::<f64>() / self.samples.len() as f64
+    }
+
+    pub(crate) fn p99_ms(&self) -> f64 {
+        self.percentile_ms(0.99)
+    }
+
+    /// Nearest-rank percentile over the current window; 0.0 when empty.
+    pub(crate) fn percentile_ms(&self, quantile: f64) -> f64 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = (quantile.clamp(0.0, 1.0) * sorted.len() as f64)
+            .ceil()
+            .max(1.0) as usize;
+        sorted[rank.min(sorted.len()) - 1]
+    }
+}
+
 pub(crate) type InterModelRoutes = HashMap<String, Vec<String>>;
 
 #[derive(Debug, Clone)]
@@ -434,4 +481,54 @@ pub(crate) fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
     let mem_bytes = (total_mem_mb * 1024.0 * 1024.0) as usize;
     let mem_capacity_bytes = (total_mem_capacity_mb * 1024.0 * 1024.0) as usize;
     Some((avg_util, mem_bytes, mem_capacity_bytes))
+}
+
+#[cfg(test)]
+mod latency_window_tests {
+    use super::LatencyWindow;
+    use super::LATENCY_WINDOW_CAPACITY;
+
+    #[test]
+    fn empty_window_reports_zero() {
+        let window = LatencyWindow::default();
+        assert_eq!(window.average_ms(), 0.0);
+        assert_eq!(window.p99_ms(), 0.0);
+    }
+
+    #[test]
+    fn computes_average_and_nearest_rank_p99() {
+        let mut window = LatencyWindow::default();
+        for ms in 1..=100 {
+            window.record(ms as f64);
+        }
+        assert!((window.average_ms() - 50.5).abs() < 1e-9);
+        // Nearest-rank p99 of 1..=100 is rank ceil(0.99*100)=99 -> value 99.
+        assert_eq!(window.p99_ms(), 99.0);
+        assert_eq!(window.percentile_ms(0.5), 50.0);
+        assert_eq!(window.percentile_ms(1.0), 100.0);
+    }
+
+    #[test]
+    fn discards_invalid_samples() {
+        let mut window = LatencyWindow::default();
+        window.record(f64::NAN);
+        window.record(-5.0);
+        window.record(f64::INFINITY);
+        assert_eq!(window.average_ms(), 0.0);
+        window.record(10.0);
+        assert_eq!(window.average_ms(), 10.0);
+    }
+
+    #[test]
+    fn evicts_oldest_beyond_capacity() {
+        let mut window = LatencyWindow::default();
+        for _ in 0..LATENCY_WINDOW_CAPACITY {
+            window.record(1.0);
+        }
+        // Newer, larger samples push out the old 1.0 values.
+        for _ in 0..LATENCY_WINDOW_CAPACITY {
+            window.record(9.0);
+        }
+        assert_eq!(window.average_ms(), 9.0);
+    }
 }

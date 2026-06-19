@@ -7,6 +7,7 @@ pub(crate) struct ModelReaderRoutesConfig {
     pub(crate) throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
     pub(crate) generated_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
     pub(crate) total_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
+    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
 }
 
 pub(crate) fn build_model_reader_routes(
@@ -19,6 +20,7 @@ pub(crate) fn build_model_reader_routes(
         throughput_samples: throughput_samples_clone,
         generated_token_samples: generated_token_samples_clone,
         total_token_samples: total_token_samples_clone,
+        latency_samples: latency_samples_clone,
     } = config;
 
     let model_registry_for_list = model_registry_clone.clone();
@@ -27,6 +29,7 @@ pub(crate) fn build_model_reader_routes(
     let throughput_samples_for_list = throughput_samples_clone.clone();
     let generated_token_samples_for_list = generated_token_samples_clone.clone();
     let total_token_samples_for_list = total_token_samples_clone.clone();
+    let latency_samples_for_list = latency_samples_clone.clone();
     let list_models = warp::path!("api" / "models").and(warp::get()).map(move || {
         #[derive(Serialize)]
         struct ModelStatus {
@@ -51,6 +54,8 @@ pub(crate) fn build_model_reader_routes(
             onnx_session_pool_idle: usize,
             onnx_session_pool_waits_total: u64,
             onnx_session_pool_wait_seconds_total: f64,
+            avg_latency_ms: f64,
+            p99_latency_ms: f64,
             healthy: bool,
         }
 
@@ -59,6 +64,7 @@ pub(crate) fn build_model_reader_routes(
         let now = Instant::now();
         let mut seen_ids = HashSet::new();
         let mut throughput_samples = throughput_samples_for_list.write();
+        let mut latency_samples = latency_samples_for_list.write();
         let mut generated_token_samples = generated_token_samples_for_list.write();
         let mut total_token_samples = total_token_samples_for_list.write();
 
@@ -141,6 +147,11 @@ pub(crate) fn build_model_reader_routes(
                 0.0
             };
 
+            let (avg_latency_ms, p99_latency_ms) = latency_samples
+                .get(&model.id)
+                .map(|window| (window.average_ms(), window.p99_ms()))
+                .unwrap_or((0.0, 0.0));
+
             statuses.push(ModelStatus {
                 info: model,
                 active_inferences: active,
@@ -162,11 +173,14 @@ pub(crate) fn build_model_reader_routes(
                 onnx_session_pool_idle,
                 onnx_session_pool_waits_total,
                 onnx_session_pool_wait_seconds_total,
+                avg_latency_ms,
+                p99_latency_ms,
                 healthy,
             });
         }
 
         throughput_samples.retain(|id, _| seen_ids.contains(id));
+        latency_samples.retain(|id, _| seen_ids.contains(id));
         generated_token_samples.retain(|id, _| seen_ids.contains(id));
         total_token_samples.retain(|id, _| seen_ids.contains(id));
         warp::reply::json(&statuses)

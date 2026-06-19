@@ -285,6 +285,8 @@ async fn main() -> Result<(), DynError> {
         Arc::new(RwLock::new(HashMap::new()));
     let total_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>> =
         Arc::new(RwLock::new(HashMap::new()));
+    let latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>> =
+        Arc::new(RwLock::new(HashMap::new()));
     let inter_model_relay_state = Arc::new(InterModelRelayState::from_env());
     if inter_model_relay_state.has_routes() {
         log::info!(
@@ -623,6 +625,7 @@ async fn main() -> Result<(), DynError> {
     let throughput_samples_clone = throughput_samples.clone();
     let generated_token_samples_clone = generated_token_samples.clone();
     let total_token_samples_clone = total_token_samples.clone();
+    let latency_samples_clone = latency_samples.clone();
     let onnx_tuning_profile_for_api = onnx_tuning_profile.clone();
 
     let extensions_root = state_layout.extensions_root.clone();
@@ -665,6 +668,7 @@ async fn main() -> Result<(), DynError> {
             throughput_samples: throughput_samples_clone.clone(),
             generated_token_samples: generated_token_samples_clone.clone(),
             total_token_samples: total_token_samples_clone.clone(),
+            latency_samples: latency_samples_clone.clone(),
             device_info: device_info_for_api.clone(),
             batch_size: args.batch_size,
             scheduler_queue_size: args.scheduler_queue_size,
