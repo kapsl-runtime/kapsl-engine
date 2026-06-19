@@ -2,24 +2,27 @@
 members = [
     "crates/kapsl-cli",
 ]
+exclude = [
+    "patches/esaxx-rs",
+]
 
 resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-llama-cpp-sys-2 = { path = "../../kapsl-sdk/patches/llama-cpp-sys-2" }
-llama-cpp-2 = { path = "../../kapsl-sdk/patches/llama-cpp-2" }
-kapsl-core = { path = "../../kapsl-sdk/crates/kapsl-core" }
-kapsl-engine-api = { path = "../../kapsl-sdk/crates/kapsl-engine-api" }
-kapsl-backends = { path = "../../kapsl-sdk/crates/kapsl-backends" }
-kapsl-hal = { path = "../../kapsl-sdk/crates/kapsl-hal" }
-kapsl-monitor = { path = "../../kapsl-sdk/crates/kapsl-monitor" }
-kapsl-llm = { path = "../../kapsl-sdk/crates/kapsl-llm" }
-kapsl-scheduler = { path = "../../kapsl-sdk/crates/kapsl-scheduler" }
-kapsl-ipc = { path = "../../kapsl-sdk/crates/kapsl-ipc" }
-kapsl-transport = { path = "../../kapsl-sdk/crates/kapsl-transport" }
-kapsl-shm = { path = "../../kapsl-sdk/crates/kapsl-shm" }
-kapsl-rag = { path = "../../kapsl-sdk/crates/kapsl-rag" }
-kapsl-rag-sdk = { path = "../../kapsl-sdk/crates/kapsl-rag-sdk" }
-kapsl-kernels = { path = "../../kapsl-sdk/crates/kapsl-kernels" }
-kapsl-quantization = { path = "../../kapsl-sdk/crates/kapsl-quantization" }
+llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }

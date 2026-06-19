@@ -3,7 +3,7 @@
 > **Last Updated**: March 5, 2026  
 > **Version**: 0.1.0
 
-A comprehensive guide for developers working with the kapsl-runtime ML inference platform.
+A guide for developers working on the `kapsl` runtime binary.
 
 ---
 
@@ -81,16 +81,16 @@ graph TB
 
 | Crate | Purpose |
 |-------|---------|
-| [`kapsl`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-cli) | Main binary, server orchestration, HTTP API |
-| [`kapsl-backends`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-backends) | ML backend implementations (ONNX, TensorRT, etc.) |
-| [`kapsl-hal`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-hal) | Hardware detection and device management |
-| [`kapsl-scheduler`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-scheduler) | Request prioritization, batching, sticky routing |
-| [`kapsl-transport`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-transport) | Transport abstraction layer |
-| [`kapsl-ipc`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-ipc) | Unix socket & TCP server implementations |
-| [`kapsl-shm`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-shm) | Shared memory zero-copy transport |
-| [`kapsl-pyo3`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-pyo3) | Python bindings (exported as `kapsl_runtime` module) |
-| [`kapsl-monitor`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-monitor) | Prometheus metrics & instrumentation |
-| [`kapsl-core`](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/crates/kapsl-core) | Core types, model registry, package loader |
+| `kapsl` | Main runtime binary in `kapsl-engine/kapsl-runtime/crates/kapsl-cli` |
+| `kapsl-backends` | SDK crate for backend implementations and provider selection |
+| `kapsl-hal` | SDK crate for hardware detection and device management |
+| `kapsl-scheduler` | SDK crate for request prioritization, batching, and routing |
+| `kapsl-transport` | SDK crate for transport abstractions |
+| `kapsl-ipc` | SDK crate for Unix socket and TCP protocol servers |
+| `kapsl-shm` | SDK crate for shared-memory transport primitives |
+| `kapsl-pyo3` | SDK crate for the Python package, exported as `kapsl_sdk` |
+| `kapsl-monitor` | SDK crate for Prometheus metrics and instrumentation |
+| `kapsl-core` | SDK crate for core types, model registry, and package loading |
 
 ---
 
@@ -98,13 +98,13 @@ graph TB
 
 ### Required
 
-- **Rust**: 1.75 or higher
+- **Rust**: 1.92.0
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
   ```
 
-- **Python**: 3.8+ (for Python client)
+- **Python**: 3.9+ (for Python client)
 
   ```bash
   python3 --version
@@ -131,7 +131,7 @@ graph TB
 ### 1. Clone & Navigate
 
 ```bash
-cd /Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime
+cd kapsl-engine/kapsl-runtime
 ```
 
 ### 2. Build the Runtime
@@ -153,27 +153,10 @@ Built binaries will be in:
 - `target/release/kapsl` (release)
 - `target/debug/kapsl` (debug)
 
-### 3. Build Python Client (Optional)
+### 3. Python Client
 
-```bash
-cd crates/kapsl-pyo3
-
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install maturin (PyO3 build tool)
-pip install maturin
-
-# Build and install Python module
-maturin develop --release
-```
-
-This creates the `kapsl_runtime` Python module with these classes:
-
-- `KapslClient` - Unix socket client
-- `KapslShmClient` - Shared memory client
-- `KapslHybridClient` - Hybrid socket+SHM client
+The Python client package is maintained in the separate `kapsl-sdk` repository
+and is exported as `kapsl_sdk`. See `kapsl-sdk/docs` for build and API details.
 
 ---
 
@@ -181,21 +164,10 @@ This creates the `kapsl_runtime` Python module with these classes:
 
 ### Quick Start (Default Configuration)
 
-#### Step 1: Create a Model Package
-
-Generate a sample MNIST model package:
+#### Step 1: Start the Runtime
 
 ```bash
-chmod +x scripts/packages/mnist/create_package.sh
-./scripts/packages/mnist/create_package.sh
-```
-
-This creates [models/mnist/mnist.aimod](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/models/mnist/mnist.aimod).
-
-#### Step 2: Start the Runtime
-
-```bash
-cargo run -p kapsl -- --model models/mnist/mnist.aimod
+cargo run -p kapsl -- --model /path/to/model.aimod
 ```
 
 **Expected output**:
@@ -364,23 +336,16 @@ cargo run -p kapsl -- --model mnist-cuda.aimod
 
 ### Python Client
 
-#### Installation
-
-```bash
-# Build and install the Python module
-cd crates/kapsl-pyo3
-maturin develop --release
-
-# Or use pip install if wheel is built
-pip install kapsl-runtime
-```
+The Python client is maintained in `kapsl-sdk` and imported as `kapsl_sdk`.
+The examples below show runtime usage; install and build details live in
+`kapsl-sdk/docs`.
 
 #### Example 1: Socket Client
 
 ```python
 #!/usr/bin/env python3
 import numpy as np
-from kapsl_runtime import KapslClient
+from kapsl_sdk import KapslClient
 
 # Connect to runtime
 client = KapslClient("/tmp/kapsl.sock")
@@ -409,7 +374,7 @@ print(f"Prediction: {np.argmax(result)}")
 ```python
 #!/usr/bin/env python3
 import numpy as np
-from kapsl_runtime import KapslHybridClient
+from kapsl_sdk import KapslHybridClient
 
 # Connect with SHM name from server logs (e.g., /kapsl_shm_12345)
 client = KapslHybridClient("/kapsl_shm_12345", "/tmp/kapsl.sock")
@@ -430,13 +395,11 @@ result = np.frombuffer(result_bytes, dtype=np.float32)
 print(f"Result: {result.shape}")
 ```
 
-See [test_hybrid_simple.py](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/test_hybrid_simple.py) for complete example.
-
 #### Example 3: Concurrent Requests
 
 ```python
 import concurrent.futures
-from kapsl_runtime import KapslClient
+from kapsl_sdk import KapslClient
 
 def run_inference(client, request_id):
     input_data = np.random.randn(1, 1, 28, 28).astype(np.float32)
@@ -492,8 +455,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
-
-See [native-hybrid-client](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/native-hybrid-client) for production examples.
 
 ---
 
@@ -956,28 +917,7 @@ LoaderError::InsufficientDiskSpace: insufficient disk space for model cache at â
 
 A one-command benchmark comparison lives at `engine/kapsl-benchmarks/run_kapsl_vs_vllm_qwen.sh`. It starts a tuned kapsl instance, verifies that vLLM is ready, then sweeps throughput and latency against both. See `engine/kapsl-benchmarks/README.md` for options.
 
-#### 4. Python Module Not Found
-
-**Error**:
-
-```python
-ModuleNotFoundError: No module named 'kapsl_runtime'
-```
-
-**Solution**:
-
-```bash
-cd crates/kapsl-pyo3
-source .venv/bin/activate
-maturin develop --release
-
-# Verify installation
-python -c "import kapsl_runtime; print(dir(kapsl_runtime))"
-```
-
----
-
-#### 5. High Latency / Slow Inference
+#### 4. High Latency / Slow Inference
 
 **Investigation**:
 
@@ -1112,23 +1052,11 @@ result = client.infer([1, 3, 224, 224], "float32", input_bytes)
 
 ## Additional Resources
 
-### Configuration Examples
+### Related Workspaces
 
-- [metadata.json](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/metadata.json) - Basic CPU config
-- [metadata_cuda.json](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/metadata_cuda.json) - CUDA config
-- [metadata_opt_all.json](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/metadata_opt_all.json) - Full optimizations
-
-### Test Scripts
-
-- [test_socket_simple.py](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/test_socket_simple.py) - Basic socket test
-- [test_hybrid_simple.py](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/test_hybrid_simple.py) - Hybrid transport test
-- [concurrent_simple.py](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/concurrent_simple.py) - Concurrent load test
-
-### Benchmark Scripts
-
-- [quick_bench.py](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/quick_bench.py) - Quick latency test
-- [benchmark_comparison.py](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/benchmark_comparison.py) - Transport mode comparison
-- [benchmark_production.sh](file:///Users/kiennguyen/Documents/Code/idx/framework/kapsl-runtime/scripts/benchmark_production.sh) - Full benchmark suite
+- `kapsl-sdk`: shared Rust crates and Python package docs/examples
+- `kapsl-benchmarks`: benchmark harnesses and inference test scripts
+- `kapsl-extensions`: runtime extension examples and connector implementations
 
 ---
 

@@ -1,6 +1,6 @@
 [package]
 name = "kapsl"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 
 [features]
@@ -52,3 +52,4 @@ rand = "0.8"
 sha2 = "0.10"
 rust-embed = "8.0"
 mime_guess = "2.0"
+dirs = "6.0.0"

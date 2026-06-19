@@ -40,6 +40,13 @@ class KapslApp {
       localStorage.getItem("kapsl_remote_placeholder_url") || "";
     this.extensions = [];
     this.marketplaceExtensions = [];
+
+    // Recent model paths — persisted in localStorage, shown as datalist options.
+    this.recentModelPaths = this.loadRecentPaths();
+    // Id of the extension whose structured config panel is open.
+    this.activeConfigExtensionId = null;
+    // File browser state
+    this.fileBrowserCallback = null;
     this.remoteArtifacts = { remote_url: "", repo: "", available_repos: [], models: [] };
     this.remoteArtifactsLoading = false;
     this.currentRemoteArtifactName = null;
@@ -58,9 +65,9 @@ class KapslApp {
   init() {
     this.bindLoginControls();
     this.bindNavigation();
+    this.bindSidebar();
     this.bindDashboardControls();
     this.bindExtensionsControls();
-    this.bindLegacyTokenControls();
     this.bindAccessControls();
     this.updateTokenStatus();
     this.updateSessionStatus();
@@ -79,7 +86,6 @@ class KapslApp {
       const now = Date.now();
       if (now - this.lastAccessRefreshAt >= this.accessRefreshIntervalMs) {
         await this.refreshAccessData({ silent: true });
-        await this.refreshLegacyTokens({ silent: true });
       }
       if (now - this.lastHardwareRefreshAt >= this.hardwareRefreshIntervalMs) {
         await this.refreshHardwareData({ silent: true });
@@ -362,7 +368,6 @@ class KapslApp {
       await this.fetchData();
       await Promise.all([
         this.refreshHardwareData({ silent: true }),
-        this.refreshLegacyTokens({ silent: true }),
         this.refreshAccessData({ silent: true }),
         this.refreshExtensionsData({ silent: true }),
         this.refreshRemoteArtifacts({ silent: true }),
@@ -499,10 +504,78 @@ class KapslApp {
         if (view) {
           this.setView(view);
         }
+        // Auto-close mobile sidebar if open
+        const sidebar = document.getElementById("sidebar");
+        const overlay = document.getElementById("sidebar-overlay");
+        if (sidebar && sidebar.classList.contains("mobile-open")) {
+          sidebar.classList.remove("mobile-open");
+          if (overlay) {
+            overlay.classList.remove("active");
+          }
+        }
       });
     }
 
     window.addEventListener("hashchange", () => this.applyInitialView());
+  }
+
+  bindSidebar() {
+    const sidebar = document.getElementById("sidebar");
+    const appShell = document.getElementById("app-shell");
+    const toggleBtn = document.getElementById("sidebar-toggle-btn");
+    const mobileToggleBtn = document.getElementById("topbar-mobile-toggle-btn");
+    const overlay = document.getElementById("sidebar-overlay");
+
+    if (!sidebar || !appShell) return;
+
+    // Load initial collapsed state
+    const isCollapsed = localStorage.getItem("kapsl_sidebar_collapsed") === "1";
+    if (isCollapsed) {
+      sidebar.classList.add("collapsed");
+      appShell.classList.add("sidebar-collapsed");
+      this.updateSidebarToggleIcon(true);
+    }
+
+    // Sidebar collapse/expand toggle
+    if (toggleBtn) {
+      toggleBtn.addEventListener("click", () => {
+        const collapsed = sidebar.classList.toggle("collapsed");
+        appShell.classList.toggle("sidebar-collapsed", collapsed);
+        localStorage.setItem("kapsl_sidebar_collapsed", collapsed ? "1" : "0");
+        this.updateSidebarToggleIcon(collapsed);
+      });
+    }
+
+    // Mobile sidebar toggle open
+    if (mobileToggleBtn) {
+      mobileToggleBtn.addEventListener("click", () => {
+        sidebar.classList.add("mobile-open");
+        if (overlay) {
+          overlay.classList.add("active");
+        }
+      });
+    }
+
+    // Mobile sidebar close via overlay
+    if (overlay) {
+      overlay.addEventListener("click", () => {
+        sidebar.classList.remove("mobile-open");
+        overlay.classList.remove("active");
+      });
+    }
+  }
+
+  updateSidebarToggleIcon(collapsed) {
+    const toggleBtn = document.getElementById("sidebar-toggle-btn");
+    if (!toggleBtn) return;
+    const svg = toggleBtn.querySelector("svg");
+    if (!svg) return;
+    
+    if (collapsed) {
+      svg.innerHTML = '<polyline points="9 18 15 12 9 6"></polyline>';
+    } else {
+      svg.innerHTML = '<polyline points="15 18 9 12 15 6"></polyline>';
+    }
   }
 
   applyInitialView() {
@@ -552,6 +625,44 @@ class KapslApp {
     }
   }
 
+  // ── Recent paths ────────────────────────────────────────────────────────
+
+  loadRecentPaths() {
+    try {
+      return JSON.parse(localStorage.getItem("kapsl_recent_model_paths") || "[]");
+    } catch (_) {
+      return [];
+    }
+  }
+
+  saveRecentPaths() {
+    try {
+      localStorage.setItem(
+        "kapsl_recent_model_paths",
+        JSON.stringify(this.recentModelPaths),
+      );
+    } catch (_) {}
+  }
+
+  addRecentPath(path) {
+    const trimmed = String(path || "").trim();
+    if (!trimmed) return;
+    this.recentModelPaths = [
+      trimmed,
+      ...this.recentModelPaths.filter((p) => p !== trimmed),
+    ].slice(0, 10);
+    this.saveRecentPaths();
+    this.renderRecentPathsDatalist();
+  }
+
+  renderRecentPathsDatalist() {
+    const dl = document.getElementById("model-path-suggestions");
+    if (!dl) return;
+    dl.innerHTML = this.recentModelPaths
+      .map((p) => `<option value="${this.escapeHtml(p)}">`)
+      .join("");
+  }
+
   bindDashboardControls() {
     const startForm = document.getElementById("start-model-form");
     startForm.addEventListener("submit", (event) =>
@@ -561,6 +672,16 @@ class KapslApp {
     document
       .getElementById("start-model-clear")
       .addEventListener("click", () => this.clearStartModelForm());
+
+    document
+      .getElementById("browse-model-path-btn")
+      ?.addEventListener("click", () =>
+        this.openFileBrowser((path) => {
+          document.getElementById("start-model-path").value = path;
+        }),
+      );
+
+    this.renderRecentPathsDatalist();
 
     const remoteUrlInput = document.getElementById("engine-remote-url");
     remoteUrlInput.value = this.remotePlaceholderUrl;
@@ -606,6 +727,17 @@ class KapslApp {
     this.updateDeveloperModeUI();
 
     document
+      .getElementById("browse-extension-path-btn")
+      ?.addEventListener("click", () =>
+        this.openFileBrowser(
+          (path) => {
+            document.getElementById("local-extension-path").value = path;
+          },
+          { title: "Browse Extension Directory", dirsOnly: true },
+        ),
+      );
+
+    document
       .getElementById("local-install-form")
       .addEventListener("submit", (event) =>
         this.handleLocalExtensionInstall(event),
@@ -620,17 +752,6 @@ class KapslApp {
       .addEventListener("click", (event) =>
         this.handleExtensionsListClick(event),
       );
-  }
-
-  bindLegacyTokenControls() {
-    document
-      .getElementById("legacy-tokens-form")
-      .addEventListener("submit", (event) =>
-        this.handleLegacyTokensSave(event),
-      );
-    document
-      .getElementById("legacy-refresh-btn")
-      .addEventListener("click", () => this.refreshLegacyTokens());
   }
 
   bindAccessControls() {
@@ -1329,52 +1450,93 @@ class KapslApp {
     }
 
     container.innerHTML = this.extensions
-      .map((ext) => {
-        const manifest = ext.manifest || {};
-        const name = manifest.name || manifest.id || "Extension";
-        const id = manifest.id || "";
-        const version = manifest.version || "";
-        const runtime = manifest.runtime || "";
-        const caps = Array.isArray(manifest.capabilities)
-          ? manifest.capabilities
-          : [];
-        const auth = Array.isArray(manifest.auth) ? manifest.auth : [];
-        const desc = manifest.description || "";
-        const configSchema = manifest.config_schema
-          ? JSON.stringify(manifest.config_schema, null, 2)
-          : "";
-
-        return `
-          <div class="ext-card" data-extension-id="${this.escapeHtml(id)}">
-            <div class="ext-head">
-              <div>
-                <div class="ext-name">${this.escapeHtml(name)}</div>
-                <div class="ext-id">${this.escapeHtml(id)}${version ? ` @ ${this.escapeHtml(version)}` : ""}</div>
-              </div>
-              <div class="chips">
-                ${runtime ? `<span class="chip">${this.escapeHtml(runtime)}</span>` : ""}
-                ${caps.map((c) => `<span class="chip">${this.escapeHtml(c)}</span>`).join("")}
-                ${auth.map((a) => `<span class="chip">${this.escapeHtml(a)}</span>`).join("")}
-              </div>
-            </div>
-            ${desc ? `<div class="ext-desc">${this.escapeHtml(desc)}</div>` : ""}
-            <div class="ext-actions">
-              <button class="btn btn-secondary" type="button" data-action="ext-launch">Launch</button>
-              <button class="btn btn-secondary" type="button" data-action="ext-sync">Sync</button>
-              <button class="btn btn-secondary" type="button" data-action="ext-load-config">Load Config</button>
-              <button class="btn btn-secondary" type="button" data-action="ext-save-config">Save Config</button>
-              <button class="btn btn-danger" type="button" data-action="ext-uninstall">Uninstall</button>
-            </div>
-            <textarea class="mono-textarea" data-field="ext-config" placeholder="Workspace config JSON (Load Config to populate)"></textarea>
-            ${
-              configSchema
-                ? `<div class="mono-block">${this.escapeHtml(configSchema)}</div>`
-                : ""
-            }
-          </div>
-        `;
-      })
+      .map((ext) => this.renderExtensionCard(ext))
       .join("");
+  }
+
+  renderExtensionCard(ext) {
+    const manifest = ext.manifest || {};
+    const name = manifest.name || manifest.id || "Extension";
+    const id = manifest.id || "";
+    const version = manifest.version || "";
+    const runtime = manifest.runtime || "";
+    const caps = Array.isArray(manifest.capabilities) ? manifest.capabilities : [];
+    const auth = Array.isArray(manifest.auth) ? manifest.auth : [];
+    const desc = manifest.description || "";
+    const enabled = ext.enabled !== false; // default true
+    const schema = manifest.config_schema || null;
+    const schemaProps = schema?.properties ? Object.entries(schema.properties) : null;
+
+    const enabledChip = enabled
+      ? `<span class="chip chip-success">enabled</span>`
+      : `<span class="chip chip-muted">disabled</span>`;
+
+    // Build the config section: structured form if schema provides properties,
+    // otherwise fall back to raw JSON textarea.
+    let configSection;
+    if (schemaProps && schemaProps.length > 0) {
+      const fields = schemaProps
+        .map(([key, spec]) => {
+          const label = spec.description || key;
+          const placeholder = spec.example ? String(spec.example) : "";
+          const isSecret = /key|secret|token|password/i.test(key);
+          const inputType = isSecret ? "password" : "text";
+          return `
+            <div class="ext-config-field">
+              <label class="ext-config-label">${this.escapeHtml(label)}</label>
+              <input
+                class="input ext-config-input"
+                type="${inputType}"
+                data-config-key="${this.escapeHtml(key)}"
+                placeholder="${this.escapeHtml(placeholder)}"
+                autocomplete="off"
+              />
+            </div>`;
+        })
+        .join("");
+      configSection = `
+        <div class="ext-config-form" data-field="ext-config-structured">
+          ${fields}
+        </div>
+        <div class="ext-actions ext-actions-config">
+          <button class="btn btn-secondary" type="button" data-action="ext-load-config">Load Config</button>
+          <button class="btn btn-primary" type="button" data-action="ext-save-config">Save Config</button>
+        </div>`;
+    } else {
+      configSection = `
+        <textarea class="mono-textarea" data-field="ext-config" placeholder="Workspace config JSON (Load Config to populate)"></textarea>
+        <div class="ext-actions ext-actions-config">
+          <button class="btn btn-secondary" type="button" data-action="ext-load-config">Load Config</button>
+          <button class="btn btn-secondary" type="button" data-action="ext-save-config">Save Config</button>
+        </div>`;
+    }
+
+    return `
+      <div class="ext-card" data-extension-id="${this.escapeHtml(id)}">
+        <div class="ext-head">
+          <div>
+            <div class="ext-name">${this.escapeHtml(name)}</div>
+            <div class="ext-id">${this.escapeHtml(id)}${version ? ` @ ${this.escapeHtml(version)}` : ""}</div>
+          </div>
+          <div class="chips">
+            ${runtime ? `<span class="chip">${this.escapeHtml(runtime)}</span>` : ""}
+            ${caps.map((c) => `<span class="chip">${this.escapeHtml(c)}</span>`).join("")}
+            ${auth.map((a) => `<span class="chip">${this.escapeHtml(a)}</span>`).join("")}
+            ${enabledChip}
+          </div>
+        </div>
+        ${desc ? `<div class="ext-desc">${this.escapeHtml(desc)}</div>` : ""}
+        <div class="ext-actions">
+          <button class="btn btn-secondary" type="button" data-action="ext-launch">Launch</button>
+          <button class="btn btn-secondary" type="button" data-action="ext-sync">Sync</button>
+          <button class="btn ${enabled ? "btn-secondary" : "btn-primary"}" type="button" data-action="ext-toggle-enabled">
+            ${enabled ? "Disable" : "Enable"}
+          </button>
+          <button class="btn btn-danger" type="button" data-action="ext-uninstall">Uninstall</button>
+        </div>
+        ${configSection}
+      </div>
+    `;
   }
 
   async handleMarketplaceSearch(event) {
@@ -1580,6 +1742,47 @@ class KapslApp {
     }
     if (action === "ext-save-config") {
       this.saveExtensionConfig(extensionId);
+      return;
+    }
+    if (action === "ext-toggle-enabled") {
+      const ext = this.extensions.find((e) => (e.manifest?.id || "") === extensionId);
+      const currentlyEnabled = ext ? ext.enabled !== false : true;
+      this.toggleExtensionEnabled(extensionId, !currentlyEnabled);
+    }
+  }
+
+  async toggleExtensionEnabled(extensionId, enable) {
+    const action = enable ? "enable" : "disable";
+    try {
+      const result = await this.requestJson(
+        `/api/extensions/${encodeURIComponent(extensionId)}/${action}`,
+        { method: "POST" },
+      );
+      if (!result.ok) {
+        throw new Error(
+          result.data?.error || `${action} failed (HTTP ${result.status})`,
+        );
+      }
+
+      // Optimistically update local state and re-render.
+      const ext = this.extensions.find((e) => (e.manifest?.id || "") === extensionId);
+      if (ext) {
+        ext.enabled = enable;
+        const card = document.querySelector(
+          `.ext-card[data-extension-id="${CSS.escape(extensionId)}"]`,
+        );
+        if (card) {
+          card.outerHTML = this.renderExtensionCard(ext);
+        }
+      }
+
+      this.setAccessFeedback(
+        "extensions-feedback",
+        `${extensionId} ${enable ? "enabled" : "disabled"}.`,
+        false,
+      );
+    } catch (error) {
+      this.setAccessFeedback("extensions-feedback", error.message, true);
     }
   }
 
@@ -1708,11 +1911,63 @@ class KapslApp {
     }
   }
 
-  findExtensionConfigTextarea(extensionId) {
-    const card = document.querySelector(
+  findExtensionCard(extensionId) {
+    return document.querySelector(
       `.ext-card[data-extension-id="${CSS.escape(extensionId)}"]`,
     );
-    return card?.querySelector("textarea[data-field='ext-config']") || null;
+  }
+
+  // Read config from whichever form is present in the card (structured or raw).
+  readExtensionConfigFromCard(extensionId) {
+    const card = this.findExtensionCard(extensionId);
+    if (!card) return null;
+
+    const structured = card.querySelector("[data-field='ext-config-structured']");
+    if (structured) {
+      const config = {};
+      for (const input of structured.querySelectorAll("input[data-config-key]")) {
+        const key = input.dataset.configKey;
+        if (key) config[key] = input.value;
+      }
+      return config;
+    }
+
+    const textarea = card.querySelector("textarea[data-field='ext-config']");
+    if (!textarea) return null;
+    const raw = textarea.value.trim();
+    if (!raw) return {};
+    try {
+      return JSON.parse(raw);
+    } catch (error) {
+      this.setAccessFeedback(
+        "extensions-feedback",
+        `Config JSON parse error: ${error.message}`,
+        true,
+      );
+      return null;
+    }
+  }
+
+  // Populate the card's config form from a config object.
+  populateExtensionConfigInCard(extensionId, config) {
+    const card = this.findExtensionCard(extensionId);
+    if (!card) return;
+
+    const structured = card.querySelector("[data-field='ext-config-structured']");
+    if (structured) {
+      for (const input of structured.querySelectorAll("input[data-config-key]")) {
+        const key = input.dataset.configKey;
+        if (key && config[key] !== undefined) {
+          input.value = config[key];
+        }
+      }
+      return;
+    }
+
+    const textarea = card.querySelector("textarea[data-field='ext-config']");
+    if (textarea) {
+      textarea.value = JSON.stringify(config, null, 2);
+    }
   }
 
   async loadExtensionConfig(extensionId) {
@@ -1736,10 +1991,7 @@ class KapslApp {
         );
       }
 
-      const textarea = this.findExtensionConfigTextarea(extensionId);
-      if (textarea) {
-        textarea.value = JSON.stringify(result.data?.config ?? {}, null, 2);
-      }
+      this.populateExtensionConfigInCard(extensionId, result.data?.config ?? {});
       this.setAccessFeedback(
         "extensions-feedback",
         `Loaded config for ${extensionId}.`,
@@ -1761,25 +2013,8 @@ class KapslApp {
       return;
     }
 
-    const textarea = this.findExtensionConfigTextarea(extensionId);
-    if (!textarea) {
-      return;
-    }
-
-    let config = {};
-    const raw = textarea.value.trim();
-    if (raw) {
-      try {
-        config = JSON.parse(raw);
-      } catch (error) {
-        this.setAccessFeedback(
-          "extensions-feedback",
-          `Config JSON parse error: ${error.message}`,
-          true,
-        );
-        return;
-      }
-    }
+    const config = this.readExtensionConfigFromCard(extensionId);
+    if (config === null) return; // parse error already reported
 
     try {
       const result = await this.requestJson(
@@ -1787,10 +2022,7 @@ class KapslApp {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            workspace_id: workspaceId,
-            config,
-          }),
+          body: JSON.stringify({ workspace_id: workspaceId, config }),
         },
       );
       if (!result.ok) {
@@ -1806,91 +2038,6 @@ class KapslApp {
       );
     } catch (error) {
       this.setAccessFeedback("extensions-feedback", error.message, true);
-    }
-  }
-
-  async refreshLegacyTokens({ silent = false } = {}) {
-    if (!this.isAuthenticated) {
-      return;
-    }
-    try {
-      const result = await this.requestJson("/api/auth/roles");
-      if (!result.ok) {
-        if (result.status === 401 || result.status === 403) {
-          document.getElementById("legacy-reader-token").value = "";
-          document.getElementById("legacy-writer-token").value = "";
-          document.getElementById("legacy-admin-token").value = "";
-          if (!silent) {
-            this.setAccessFeedback(
-              "legacy-feedback",
-              "Admin access required to view legacy role tokens.",
-              true,
-            );
-          }
-          return;
-        }
-        throw new Error(
-          result.data?.error ||
-            `Legacy role tokens API error (HTTP ${result.status})`,
-        );
-      }
-
-      const cfg = result.data || {};
-      document.getElementById("legacy-reader-token").value =
-        cfg.reader_token || "";
-      document.getElementById("legacy-writer-token").value =
-        cfg.writer_token || "";
-      document.getElementById("legacy-admin-token").value =
-        cfg.admin_token || "";
-
-      if (!silent) {
-        this.setAccessFeedback(
-          "legacy-feedback",
-          "Loaded legacy tokens.",
-          false,
-        );
-      }
-    } catch (error) {
-      console.error("Error refreshing legacy tokens:", error);
-      if (!silent) {
-        this.setAccessFeedback("legacy-feedback", error.message, true);
-      }
-    }
-  }
-
-  async handleLegacyTokensSave(event) {
-    event.preventDefault();
-
-    const payload = {
-      reader_token:
-        document.getElementById("legacy-reader-token").value.trim() || null,
-      writer_token:
-        document.getElementById("legacy-writer-token").value.trim() || null,
-      admin_token:
-        document.getElementById("legacy-admin-token").value.trim() || null,
-    };
-
-    try {
-      const result = await this.requestJson("/api/auth/roles", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!result.ok) {
-        throw new Error(
-          result.data?.error ||
-            `Save legacy tokens failed (HTTP ${result.status})`,
-        );
-      }
-
-      this.setAccessFeedback(
-        "legacy-feedback",
-        "Legacy tokens updated.",
-        false,
-      );
-      await this.refreshLegacyTokens({ silent: true });
-    } catch (error) {
-      this.setAccessFeedback("legacy-feedback", error.message, true);
     }
   }
 
@@ -2504,6 +2651,10 @@ class KapslApp {
     } else {
       startStopButton = `<button class="btn btn-disabled" type="button" disabled>${this.escapeHtml(statusText)}</button>`;
     }
+    const removeButton =
+      status === "inactive"
+        ? `<button class="btn btn-danger" type="button" onclick="event.stopPropagation(); app.removeModel(${model.id})">Remove</button>`
+        : `<button class="btn btn-disabled" type="button" disabled title="Stop the model before removing it">Remove</button>`;
 
     return `
       <div class="model-card" onclick="app.showModelDetail(${model.id})">
@@ -2559,10 +2710,118 @@ class KapslApp {
         <div class="model-actions">
           <button class="btn btn-secondary" type="button" onclick="event.stopPropagation(); app.showModelDetail(${model.id})">Details</button>
           ${startStopButton}
-          <button class="btn btn-danger" type="button" onclick="event.stopPropagation(); app.removeModel(${model.id})">Remove</button>
+          ${removeButton}
         </div>
       </div>
     `;
+  }
+
+  // ── File browser ────────────────────────────────────────────────────────
+
+  openFileBrowser(callback, { startPath = "", title = "Browse Files", dirsOnly = false } = {}) {
+    this.fileBrowserCallback = callback;
+    this.fileBrowserDirsOnly = dirsOnly;
+    const titleEl = document.getElementById("fb-modal-title");
+    if (titleEl) titleEl.textContent = title;
+
+    // Show/hide the "Select this folder" footer button
+    let selectBtn = document.getElementById("fb-select-dir-btn");
+    if (dirsOnly && !selectBtn) {
+      const footer = document.querySelector("#file-browser-modal .modal-footer");
+      selectBtn = document.createElement("button");
+      selectBtn.id = "fb-select-dir-btn";
+      selectBtn.className = "btn btn-primary";
+      selectBtn.type = "button";
+      selectBtn.textContent = "Select This Folder";
+      selectBtn.addEventListener("click", () => {
+        const currentPath = document.getElementById("fb-current-path").textContent;
+        if (this.fileBrowserCallback && currentPath && currentPath !== "—") {
+          this.fileBrowserCallback(currentPath);
+        }
+        this.closeFileBrowser();
+      });
+      footer.insertBefore(selectBtn, footer.firstChild);
+    }
+    if (selectBtn) selectBtn.style.display = dirsOnly ? "" : "none";
+
+    document.getElementById("file-browser-modal").classList.add("active");
+    this.browseTo(startPath);
+  }
+
+  closeFileBrowser() {
+    document.getElementById("file-browser-modal").classList.remove("active");
+    this.fileBrowserCallback = null;
+    this.fileBrowserDirsOnly = false;
+  }
+
+  async browseTo(path = "") {
+    const feedbackEl = document.getElementById("fb-feedback");
+    const listEl = document.getElementById("fb-list");
+    const pathEl = document.getElementById("fb-current-path");
+
+    listEl.innerHTML = '<div class="fb-loading">Loading…</div>';
+    feedbackEl.textContent = "";
+    feedbackEl.classList.remove("error");
+
+    const params = new URLSearchParams();
+    if (path) params.set("path", path);
+
+    try {
+      const result = await this.requestJson(
+        `/api/engine/browse${params.toString() ? `?${params}` : ""}`,
+      );
+      if (!result.ok) {
+        throw new Error(
+          result.data?.error || `Browse failed (HTTP ${result.status})`,
+        );
+      }
+
+      const { path: currentPath, entries } = result.data;
+      pathEl.textContent = currentPath || "/";
+      listEl.innerHTML = "";
+
+      const dirsOnly = Boolean(this.fileBrowserDirsOnly);
+
+      const visible = (entries || []).filter(
+        (e) => dirsOnly ? e.is_dir : true,
+      );
+
+      if (!visible.length) {
+        listEl.innerHTML = `<div class="fb-empty">${dirsOnly ? "No subdirectories found here." : "No model files found here."}</div>`;
+        return;
+      }
+
+      for (const entry of visible) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = `fb-entry ${entry.is_dir ? "fb-dir" : "fb-file"}`;
+
+        const icon = entry.is_dir ? "📁" : "📄";
+        const size =
+          !entry.is_dir && entry.size !== undefined && entry.size !== null
+            ? ` <span class="fb-size">${this.formatBytes(entry.size)}</span>`
+            : "";
+        row.innerHTML = `<span class="fb-icon">${icon}</span><span class="fb-name">${this.escapeHtml(entry.name)}</span>${size}`;
+
+        row.addEventListener("click", () => {
+          if (entry.is_dir) {
+            this.browseTo(entry.path);
+          } else {
+            // File selected — fill input and close.
+            if (this.fileBrowserCallback) {
+              this.fileBrowserCallback(entry.path);
+            }
+            this.closeFileBrowser();
+          }
+        });
+
+        listEl.appendChild(row);
+      }
+    } catch (error) {
+      feedbackEl.textContent = error.message;
+      feedbackEl.classList.add("error");
+      listEl.innerHTML = "";
+    }
   }
 
   clearStartModelForm() {
@@ -2880,9 +3139,11 @@ class KapslApp {
     const block = document.getElementById("engine-remote-result");
     if (!payload) {
       block.textContent = "";
+      block.style.display = "none";
       return;
     }
     block.textContent = JSON.stringify(payload, null, 2);
+    block.style.display = "";
   }
 
   async pullRemoteArtifact(reference) {
@@ -3126,6 +3387,9 @@ class KapslApp {
         false,
       );
 
+      // Persist path to recent list so next time it autocompletes.
+      this.addRecentPath(modelPath);
+
       // The model loads asynchronously; refresh quickly.
       this.fetchData();
     } catch (error) {
@@ -3202,6 +3466,15 @@ class KapslApp {
   }
 
   async removeModel(modelId) {
+    const model = (Array.isArray(this.modelsData) ? this.modelsData : []).find(
+      (candidate) => candidate.id === modelId,
+    );
+    if (!model || String(model.status || "").toLowerCase() !== "inactive") {
+      alert("Stop the model before removing it.");
+      this.fetchData();
+      return;
+    }
+
     if (
       !confirm(
         `Remove model ${modelId}? This unregisters the model and all replicas.`,
@@ -3339,6 +3612,10 @@ class KapslApp {
     } else {
       startStopButton = `<button class="btn btn-disabled" type="button" disabled>${this.escapeHtml(statusText)}</button>`;
     }
+    const removeButton =
+      status === "inactive"
+        ? `<button class="btn btn-danger" type="button" onclick="app.removeModel(${model.id})">Remove</button>`
+        : `<button class="btn btn-disabled" type="button" disabled title="Stop the model before removing it">Remove</button>`;
 
     modalBody.innerHTML = `
       <div class="modal-section">
@@ -3350,7 +3627,7 @@ class KapslApp {
           </div>
           <div class="modal-actions-buttons">
             ${startStopButton}
-            <button class="btn btn-danger" type="button" onclick="app.removeModel(${model.id})">Remove</button>
+            ${removeButton}
           </div>
         </div>
       </div>
