@@ -26,6 +26,7 @@ pub(crate) struct ModelRoutesConfig {
     pub(crate) throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
     pub(crate) generated_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
     pub(crate) total_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
+    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
     pub(crate) device_info: Arc<DeviceInfo>,
     pub(crate) batch_size: usize,
     pub(crate) scheduler_queue_size: usize,
@@ -53,6 +54,7 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         throughput_samples: throughput_samples_clone,
         generated_token_samples: generated_token_samples_clone,
         total_token_samples: total_token_samples_clone,
+        latency_samples: latency_samples_clone,
         device_info: device_info_for_api,
         batch_size,
         scheduler_queue_size,
@@ -79,6 +81,7 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         throughput_samples: throughput_samples_clone.clone(),
         generated_token_samples: generated_token_samples_clone.clone(),
         total_token_samples: total_token_samples_clone.clone(),
+        latency_samples: latency_samples_clone.clone(),
     });
 
     let lifecycle_routes = build_model_lifecycle_routes(ModelLifecycleRoutesConfig {
@@ -105,6 +108,7 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
     let infer_route = build_model_infer_route(ModelInferRouteConfig {
         replica_pools: replica_pools_clone.clone(),
         model_registry: model_registry_clone.clone(),
+        latency_samples: latency_samples_clone.clone(),
         log_sensitive_ids: log_sensitive_ids_for_api,
         rag_state: rag_state_for_api.clone(),
         inter_model_relay_state: inter_model_relay_state.clone(),

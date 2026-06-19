@@ -3,6 +3,7 @@ use super::*;
 pub(crate) struct ModelInferRouteConfig {
     pub(crate) replica_pools: ReplicaPools,
     pub(crate) model_registry: Arc<ModelRegistry>,
+    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
     pub(crate) log_sensitive_ids: bool,
     pub(crate) rag_state: RagRuntimeState,
     pub(crate) inter_model_relay_state: Arc<InterModelRelayState>,
@@ -16,6 +17,7 @@ pub(crate) fn build_model_infer_route(
     let ModelInferRouteConfig {
         replica_pools: replica_pools_clone,
         model_registry: model_registry_clone,
+        latency_samples: latency_samples_clone,
         log_sensitive_ids: log_sensitive_ids_for_api,
         rag_state: rag_state_for_api,
         inter_model_relay_state,
@@ -26,6 +28,7 @@ pub(crate) fn build_model_infer_route(
     // POST /api/models/:id/infer - Synchronous inference
     let replica_pools_for_infer = replica_pools_clone.clone();
     let model_registry_for_infer = model_registry_clone.clone();
+    let latency_samples_for_infer = latency_samples_clone.clone();
     let request_adapters_for_infer = Arc::new(default_request_adapter_registry());
     let log_sensitive_ids_for_infer = log_sensitive_ids_for_api;
     let rag_state_for_infer = rag_state_for_api.clone();
@@ -38,6 +41,7 @@ pub(crate) fn build_model_infer_route(
     .and_then(move |model_id: u32, body: warp::hyper::body::Bytes| {
         let pools = replica_pools_for_infer.clone();
         let model_registry = model_registry_for_infer.clone();
+        let latency_samples = latency_samples_for_infer.clone();
         let request_adapters = request_adapters_for_infer.clone();
         let log_sensitive_ids = log_sensitive_ids_for_infer;
         let rag_state = rag_state_for_infer.clone();
@@ -329,6 +333,9 @@ pub(crate) fn build_model_infer_route(
                         .and_then(|metadata| metadata.timeout_ms)
                         .filter(|ms| *ms > 0);
 
+                    // End-to-end inference latency: scheduler queue wait + compute.
+                    // This is the signal the enterprise autoscaler scales SLOs on.
+                    let inference_started = std::time::Instant::now();
                     let infer_fut = pool.infer(&request, scheduler_priority, force_cpu);
                     let infer_result = if let Some(timeout_ms) = timeout_ms {
                         match tokio::time::timeout(
@@ -351,6 +358,12 @@ pub(crate) fn build_model_infer_route(
 
                     match infer_result {
                         Ok(output) => {
+                            let latency_ms = inference_started.elapsed().as_secs_f64() * 1000.0;
+                            latency_samples
+                                .write()
+                                .entry(model_id)
+                                .or_default()
+                                .record(latency_ms);
                             maybe_publish_inter_model_relays(
                                 &inter_model_relay,
                                 model_id,
