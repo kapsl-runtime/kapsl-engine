@@ -7,19 +7,19 @@ resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
-kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "feature/kien/gguf-prefill-autotune" }
+llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
+kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
