@@ -15,6 +15,19 @@ pub(crate) struct ApiLocalOnly;
 
 impl warp::reject::Reject for ApiLocalOnly {}
 
+pub(crate) fn format_authorization_header(token: Option<&str>) -> Option<String> {
+    let raw = token?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some((scheme, _)) = raw.split_once(' ') {
+        if scheme.eq_ignore_ascii_case("bearer") {
+            return Some(raw.to_string());
+        }
+    }
+    Some(format!("Bearer {}", raw))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ApiRole {

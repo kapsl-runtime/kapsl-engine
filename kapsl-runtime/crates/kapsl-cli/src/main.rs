@@ -54,7 +54,6 @@ use parking_lot::{Mutex, RwLock};
 use prometheus::Registry;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -99,7 +98,6 @@ async fn main() -> Result<(), DynError> {
         Some(KapslCommand::Push(args)) => return execute_push_command(args),
         Some(KapslCommand::Pull(args)) => return execute_pull_command(args),
         Some(KapslCommand::Login(args)) => return execute_login_command(args),
-        Some(KapslCommand::Control(args)) => return execute_control_command(args),
         Some(KapslCommand::AddModel(args)) => return execute_add_model_command(args),
         Some(KapslCommand::Run(_)) | None => {}
     }

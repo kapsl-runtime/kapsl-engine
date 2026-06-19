@@ -38,17 +38,6 @@ pub(crate) fn cli_after_help() -> String {
     let _ = writeln!(
         out,
         "  {}",
-        comment("# Multi-GPU load-balancing across two runtime instances")
-    );
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl control --runtime gpu0=http://127.0.0.1:9095 --runtime gpu1=http://127.0.0.1:9096")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
         comment("# Package a model directory or single file")
     );
     let _ = writeln!(out, "  {}", cmd("kapsl build ./models/gpt-llm"));
@@ -139,8 +128,6 @@ pub(crate) struct Cli {
 pub(crate) enum KapslCommand {
     /// Start the inference server and load one or more model packages
     Run(Args),
-    /// Continuously balance load and scale replicas across multiple runtimes
-    Control(ControlCommandArgs),
     /// Package a model file or directory into a portable .aimod archive
     Build(BuildCommandArgs),
     /// Upload a .aimod package to a remote registry
@@ -708,108 +695,6 @@ impl OAuthProvider {
             Self::Google => "google",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum RuntimeGroupProfile {
-    Latency,
-    Balanced,
-    Throughput,
-}
-
-#[derive(clap::Args, Debug)]
-#[command(next_help_heading = "Control Options")]
-pub(crate) struct ControlCommandArgs {
-    /// Register a runtime endpoint. Repeat for each instance.
-    /// Format: NAME=http://HOST:PORT (e.g. gpu0=http://127.0.0.1:9095)
-    #[arg(long = "runtime", value_name = "NAME=URL", required = true)]
-    pub(crate) runtimes: Vec<String>,
-
-    /// Override the performance profile for a specific runtime.
-    /// Format: NAME=latency|balanced|throughput
-    #[arg(long = "runtime-profile", value_name = "NAME=PROFILE")]
-    pub(crate) runtime_profiles: Vec<String>,
-
-    /// Set a bearer token for a specific runtime.
-    /// Format: NAME=TOKEN (takes precedence over --auth-token for that runtime)
-    #[arg(long = "runtime-token", value_name = "NAME=TOKEN")]
-    pub(crate) runtime_tokens: Vec<String>,
-
-    /// Shared bearer token applied to all runtimes that have no --runtime-token
-    #[arg(long = "auth-token", value_name = "TOKEN")]
-    pub(crate) auth_token: Option<String>,
-
-    /// Cap the VRAM budget used for scoring a specific runtime.
-    /// Format: NAME=BYTES (e.g. gpu0=17179869184 for 16 GiB)
-    #[arg(long = "memory-budget-bytes", value_name = "NAME=BYTES")]
-    pub(crate) memory_budget_bytes: Vec<String>,
-
-    /// How often (seconds) to poll runtime metrics and recompute weights
-    #[arg(long, default_value_t = 5)]
-    pub(crate) interval_seconds: u64,
-
-    /// Per-call HTTP timeout (ms) for polling and weight-update requests
-    #[arg(long, default_value_t = 1500)]
-    pub(crate) timeout_ms: u64,
-
-    /// Queue depth considered "normal" when computing the pressure score.
-    /// Queues deeper than this start to penalise the runtime's weight.
-    #[arg(long, default_value_t = 10)]
-    pub(crate) queue_target: usize,
-
-    /// Pressure score above which the runtime loses weight each cycle (0.0–1.0)
-    #[arg(long, default_value_t = 0.85)]
-    pub(crate) high_pressure_score: f64,
-
-    /// Pressure score below which the runtime gains weight each cycle (0.0–1.0)
-    #[arg(long, default_value_t = 0.45)]
-    pub(crate) low_pressure_score: f64,
-
-    /// GPU utilisation fraction (0.0–1.0) above which the runtime is considered hot
-    #[arg(long, default_value_t = 0.92)]
-    pub(crate) hot_gpu_utilization: f64,
-
-    /// Memory utilisation fraction (0.0–1.0) above which the runtime is considered hot.
-    /// Only active when --memory-budget-bytes is provided for the runtime.
-    #[arg(long, default_value_t = 0.90)]
-    pub(crate) hot_memory_utilization: f64,
-
-    /// Seconds a runtime must remain overloaded before an extra weight penalty is applied
-    #[arg(long, default_value_t = 30)]
-    pub(crate) overload_window_seconds: u64,
-
-    /// Seconds a runtime must remain hot before an extra weight penalty is applied
-    #[arg(long, default_value_t = 20)]
-    pub(crate) hot_window_seconds: u64,
-
-    /// Seconds a runtime stays at weight 0 after a health-check or API failure
-    #[arg(long, default_value_t = 30)]
-    pub(crate) unhealthy_hold_seconds: u64,
-
-    /// Maximum fractional weight change applied per control cycle (0.0–1.0)
-    #[arg(long, default_value_t = 0.10)]
-    pub(crate) weight_step: f64,
-
-    /// Minimum weight assigned to eligible runtimes — prevents them from reaching zero under normal load
-    #[arg(long, default_value_t = 0.05)]
-    pub(crate) weight_floor: f64,
-
-    /// Additional weight fraction removed when the overload or hot window is exceeded
-    #[arg(long, default_value_t = 0.20)]
-    pub(crate) overload_shift_fraction: f64,
-
-    /// Compute and log scores/weights without posting any updates to the runtimes
-    #[arg(long, default_value_t = false)]
-    pub(crate) dry_run: bool,
-
-    /// JSON file where each cycle's computed weights and telemetry snapshot are written
-    #[arg(
-        long,
-        value_name = "PATH",
-        default_value = "runtime-control-weights.json"
-    )]
-    pub(crate) weights_file: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

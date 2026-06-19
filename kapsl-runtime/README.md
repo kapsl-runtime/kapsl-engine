@@ -55,29 +55,6 @@ You can also specify a custom socket path for the IPC server:
 cargo run -p kapsl -- --model /path/to/model.aimod --socket /tmp/kapsl.sock
 ```
 
-### 2. Run Cross-Port Control Loop
-
-Use the built-in control command to orchestrate model groups running on different runtime ports.
-It polls health/model/system stats, computes pressure-based routing weights, and applies per-model
-scaling policy templates by runtime profile.
-
-```bash
-# Example: control loop across two runtimes
-cargo run -p kapsl -- control \
-  --runtime gpu-latency=http://127.0.0.1:9095 \
-  --runtime gpu-throughput=http://127.0.0.1:9096 \
-  --runtime-profile gpu-latency=latency \
-  --runtime-profile gpu-throughput=throughput \
-  --auth-token "$KAPSL_API_TOKEN_ADMIN" \
-  --weights-file ./runtime-control-weights.json
-```
-
-Notes:
-
-- `--auth-token` or `--runtime-token NAME=TOKEN` should have writer/admin access when scaling updates are enabled.
-- Use `--dry-run` to compute weights without posting scaling updates.
-- The output weights snapshot file is intended for external gateways/load balancers.
-
 ## Package Structure
 
 A `.aimod` package is a `tar.gz` archive containing:

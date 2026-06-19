@@ -1,6 +1,5 @@
 use super::*;
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::{Deserialize, Serialize};
 
 pub(crate) mod cli;
 pub(crate) mod constants;
