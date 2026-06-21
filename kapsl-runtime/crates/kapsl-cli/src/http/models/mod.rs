@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 use warp::Filter;
 
 mod infer;
+mod infer_stream;
 mod lifecycle;
 mod reader;
 mod scaling;
 mod swap;
 
 use infer::{build_model_infer_route, ModelInferRouteConfig};
+use infer_stream::{build_model_infer_stream_route, ModelInferStreamRouteConfig};
 use lifecycle::{build_model_lifecycle_routes, ModelLifecycleRoutesConfig};
 use reader::{build_model_reader_routes, ModelReaderRoutesConfig};
 use scaling::{build_model_scaling_routes, ModelScalingRoutesConfig};
@@ -116,11 +118,16 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         runtime_pressure_config: runtime_pressure_config.clone(),
     });
 
+    let infer_stream_route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
+        replica_pools: replica_pools_clone.clone(),
+    });
+
     let scaling_routes = build_model_scaling_routes(ModelScalingRoutesConfig {
         auto_scaler: auto_scaler_api.clone(),
     });
 
     let reader = reader_routes
+        .or(infer_stream_route)
         .or(infer_route)
         .or(scaling_routes.reader)
         .map(reply_into_response)
