@@ -56,6 +56,7 @@ pub(crate) fn build_model_reader_routes(
             onnx_session_pool_wait_seconds_total: f64,
             avg_latency_ms: f64,
             p99_latency_ms: f64,
+            time_to_first_token_ms: f64,
             healthy: bool,
         }
 
@@ -151,6 +152,12 @@ pub(crate) fn build_model_reader_routes(
                 .get(&model.id)
                 .map(|window| (window.average_ms(), window.p99_ms()))
                 .unwrap_or((0.0, 0.0));
+            // Most recent time-to-first-token, recorded by the monitoring
+            // middleware into a per-model gauge.
+            let time_to_first_token_ms = metrics_for_list
+                .model_ttft_ms
+                .with_label_values(&[&model_id_str])
+                .get();
 
             statuses.push(ModelStatus {
                 info: model,
@@ -175,6 +182,7 @@ pub(crate) fn build_model_reader_routes(
                 onnx_session_pool_wait_seconds_total,
                 avg_latency_ms,
                 p99_latency_ms,
+                time_to_first_token_ms,
                 healthy,
             });
         }
