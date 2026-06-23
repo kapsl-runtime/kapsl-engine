@@ -13,11 +13,11 @@ pub(crate) struct ModelInferStreamRouteConfig {
 /// `POST /api/models/:id/infer/stream` — Server-Sent Events token streaming.
 ///
 /// This is the HTTP/SSE sibling of the binary `OP_INFER_STREAM` transport: it
-/// drives the same `ReplicaPool::infer_stream` scheduler path but emits each
-/// generated `BinaryTensorPacket` as an SSE `data:` event (identical JSON shape
-/// to the synchronous `/infer` response), terminated by `data: [DONE]`. The
-/// kapsl-enterprise gateway proxies this endpoint to back OpenAI streaming chat
-/// completions.
+/// drives the same `ReplicaPool::infer_stream` scheduler path and emits each
+/// generated token as an SSE `data:` event of the form
+/// `{"text": "<token>", "shape": [...], "dtype": "..."}`, terminated by
+/// `data: [DONE]`. `text` is the decoded token; the kapsl-enterprise gateway
+/// reads it to back OpenAI streaming chat completions.
 pub(crate) fn build_model_infer_stream_route(
     config: ModelInferStreamRouteConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
@@ -266,8 +266,21 @@ pub(crate) fn build_model_infer_stream_route(
                     .map(move |item| {
                         let _hold = &guard;
                         let payload = match item {
-                            Ok(packet) => serde_json::to_string(&packet)
-                                .unwrap_or_else(|_| "{}".to_string()),
+                            // Emit the decoded token text under `text` rather than the
+                            // raw packet: `BinaryTensorPacket`'s JSON form carries bytes
+                            // as `data_base64`, which the gateway's text extractor can't
+                            // read. `text` is its first-choice key and is what any plain
+                            // SSE client wants anyway. `shape`/`dtype` are kept for
+                            // clients that need the tensor metadata.
+                            Ok(packet) => {
+                                let text = String::from_utf8_lossy(&packet.data);
+                                serde_json::json!({
+                                    "text": text,
+                                    "shape": packet.shape,
+                                    "dtype": packet.dtype,
+                                })
+                                .to_string()
+                            }
                             Err(error) => {
                                 // Surface as an SSE comment (`:`), which streaming
                                 // clients and the gateway both skip, then let the
