@@ -364,9 +364,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.64"
+version = "1.2.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dad887fd958be91b5098c0248def011f4523ab786cd411be668777e55063501f"
+checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -848,6 +848,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
  "uuid",
+]
+
+[[package]]
+name = "defmt"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6e524506490a1953d237cb87b1cfc1e46f88c18f10a22dfe0f507dc6bfc7f7f"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt-macros",
+]
+
+[[package]]
+name = "defmt-macros"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0a27770e9c8f719a79d8b638281f4d828f77d8fd61e0bd94451b9b85e576a0b"
+dependencies = [
+ "defmt-parser",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "defmt-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
+dependencies = [
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1926,10 +1958,11 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.28"
+version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4603d3033e49e2b0e31229fcab20a5d40089c607d975cd9c80551dc69eed9102"
+checksum = "34f877a98676d2fb664698d74cc6a51ce6c484ce8c770f05d0108ec9090aeb46"
 dependencies = [
+ "defmt",
  "jiff-static",
  "log",
  "portable-atomic",
@@ -1939,9 +1972,9 @@ dependencies = [
 
 [[package]]
 name = "jiff-static"
-version = "0.2.28"
+version = "0.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "782d32378dddf207193ac91cefb848ad41abb58195c95168e1291227a0832b47"
+checksum = "0666b5ab5ecaca213fc2a85b8c0083d9004e84ee2d5f9a7e0017aaf50986f25f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2014,8 +2047,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-backends"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77a561fdffbf2d6df8e5f63ed05df273a33006672ea443458806dc274f8e7c34"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2041,8 +2075,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-core"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cdc83f061200b5e9f3d3aa2c5407ef8790c775979a0a443cf07d8a5178867de"
 dependencies = [
  "flate2",
  "fs2",
@@ -2061,8 +2096,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-engine-api"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4051734e2d4eb8fd2ca2ce2cb927349aff001f32b6581561872cb4afbe3dfd14"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2073,8 +2109,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-hal"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ac7c2592dc55c0992b48b6bf9c2c9ddc019985547ae4dce91529efc040de435"
 dependencies = [
  "cudarc",
  "half",
@@ -2087,8 +2124,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-ipc"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10e1af27303785c1b2a3a24ba8ecd50cb64975dbfc319e1d8a3341117dac10e6"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2105,8 +2143,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-kernels"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cc76b190dd0df3322aa03be08bc69a550ba9292cb46f58245d4bfc381e6675c"
 dependencies = [
  "cudarc",
  "half",
@@ -2118,8 +2157,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llm"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e75e89b68f2d11b625886f4930fe5b2491171e851469d07f0992dc191f7fcb"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2148,8 +2188,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-loader"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a95ec949e8976adf35fc761c95e90959a5444612127b2984793079fef81b0ed1"
 dependencies = [
  "half",
  "kapsl-hal",
@@ -2163,8 +2204,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-monitor"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "118ba79f17155133bd88e9430873ce7c7264cc24da2033f118f266a45cbaca66"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2177,8 +2219,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-quantization"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a440adf7b939ab63e130250724329740cd78b22b77e3446be57ebdb83c16e4ed"
 dependencies = [
  "anyhow",
  "half",
@@ -2192,8 +2235,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24ebad33d6cb98d2de0c6155615478db67a0887f031062ffbbda0073b14740c0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2212,8 +2256,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag-sdk"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe1c6cc996ca32268f3db0308d6c7f31a9f1a54a3ccb2ea9f6b69007d7822753"
 dependencies = [
  "async-trait",
  "futures",
@@ -2224,8 +2269,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-scheduler"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5df1f69f16eda8767b3416b88e18ccea794790ae2bdd2eced43332aaf02cadc"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2243,8 +2289,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-shm"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "677e380e7b43c885a5ccd5a94450e821676f0f2436764acd99ee83be0924e967"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2264,8 +2311,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-transport"
-version = "0.1.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "607644a7841524e82341f4c099266dd8277b911c04eaa147b476502ebb9b9c73"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2357,7 +2405,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.146"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#c3b05b970220bac2b51e7ce09e1a3f068ce800d0"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2370,7 +2418,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.146"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#0a55728b4249c0d951a2de22bde21f65fc0b726c"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?branch=develop#c3b05b970220bac2b51e7ce09e1a3f068ce800d0"
 dependencies = [
  "bindgen",
  "cc",
@@ -2391,9 +2439,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lru"
@@ -2468,9 +2516,9 @@ dependencies = [
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
@@ -2989,6 +3037,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-error-attr2"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96de42df36bb9bba5542fe9f1a054b8cc87e172759a1868aa05c1f3acc89dfc5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
+name = "proc-macro-error2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
+dependencies = [
+ "proc-macro-error-attr2",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3069,9 +3139,9 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quote"
-version = "1.0.45"
+version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
+checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
@@ -3380,9 +3450,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "log",
  "once_cell",
