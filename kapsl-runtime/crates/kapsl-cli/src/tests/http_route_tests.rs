@@ -151,3 +151,47 @@ async fn test_engine_browse_route_lists_model_relevant_files() {
     assert!(names.contains(&"model.gguf"));
     assert!(!names.contains(&"notes.txt"));
 }
+
+#[tokio::test]
+async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
+    let rag_root = unique_temp_path("infer-stream-rag");
+    let docs_root = rag_root.join("docs");
+    fs::create_dir_all(&docs_root).expect("create rag docs dir");
+    let rag_state = RagRuntimeState {
+        vector_store: Arc::new(
+            SqliteVectorStore::open(&rag_root.join("vectors.sqlite3")).expect("open vector store"),
+        ),
+        doc_store: FsDocStore::new(&docs_root),
+    };
+
+    let route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
+        replica_pools: Arc::new(RwLock::new(HashMap::new())),
+        model_registry: Arc::new(ModelRegistry::new()),
+        log_sensitive_ids: false,
+        rag_state,
+        runtime_pressure_state: Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+        runtime_pressure_config: Arc::new(RuntimePressureConfig {
+            memory_conserve_ratio: 0.7,
+            memory_emergency_ratio: 0.9,
+            gpu_util_conserve_ratio: 0.8,
+            gpu_util_emergency_ratio: 0.95,
+            gpu_mem_conserve_ratio: 0.8,
+            gpu_mem_emergency_ratio: 0.95,
+            conserve_max_new_tokens: Some(256),
+            emergency_max_new_tokens: Some(128),
+        }),
+    });
+
+    let response = warp::test::request()
+        .method("POST")
+        .path("/api/models/0/infer/stream")
+        .header("content-type", "application/json")
+        .body(r#"{"input":{"shape":[1],"dtype":"string","data":[104,105]}}"#)
+        .reply(&route)
+        .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value =
+        serde_json::from_slice(response.body()).expect("infer-stream json");
+    assert_eq!(body["error"], "Model 0 not found");
+}
