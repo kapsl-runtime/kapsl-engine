@@ -10,8 +10,5 @@ resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-# kapsl-* crates are consumed from crates.io (published 0.1.1). Only the llama.cpp
-# fork stays patched in from git: the published llama-cpp-2 on crates.io is upstream
-# and lacks the kapsl fork APIs (set_sampler, sampled_token_ith, ...).
 llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
 llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", branch = "develop" }
