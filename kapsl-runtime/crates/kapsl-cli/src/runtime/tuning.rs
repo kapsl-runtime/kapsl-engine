@@ -14,6 +14,69 @@ pub(crate) fn optional_env_var_alias(primary: &str, legacy: &str) -> Option<Stri
     optional_env_var(primary).or_else(|| optional_env_var(legacy))
 }
 
+/// Resolve the per-device VRAM cap (bytes) for cooperative software-vGPU
+/// self-limiting, reading the environment so a HAMi-capped pod self-configures
+/// with zero model metadata. Returns `None` when nothing is configured (every
+/// clamp built on it is then a no-op, so default behavior is unchanged).
+///
+/// Priority order: HAMi's per-device `CUDA_DEVICE_MEMORY_LIMIT_<id>`, then its
+/// process-wide `CUDA_DEVICE_MEMORY_LIMIT`, then the kapsl alias
+/// `KAPSL_GPU_MEMORY_LIMIT_MB`. The model-metadata path
+/// (`HardwareRequirements::gpu_memory_limit_mb`) is intentionally routed through
+/// this same helper later; today it is env-only, which covers the HAMi case.
+pub(crate) fn device_vram_cap_bytes(device_id: usize) -> Option<usize> {
+    resolve_vram_cap_bytes(
+        optional_env_var(&format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_{device_id}")),
+        optional_env_var(CUDA_DEVICE_MEMORY_LIMIT_ENV),
+        optional_env_var(KAPSL_GPU_MEMORY_LIMIT_MB_ENV),
+    )
+}
+
+/// Pure resolution of the cap-source priority, split out from environment access
+/// so it is unit-testable without touching process-global state. A malformed
+/// higher-priority value falls through to the next source rather than failing.
+fn resolve_vram_cap_bytes(
+    per_device: Option<String>,
+    process_wide: Option<String>,
+    kapsl_mb: Option<String>,
+) -> Option<usize> {
+    per_device
+        .as_deref()
+        .and_then(parse_cuda_memory_limit)
+        .or_else(|| process_wide.as_deref().and_then(parse_cuda_memory_limit))
+        .or_else(|| {
+            kapsl_mb
+                .as_deref()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|mb| *mb > 0)
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+        })
+}
+
+/// Parse a HAMi `CUDA_DEVICE_MEMORY_LIMIT` value into bytes. Accepts a plain
+/// byte count or a value with a binary unit suffix (`k`/`m`/`g`, optionally
+/// followed by `b`, case-insensitive — e.g. `2560m`, `4g`, `8gb`). Returns
+/// `None` for empty, zero, or otherwise malformed input.
+fn parse_cuda_memory_limit(value: &str) -> Option<usize> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if lowered.is_empty() {
+        return None;
+    }
+    let digits = lowered.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let multiplier: usize = match &lowered[digits.len()..] {
+        "" | "b" => 1,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    digits
+        .parse::<usize>()
+        .ok()
+        .filter(|amount| *amount > 0)
+        .map(|amount| amount.saturating_mul(multiplier))
+}
+
 pub(crate) fn resolve_model_load_parallelism(model_count: usize) -> usize {
     if model_count <= 1 {
         return 1;
@@ -289,4 +352,82 @@ pub(crate) fn apply_performance_profile(
     }
 
     tuning
+}
+
+#[cfg(test)]
+mod vram_cap_tests {
+    use super::{device_vram_cap_bytes, parse_cuda_memory_limit, resolve_vram_cap_bytes};
+    use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    #[test]
+    fn parses_plain_bytes_and_binary_suffixes() {
+        assert_eq!(parse_cuda_memory_limit("1048576"), Some(MIB));
+        assert_eq!(parse_cuda_memory_limit("8g"), Some(8 * GIB));
+        assert_eq!(parse_cuda_memory_limit("2560m"), Some(2560 * MIB));
+        assert_eq!(parse_cuda_memory_limit("4gb"), Some(4 * GIB));
+        assert_eq!(parse_cuda_memory_limit("512k"), Some(512 * 1024));
+        // Case-insensitive and whitespace-tolerant.
+        assert_eq!(parse_cuda_memory_limit("  8G  "), Some(8 * GIB));
+    }
+
+    #[test]
+    fn rejects_empty_zero_and_malformed_values() {
+        assert_eq!(parse_cuda_memory_limit(""), None);
+        assert_eq!(parse_cuda_memory_limit("   "), None);
+        assert_eq!(parse_cuda_memory_limit("0"), None);
+        assert_eq!(parse_cuda_memory_limit("0g"), None);
+        assert_eq!(parse_cuda_memory_limit("abc"), None);
+        assert_eq!(parse_cuda_memory_limit("8t"), None);
+        assert_eq!(parse_cuda_memory_limit("8 g"), None);
+    }
+
+    #[test]
+    fn per_device_cap_wins_over_process_wide_and_kapsl_alias() {
+        let cap = resolve_vram_cap_bytes(
+            Some("4g".to_string()),
+            Some("8g".to_string()),
+            Some("16384".to_string()),
+        );
+        assert_eq!(cap, Some(4 * GIB));
+    }
+
+    #[test]
+    fn malformed_higher_priority_source_falls_through() {
+        // A malformed per-device value defers to the process-wide cap.
+        let cap = resolve_vram_cap_bytes(
+            Some("garbage".to_string()),
+            Some("8g".to_string()),
+            None,
+        );
+        assert_eq!(cap, Some(8 * GIB));
+    }
+
+    #[test]
+    fn kapsl_alias_is_plain_mib_converted_to_bytes() {
+        let cap = resolve_vram_cap_bytes(None, None, Some("2048".to_string()));
+        assert_eq!(cap, Some(2048 * MIB));
+        // Non-positive / malformed MiB is ignored.
+        assert_eq!(resolve_vram_cap_bytes(None, None, Some("0".to_string())), None);
+        assert_eq!(resolve_vram_cap_bytes(None, None, Some("x".to_string())), None);
+    }
+
+    #[test]
+    fn no_sources_configured_yields_no_cap() {
+        assert_eq!(resolve_vram_cap_bytes(None, None, None), None);
+    }
+
+    #[test]
+    fn device_vram_cap_bytes_reads_per_device_env() {
+        // Uses a unique device index so the process-global env never collides
+        // with other tests running in parallel; the suffixed var is checked
+        // first, so this is independent of any bare-name env state.
+        let device_id = 9090;
+        let var = format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_{device_id}");
+        std::env::set_var(&var, "8g");
+        assert_eq!(device_vram_cap_bytes(device_id), Some(8 * GIB));
+        std::env::remove_var(&var);
+    }
 }
