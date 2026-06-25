@@ -26,10 +26,12 @@ jobs:
             dockerfile: docker/Dockerfile.cpu
             runner: ubuntu-latest
             suffix: cpu
+            platforms: linux/amd64,linux/arm64
           - variant: cuda
             dockerfile: docker/Dockerfile.cuda
             runner: ubuntu-latest
             suffix: cuda
+            platforms: linux/amd64
 
     steps:
       - name: Checkout
@@ -39,13 +41,20 @@ jobs:
         id: version
         run: |
           cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          # runtime_version is the exact published binary version (no dev- prefix)
+          # that the in-image install script downloads from downloads.kapsl.net.
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            echo "runtime_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
             echo "version=dev-${cargo_version}" >> "$GITHUB_OUTPUT"
+            echo "runtime_version=${cargo_version}" >> "$GITHUB_OUTPUT"
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -63,6 +72,9 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          platforms: ${{ matrix.platforms }}
+          build-args: |
+            KAPSL_VERSION=${{ steps.version.outputs.runtime_version }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.suffix }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.suffix }}
@@ -76,5 +88,8 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: true
+          platforms: ${{ matrix.platforms }}
+          build-args: |
+            KAPSL_VERSION=${{ steps.version.outputs.runtime_version }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           cache-from: type=gha

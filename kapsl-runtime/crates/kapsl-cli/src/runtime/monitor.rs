@@ -444,12 +444,27 @@ pub(crate) fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    aggregate_gpu_samples(&stdout, device_vram_cap_bytes)
+}
+
+/// Parse `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total` CSV
+/// (one line per GPU, in device-index order) into average utilization plus
+/// summed used/total VRAM bytes. `cap_for_device` supplies the cooperative
+/// software-vGPU cap per device index: each GPU's reported *total* is clamped to
+/// its cap so back-pressure and the enterprise admission guard reason about the
+/// virtual slice, not the physical card. The cap never inflates the reported
+/// total (it is a `min`), and a missing cap leaves the device unchanged. Split
+/// out from the command invocation so the clamp is unit-testable without a GPU.
+fn aggregate_gpu_samples(
+    stdout: &str,
+    cap_for_device: impl Fn(usize) -> Option<usize>,
+) -> Option<(f64, usize, usize)> {
     let mut total_util = 0.0;
-    let mut total_mem_mb = 0.0;
-    let mut total_mem_capacity_mb = 0.0;
+    let mut total_mem_bytes: usize = 0;
+    let mut total_mem_capacity_bytes: usize = 0;
     let mut count = 0.0;
 
-    for line in stdout.lines() {
+    for (device_index, line) in stdout.lines().enumerate() {
         let mut parts = line.split(',');
         let util_str = parts.next().map(|s| s.trim());
         let mem_str = parts.next().map(|s| s.trim());
@@ -466,9 +481,13 @@ pub(crate) fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
             mem_str.parse::<f64>(),
             mem_total_str.parse::<f64>(),
         ) {
+            let mem_total_bytes = (mem_total_mb * 1024.0 * 1024.0) as usize;
+            let capped_total = cap_for_device(device_index)
+                .map_or(mem_total_bytes, |cap| mem_total_bytes.min(cap));
             total_util += util;
-            total_mem_mb += mem_mb;
-            total_mem_capacity_mb += mem_total_mb;
+            total_mem_bytes =
+                total_mem_bytes.saturating_add((mem_mb * 1024.0 * 1024.0) as usize);
+            total_mem_capacity_bytes = total_mem_capacity_bytes.saturating_add(capped_total);
             count += 1.0;
         }
     }
@@ -478,9 +497,7 @@ pub(crate) fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
     }
 
     let avg_util = (total_util / count) / 100.0;
-    let mem_bytes = (total_mem_mb * 1024.0 * 1024.0) as usize;
-    let mem_capacity_bytes = (total_mem_capacity_mb * 1024.0 * 1024.0) as usize;
-    Some((avg_util, mem_bytes, mem_capacity_bytes))
+    Some((avg_util, total_mem_bytes, total_mem_capacity_bytes))
 }
 
 #[cfg(test)]
@@ -530,5 +547,94 @@ mod latency_window_tests {
             window.record(9.0);
         }
         assert_eq!(window.average_ms(), 9.0);
+    }
+}
+
+#[cfg(test)]
+mod vram_clamp_tests {
+    use super::{
+        aggregate_gpu_samples, evaluate_runtime_pressure_state, RuntimePressureConfig,
+        RuntimePressureState, RuntimeSamples,
+    };
+
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    // One GPU reporting 4 GiB used of a 24 GiB physical card.
+    const ONE_GPU_CSV: &str = "30, 4096, 24576";
+
+    #[test]
+    fn no_cap_reports_physical_total() {
+        let (util, used, total) = aggregate_gpu_samples(ONE_GPU_CSV, |_| None).unwrap();
+        assert!((util - 0.30).abs() < 1e-9);
+        assert_eq!(used, (4096.0 * MIB) as usize);
+        // Physical 24 GiB is reported unchanged when no cap is configured.
+        assert_eq!(total, (24576.0 * MIB) as usize);
+    }
+
+    #[test]
+    fn cap_clamps_reported_total_to_the_slice() {
+        // An 8 GiB software-vGPU slice on the same 24 GiB card.
+        let (_, _, total) = aggregate_gpu_samples(ONE_GPU_CSV, |_| Some(8 * GIB)).unwrap();
+        assert_eq!(total, 8 * GIB);
+    }
+
+    #[test]
+    fn cap_larger_than_card_never_inflates_total() {
+        // A cap above the physical card is ignored (clamp is a min).
+        let (_, _, total) = aggregate_gpu_samples(ONE_GPU_CSV, |_| Some(64 * GIB)).unwrap();
+        assert_eq!(total, (24576.0 * MIB) as usize);
+    }
+
+    #[test]
+    fn per_device_caps_are_applied_by_index() {
+        // Two GPUs; only device 1 is capped to 8 GiB.
+        let csv = "10, 2048, 24576\n20, 2048, 24576";
+        let (_, _, total) = aggregate_gpu_samples(csv, |id| (id == 1).then_some(8 * GIB)).unwrap();
+        // device 0 physical (24 GiB) + device 1 capped (8 GiB).
+        assert_eq!(total, (24576.0 * MIB) as usize + 8 * GIB);
+    }
+
+    #[test]
+    fn pressure_ratio_is_computed_against_the_cap() {
+        // 7 GiB used on a 24 GiB card is calm (29%) physically, but against an
+        // 8 GiB slice it is 88% — the clamped total drives back-pressure into
+        // emergency, which is the whole point of the cooperative clamp.
+        let csv = "10, 7168, 24576";
+        let config = RuntimePressureConfig {
+            memory_conserve_ratio: 0.7,
+            memory_emergency_ratio: 0.9,
+            gpu_util_conserve_ratio: 0.8,
+            gpu_util_emergency_ratio: 0.95,
+            gpu_mem_conserve_ratio: 0.8,
+            gpu_mem_emergency_ratio: 0.85,
+            conserve_max_new_tokens: Some(256),
+            emergency_max_new_tokens: Some(128),
+        };
+
+        let (_, used, physical_total) = aggregate_gpu_samples(csv, |_| None).unwrap();
+        let physical = RuntimeSamples {
+            process_memory_bytes: 0,
+            total_system_memory_bytes: Some(64 * GIB),
+            gpu_utilization: 0.1,
+            gpu_memory_bytes: Some(used),
+            gpu_memory_total_bytes: Some(physical_total),
+            collected_at_ms: 0,
+        };
+        assert_eq!(
+            evaluate_runtime_pressure_state(&physical, &config),
+            RuntimePressureState::Normal
+        );
+
+        let (_, used, capped_total) = aggregate_gpu_samples(csv, |_| Some(8 * GIB)).unwrap();
+        let capped = RuntimeSamples {
+            gpu_memory_bytes: Some(used),
+            gpu_memory_total_bytes: Some(capped_total),
+            ..physical
+        };
+        assert_eq!(
+            evaluate_runtime_pressure_state(&capped, &config),
+            RuntimePressureState::Emergency
+        );
     }
 }

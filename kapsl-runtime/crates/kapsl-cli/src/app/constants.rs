@@ -71,3 +71,11 @@ pub(crate) const PRESSURE_CONSERVE_MAX_TOKENS_ENV: &str =
     "KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS";
 pub(crate) const PRESSURE_EMERGENCY_MAX_TOKENS_ENV: &str =
     "KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS";
+/// HAMi's own per-process VRAM cap (software vGPU). A HAMi-managed pod sets this
+/// — or the per-device `CUDA_DEVICE_MEMORY_LIMIT_<id>` variant — so the engine
+/// self-limits its KV cache and reported total to the slice with zero extra
+/// config. Value is a byte count or a binary-suffixed size (e.g. `8g`, `2560m`).
+pub(crate) const CUDA_DEVICE_MEMORY_LIMIT_ENV: &str = "CUDA_DEVICE_MEMORY_LIMIT";
+/// kapsl alias for the per-device VRAM cap, in plain MiB, for non-HAMi
+/// deployments that still want cooperative self-limiting.
+pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_MB";

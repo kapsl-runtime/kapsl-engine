@@ -66,6 +66,12 @@ impl SharedKvStateInner {
                 continue;
             }
             let total = (device.memory_mb as usize).saturating_mul(1024 * 1024);
+            // Cooperative software-vGPU clamp: when a per-device VRAM cap is
+            // configured (HAMi env or the kapsl alias), size the KV budget to
+            // the slice rather than the whole card. A no-op when no cap is set
+            // or the cap exceeds the card, so default behavior is unchanged and
+            // a MIG slice (which already reports its true size) is never inflated.
+            let total = device_vram_cap_bytes(device.id).map_or(total, |cap| total.min(cap));
             device_bytes.insert(device.id, total);
             let kv_blocks = (total / 2) / KV_BYTES_PER_BLOCK;
             estimated_kv_tokens = estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
@@ -386,5 +392,73 @@ impl SharedKvStateInner {
                 sched.unregister_device(dev_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod vram_clamp_tests {
+    use super::SharedKvStateInner;
+    use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+    use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
+
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    fn cuda_device(id: usize, memory_mb: u64) -> Device {
+        Device {
+            id,
+            name: format!("test-gpu-{id}"),
+            backend: DeviceBackend::Cuda,
+            memory_mb,
+            compute_units: 1,
+            pci_bus_id: None,
+            partition_id: None,
+            driver_version: None,
+            cuda_version: None,
+            compute_capability: None,
+            utilization_gpu_pct: None,
+            temperature_c: None,
+            supports_fp16: true,
+            supports_int8: true,
+        }
+    }
+
+    fn device_info(devices: Vec<Device>) -> DeviceInfo {
+        DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 0,
+            os_type: "test".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: true,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices,
+        }
+    }
+
+    #[test]
+    fn device_bytes_unchanged_without_a_cap() {
+        // device id 4242 has no per-device cap env, and the bare
+        // CUDA_DEVICE_MEMORY_LIMIT / KAPSL_GPU_MEMORY_LIMIT_MB globals are never
+        // set by any test, so the cooperative clamp is a no-op here.
+        let info = device_info(vec![cuda_device(4242, 24576)]);
+        let state = SharedKvStateInner::new(&info);
+        assert_eq!(state.device_bytes.get(&4242).copied(), Some(24 * GIB));
+    }
+
+    #[test]
+    fn device_bytes_clamped_to_the_configured_cap() {
+        // Unique device index so the per-device env never collides with other
+        // tests running in parallel.
+        let device_id = 4243;
+        let var = format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_{device_id}");
+        std::env::set_var(&var, "8g");
+        let info = device_info(vec![cuda_device(device_id, 24576)]);
+        let state = SharedKvStateInner::new(&info);
+        std::env::remove_var(&var);
+        // The KV budget sizes to the 8 GiB slice, not the 24 GiB physical card,
+        // so the whole downstream KV chain (pools, per-engine caps, rebalancing)
+        // self-limits.
+        assert_eq!(state.device_bytes.get(&device_id).copied(), Some(8 * GIB));
     }
 }

@@ -7,8 +7,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Install the pre-built kapsl binary, pinned to KAPSL_VERSION so this layer
+# cache-busts per release and never reuses a stale, binary-less layer.
+# Verify in the same RUN so a failed/empty install fails the build.
+ARG KAPSL_VERSION
 RUN curl -fsSL https://downloads.kapsl.net/install.sh \
-    | KAPSL_INSTALL_DIR=/usr/local/bin sh
+    | KAPSL_VERSION="${KAPSL_VERSION}" KAPSL_INSTALL_DIR=/usr/local/bin sh \
+    && kapsl --version
 
 RUN mkdir -p /models /data
 ENV KAPSL_MODEL_DIR=/models
