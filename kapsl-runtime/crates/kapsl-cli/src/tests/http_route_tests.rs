@@ -41,6 +41,7 @@ async fn test_system_routes_report_health_and_pressure_state() {
         gpu_utilization: 7.5,
         gpu_memory_bytes: Some(10),
         gpu_memory_total_bytes: Some(20),
+        foreign_gpu_memory_bytes: None,
         collected_at_ms: 789,
     }));
     let pressure_state = Arc::new(AtomicU8::new(RuntimePressureState::Conserve as u8));

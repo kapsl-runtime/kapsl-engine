@@ -188,6 +188,22 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                 );
 
                 if let Some(target_replicas) = should_scale_up {
+                    // Queue depth driven by a co-tenant squeezing the GPU is not
+                    // load growth: a new replica would land on the same starved
+                    // device and thrash. Skip and re-evaluate next tick — the
+                    // ceiling's grow-slow recovery provides the hysteresis.
+                    if shared_kv_for_scaler.foreign_pressure_active() {
+                        log::warn!(
+                            "Auto-scaler: model {} queue depth {} exceeds threshold, but a \
+                             co-tenant GPU process is limiting the KV ceiling; suppressing \
+                             scale-up from {} to {} replicas",
+                            base_model_id,
+                            total_queue_depth,
+                            current_replicas,
+                            target_replicas
+                        );
+                        continue;
+                    }
                     let onnx_tuning = onnx_tuning_profile_for_scaler.resolve(base_model_id);
                     let capped_target = cap_scale_up_target_by_memory_headroom(
                         current_replicas,
