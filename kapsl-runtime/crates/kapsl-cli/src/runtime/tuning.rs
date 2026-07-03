@@ -77,6 +77,37 @@ fn parse_cuda_memory_limit(value: &str) -> Option<usize> {
         .map(|amount| amount.saturating_mul(multiplier))
 }
 
+/// Instantaneous per-device KV ceiling in bytes under co-tenancy: the declared
+/// budget (the physical card, or the HAMi / kapsl software-vGPU cap when that is
+/// smaller), minus VRAM held by foreign processes, minus a safety reserve so a
+/// trainer's next allocation spike lands in slack instead of racing our
+/// allocator into an OOM. The reserve is 10% of the declared budget with a
+/// 512 MiB floor. Saturating throughout: a foreign footprint larger than the
+/// budget floors the ceiling at zero, and callers clamp back up to their
+/// per-engine block minimum. With no cap configured and no foreign process this
+/// returns `physical - reserve`, so single-tenant behavior only loses the small
+/// reserve band (and the whole path is gated off by default anyway).
+pub(crate) fn effective_ceiling_bytes(device_id: usize, physical: usize, foreign: usize) -> usize {
+    const RESERVE_FLOOR_BYTES: usize = 512 * 1024 * 1024;
+    let declared = device_vram_cap_bytes(device_id).map_or(physical, |cap| physical.min(cap));
+    let reserve = (declared / 10).max(RESERVE_FLOOR_BYTES);
+    declared.saturating_sub(foreign).saturating_sub(reserve)
+}
+
+/// Blend a freshly measured ceiling `target` toward the `previous` live value,
+/// asymmetrically. Shrink immediately (drop straight to the lower value) so a
+/// trainer's allocation is honored before it can OOM us; grow slowly (a quarter
+/// of the gap per tick) so a transient dip in the trainer's footprint between
+/// samples does not make the KV batch width flap. An unseeded `previous` of 0
+/// adopts the target directly. Downward "flap" is harmless — it just keeps us
+/// conservatively low — so only the grow side is damped.
+pub(crate) fn smooth_ceiling_bytes(previous: usize, target: usize) -> usize {
+    if previous == 0 || target <= previous {
+        return target;
+    }
+    previous + (target - previous) / 4
+}
+
 pub(crate) fn resolve_model_load_parallelism(model_count: usize) -> usize {
     if model_count <= 1 {
         return 1;
@@ -429,5 +460,60 @@ mod vram_cap_tests {
         std::env::set_var(&var, "8g");
         assert_eq!(device_vram_cap_bytes(device_id), Some(8 * GIB));
         std::env::remove_var(&var);
+    }
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::{effective_ceiling_bytes, smooth_ceiling_bytes};
+    use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+
+    const GIB: usize = 1024 * 1024 * 1024;
+    const RESERVE_FLOOR: usize = 512 * 1024 * 1024;
+
+    #[test]
+    fn subtracts_foreign_and_percentage_reserve_when_uncapped() {
+        // Unique device id with no cap env → declared == physical (40 GiB).
+        // Reserve is 10% (4 GiB, above the 512 MiB floor); a 6 GiB trainer
+        // leaves 40 - 6 - 4 = 30 GiB.
+        let ceiling = effective_ceiling_bytes(9101, 40 * GIB, 6 * GIB);
+        assert_eq!(ceiling, 30 * GIB);
+    }
+
+    #[test]
+    fn reserve_never_below_the_512mib_floor() {
+        // Tiny 2 GiB budget: 10% would be ~205 MiB, so the 512 MiB floor wins.
+        let ceiling = effective_ceiling_bytes(9102, 2 * GIB, 0);
+        assert_eq!(ceiling, 2 * GIB - RESERVE_FLOOR);
+    }
+
+    #[test]
+    fn ceiling_is_clamped_to_the_configured_cap_not_the_card() {
+        let device_id = 9103;
+        let var = format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_{device_id}");
+        std::env::set_var(&var, "8g");
+        // Physical 40 GiB but capped to an 8 GiB slice; reserve is 10% of 8 GiB.
+        let ceiling = effective_ceiling_bytes(device_id, 40 * GIB, 0);
+        std::env::remove_var(&var);
+        assert_eq!(ceiling, 8 * GIB - (8 * GIB / 10));
+    }
+
+    #[test]
+    fn foreign_larger_than_budget_floors_at_zero() {
+        // A trainer holding more than the whole budget must not underflow.
+        let ceiling = effective_ceiling_bytes(9104, 8 * GIB, 16 * GIB);
+        assert_eq!(ceiling, 0);
+    }
+
+    #[test]
+    fn smoothing_shrinks_immediately_but_grows_a_quarter_at_a_time() {
+        // Unseeded adopts the target.
+        assert_eq!(smooth_ceiling_bytes(0, 30 * GIB), 30 * GIB);
+        // Shrink: drop straight to the lower value (safety).
+        assert_eq!(smooth_ceiling_bytes(30 * GIB, 10 * GIB), 10 * GIB);
+        // Grow: move a quarter of the 20 GiB gap → 10 + 5 = 15 GiB.
+        assert_eq!(smooth_ceiling_bytes(10 * GIB, 30 * GIB), 15 * GIB);
+        // Equal target is a no-op.
+        assert_eq!(smooth_ceiling_bytes(15 * GIB, 15 * GIB), 15 * GIB);
     }
 }

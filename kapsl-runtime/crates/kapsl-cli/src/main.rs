@@ -315,6 +315,11 @@ async fn main() -> Result<(), DynError> {
         let mut nvidia_smi_retry_after: Option<Instant> = None;
         system.refresh_memory();
         let total_system_memory_bytes = Some(system.total_memory() as usize * 1024);
+        // Opt-in co-tenancy guard: probe for foreign GPU processes each tick,
+        // shrink the live KV ceiling by their footprint, and exclude their bytes
+        // from the pressure ratio. Default off — single-tenant behavior unchanged.
+        let cotenancy_guard = optional_env_var(COTENANCY_GUARD_ENV)
+            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
 
         loop {
             interval.tick().await;
@@ -351,6 +356,22 @@ async fn main() -> Result<(), DynError> {
                     (0.0, None, None)
                 };
 
+            // Co-tenancy: measure foreign VRAM, push it into the live KV
+            // ceiling (concurrency lever), and report it to the pressure split
+            // (so it never drives output truncation). Shares the nvidia-smi
+            // backoff above: while the sampler is backing off, skip the probe
+            // too rather than shelling out to a broken nvidia-smi twice.
+            let foreign_gpu_memory_bytes = if cotenancy_guard
+                && has_cuda_for_sampler
+                && !nvidia_smi_retry_after.is_some_and(|retry_after| now < retry_after)
+            {
+                let foreign = sample_foreign_vram();
+                shared_kv_for_rebalance.refresh_ceilings(&foreign);
+                Some(foreign.values().sum::<usize>())
+            } else {
+                None
+            };
+
             let collected_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -362,6 +383,7 @@ async fn main() -> Result<(), DynError> {
                 gpu_utilization,
                 gpu_memory_bytes,
                 gpu_memory_total_bytes,
+                foreign_gpu_memory_bytes,
                 collected_at_ms,
             };
             *runtime_samples_for_sampler.write() = snapshot.clone();
@@ -373,14 +395,15 @@ async fn main() -> Result<(), DynError> {
             let previous = RuntimePressureState::from_u8(previous_raw);
             if previous != next_state {
                 log::warn!(
-                    "Runtime pressure state changed: {} -> {} (rss={}B total_mem={}B gpu_util={:.2} gpu_mem={:?}/{:?})",
+                    "Runtime pressure state changed: {} -> {} (rss={}B total_mem={}B gpu_util={:.2} gpu_mem={:?}/{:?} foreign_gpu_mem={:?})",
                     previous.as_str(),
                     next_state.as_str(),
                     snapshot.process_memory_bytes,
                     snapshot.total_system_memory_bytes.unwrap_or(0),
                     snapshot.gpu_utilization,
                     snapshot.gpu_memory_bytes,
-                    snapshot.gpu_memory_total_bytes
+                    snapshot.gpu_memory_total_bytes,
+                    snapshot.foreign_gpu_memory_bytes
                 );
             }
         }

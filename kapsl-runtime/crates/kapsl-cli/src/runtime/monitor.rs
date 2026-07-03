@@ -7,6 +7,14 @@ pub(crate) struct RuntimeSamples {
     pub(crate) gpu_utilization: f64,
     pub(crate) gpu_memory_bytes: Option<usize>,
     pub(crate) gpu_memory_total_bytes: Option<usize>,
+    /// VRAM held by co-tenant processes (summed across devices), from
+    /// `sample_foreign_vram`. Subtracted from `gpu_memory_bytes` in the pressure
+    /// calculation so a trainer sharing the GPU throttles kapsl's *concurrency*
+    /// (via the KV ceiling) rather than tripping Conserve/Emergency and
+    /// truncating every request's max_new_tokens. `None` when the co-tenancy
+    /// probe is disabled or unavailable, which leaves pressure behavior exactly
+    /// as before.
+    pub(crate) foreign_gpu_memory_bytes: Option<usize>,
     pub(crate) collected_at_ms: u64,
 }
 
@@ -112,9 +120,14 @@ pub(crate) fn evaluate_runtime_pressure_state(
         .map(|total| (samples.process_memory_bytes as f64 / total as f64).clamp(0.0, 1.0));
 
     let gpu_util_ratio = samples.gpu_utilization.clamp(0.0, 1.0);
+    // Pressure reasons about *our own* footprint: a co-tenant's bytes are
+    // subtracted so a trainer sharing the GPU is answered by the KV concurrency
+    // ceiling (smaller batches), not by truncating every request's output. With
+    // no probe data this is the historical device-wide ratio.
     let gpu_mem_ratio = match (samples.gpu_memory_bytes, samples.gpu_memory_total_bytes) {
         (Some(used), Some(total)) if total > 0 => {
-            Some((used as f64 / total as f64).clamp(0.0, 1.0))
+            let own = used.saturating_sub(samples.foreign_gpu_memory_bytes.unwrap_or(0));
+            Some((own as f64 / total as f64).clamp(0.0, 1.0))
         }
         _ => None,
     };
@@ -500,6 +513,104 @@ fn aggregate_gpu_samples(
     Some((avg_util, total_mem_bytes, total_mem_capacity_bytes))
 }
 
+/// Bytes of device VRAM held by compute processes that are NOT this engine,
+/// keyed by physical device index. Powers the co-tenancy ceiling: when another
+/// process (e.g. a training job) shares the GPU, its footprint is subtracted
+/// from the KV pool's effective ceiling so kapsl throttles concurrency instead
+/// of OOMing the neighbor.
+///
+/// Shells out to `nvidia-smi` twice: once to map each GPU's UUID to its device
+/// index (the compute-apps query reports UUID, not index), then to enumerate
+/// running compute apps. Our own PID is excluded. Returns an empty map on any
+/// failure so callers treat "no signal" as "no co-tenant" and default,
+/// single-tenant behavior is unchanged.
+///
+/// Caveat: under CUDA MPS every client's memory is attributed to the MPS server
+/// PID, so per-process filtering collapses. In that mode callers should fall
+/// back to device-wide `memory.used` minus kapsl's own known block bytes.
+pub(crate) fn sample_foreign_vram() -> HashMap<usize, usize> {
+    let uuid_to_index = query_gpu_uuid_index();
+    if uuid_to_index.is_empty() {
+        return HashMap::new();
+    }
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let stdout = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => return HashMap::new(),
+    };
+    aggregate_foreign_vram(&stdout, &uuid_to_index, std::process::id())
+}
+
+/// Map each GPU's UUID to its device index. The compute-apps query reports a
+/// UUID rather than the index the rest of the runtime keys on, so this bridges
+/// the two. Empty on any failure.
+fn query_gpu_uuid_index() -> HashMap<String, usize> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=uuid,index", "--format=csv,noheader,nounits"])
+        .output();
+    let stdout = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => return HashMap::new(),
+    };
+    parse_uuid_index(&stdout)
+}
+
+/// Parse `nvidia-smi --query-gpu=uuid,index` CSV into a UUID→index map. Split
+/// from the command invocation so it is unit-testable without a GPU.
+fn parse_uuid_index(stdout: &str) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split(',');
+        let (Some(uuid), Some(index)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if let Ok(index) = index.trim().parse::<usize>() {
+            map.insert(uuid.trim().to_string(), index);
+        }
+    }
+    map
+}
+
+/// Sum per-process VRAM by device index, excluding `own_pid`. Split out from the
+/// `nvidia-smi` invocation so it is unit-testable without a GPU. Rows whose UUID
+/// is not in `uuid_to_index` are skipped rather than misattributed to device 0.
+fn aggregate_foreign_vram(
+    stdout: &str,
+    uuid_to_index: &HashMap<String, usize>,
+    own_pid: u32,
+) -> HashMap<usize, usize> {
+    let mut foreign: HashMap<usize, usize> = HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split(',');
+        let (Some(pid_str), Some(used_str), Some(uuid_str)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(used_mb)) = (
+            pid_str.trim().parse::<u32>(),
+            used_str.trim().parse::<f64>(),
+        ) else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let Some(&device) = uuid_to_index.get(uuid_str.trim()) else {
+            continue;
+        };
+        let used_bytes = (used_mb * 1024.0 * 1024.0) as usize;
+        let entry = foreign.entry(device).or_insert(0);
+        *entry = entry.saturating_add(used_bytes);
+    }
+    foreign
+}
+
 #[cfg(test)]
 mod latency_window_tests {
     use super::LatencyWindow;
@@ -619,6 +730,7 @@ mod vram_clamp_tests {
             gpu_utilization: 0.1,
             gpu_memory_bytes: Some(used),
             gpu_memory_total_bytes: Some(physical_total),
+            foreign_gpu_memory_bytes: None,
             collected_at_ms: 0,
         };
         assert_eq!(
@@ -636,5 +748,96 @@ mod vram_clamp_tests {
             evaluate_runtime_pressure_state(&capped, &config),
             RuntimePressureState::Emergency
         );
+    }
+
+    #[test]
+    fn foreign_bytes_are_excluded_from_the_pressure_ratio() {
+        let config = RuntimePressureConfig {
+            memory_conserve_ratio: 0.7,
+            memory_emergency_ratio: 0.9,
+            gpu_util_conserve_ratio: 0.8,
+            gpu_util_emergency_ratio: 0.95,
+            gpu_mem_conserve_ratio: 0.8,
+            gpu_mem_emergency_ratio: 0.85,
+            conserve_max_new_tokens: Some(256),
+            emergency_max_new_tokens: Some(128),
+        };
+        // 22 of 24 GiB used device-wide (92% → Emergency), but 16 GiB of that
+        // belongs to a trainer. Our own 6 GiB is 25% — calm. The trainer must be
+        // answered by the KV concurrency ceiling, not output truncation.
+        let shared = RuntimeSamples {
+            gpu_memory_bytes: Some(22 * GIB),
+            gpu_memory_total_bytes: Some(24 * GIB),
+            foreign_gpu_memory_bytes: Some(16 * GIB),
+            ..RuntimeSamples::default()
+        };
+        assert_eq!(
+            evaluate_runtime_pressure_state(&shared, &config),
+            RuntimePressureState::Normal
+        );
+        // Without the probe (None) the historical device-wide behavior holds.
+        let unprobed = RuntimeSamples {
+            foreign_gpu_memory_bytes: None,
+            ..shared
+        };
+        assert_eq!(
+            evaluate_runtime_pressure_state(&unprobed, &config),
+            RuntimePressureState::Emergency
+        );
+    }
+}
+
+#[cfg(test)]
+mod foreign_vram_tests {
+    use super::{aggregate_foreign_vram, parse_uuid_index};
+    use std::collections::HashMap;
+
+    const MIB: usize = 1024 * 1024;
+
+    fn uuid_index(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs.iter().map(|(u, i)| ((*u).to_string(), *i)).collect()
+    }
+
+    #[test]
+    fn parses_uuid_index_csv() {
+        let csv = "GPU-aaa, 0\nGPU-bbb, 1";
+        let map = parse_uuid_index(csv);
+        assert_eq!(map.get("GPU-aaa").copied(), Some(0));
+        assert_eq!(map.get("GPU-bbb").copied(), Some(1));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn sums_foreign_and_excludes_own_pid() {
+        // Our PID is 4242. A trainer (pid 99) holds 6 GiB; our own 2 GiB row is
+        // ignored so the ceiling only backs off for the neighbor's footprint.
+        let csv = "99, 6144, GPU-aaa\n4242, 2048, GPU-aaa";
+        let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
+        assert_eq!(foreign.get(&0).copied(), Some(6144 * MIB));
+    }
+
+    #[test]
+    fn attributes_by_device_and_sums_multiple_foreign_procs() {
+        let csv = "10, 1024, GPU-aaa\n11, 2048, GPU-aaa\n12, 4096, GPU-bbb";
+        let foreign =
+            aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0), ("GPU-bbb", 1)]), 4242);
+        assert_eq!(foreign.get(&0).copied(), Some(3072 * MIB));
+        assert_eq!(foreign.get(&1).copied(), Some(4096 * MIB));
+    }
+
+    #[test]
+    fn skips_rows_with_unknown_uuid_rather_than_misattributing() {
+        // A GPU not in the index map (e.g. a MIG child or a device kapsl doesn't
+        // manage) must not be folded into device 0.
+        let csv = "10, 4096, GPU-unknown";
+        let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
+        assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn empty_when_only_our_pid_present() {
+        let csv = "4242, 8192, GPU-aaa";
+        let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
+        assert!(foreign.is_empty());
     }
 }
