@@ -535,7 +535,7 @@ pub(crate) fn sample_foreign_vram() -> HashMap<usize, usize> {
     }
     let output = Command::new("nvidia-smi")
         .args([
-            "--query-compute-apps=pid,used_memory,gpu_uuid",
+            "--query-compute-apps=pid,process_name,used_memory,gpu_uuid",
             "--format=csv,noheader,nounits",
         ])
         .output();
@@ -543,7 +543,35 @@ pub(crate) fn sample_foreign_vram() -> HashMap<usize, usize> {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         _ => return HashMap::new(),
     };
+    // Under CUDA MPS every client's memory is attributed to the MPS server
+    // process, so the per-PID split below cannot separate our own bytes from a
+    // neighbor's — the guard is effectively blind. Warn once so an operator does
+    // not mistake the over-subtracted ceiling (or an un-throttled neighbor) for
+    // a bug; MPS isolation needs MPS resource limits or MIG instead.
+    if compute_apps_show_mps(&stdout) {
+        static MPS_WARNED: std::sync::Once = std::sync::Once::new();
+        MPS_WARNED.call_once(|| {
+            log::warn!(
+                "co-tenancy guard: CUDA MPS server detected in nvidia-smi compute-apps; \
+                 per-process VRAM attribution collapses to the MPS server PID, so the \
+                 foreign-VRAM ceiling is unreliable under MPS (use MPS resource limits or \
+                 MIG for isolation in this mode)"
+            );
+        });
+    }
     aggregate_foreign_vram(&stdout, &uuid_to_index, std::process::id())
+}
+
+/// Whether any `nvidia-smi --query-compute-apps` row is the CUDA MPS server,
+/// which signals that per-process VRAM attribution has collapsed. Split from the
+/// command invocation so it is unit-testable without a GPU. Expects the
+/// `pid,process_name,used_memory,gpu_uuid` column layout.
+fn compute_apps_show_mps(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .is_some_and(|name| name.trim().contains("nvidia-cuda-mps-server"))
+    })
 }
 
 /// Map each GPU's UUID to its device index. The compute-apps query reports a
@@ -579,6 +607,8 @@ fn parse_uuid_index(stdout: &str) -> HashMap<String, usize> {
 /// Sum per-process VRAM by device index, excluding `own_pid`. Split out from the
 /// `nvidia-smi` invocation so it is unit-testable without a GPU. Rows whose UUID
 /// is not in `uuid_to_index` are skipped rather than misattributed to device 0.
+/// Expects the `pid,process_name,used_memory,gpu_uuid` column layout; the
+/// process name is used only for MPS detection (see `compute_apps_show_mps`).
 fn aggregate_foreign_vram(
     stdout: &str,
     uuid_to_index: &HashMap<String, usize>,
@@ -587,8 +617,8 @@ fn aggregate_foreign_vram(
     let mut foreign: HashMap<usize, usize> = HashMap::new();
     for line in stdout.lines() {
         let mut parts = line.split(',');
-        let (Some(pid_str), Some(used_str), Some(uuid_str)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(pid_str), Some(_name), Some(used_str), Some(uuid_str)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
@@ -789,7 +819,7 @@ mod vram_clamp_tests {
 
 #[cfg(test)]
 mod foreign_vram_tests {
-    use super::{aggregate_foreign_vram, parse_uuid_index};
+    use super::{aggregate_foreign_vram, compute_apps_show_mps, parse_uuid_index};
     use std::collections::HashMap;
 
     const MIB: usize = 1024 * 1024;
@@ -811,14 +841,15 @@ mod foreign_vram_tests {
     fn sums_foreign_and_excludes_own_pid() {
         // Our PID is 4242. A trainer (pid 99) holds 6 GiB; our own 2 GiB row is
         // ignored so the ceiling only backs off for the neighbor's footprint.
-        let csv = "99, 6144, GPU-aaa\n4242, 2048, GPU-aaa";
+        // Column layout is pid,process_name,used_memory,gpu_uuid.
+        let csv = "99, python, 6144, GPU-aaa\n4242, kapsl, 2048, GPU-aaa";
         let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
         assert_eq!(foreign.get(&0).copied(), Some(6144 * MIB));
     }
 
     #[test]
     fn attributes_by_device_and_sums_multiple_foreign_procs() {
-        let csv = "10, 1024, GPU-aaa\n11, 2048, GPU-aaa\n12, 4096, GPU-bbb";
+        let csv = "10, a, 1024, GPU-aaa\n11, b, 2048, GPU-aaa\n12, c, 4096, GPU-bbb";
         let foreign =
             aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0), ("GPU-bbb", 1)]), 4242);
         assert_eq!(foreign.get(&0).copied(), Some(3072 * MIB));
@@ -829,15 +860,24 @@ mod foreign_vram_tests {
     fn skips_rows_with_unknown_uuid_rather_than_misattributing() {
         // A GPU not in the index map (e.g. a MIG child or a device kapsl doesn't
         // manage) must not be folded into device 0.
-        let csv = "10, 4096, GPU-unknown";
+        let csv = "10, trainer, 4096, GPU-unknown";
         let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
         assert!(foreign.is_empty());
     }
 
     #[test]
     fn empty_when_only_our_pid_present() {
-        let csv = "4242, 8192, GPU-aaa";
+        let csv = "4242, kapsl, 8192, GPU-aaa";
         let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
         assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn detects_mps_server_row_and_ignores_plain_processes() {
+        let plain = "99, python, 6144, GPU-aaa\n4242, kapsl, 2048, GPU-aaa";
+        assert!(!compute_apps_show_mps(plain));
+
+        let with_mps = "99, python, 6144, GPU-aaa\n77, nvidia-cuda-mps-server, 10240, GPU-aaa";
+        assert!(compute_apps_show_mps(with_mps));
     }
 }
