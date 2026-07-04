@@ -641,6 +641,142 @@ fn aggregate_foreign_vram(
     foreign
 }
 
+/// Prometheus gauges and transition logs for the co-tenancy KV ceiling, fed
+/// with the `CeilingSample`s returned by `refresh_ceilings` each monitor tick.
+/// Without this the shrink-fast/recover-slow behavior is invisible from outside
+/// the process: an operator sees throughput drop (or the autoscaler hold back)
+/// with nothing to correlate it against. Only constructed when the co-tenancy
+/// guard is enabled, so the default configuration exports no new series.
+pub(crate) struct CotenancyCeilingExporter {
+    /// Smoothed live ceiling — the value that actually drives per-engine caps.
+    ceiling_bytes: prometheus::IntGaugeVec,
+    /// Instantaneous target; the smoothed gauge lags it during recovery, and
+    /// that visible gap is the grow-slow hysteresis.
+    ceiling_target_bytes: prometheus::IntGaugeVec,
+    foreign_vram_bytes: prometheus::IntGaugeVec,
+    squeeze_active: prometheus::IntGaugeVec,
+    /// Last squeeze state per device, so the squeeze/recover log lines fire on
+    /// transitions only — a steady trainer produces one WARN, not one per tick.
+    squeezed_devices: HashMap<usize, bool>,
+}
+
+impl CotenancyCeilingExporter {
+    pub(crate) fn new(registry: &prometheus::Registry) -> Self {
+        let ceiling_bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_kv_ceiling_bytes",
+                "Live smoothed foreign-aware KV ceiling per device (bytes); drives per-engine \
+                 KV caps. Shrinks immediately under a co-tenant, recovers a quarter of the \
+                 remaining gap per tick.",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let ceiling_target_bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_kv_ceiling_target_bytes",
+                "Instantaneous foreign-aware KV ceiling per device (bytes): declared budget \
+                 minus co-tenant VRAM minus safety reserve. The smoothed ceiling lags this \
+                 while recovering.",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let foreign_vram_bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_foreign_vram_bytes",
+                "VRAM held by co-tenant (non-kapsl) compute processes per device (bytes).",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let squeeze_active = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_squeeze_active",
+                "1 while a co-tenant is squeezing this device's KV ceiling (queue-depth \
+                 scale-ups suppressed), else 0.",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(ceiling_bytes.clone()))
+            .expect("Failed to register kapsl_cotenancy_kv_ceiling_bytes");
+        registry
+            .register(Box::new(ceiling_target_bytes.clone()))
+            .expect("Failed to register kapsl_cotenancy_kv_ceiling_target_bytes");
+        registry
+            .register(Box::new(foreign_vram_bytes.clone()))
+            .expect("Failed to register kapsl_cotenancy_foreign_vram_bytes");
+        registry
+            .register(Box::new(squeeze_active.clone()))
+            .expect("Failed to register kapsl_cotenancy_squeeze_active");
+        Self {
+            ceiling_bytes,
+            ceiling_target_bytes,
+            foreign_vram_bytes,
+            squeeze_active,
+            squeezed_devices: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, samples: &[CeilingSample]) {
+        for sample in samples {
+            let device = sample.device_id.to_string();
+            self.ceiling_bytes
+                .with_label_values(&[device.as_str()])
+                .set(sample.smoothed_bytes as i64);
+            self.ceiling_target_bytes
+                .with_label_values(&[device.as_str()])
+                .set(sample.target_bytes as i64);
+            self.foreign_vram_bytes
+                .with_label_values(&[device.as_str()])
+                .set(sample.foreign_bytes as i64);
+            self.squeeze_active
+                .with_label_values(&[device.as_str()])
+                .set(sample.squeezed as i64);
+
+            // Every ceiling step at debug so the shrink-fast/recover-slow ramp
+            // can be traced tick-by-tick; the operator-facing lines below fire
+            // only on squeeze transitions.
+            if sample.smoothed_bytes != sample.previous_bytes {
+                log::debug!(
+                    "co-tenancy guard: device {} KV ceiling {}B -> {}B (target {}B, foreign {}B)",
+                    sample.device_id,
+                    sample.previous_bytes,
+                    sample.smoothed_bytes,
+                    sample.target_bytes,
+                    sample.foreign_bytes,
+                );
+            }
+
+            let was_squeezed = self
+                .squeezed_devices
+                .insert(sample.device_id, sample.squeezed)
+                .unwrap_or(false);
+            if sample.squeezed && !was_squeezed {
+                log::warn!(
+                    "co-tenancy guard: device {} KV ceiling squeezed to {}B by {}B of foreign \
+                     VRAM (instantaneous target {}B); admission is backing off and queue-depth \
+                     scale-ups are suppressed",
+                    sample.device_id,
+                    sample.smoothed_bytes,
+                    sample.foreign_bytes,
+                    sample.target_bytes,
+                );
+            } else if !sample.squeezed && was_squeezed {
+                log::info!(
+                    "co-tenancy guard: device {} KV ceiling recovered to {}B (target {}B); \
+                     scale-up suppression released",
+                    sample.device_id,
+                    sample.smoothed_bytes,
+                    sample.target_bytes,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod latency_window_tests {
     use super::LatencyWindow;
@@ -879,5 +1015,80 @@ mod foreign_vram_tests {
 
         let with_mps = "99, python, 6144, GPU-aaa\n77, nvidia-cuda-mps-server, 10240, GPU-aaa";
         assert!(compute_apps_show_mps(with_mps));
+    }
+}
+
+#[cfg(test)]
+mod cotenancy_exporter_tests {
+    use super::CotenancyCeilingExporter;
+    use crate::runtime::shared_kv::CeilingSample;
+
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    fn gauge_value(registry: &prometheus::Registry, name: &str, device: &str) -> Option<i64> {
+        registry
+            .gather()
+            .iter()
+            .find(|family| family.name() == name)?
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "device" && label.value() == device)
+            })
+            .map(|metric| metric.get_gauge().value() as i64)
+    }
+
+    #[test]
+    fn exports_ceiling_gauges_per_device_and_tracks_recovery() {
+        let registry = prometheus::Registry::new();
+        let mut exporter = CotenancyCeilingExporter::new(&registry);
+
+        // A 12 GiB trainer squeezes device 0 to a 24 GiB ceiling.
+        exporter.observe(&[CeilingSample {
+            device_id: 0,
+            foreign_bytes: 12 * GIB,
+            target_bytes: 24 * GIB,
+            smoothed_bytes: 24 * GIB,
+            previous_bytes: 40 * GIB,
+            squeezed: true,
+        }]);
+        let ceiling = |name: &str| gauge_value(&registry, name, "0");
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_bytes"),
+            Some((24 * GIB) as i64)
+        );
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_target_bytes"),
+            Some((24 * GIB) as i64)
+        );
+        assert_eq!(
+            ceiling("kapsl_cotenancy_foreign_vram_bytes"),
+            Some((12 * GIB) as i64)
+        );
+        assert_eq!(ceiling("kapsl_cotenancy_squeeze_active"), Some(1));
+
+        // Trainer exits: the smoothed gauge lags the target (grow-slow), which
+        // is exactly the gap a dashboard should show, and the squeeze clears.
+        exporter.observe(&[CeilingSample {
+            device_id: 0,
+            foreign_bytes: 0,
+            target_bytes: 36 * GIB,
+            smoothed_bytes: 27 * GIB,
+            previous_bytes: 24 * GIB,
+            squeezed: false,
+        }]);
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_bytes"),
+            Some((27 * GIB) as i64)
+        );
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_target_bytes"),
+            Some((36 * GIB) as i64)
+        );
+        assert_eq!(ceiling("kapsl_cotenancy_foreign_vram_bytes"), Some(0));
+        assert_eq!(ceiling("kapsl_cotenancy_squeeze_active"), Some(0));
     }
 }
