@@ -66,6 +66,41 @@ pub(crate) struct SharedKvStateInner {
 
 pub(crate) type SharedKvState = Arc<SharedKvStateInner>;
 
+/// One device's ceiling arithmetic from a `refresh_ceilings` tick, surfaced so
+/// the monitor loop can export it (Prometheus gauges + transition logs) —
+/// otherwise the shrink-fast/recover-slow behavior is invisible from outside
+/// the process. `target_bytes` is the instantaneous foreign-aware ceiling;
+/// `smoothed_bytes` is the damped value that actually drives the KV caps, and
+/// during grow-slow recovery it lags `target_bytes` — that gap is the
+/// hysteresis, and it is exactly what a dashboard should show.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CeilingSample {
+    pub(crate) device_id: usize,
+    /// Co-tenant VRAM bytes observed on this device this tick.
+    pub(crate) foreign_bytes: usize,
+    /// Instantaneous ceiling: declared budget minus foreign minus reserve.
+    pub(crate) target_bytes: usize,
+    /// Damped live ceiling after shrink-fast/grow-slow smoothing.
+    pub(crate) smoothed_bytes: usize,
+    /// Live ceiling before this tick (equals `smoothed_bytes` when unchanged).
+    pub(crate) previous_bytes: usize,
+    /// Whether this device currently reads as squeezed by a co-tenant — the
+    /// same per-device predicate `foreign_pressure_active` ORs together, so a
+    /// dashboard can show exactly why the autoscaler is suppressed.
+    pub(crate) squeezed: bool,
+}
+
+/// The per-device squeeze predicate behind `foreign_pressure_active`: the live
+/// soft ceiling sits below 90% of the no-foreign target (the reserve alone
+/// keeps the idle ceiling under the declared bytes, so the baseline is the
+/// idle target, not the raw budget). Shared with `refresh_ceilings` so the
+/// exported `CeilingSample::squeezed` can never drift from the autoscaler's
+/// suppression signal.
+fn ceiling_is_squeezed(device_id: usize, declared: usize, live_bytes: usize) -> bool {
+    let idle_target = effective_ceiling_bytes(device_id, declared, 0);
+    live_bytes < idle_target.saturating_mul(9) / 10
+}
+
 impl SharedKvStateInner {
     pub(crate) fn new(device_info: &DeviceInfo) -> SharedKvState {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
@@ -311,8 +346,12 @@ impl SharedKvStateInner {
     /// map read. A ceiling that floors to zero is stored as-is; the
     /// `MIN_BLOCKS_PER_ENGINE` clamp in `rebalance_kv_caps` keeps each engine at
     /// a minimal batch rather than fully stalling.
-    pub(crate) fn refresh_ceilings(&self, foreign: &HashMap<usize, usize>) {
+    ///
+    /// Returns one `CeilingSample` per device so the caller can export the
+    /// arithmetic (metrics + logs) without re-deriving it.
+    pub(crate) fn refresh_ceilings(&self, foreign: &HashMap<usize, usize>) -> Vec<CeilingSample> {
         let mut changed = false;
+        let mut samples = Vec::with_capacity(self.device_bytes.len());
         {
             let mut live = self.live_ceiling.lock();
             for (&device_id, &declared) in &self.device_bytes {
@@ -327,11 +366,20 @@ impl SharedKvStateInner {
                     atom.store(smoothed, Ordering::Relaxed);
                     changed = true;
                 }
+                samples.push(CeilingSample {
+                    device_id,
+                    foreign_bytes,
+                    target_bytes: target,
+                    smoothed_bytes: smoothed,
+                    previous_bytes: previous,
+                    squeezed: ceiling_is_squeezed(device_id, declared, smoothed),
+                });
             }
         }
         if changed {
             self.rebalance_kv_caps();
         }
+        samples
     }
 
     /// True while a co-tenant process is squeezing any device's KV ceiling:
@@ -347,8 +395,7 @@ impl SharedKvStateInner {
         let live = self.live_ceiling.lock();
         live.iter().any(|(device_id, atom)| {
             let declared = self.device_bytes.get(device_id).copied().unwrap_or(0);
-            let idle_target = effective_ceiling_bytes(*device_id, declared, 0);
-            atom.load(Ordering::Relaxed) < idle_target.saturating_mul(9) / 10
+            ceiling_is_squeezed(*device_id, declared, atom.load(Ordering::Relaxed))
         })
     }
 
@@ -552,6 +599,52 @@ mod vram_clamp_tests {
             state.device_soft_ceiling_bytes(device_id),
             30 * GIB + (6 * GIB) / 4
         );
+    }
+
+    #[test]
+    fn refresh_ceilings_samples_expose_the_smoothing_gap_and_squeeze() {
+        use std::collections::HashMap;
+        // Same 40 GiB card as the shrink/recover test; the returned samples must
+        // mirror the stored arithmetic so metrics can't drift from behavior.
+        let device_id = 4247;
+        let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
+        let state = SharedKvStateInner::new(&info);
+
+        // A 12 GiB trainer: target = 40 - 12 - 4 (reserve) = 24 GiB, shrink is
+        // immediate so smoothed == target, and the device reads as squeezed —
+        // the same predicate the autoscaler suppression uses.
+        let mut foreign = HashMap::new();
+        foreign.insert(device_id, 12 * GIB);
+        let samples = state.refresh_ceilings(&foreign);
+        assert_eq!(samples.len(), 1);
+        let sample = samples[0];
+        assert_eq!(sample.device_id, device_id);
+        assert_eq!(sample.foreign_bytes, 12 * GIB);
+        assert_eq!(sample.target_bytes, 24 * GIB);
+        assert_eq!(sample.smoothed_bytes, 24 * GIB);
+        assert_eq!(sample.previous_bytes, 40 * GIB);
+        assert!(sample.squeezed);
+        assert_eq!(sample.squeezed, state.foreign_pressure_active());
+
+        // Trainer exits: target snaps back to the 36 GiB idle ceiling but the
+        // smoothed value only closes a quarter of the gap — the sample exposes
+        // exactly that lag (24 + 12/4 = 27 GiB) while still reading squeezed.
+        let samples = state.refresh_ceilings(&HashMap::new());
+        let sample = samples[0];
+        assert_eq!(sample.foreign_bytes, 0);
+        assert_eq!(sample.target_bytes, 36 * GIB);
+        assert_eq!(sample.previous_bytes, 24 * GIB);
+        assert_eq!(sample.smoothed_bytes, 24 * GIB + 3 * GIB);
+        assert!(sample.squeezed);
+
+        // Once recovery converges the squeeze clears in the sample and in the
+        // autoscaler signal together.
+        let mut last = sample;
+        for _ in 0..16 {
+            last = state.refresh_ceilings(&HashMap::new())[0];
+        }
+        assert!(!last.squeezed);
+        assert!(!state.foreign_pressure_active());
     }
 
     #[test]

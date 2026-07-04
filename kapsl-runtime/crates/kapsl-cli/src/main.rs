@@ -308,6 +308,14 @@ async fn main() -> Result<(), DynError> {
     let runtime_pressure_config_for_sampler = runtime_pressure_config.clone();
     let runtime_pressure_state_for_sampler = runtime_pressure_state.clone();
     let shared_kv_for_rebalance = shared_kv.clone();
+    // Opt-in co-tenancy guard: probe for foreign GPU processes each tick,
+    // shrink the live KV ceiling by their footprint, and exclude their bytes
+    // from the pressure ratio. Default off — single-tenant behavior unchanged.
+    let cotenancy_guard = optional_env_var(COTENANCY_GUARD_ENV)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+    // Ceiling observability exists only when the guard does, so the default
+    // configuration exports no new metric series and logs nothing new.
+    let mut cotenancy_exporter = cotenancy_guard.then(|| CotenancyCeilingExporter::new(&registry));
     tokio::spawn(async move {
         let pid = Pid::from_u32(std::process::id());
         let mut system = System::new();
@@ -315,12 +323,6 @@ async fn main() -> Result<(), DynError> {
         let mut nvidia_smi_retry_after: Option<Instant> = None;
         system.refresh_memory();
         let total_system_memory_bytes = Some(system.total_memory() as usize * 1024);
-        // Opt-in co-tenancy guard: probe for foreign GPU processes each tick,
-        // shrink the live KV ceiling by their footprint, and exclude their bytes
-        // from the pressure ratio. Default off — single-tenant behavior unchanged.
-        let cotenancy_guard = optional_env_var(COTENANCY_GUARD_ENV)
-            .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
-
         loop {
             interval.tick().await;
 
@@ -366,7 +368,10 @@ async fn main() -> Result<(), DynError> {
                 && !nvidia_smi_retry_after.is_some_and(|retry_after| now < retry_after)
             {
                 let foreign = sample_foreign_vram();
-                shared_kv_for_rebalance.refresh_ceilings(&foreign);
+                let ceilings = shared_kv_for_rebalance.refresh_ceilings(&foreign);
+                if let Some(exporter) = cotenancy_exporter.as_mut() {
+                    exporter.observe(&ceilings);
+                }
                 Some(foreign.values().sum::<usize>())
             } else {
                 None
