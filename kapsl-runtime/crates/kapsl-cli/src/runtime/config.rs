@@ -581,7 +581,9 @@ pub(crate) fn select_mesh_devices(
             }
         };
         if device_info.has_cuda {
-            push_if_missing("tensorrt");
+            // Do not auto-upgrade cpu/missing-provider manifests to TensorRT:
+            // its EP rejects some quantized ONNX graphs (non-zero zero-points in
+            // Q/DQ). Only use TensorRT when a manifest explicitly requests it.
             push_if_missing("cuda");
         }
         if device_info.has_metal {
