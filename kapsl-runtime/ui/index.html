@@ -573,6 +573,18 @@
                                 ></canvas>
                             </div>
                             <div class="metric-card">
+                                <div class="metric-label">GPU Memory</div>
+                                <div class="metric-value" id="sys-gpu-mem-pct">
+                                    -
+                                </div>
+                                <canvas
+                                    id="chart-gpu-mem"
+                                    class="spark"
+                                    width="360"
+                                    height="120"
+                                ></canvas>
+                            </div>
+                            <div class="metric-card">
                                 <div class="metric-label">Throughput</div>
                                 <div class="metric-value" id="sys-throughput">
                                     -
@@ -621,8 +633,30 @@
                                     <strong id="sys-pid">-</strong>
                                 </div>
                                 <div class="kv-row">
+                                    <span>Pressure State</span>
+                                    <strong id="sys-pressure">
+                                        <span
+                                            class="status-dot"
+                                            id="sys-pressure-dot"
+                                        ></span>
+                                        <span id="sys-pressure-text">-</span>
+                                    </strong>
+                                </div>
+                                <div class="kv-row">
+                                    <span>Process Memory</span>
+                                    <strong id="sys-mem-detail">-</strong>
+                                </div>
+                                <div class="kv-row">
+                                    <span>System Memory</span>
+                                    <strong id="sys-total-mem">-</strong>
+                                </div>
+                                <div class="kv-row">
                                     <span>GPU Memory</span>
                                     <strong id="sys-gpu-mem">-</strong>
+                                </div>
+                                <div class="kv-row">
+                                    <span>Co-tenant GPU Memory</span>
+                                    <strong id="sys-foreign-gpu-mem">-</strong>
                                 </div>
                                 <div class="kv-row">
                                     <span>Collected</span>
