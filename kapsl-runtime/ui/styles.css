@@ -738,6 +738,13 @@ body.auth-locked {
     color: var(--text);
 }
 
+#sys-pressure {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-transform: capitalize;
+}
+
 /* ─── Mono Block ───────────────────────────────────────────────────────── */
 .mono-block {
     margin-top: var(--space-3);

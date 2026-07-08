@@ -41,7 +41,7 @@ async fn test_system_routes_report_health_and_pressure_state() {
         gpu_utilization: 7.5,
         gpu_memory_bytes: Some(10),
         gpu_memory_total_bytes: Some(20),
-        foreign_gpu_memory_bytes: None,
+        foreign_gpu_memory_bytes: Some(4),
         collected_at_ms: 789,
     }));
     let pressure_state = Arc::new(AtomicU8::new(RuntimePressureState::Conserve as u8));
@@ -70,6 +70,9 @@ async fn test_system_routes_report_health_and_pressure_state() {
     assert_eq!(stats.status(), StatusCode::OK);
     let stats_json: serde_json::Value = serde_json::from_slice(stats.body()).expect("stats json");
     assert_eq!(stats_json["process_memory_bytes"], 123);
+    assert_eq!(stats_json["total_system_memory_bytes"], 456);
+    assert_eq!(stats_json["gpu_memory_total_bytes"], 20);
+    assert_eq!(stats_json["foreign_gpu_memory_bytes"], 4);
     assert_eq!(stats_json["pressure_state"], "conserve");
 }
 
