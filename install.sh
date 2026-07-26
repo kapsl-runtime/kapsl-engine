@@ -75,18 +75,49 @@ if [ -z "$VERSION" ]; then
     echo "$VERSION"
 fi
 
+BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+BUNDLE_URL="${BASE_URL}/runtime/v${VERSION}/${BUNDLE_FILE}"
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
 DOWNLOAD_URL="${BASE_URL}/runtime/v${VERSION}/${BIN_FILE}"
 
 echo "Installing kapsl ${VERSION} (${PLATFORM}) to ${INSTALL_DIR}..."
 
 mkdir -p "$INSTALL_DIR"
-TMP="$(mktemp)"
-trap 'rm -f "$TMP"' EXIT
 
-download "$DOWNLOAD_URL" "$TMP"
-chmod +x "$TMP"
-mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+BUNDLE_TMP="${TMP_DIR}/${BUNDLE_FILE}"
+EXTRACT_DIR="${TMP_DIR}/bundle"
+
+if download "$BUNDLE_URL" "$BUNDLE_TMP"; then
+    mkdir -p "$EXTRACT_DIR"
+    if tar -xzf "$BUNDLE_TMP" -C "$EXTRACT_DIR"; then
+        BUNDLE_BIN="$(find "$EXTRACT_DIR" -type f -name "$BIN_NAME" | head -n 1)"
+        if [ -n "$BUNDLE_BIN" ]; then
+            cp -R "$(dirname "$BUNDLE_BIN")/." "$INSTALL_DIR/"
+            chmod +x "${INSTALL_DIR}/${BIN_NAME}"
+        else
+            echo "Downloaded bundle does not contain ${BIN_NAME}; falling back to single executable." >&2
+            TMP="${TMP_DIR}/${BIN_FILE}"
+            download "$DOWNLOAD_URL" "$TMP"
+            chmod +x "$TMP"
+            mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+        fi
+    else
+        echo "Failed to extract bundle; falling back to single executable." >&2
+        TMP="${TMP_DIR}/${BIN_FILE}"
+        download "$DOWNLOAD_URL" "$TMP"
+        chmod +x "$TMP"
+        mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+    fi
+else
+    echo "Bundle unavailable; falling back to single executable." >&2
+    TMP="${TMP_DIR}/${BIN_FILE}"
+    download "$DOWNLOAD_URL" "$TMP"
+    chmod +x "$TMP"
+    mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+fi
 
 echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
 

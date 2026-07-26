@@ -132,11 +132,78 @@ jobs:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
+      - name: Collect ONNX Runtime sidecar libraries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p ort-runtime-libs
+
+          search_roots=(
+            "kapsl-runtime/target/release"
+            "kapsl-runtime/target/release/deps"
+            "${HOME}/.cache/ort.pyke.io/dfbin"
+            "${HOME}/Library/Caches/ort.pyke.io/dfbin"
+          )
+
+          existing_roots=()
+          for root in "${search_roots[@]}"; do
+            if [ -d "$root" ]; then
+              existing_roots+=("$root")
+            fi
+          done
+
+          if [ "${#existing_roots[@]}" -eq 0 ]; then
+            echo "No ORT search roots found; continuing without sidecar libraries."
+            exit 0
+          fi
+
+          while IFS= read -r lib; do
+            [ -n "$lib" ] || continue
+            echo "Bundling ORT sidecar: $lib"
+            cp -L "$lib" "ort-runtime-libs/$(basename "$lib")"
+          done < <(
+            find "${existing_roots[@]}" -type f \( \
+              -name 'libonnxruntime*.so' -o \
+              -name 'libonnxruntime*.so.*' -o \
+              -name 'libonnxruntime*.dylib' -o \
+              -name 'libonnxruntime*.dylib.*' \
+            \) 2>/dev/null | sort -u
+          )
+
+          case "${RUNNER_OS}:${RUNNER_ARCH}" in
+            Linux:X64)
+              missing=()
+              for required in \
+                libonnxruntime_providers_shared.so \
+                libonnxruntime_providers_cuda.so
+              do
+                if [ ! -f "ort-runtime-libs/$required" ]; then
+                  missing+=("$required")
+                fi
+              done
+              if [ "${#missing[@]}" -gt 0 ]; then
+                echo "Missing required Linux x64 ORT CUDA sidecar(s): ${missing[*]}" >&2
+                exit 1
+              fi
+              ;;
+          esac
+
+          if [ -n "$(find ort-runtime-libs -type f -print -quit)" ]; then
+            ls -la ort-runtime-libs
+          else
+            echo "No ORT sidecar libraries found for this platform/build."
+          fi
+
       - name: Package Debian installer (.deb)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist pkgroot/DEBIAN pkgroot/usr/local/bin
           install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+          if [ -d ort-runtime-libs ]; then
+            cp -L ort-runtime-libs/* pkgroot/usr/local/bin/ 2>/dev/null || true
+          fi
 
           arch="$(dpkg --print-architecture)"
 
@@ -173,6 +240,9 @@ jobs:
         run: |
           mkdir -p dist pkgroot/usr/local/bin
           install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+          if [ -d ort-runtime-libs ]; then
+            cp -L ort-runtime-libs/* pkgroot/usr/local/bin/ 2>/dev/null || true
+          fi
 
           arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
           case "${arch_name}" in
@@ -184,6 +254,10 @@ jobs:
           pkg_path="dist/kapsl-runtime-${KAPSL_VERSION}-macos-${arch_name}.pkg"
 
           if [ -n "${APPLE_TEAM_ID:-}" ]; then
+            while IFS= read -r -d '' dylib_path; do
+              codesign --force --options runtime --sign "Developer ID Application: Kapsl ($APPLE_TEAM_ID)" \
+                "$dylib_path"
+            done < <(find pkgroot/usr/local/bin -type f -name 'libonnxruntime*.dylib*' -print0)
             codesign --force --options runtime --sign "Developer ID Application: Kapsl ($APPLE_TEAM_ID)" \
               pkgroot/usr/local/bin/kapsl
           else
@@ -247,6 +321,61 @@ jobs:
           $msiName = "kapsl-runtime-$($env:KAPSL_VERSION)-windows-$arch.msi"
           Copy-Item "kapsl-runtime/target/release/kapsl.exe" "wix/kapsl.exe" -Force
 
+          $ortSearchRoots = @(
+            "kapsl-runtime/target/release",
+            "kapsl-runtime/target/release/deps"
+          )
+          if ($env:LOCALAPPDATA) {
+            $ortSearchRoots += Join-Path $env:LOCALAPPDATA "ort.pyke.io\dfbin"
+          }
+          if ($env:CARGO_HOME) {
+            $ortSearchRoots += $env:CARGO_HOME
+          } elseif ($env:USERPROFILE) {
+            $ortSearchRoots += Join-Path $env:USERPROFILE ".cargo"
+          }
+          $ortSearchRoots = $ortSearchRoots | Where-Object { Test-Path $_ }
+
+          $cudaProviderDll = Get-ChildItem -Path $ortSearchRoots -Filter "onnxruntime_providers_cuda.dll" -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $cudaProviderDll) {
+            throw "Could not find onnxruntime_providers_cuda.dll after build. The Windows MSI would miss the ONNX Runtime CUDA provider sidecars."
+          }
+
+          $ortBundleDir = $cudaProviderDll.Directory.FullName
+          $requiredOrtDlls = @(
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_cuda.dll",
+            "onnxruntime_providers_tensorrt.dll"
+          )
+          $missingOrtDlls = @($requiredOrtDlls | Where-Object { -not (Test-Path (Join-Path $ortBundleDir $_)) })
+          if ($missingOrtDlls.Count -gt 0) {
+            throw "ORT provider bundle at $ortBundleDir is missing required DLL(s): $($missingOrtDlls -join ', ')"
+          }
+
+          $ortDlls = @(Get-ChildItem -Path $ortBundleDir -Filter "*.dll" -File | Sort-Object Name)
+          if ($ortDlls.Count -eq 0) {
+            throw "No ORT DLLs found in $ortBundleDir"
+          }
+
+          Write-Host "Bundling ONNX Runtime DLLs from $ortBundleDir"
+          foreach ($dll in $ortDlls) {
+            Write-Host "  $($dll.Name)"
+            Copy-Item $dll.FullName (Join-Path "wix" $dll.Name) -Force
+          }
+
+          $ortDllComponentLines = @()
+          $ortDllComponentRefLines = @()
+          for ($i = 0; $i -lt $ortDlls.Count; $i++) {
+            $componentId = "OrtDllComponent$i"
+            $fileId = "OrtDllFile$i"
+            $fileName = $ortDlls[$i].Name
+            $ortDllComponentLines += "          <Component Id=""$componentId"" Guid=""*"" Win64=""$win64"">"
+            $ortDllComponentLines += "            <File Id=""$fileId"" Source=""$fileName"" KeyPath=""yes"" />"
+            $ortDllComponentLines += '          </Component>'
+            $ortDllComponentRefLines += "      <ComponentRef Id=""$componentId"" />"
+          }
+
           $wxsLines = @(
             '<?xml version="1.0" encoding="UTF-8"?>'
             '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">'
@@ -267,11 +396,13 @@ jobs:
             '            <File Id="KapslExeFile" Source="kapsl.exe" KeyPath="yes" />'
             '            <Environment Id="KapslPathEnv" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last" Permanent="no" System="yes" />'
             '          </Component>'
+          ) + $ortDllComponentLines + @(
             '        </Directory>'
             '      </Directory>'
             '    </Directory>'
             '    <Feature Id="MainFeature" Title="Kapsl Runtime" Level="1">'
             '      <ComponentRef Id="KapslExeComponent" />'
+          ) + $ortDllComponentRefLines + @(
             '    </Feature>'
             '  </Product>'
             '</Wix>'
@@ -305,6 +436,10 @@ jobs:
             /p $env:WINDOWS_CERTIFICATE_PASSWORD `
             $msiPath
 
+          $msiName = Split-Path $msiPath -Leaf
+          $hash = (Get-FileHash -Path $msiPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $msiName" | Set-Content -Path "dist\$msiName.sha256"
+
           Remove-Item $certPath -Force
 
       - name: Package raw binary (Unix)
@@ -321,6 +456,18 @@ jobs:
           chmod +x "dist/${bin_name}"
           sha256sum "dist/${bin_name}" > "dist/${bin_name}.sha256" 2>/dev/null || shasum -a 256 "dist/${bin_name}" > "dist/${bin_name}.sha256"
 
+          bundle_root="dist/${bin_name}.bundle"
+          mkdir -p "${bundle_root}"
+          cp kapsl-runtime/target/release/kapsl "${bundle_root}/kapsl"
+          chmod +x "${bundle_root}/kapsl"
+          if [ -d ort-runtime-libs ]; then
+            cp -L ort-runtime-libs/* "${bundle_root}/" 2>/dev/null || true
+          fi
+          tar_path="dist/${bin_name}.tar.gz"
+          tar -C "${bundle_root}" -czf "${tar_path}" .
+          rm -rf "${bundle_root}"
+          sha256sum "${tar_path}" > "${tar_path}.sha256" 2>/dev/null || shasum -a 256 "${tar_path}" > "${tar_path}.sha256"
+
       - name: Package raw binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -332,6 +479,19 @@ jobs:
           Copy-Item "kapsl-runtime/target/release/kapsl.exe" "dist/$binName"
           $hash = (Get-FileHash -Path "dist/$binName" -Algorithm SHA256).Hash.ToLower()
           "$hash  $binName" | Set-Content -Path "dist/$binName.sha256"
+
+          $bundleName = "kapsl-$($env:KAPSL_VERSION)-windows-$arch.zip"
+          $bundleRoot = "dist/kapsl-$($env:KAPSL_VERSION)-windows-$arch"
+          New-Item -ItemType Directory -Path $bundleRoot -Force | Out-Null
+          Copy-Item "wix/kapsl.exe" (Join-Path $bundleRoot "kapsl.exe") -Force
+          Copy-Item "wix/*.dll" $bundleRoot -Force
+          if (Test-Path "dist/$bundleName") {
+            Remove-Item "dist/$bundleName" -Force
+          }
+          Compress-Archive -Path (Join-Path $bundleRoot "*") -DestinationPath "dist/$bundleName"
+          Remove-Item $bundleRoot -Recurse -Force
+          $bundleHash = (Get-FileHash -Path "dist/$bundleName" -Algorithm SHA256).Hash.ToLower()
+          "$bundleHash  $bundleName" | Set-Content -Path "dist/$bundleName.sha256"
 
       - name: Upload installer artifacts
         uses: actions/upload-artifact@v4

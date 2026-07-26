@@ -47,6 +47,8 @@ if (-not $Version) {
     Write-Host $Version
 }
 
+$BundleFile = "$BinName-$Version-$Platform.zip"
+$BundleUrl = "$BaseUrl/runtime/v$Version/$BundleFile"
 $BinFile = "$BinName-$Version-$Platform.exe"
 $DownloadUrl = "$BaseUrl/runtime/v$Version/$BinFile"
 
@@ -54,17 +56,43 @@ Write-Host "Installing kapsl $Version ($Platform) to $InstallDir..."
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
-$TempFile = Join-Path ([System.IO.Path]::GetTempPath()) "$BinFile"
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "kapsl-install-$([Guid]::NewGuid().ToString())"
+New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+
 try {
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempFile -UseBasicParsing
-} catch {
-    Write-Error "Download failed: $DownloadUrl"
-    exit 1
+    $TempBundle = Join-Path $TempDir $BundleFile
+    $ExtractDir = Join-Path $TempDir "bundle"
+
+    try {
+        Invoke-WebRequest -Uri $BundleUrl -OutFile $TempBundle -UseBasicParsing
+        New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
+        Expand-Archive -Path $TempBundle -DestinationPath $ExtractDir -Force
+
+        $BundleExe = Get-ChildItem -Path $ExtractDir -Filter "$BinName.exe" -Recurse -File | Select-Object -First 1
+        if (-not $BundleExe) {
+            throw "Downloaded bundle does not contain $BinName.exe"
+        }
+
+        Copy-Item -Path (Join-Path $BundleExe.Directory.FullName "*") -Destination $InstallDir -Recurse -Force
+    } catch {
+        Write-Host "Bundle install failed or is unavailable: $($_.Exception.Message)"
+        Write-Host "Falling back to single executable."
+        $TempFile = Join-Path $TempDir $BinFile
+        try {
+            Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempFile -UseBasicParsing
+        } catch {
+            Write-Error "Download failed: $BundleUrl and $DownloadUrl"
+            exit 1
+        }
+
+        $DestPath = Join-Path $InstallDir "$BinName.exe"
+        Move-Item -Path $TempFile -Destination $DestPath -Force
+    }
+} finally {
+    Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $DestPath = Join-Path $InstallDir "$BinName.exe"
-Move-Item -Path $TempFile -Destination $DestPath -Force
-
 Write-Host "Installed to $DestPath"
 
 # Add to user PATH if not already present
