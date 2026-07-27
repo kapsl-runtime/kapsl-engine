@@ -2,6 +2,16 @@ name: Release Docker Images
 
 on:
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Existing GitHub Release version to publish (for example, 0.1.19). Leave empty for a development image."
+        required: false
+        type: string
+      update_channel_tags:
+        description: "Also update mutable channel tags such as latest or beta."
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -15,31 +25,46 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/kapsl-engine
 
 jobs:
+  resolve-version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      runtime_version: ${{ steps.version.outputs.runtime_version }}
+      channel: ${{ steps.version.outputs.channel }}
+      update_channel_tags: ${{ steps.version.outputs.update_channel_tags }}
+      wait_for_assets: ${{ steps.version.outputs.wait_for_assets }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        env:
+          DISPATCH_RELEASE_VERSION: ${{ inputs.release_version }}
+          DISPATCH_UPDATE_CHANNEL_TAGS: ${{ inputs.update_channel_tags }}
+        run: docker/resolve-release-version.sh
+
   wait-for-release-assets:
     name: Wait for release assets
+    needs: resolve-version
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for tagged runtime bundle
-        if: github.ref_type == 'tag'
+      - name: Checkout
+        if: needs.resolve-version.outputs.wait_for_assets == 'true'
+        uses: actions/checkout@v4
+
+      - name: Wait for complete release asset set
+        if: needs.resolve-version.outputs.wait_for_assets == 'true'
         env:
-          RELEASE_VERSION: ${{ github.ref_name }}
-        run: |
-          version="${RELEASE_VERSION#v}"
-          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}/kapsl-${version}-linux-x86_64.tar.gz"
-          for attempt in $(seq 1 180); do
-            if curl -fsSLI "$asset_url" >/dev/null; then
-              echo "Runtime release assets are available."
-              exit 0
-            fi
-            echo "Runtime release assets are not available yet (attempt ${attempt}/180)."
-            sleep 10
-          done
-          echo "Timed out waiting for runtime release assets." >&2
-          exit 1
+          KAPSL_VERSION: ${{ needs.resolve-version.outputs.runtime_version }}
+        run: docker/wait-for-release-assets.sh
 
   build-and-push:
     name: Build ${{ matrix.variant }} image
-    needs: wait-for-release-assets
+    needs:
+      - resolve-version
+      - wait-for-release-assets
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -65,33 +90,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Resolve version
-        id: version
-        run: |
-          cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          # runtime_version is the exact published binary version (no dev- prefix)
-          # that the in-image installer downloads from GitHub Release assets.
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            release_version="${GITHUB_REF_NAME#v}"
-            channel=stable
-            case "${release_version}" in
-              *-beta*) channel=beta ;;
-              *-*) channel=prerelease ;;
-            esac
-            echo "version=${release_version}" >> "$GITHUB_OUTPUT"
-            echo "runtime_version=${release_version}" >> "$GITHUB_OUTPUT"
-            echo "channel=${channel}" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=dev-${cargo_version}-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
-            echo "runtime_version=${cargo_version}" >> "$GITHUB_OUTPUT"
-            echo "channel=development" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Resolve image tags
         id: tags
         env:
-          VERSION: ${{ steps.version.outputs.version }}
-          CHANNEL: ${{ steps.version.outputs.channel }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+          CHANNEL: ${{ needs.resolve-version.outputs.channel }}
+          UPDATE_CHANNEL_TAGS: ${{ needs.resolve-version.outputs.update_channel_tags }}
           VARIANT: ${{ matrix.variant }}
           SUFFIX: ${{ matrix.suffix }}
         run: |
@@ -99,12 +103,12 @@ jobs:
           {
             echo "tags<<EOF"
             echo "${image}:${VERSION}-${SUFFIX}"
-            if [ "${CHANNEL}" = "stable" ]; then
+            if [ "${UPDATE_CHANNEL_TAGS}" = "true" ] && [ "${CHANNEL}" = "stable" ]; then
               echo "${image}:latest-${SUFFIX}"
               if [ "${VARIANT}" = "cpu" ]; then
                 echo "${image}:latest"
               fi
-            elif [ "${CHANNEL}" = "beta" ]; then
+            elif [ "${UPDATE_CHANNEL_TAGS}" = "true" ] && [ "${CHANNEL}" = "beta" ]; then
               echo "${image}:beta-${SUFFIX}"
               if [ "${VARIANT}" = "cpu" ]; then
                 echo "${image}:beta"
@@ -134,7 +138,7 @@ jobs:
           push: true
           platforms: ${{ matrix.platforms }}
           build-args: |
-            KAPSL_VERSION=${{ steps.version.outputs.runtime_version }}
+            KAPSL_VERSION=${{ needs.resolve-version.outputs.runtime_version }}
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
