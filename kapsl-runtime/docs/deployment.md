@@ -108,7 +108,9 @@ docker run --rm --gpus all \
 Release-specific tags use `<kapsl-version>-cpu`, `<kapsl-version>-cuda`, and
 `<kapsl-version>-tensorrt`. The unqualified `latest` tag always points to the
 CPU image so pulling Kapsl never downloads NVIDIA or TensorRT libraries
-implicitly.
+implicitly. Stable releases update `latest`, `latest-cpu`, `latest-cuda`, and
+`latest-tensorrt`; beta releases instead update `beta`, `beta-cpu`,
+`beta-cuda`, and `beta-tensorrt`.
 
 ## Build from source
 
