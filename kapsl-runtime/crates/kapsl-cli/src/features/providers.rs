@@ -116,13 +116,19 @@ fn execute_provider_install_command(args: ProviderInstallCommandArgs) -> Result<
 
     println!();
     println!("Provider installation complete.");
-    println!(
-        "Run `kapsl --model <model.aimod> --provider {}` to use it.",
-        match args.provider {
-            ProviderPackage::Cuda12 => "cuda",
-            ProviderPackage::TensorRt10 => "tensorrt",
+    match args.provider {
+        ProviderPackage::Cuda12 => {
+            println!("CUDA 12 is now available to Kapsl's automatic provider selection.");
         }
-    );
+        ProviderPackage::TensorRt10 => {
+            println!(
+                "TensorRT 10 is now available to packages that declare `preferred_provider: tensorrt`."
+            );
+            println!(
+                "Set KAPSL_PROVIDER_POLICY=manifest to require the package-declared provider."
+            );
+        }
+    }
     Ok(())
 }
 
