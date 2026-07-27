@@ -6,8 +6,111 @@
 - Python 3.8+ (optional — only needed for helper scripts and building `kapsl-sdk`)
 - `ffmpeg` (optional — required for video/audio inference payloads)
 - GPU drivers and SDKs only if using a non-CPU backend:
-  - CUDA 11+ / TensorRT 8+ for NVIDIA
+  - A compatible NVIDIA display driver on Windows; the provider packs include
+    the required CUDA 12, cuDNN 9, and TensorRT 10 user-space runtime libraries
+  - Compatible system CUDA/TensorRT runtime libraries on Linux
   - Xcode command line tools for Metal (macOS)
+
+## Runtime and accelerator packages
+
+The default installer contains the portable Kapsl runtime and ONNX Runtime core
+libraries. NVIDIA libraries are published separately so CPU, DirectML, and Apple
+Silicon installations stay small.
+
+Install the default runtime:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
+Install it with the CUDA 12 pack:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh |
+  sh -s -- --accelerator cuda
+```
+
+Install CUDA 12 and TensorRT 10 packs:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh |
+  sh -s -- --accelerator tensorrt
+```
+
+On Windows PowerShell, use the installer matching the required runtime:
+
+```powershell
+# Core runtime
+irm https://downloads.kapsl.net/install.ps1 | iex
+
+# Core runtime with CUDA 12
+irm https://downloads.kapsl.net/install-cuda.ps1 | iex
+
+# Core runtime with CUDA 12 and TensorRT 10
+irm https://downloads.kapsl.net/install-tensorrt.ps1 | iex
+```
+
+Add acceleration to an existing Windows installation:
+
+```powershell
+kapsl provider install cuda12
+kapsl provider install tensorrt10
+```
+
+The TensorRT command installs CUDA 12 first when needed. For a system-wide MSI
+installation under `C:\Program Files`, run the command from an Administrator
+PowerShell. A saved copy of the general installer also accepts explicit parameters:
+
+```powershell
+.\install.ps1 -Accelerator cuda
+.\install.ps1 -Accelerator tensorrt
+```
+
+The latest beta has equivalent Windows entry points:
+
+```powershell
+irm https://downloads.kapsl.net/install-beta.ps1 | iex
+irm https://downloads.kapsl.net/install-beta-cuda.ps1 | iex
+irm https://downloads.kapsl.net/install-beta-tensorrt.ps1 | iex
+```
+
+Windows provider packs contain the calculated NVIDIA DLL dependency closure.
+Linux packs contain the ONNX Runtime provider sidecars and require compatible
+NVIDIA driver and system runtime libraries. macOS uses system Metal/CoreML
+frameworks and does not require an accelerator pack.
+
+## Docker images
+
+Docker images follow the same modular split:
+
+```bash
+# Small, multi-architecture CPU image; also published as :latest
+docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-cpu
+
+# Linux amd64 with CUDA 12, cuDNN, and the Kapsl CUDA provider pack
+docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-cuda
+
+# Linux amd64 with CUDA 12, cuDNN, TensorRT 10, and both provider packs
+docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-tensorrt
+```
+
+Run NVIDIA images with the NVIDIA Container Toolkit:
+
+```bash
+docker run --rm --gpus all \
+  -v "$PWD/models:/models" \
+  -p 9095:9095 \
+  -e KAPSL_ALLOW_INSECURE_HTTP=1 \
+  ghcr.io/kapsl-runtime/kapsl-engine:latest-cuda \
+  run --model /models/model.aimod --http-bind 0.0.0.0
+```
+
+Release-specific tags use `<kapsl-version>-cpu`, `<kapsl-version>-cuda`, and
+`<kapsl-version>-tensorrt`. The unqualified `latest` tag always points to the
+CPU image so pulling Kapsl never downloads NVIDIA or TensorRT libraries
+implicitly. Stable releases update `latest`, `latest-cpu`, `latest-cuda`, and
+`latest-tensorrt`; beta releases instead update `beta`, `beta-cpu`,
+`beta-cuda`, and `beta-tensorrt`.
 
 ## Build from source
 
