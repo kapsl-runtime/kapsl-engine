@@ -440,7 +440,7 @@ jobs:
             '    Manufacturer="Kapsl"'
             '    UpgradeCode="{DF997FCA-4EFD-447B-B368-376A32522B9B}">'
             '    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />'
-            '    <MajorUpgrade DowngradeErrorMessage="A newer version of Kapsl Runtime is already installed." />'
+            '    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of Kapsl Runtime is already installed." />'
             '    <MediaTemplate EmbedCab="yes" />'
             '    <Directory Id="TARGETDIR" Name="SourceDir">'
             "      <Directory Id=""$programFilesFolderId"">"
