@@ -14,8 +14,8 @@ use kapsl_core::{
     AutoScaler, EngineKind, ModelInfo, ModelRegistry, ModelStatus, PackageLoader, ScalingPolicy,
 };
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics, EngineModelInfo,
-    InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics,
+    EngineModelInfo, InferenceRequest, TensorDtype,
 };
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
