@@ -6,8 +6,9 @@
 - Python 3.8+ (optional — only needed for helper scripts and building `kapsl-sdk`)
 - `ffmpeg` (optional — required for video/audio inference payloads)
 - GPU drivers and SDKs only if using a non-CPU backend:
-  - CUDA 12 and cuDNN 9 for the CUDA provider pack
-  - TensorRT 10 plus the CUDA provider pack for TensorRT
+  - A compatible NVIDIA display driver on Windows; the provider packs include
+    the required CUDA 12, cuDNN 9, and TensorRT 10 user-space runtime libraries
+  - Compatible system CUDA/TensorRT runtime libraries on Linux
   - Xcode command line tools for Metal (macOS)
 
 ## Runtime and accelerator packages
@@ -26,21 +27,51 @@ Install it with the CUDA 12 pack:
 
 ```bash
 curl -fsSL https://downloads.kapsl.net/install.sh |
-  KAPSL_ACCELERATOR=cuda sh
+  sh -s -- --accelerator cuda
 ```
 
 Install CUDA 12 and TensorRT 10 packs:
 
 ```bash
 curl -fsSL https://downloads.kapsl.net/install.sh |
-  KAPSL_ACCELERATOR=tensorrt sh
+  sh -s -- --accelerator tensorrt
 ```
 
-On Windows PowerShell, set `KAPSL_ACCELERATOR` before invoking the installer:
+On Windows PowerShell, use the installer matching the required runtime:
 
 ```powershell
-$env:KAPSL_ACCELERATOR = "cuda" # or "tensorrt"
+# Core runtime
 irm https://downloads.kapsl.net/install.ps1 | iex
+
+# Core runtime with CUDA 12
+irm https://downloads.kapsl.net/install-cuda.ps1 | iex
+
+# Core runtime with CUDA 12 and TensorRT 10
+irm https://downloads.kapsl.net/install-tensorrt.ps1 | iex
+```
+
+Add acceleration to an existing Windows installation:
+
+```powershell
+kapsl provider install cuda12
+kapsl provider install tensorrt10
+```
+
+The TensorRT command installs CUDA 12 first when needed. For a system-wide MSI
+installation under `C:\Program Files`, run the command from an Administrator
+PowerShell. A saved copy of the general installer also accepts explicit parameters:
+
+```powershell
+.\install.ps1 -Accelerator cuda
+.\install.ps1 -Accelerator tensorrt
+```
+
+The latest beta has equivalent Windows entry points:
+
+```powershell
+irm https://downloads.kapsl.net/install-beta.ps1 | iex
+irm https://downloads.kapsl.net/install-beta-cuda.ps1 | iex
+irm https://downloads.kapsl.net/install-beta-tensorrt.ps1 | iex
 ```
 
 Windows provider packs contain the calculated NVIDIA DLL dependency closure.

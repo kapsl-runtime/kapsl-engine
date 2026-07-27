@@ -458,17 +458,19 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-      - name: Upload install.ps1 to R2 (stable URL)
+      - name: Upload Windows installer scripts to R2 (stable URLs)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          aws s3 cp install.ps1 \
-            s3://kapsl-installer/install.ps1 \
-            --content-type "text/plain" \
-            --no-progress \
-            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          for script in install.ps1 install-cuda.ps1 install-tensorrt.ps1; do
+            aws s3 cp "$script" \
+              "s3://kapsl-installer/$script" \
+              --content-type "text/plain" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done
 
       - name: Update latest.txt in R2 (tagged releases only)
         if: steps.version.outputs.is_release == 'true'

@@ -1,13 +1,78 @@
 #!/usr/bin/env sh
 # Kapsl CLI installer
 # Usage: curl -fsSL https://downloads.kapsl.net/install.sh | sh
-# Optional NVIDIA pack: KAPSL_ACCELERATOR=cuda (or tensorrt)
+# CUDA: curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator cuda
 set -e
 
 BASE_URL="${KAPSL_BASE_URL:-https://downloads.kapsl.net}"
 BIN_NAME="kapsl"
 INSTALL_DIR="${KAPSL_INSTALL_DIR:-$HOME/.local/bin}"
 ACCELERATOR="${KAPSL_ACCELERATOR:-cpu}"
+CHANNEL="stable"
+VERSION="${KAPSL_VERSION:-}"
+
+usage() {
+    cat <<'EOF'
+Install Kapsl
+
+Usage:
+  install.sh [--accelerator cpu|cuda|tensorrt] [--channel stable|beta]
+             [--version VERSION] [--install-dir DIR] [--base-url URL]
+
+Examples:
+  curl -fsSL https://downloads.kapsl.net/install.sh | sh
+  curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator cuda
+  curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator tensorrt
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --accelerator)
+            [ "$#" -ge 2 ] || { echo "--accelerator requires a value" >&2; exit 1; }
+            ACCELERATOR="$2"
+            shift 2
+            ;;
+        --channel)
+            [ "$#" -ge 2 ] || { echo "--channel requires a value" >&2; exit 1; }
+            CHANNEL="$2"
+            shift 2
+            ;;
+        --version)
+            [ "$#" -ge 2 ] || { echo "--version requires a value" >&2; exit 1; }
+            VERSION="$2"
+            shift 2
+            ;;
+        --install-dir)
+            [ "$#" -ge 2 ] || { echo "--install-dir requires a value" >&2; exit 1; }
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
+        --base-url)
+            [ "$#" -ge 2 ] || { echo "--base-url requires a value" >&2; exit 1; }
+            BASE_URL="$2"
+            shift 2
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown installer option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+case "$CHANNEL" in
+    stable) RUNTIME_PATH="runtime" ;;
+    beta) RUNTIME_PATH="runtime/beta" ;;
+    *)
+        echo "Unsupported channel '${CHANNEL}'. Use stable or beta." >&2
+        exit 1
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Detect OS and arch
@@ -41,7 +106,7 @@ detect_platform() {
 # Resolve latest version from R2
 # ---------------------------------------------------------------------------
 latest_version() {
-    url="${BASE_URL}/runtime/latest.txt"
+    url="${BASE_URL}/${RUNTIME_PATH}/latest.txt"
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$url"
     elif command -v wget >/dev/null 2>&1; then
@@ -75,7 +140,7 @@ install_provider_pack() {
     fi
 
     pack_file="kapsl-provider-${provider}${provider_version}-${VERSION}-${PLATFORM}.tar.gz"
-    pack_url="${BASE_URL}/runtime/v${VERSION}/${pack_file}"
+    pack_url="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${pack_file}"
     pack_tmp="${TMP_DIR}/${pack_file}"
 
     echo "Installing Kapsl ${provider}${provider_version} provider pack..."
@@ -86,13 +151,12 @@ install_provider_pack() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-VERSION="${KAPSL_VERSION:-}"
 PLATFORM="$(detect_platform)"
 
 case "$ACCELERATOR" in
     cpu | cuda | cuda12 | tensorrt | tensorrt10) ;;
     *)
-        echo "Unsupported KAPSL_ACCELERATOR '${ACCELERATOR}'. Use cpu, cuda, or tensorrt." >&2
+        echo "Unsupported accelerator '${ACCELERATOR}'. Use cpu, cuda, or tensorrt." >&2
         exit 1
         ;;
 esac
@@ -104,11 +168,11 @@ if [ -z "$VERSION" ]; then
 fi
 
 BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
-BUNDLE_URL="${BASE_URL}/runtime/v${VERSION}/${BUNDLE_FILE}"
+BUNDLE_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BUNDLE_FILE}"
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
-DOWNLOAD_URL="${BASE_URL}/runtime/v${VERSION}/${BIN_FILE}"
+DOWNLOAD_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BIN_FILE}"
 
-echo "Installing kapsl ${VERSION} (${PLATFORM}) to ${INSTALL_DIR}..."
+echo "Installing kapsl ${VERSION} (${CHANNEL}, ${PLATFORM}) to ${INSTALL_DIR}..."
 
 mkdir -p "$INSTALL_DIR"
 

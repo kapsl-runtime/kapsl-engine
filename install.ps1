@@ -1,13 +1,29 @@
 # Kapsl CLI installer for Windows
 # Usage: irm https://downloads.kapsl.net/install.ps1 | iex
-# Optional NVIDIA pack: $env:KAPSL_ACCELERATOR="cuda" (or "tensorrt")
+# Saved-script usage: .\install.ps1 -Accelerator cuda
+[CmdletBinding()]
+param(
+    [ValidateSet("cpu", "cuda", "cuda12", "tensorrt", "tensorrt10")]
+    [string]$Accelerator = "cpu",
+    [ValidateSet("stable", "beta")]
+    [string]$Channel = "stable"
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $BaseUrl = if ($env:KAPSL_BASE_URL) { $env:KAPSL_BASE_URL } else { "https://downloads.kapsl.net" }
 $BinName = "kapsl"
 $InstallDir = if ($env:KAPSL_INSTALL_DIR) { $env:KAPSL_INSTALL_DIR } else { "$env:LOCALAPPDATA\Kapsl\bin" }
-$Accelerator = if ($env:KAPSL_ACCELERATOR) { $env:KAPSL_ACCELERATOR.ToLowerInvariant() } else { "cpu" }
+
+# Backward-compatible automation fallback. Interactive users should use
+# install-cuda.ps1, install-tensorrt.ps1, or the -Accelerator parameter.
+if (-not $PSBoundParameters.ContainsKey("Accelerator") -and $env:KAPSL_ACCELERATOR) {
+    $Accelerator = $env:KAPSL_ACCELERATOR
+}
+$Accelerator = $Accelerator.ToLowerInvariant()
+$Channel = $Channel.ToLowerInvariant()
+$RuntimePath = if ($Channel -eq "beta") { "runtime/beta" } else { "runtime" }
 
 # ---------------------------------------------------------------------------
 # Detect architecture
@@ -28,7 +44,7 @@ function Get-Platform {
 # Resolve latest version from R2
 # ---------------------------------------------------------------------------
 function Get-LatestVersion {
-    $url = "$BaseUrl/runtime/latest.txt"
+    $url = "$BaseUrl/$RuntimePath/latest.txt"
     try {
         return (Invoke-RestMethod -Uri $url -UseBasicParsing).Trim()
     } catch {
@@ -52,7 +68,7 @@ function Install-ProviderPack {
     }
 
     $PackFile = "kapsl-provider-$Provider$ProviderVersion-$Version-$Platform.zip"
-    $PackUrl = "$BaseUrl/runtime/v$Version/$PackFile"
+    $PackUrl = "$BaseUrl/$RuntimePath/v$Version/$PackFile"
     $PackArchive = Join-Path $TempDirectory $PackFile
     $PackExtract = Join-Path $TempDirectory "$Provider-provider"
 
@@ -69,7 +85,7 @@ function Install-ProviderPack {
 $Platform = Get-Platform
 
 if ($Accelerator -notin @("cpu", "cuda", "cuda12", "tensorrt", "tensorrt10")) {
-    throw "Unsupported KAPSL_ACCELERATOR '$Accelerator'. Use cpu, cuda, or tensorrt."
+    throw "Unsupported accelerator '$Accelerator'. Use cpu, cuda, or tensorrt."
 }
 
 $Version = $env:KAPSL_VERSION
@@ -80,11 +96,11 @@ if (-not $Version) {
 }
 
 $BundleFile = "$BinName-$Version-$Platform.zip"
-$BundleUrl = "$BaseUrl/runtime/v$Version/$BundleFile"
+$BundleUrl = "$BaseUrl/$RuntimePath/v$Version/$BundleFile"
 $BinFile = "$BinName-$Version-$Platform.exe"
-$DownloadUrl = "$BaseUrl/runtime/v$Version/$BinFile"
+$DownloadUrl = "$BaseUrl/$RuntimePath/v$Version/$BinFile"
 
-Write-Host "Installing kapsl $Version ($Platform) to $InstallDir..."
+Write-Host "Installing kapsl $Version ($Channel, $Platform) to $InstallDir..."
 
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 
