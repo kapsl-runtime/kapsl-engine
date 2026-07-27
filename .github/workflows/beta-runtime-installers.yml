@@ -500,6 +500,60 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Prepare GitHub release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_limit_bytes=2147483648
+          mkdir -p github-release-assets
+          oversized_names="${RUNNER_TEMP}/oversized-release-assets.txt"
+          : > "$oversized_names"
+
+          while IFS= read -r -d '' file; do
+            size="$(stat -c '%s' "$file")"
+            name="$(basename "$file")"
+            if [ "$size" -ge "$release_limit_bytes" ]; then
+              echo "$name" >> "$oversized_names"
+              echo "::warning file=$file::Skipping GitHub release asset '$name' because it is ${size} bytes; GitHub requires each release asset to be under ${release_limit_bytes} bytes. The full file remains in workflow artifacts and R2 uploads."
+            fi
+          done < <(find release-assets -type f -print0)
+
+          while IFS= read -r -d '' file; do
+            size="$(stat -c '%s' "$file")"
+            name="$(basename "$file")"
+            if [ "$size" -ge "$release_limit_bytes" ]; then
+              continue
+            fi
+            if [[ "$name" == *.sha256 ]]; then
+              asset_name="${name%.sha256}"
+              if grep -Fxq "$asset_name" "$oversized_names"; then
+                echo "Skipping orphan checksum for oversized GitHub release asset: $name"
+                continue
+              fi
+            fi
+            cp "$file" "github-release-assets/$name"
+          done < <(find release-assets -type f -print0)
+
+          if [ -s "$oversized_names" ]; then
+            {
+              echo "The following assets exceeded GitHub Releases' 2 GiB per-file limit and were not attached to this GitHub release:"
+              echo
+              while IFS= read -r name; do
+                echo "- $name"
+              done < "$oversized_names"
+              echo
+              echo "Use the R2 release path or workflow artifacts for these files."
+            } > github-release-assets/OVERSIZED_RELEASE_ASSETS.txt
+          fi
+
+          if [ -z "$(find github-release-assets -type f -print -quit)" ]; then
+            echo "No GitHub release assets were prepared."
+            exit 1
+          fi
+
+          find github-release-assets -maxdepth 1 -type f -print | sort
+
       - name: Create GitHub pre-release
         uses: softprops/action-gh-release@v2
         with:
@@ -507,7 +561,7 @@ jobs:
           name: "Beta ${{ steps.version.outputs.version }}"
           prerelease: true
           generate_release_notes: true
-          files: release-assets/**
+          files: github-release-assets/**
 
       - name: Upload beta installers to R2
         env:
