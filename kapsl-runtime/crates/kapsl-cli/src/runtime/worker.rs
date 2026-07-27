@@ -304,6 +304,10 @@ pub(crate) struct RemoteEngine {
     worker: Arc<WorkerProcess>,
 }
 
+fn remote_batching_policy() -> BatchingPolicy {
+    BatchingPolicy::delegated().with_priority_support()
+}
+
 impl RemoteEngine {
     pub(crate) fn new(model_id: u32, worker: Arc<WorkerProcess>) -> Self {
         Self {
@@ -394,6 +398,14 @@ impl Engine for RemoteEngine {
                 )))
             }
         }
+    }
+
+    fn self_batches(&self) -> bool {
+        true
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        remote_batching_policy()
     }
 
     fn infer_stream(
@@ -572,5 +584,20 @@ impl Engine for RemoteEngine {
                 .map(|_| ())
                 .map_err(|e| EngineError::backend(format!("IPC health check failed: {}", e)))
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_engine_tests {
+    use super::*;
+    use kapsl_engine_api::BatchingMode;
+
+    #[test]
+    fn remote_engine_delegates_batching_and_forwards_priority() {
+        let policy = remote_batching_policy();
+
+        assert_eq!(policy.mode, BatchingMode::Delegated);
+        assert_eq!(policy.max_requests, 1);
+        assert!(policy.supports_priority);
     }
 }
