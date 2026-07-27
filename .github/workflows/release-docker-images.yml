@@ -15,8 +15,31 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/kapsl-engine
 
 jobs:
+  wait-for-release-assets:
+    name: Wait for release assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for tagged runtime bundle
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_VERSION#v}"
+          asset_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}/kapsl-${version}-linux-x86_64.tar.gz"
+          for attempt in $(seq 1 180); do
+            if curl -fsSLI "$asset_url" >/dev/null; then
+              echo "Runtime release assets are available."
+              exit 0
+            fi
+            echo "Runtime release assets are not available yet (attempt ${attempt}/180)."
+            sleep 10
+          done
+          echo "Timed out waiting for runtime release assets." >&2
+          exit 1
+
   build-and-push:
     name: Build ${{ matrix.variant }} image
+    needs: wait-for-release-assets
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -47,7 +70,7 @@ jobs:
         run: |
           cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
           # runtime_version is the exact published binary version (no dev- prefix)
-          # that the in-image install script downloads from downloads.kapsl.net.
+          # that the in-image installer downloads from GitHub Release assets.
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             release_version="${GITHUB_REF_NAME#v}"
             channel=stable
