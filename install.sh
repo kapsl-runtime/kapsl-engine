@@ -1,11 +1,13 @@
 #!/usr/bin/env sh
 # Kapsl CLI installer
 # Usage: curl -fsSL https://downloads.kapsl.net/install.sh | sh
+# Optional NVIDIA pack: KAPSL_ACCELERATOR=cuda (or tensorrt)
 set -e
 
 BASE_URL="${KAPSL_BASE_URL:-https://downloads.kapsl.net}"
 BIN_NAME="kapsl"
 INSTALL_DIR="${KAPSL_INSTALL_DIR:-$HOME/.local/bin}"
+ACCELERATOR="${KAPSL_ACCELERATOR:-cpu}"
 
 # ---------------------------------------------------------------------------
 # Detect OS and arch
@@ -63,11 +65,37 @@ download() {
     fi
 }
 
+install_provider_pack() {
+    provider="$1"
+    provider_version="$2"
+
+    if [ "$PLATFORM" != "linux-x86_64" ]; then
+        echo "The ${provider} provider pack is currently available only for Linux x86_64." >&2
+        exit 1
+    fi
+
+    pack_file="kapsl-provider-${provider}${provider_version}-${VERSION}-${PLATFORM}.tar.gz"
+    pack_url="${BASE_URL}/runtime/v${VERSION}/${pack_file}"
+    pack_tmp="${TMP_DIR}/${pack_file}"
+
+    echo "Installing Kapsl ${provider}${provider_version} provider pack..."
+    download "$pack_url" "$pack_tmp"
+    tar -xzf "$pack_tmp" -C "$INSTALL_DIR"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 VERSION="${KAPSL_VERSION:-}"
 PLATFORM="$(detect_platform)"
+
+case "$ACCELERATOR" in
+    cpu | cuda | cuda12 | tensorrt | tensorrt10) ;;
+    *)
+        echo "Unsupported KAPSL_ACCELERATOR '${ACCELERATOR}'. Use cpu, cuda, or tensorrt." >&2
+        exit 1
+        ;;
+esac
 
 if [ -z "$VERSION" ]; then
     printf "Fetching latest version... "
@@ -119,6 +147,17 @@ else
     mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
 fi
 
+case "$ACCELERATOR" in
+    cuda | cuda12 | tensorrt | tensorrt10)
+        install_provider_pack "cuda" "12"
+        ;;
+esac
+case "$ACCELERATOR" in
+    tensorrt | tensorrt10)
+        install_provider_pack "tensorrt" "10"
+        ;;
+esac
+
 echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
 
 # Remind user to add to PATH if needed
@@ -132,4 +171,8 @@ case ":${PATH}:" in
 esac
 
 echo ""
+if [ "$ACCELERATOR" != "cpu" ]; then
+    echo "Installed accelerator profile: ${ACCELERATOR}"
+    echo "Linux accelerator packs require compatible NVIDIA system runtime libraries."
+fi
 echo "Run 'kapsl --help' to get started."

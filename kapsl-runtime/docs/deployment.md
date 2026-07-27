@@ -6,8 +6,47 @@
 - Python 3.8+ (optional — only needed for helper scripts and building `kapsl-sdk`)
 - `ffmpeg` (optional — required for video/audio inference payloads)
 - GPU drivers and SDKs only if using a non-CPU backend:
-  - CUDA 11+ / TensorRT 8+ for NVIDIA
+  - CUDA 12 and cuDNN 9 for the CUDA provider pack
+  - TensorRT 10 plus the CUDA provider pack for TensorRT
   - Xcode command line tools for Metal (macOS)
+
+## Runtime and accelerator packages
+
+The default installer contains the portable Kapsl runtime and ONNX Runtime core
+libraries. NVIDIA libraries are published separately so CPU, DirectML, and Apple
+Silicon installations stay small.
+
+Install the default runtime:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh | sh
+```
+
+Install it with the CUDA 12 pack:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh |
+  KAPSL_ACCELERATOR=cuda sh
+```
+
+Install CUDA 12 and TensorRT 10 packs:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install.sh |
+  KAPSL_ACCELERATOR=tensorrt sh
+```
+
+On Windows PowerShell, set `KAPSL_ACCELERATOR` before invoking the installer:
+
+```powershell
+$env:KAPSL_ACCELERATOR = "cuda" # or "tensorrt"
+irm https://downloads.kapsl.net/install.ps1 | iex
+```
+
+Windows provider packs contain the calculated NVIDIA DLL dependency closure.
+Linux packs contain the ONNX Runtime provider sidecars and require compatible
+NVIDIA driver and system runtime libraries. macOS uses system Metal/CoreML
+frameworks and does not require an accelerator pack.
 
 ## Build from source
 

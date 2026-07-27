@@ -1,11 +1,13 @@
 # Kapsl CLI installer for Windows
 # Usage: irm https://downloads.kapsl.net/install.ps1 | iex
+# Optional NVIDIA pack: $env:KAPSL_ACCELERATOR="cuda" (or "tensorrt")
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $BaseUrl = if ($env:KAPSL_BASE_URL) { $env:KAPSL_BASE_URL } else { "https://downloads.kapsl.net" }
 $BinName = "kapsl"
 $InstallDir = if ($env:KAPSL_INSTALL_DIR) { $env:KAPSL_INSTALL_DIR } else { "$env:LOCALAPPDATA\Kapsl\bin" }
+$Accelerator = if ($env:KAPSL_ACCELERATOR) { $env:KAPSL_ACCELERATOR.ToLowerInvariant() } else { "cpu" }
 
 # ---------------------------------------------------------------------------
 # Detect architecture
@@ -35,10 +37,40 @@ function Get-LatestVersion {
     }
 }
 
+function Install-ProviderPack {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Provider,
+        [Parameter(Mandatory = $true)]
+        [string]$ProviderVersion,
+        [Parameter(Mandatory = $true)]
+        [string]$TempDirectory
+    )
+
+    if ($Platform -ne "windows-x86_64") {
+        throw "The $Provider provider pack is currently available only for Windows x86_64."
+    }
+
+    $PackFile = "kapsl-provider-$Provider$ProviderVersion-$Version-$Platform.zip"
+    $PackUrl = "$BaseUrl/runtime/v$Version/$PackFile"
+    $PackArchive = Join-Path $TempDirectory $PackFile
+    $PackExtract = Join-Path $TempDirectory "$Provider-provider"
+
+    Write-Host "Installing Kapsl $Provider$ProviderVersion provider pack..."
+    Invoke-WebRequest -Uri $PackUrl -OutFile $PackArchive -UseBasicParsing
+    New-Item -ItemType Directory -Path $PackExtract -Force | Out-Null
+    Expand-Archive -Path $PackArchive -DestinationPath $PackExtract -Force
+    Copy-Item -Path (Join-Path $PackExtract "*") -Destination $InstallDir -Recurse -Force
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 $Platform = Get-Platform
+
+if ($Accelerator -notin @("cpu", "cuda", "cuda12", "tensorrt", "tensorrt10")) {
+    throw "Unsupported KAPSL_ACCELERATOR '$Accelerator'. Use cpu, cuda, or tensorrt."
+}
 
 $Version = $env:KAPSL_VERSION
 if (-not $Version) {
@@ -88,6 +120,13 @@ try {
         $DestPath = Join-Path $InstallDir "$BinName.exe"
         Move-Item -Path $TempFile -Destination $DestPath -Force
     }
+
+    if ($Accelerator -in @("cuda", "cuda12", "tensorrt", "tensorrt10")) {
+        Install-ProviderPack -Provider "cuda" -ProviderVersion "12" -TempDirectory $TempDir
+    }
+    if ($Accelerator -in @("tensorrt", "tensorrt10")) {
+        Install-ProviderPack -Provider "tensorrt" -ProviderVersion "10" -TempDirectory $TempDir
+    }
 } finally {
     Remove-Item $TempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -105,4 +144,7 @@ if ($UserPath -notlike "*$InstallDir*") {
 }
 
 Write-Host ""
+if ($Accelerator -ne "cpu") {
+    Write-Host "Installed accelerator profile: $Accelerator"
+}
 Write-Host "Run 'kapsl --help' to get started."
