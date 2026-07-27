@@ -36,11 +36,23 @@ jobs:
 
       - name: Build CPU image
         run: |
-          docker build \
-            --build-arg "KAPSL_VERSION=${KAPSL_SMOKE_VERSION}" \
-            --file docker/Dockerfile.cpu \
-            --tag kapsl-engine:pr-smoke \
-            .
+          for attempt in 1 2 3; do
+            if docker build \
+              --build-arg "KAPSL_VERSION=${KAPSL_SMOKE_VERSION}" \
+              --file docker/Dockerfile.cpu \
+              --tag kapsl-engine:pr-smoke \
+              .; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq 3 ]; then
+              echo "CPU image build failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+
+            echo "CPU image build failed on attempt ${attempt}; retrying in 15 seconds."
+            sleep 15
+          done
 
       - name: Run CPU image
         run: docker run --rm kapsl-engine:pr-smoke --version
