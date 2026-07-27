@@ -1,0 +1,60 @@
+# Kapsl Runtime — TensorRT image
+# CUDA 12 + cuDNN + TensorRT 10 with matching Kapsl provider packs.
+
+FROM python:3.12-slim AS tensorrt-libs
+
+ARG TENSORRT_VERSION=10.16.1.11
+RUN python -m pip install --no-cache-dir \
+    --no-deps \
+    --target /opt/tensorrt \
+    --extra-index-url https://pypi.nvidia.com \
+    "tensorrt-cu12-libs==${TENSORRT_VERSION}" \
+    && test -e /opt/tensorrt/tensorrt_libs/libnvinfer.so.10 \
+    && test -e /opt/tensorrt/tensorrt_libs/libnvonnxparser.so.10
+
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=tensorrt-libs /opt/tensorrt /opt/kapsl/tensorrt-package
+RUN echo "/opt/kapsl/tensorrt-package/tensorrt_libs" > /etc/ld.so.conf.d/kapsl-tensorrt.conf \
+    && ldconfig \
+    && test -e /opt/kapsl/tensorrt-package/tensorrt_libs/libnvinfer.so.10 \
+    && test -e /opt/kapsl/tensorrt-package/tensorrt_libs/libnvonnxparser.so.10
+
+ARG KAPSL_VERSION
+RUN set -eux; \
+    test -n "${KAPSL_VERSION}"; \
+    attempt=1; \
+    until curl -fsSL https://downloads.kapsl.net/install.sh \
+        | KAPSL_VERSION="${KAPSL_VERSION}" KAPSL_INSTALL_DIR=/usr/local/bin \
+          KAPSL_ACCELERATOR=tensorrt \
+          sh -s -- --version "${KAPSL_VERSION}" --install-dir /usr/local/bin \
+          --accelerator tensorrt; do \
+        if [ "${attempt}" -ge 20 ]; then exit 1; fi; \
+        attempt=$((attempt + 1)); \
+        sleep 15; \
+    done; \
+    kapsl --version; \
+    test -f /usr/local/bin/kapsl-provider-cuda12.json; \
+    test -f /usr/local/bin/kapsl-provider-tensorrt10.json; \
+    test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \
+    test -f /usr/local/bin/libonnxruntime_providers_tensorrt.so; \
+    if ldd /usr/local/bin/libonnxruntime_providers_cuda.so \
+        /usr/local/bin/libonnxruntime_providers_tensorrt.so | grep -q "not found"; then \
+        ldd /usr/local/bin/libonnxruntime_providers_cuda.so \
+            /usr/local/bin/libonnxruntime_providers_tensorrt.so; \
+        exit 1; \
+    fi
+
+RUN mkdir -p /models /data
+ENV KAPSL_MODEL_DIR=/models
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+EXPOSE 9095
+
+ENTRYPOINT ["kapsl"]
+CMD ["--help"]

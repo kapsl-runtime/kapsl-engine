@@ -79,6 +79,37 @@ Linux packs contain the ONNX Runtime provider sidecars and require compatible
 NVIDIA driver and system runtime libraries. macOS uses system Metal/CoreML
 frameworks and does not require an accelerator pack.
 
+## Docker images
+
+Docker images follow the same modular split:
+
+```bash
+# Small, multi-architecture CPU image; also published as :latest
+docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-cpu
+
+# Linux amd64 with CUDA 12, cuDNN, and the Kapsl CUDA provider pack
+docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-cuda
+
+# Linux amd64 with CUDA 12, cuDNN, TensorRT 10, and both provider packs
+docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-tensorrt
+```
+
+Run NVIDIA images with the NVIDIA Container Toolkit:
+
+```bash
+docker run --rm --gpus all \
+  -v "$PWD/models:/models" \
+  -p 9095:9095 \
+  -e KAPSL_ALLOW_INSECURE_HTTP=1 \
+  ghcr.io/kapsl-runtime/kapsl-engine:latest-cuda \
+  run --model /models/model.aimod --http-bind 0.0.0.0
+```
+
+Release-specific tags use `<kapsl-version>-cpu`, `<kapsl-version>-cuda`, and
+`<kapsl-version>-tensorrt`. The unqualified `latest` tag always points to the
+CPU image so pulling Kapsl never downloads NVIDIA or TensorRT libraries
+implicitly.
+
 ## Build from source
 
 ```bash

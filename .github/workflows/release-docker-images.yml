@@ -32,6 +32,11 @@ jobs:
             runner: ubuntu-latest
             suffix: cuda
             platforms: linux/amd64
+          - variant: tensorrt
+            dockerfile: docker/Dockerfile.tensorrt
+            runner: ubuntu-latest
+            suffix: tensorrt
+            platforms: linux/amd64
 
     steps:
       - name: Checkout
