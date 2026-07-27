@@ -227,9 +227,28 @@ List detected hardware accelerators (GPUs, etc.).
 
 ### GET /api/system/stats
 
-Runtime statistics: queue depth, active requests, throughput.
+Host-level runtime process stats, sampled by the monitor loop.
 
 **Auth**: reader
+
+```json
+{
+  "pid": 12345,
+  "process_memory_bytes": 1073741824,
+  "total_system_memory_bytes": 34359738368,
+  "gpu_utilization": 0.42,
+  "gpu_memory_bytes": 8589934592,
+  "gpu_memory_total_bytes": 25769803776,
+  "foreign_gpu_memory_bytes": 2147483648,
+  "pressure_state": "normal",
+  "collected_at_ms": 1720353600000
+}
+```
+
+`gpu_memory_bytes` / `gpu_memory_total_bytes` are `null` when no GPU probe is
+available. `foreign_gpu_memory_bytes` is the VRAM held by co-tenant processes
+sharing the GPU; it is `null` unless the co-tenancy guard is enabled.
+`pressure_state` is one of `normal`, `conserve`, or `emergency`.
 
 ### GET /metrics
 

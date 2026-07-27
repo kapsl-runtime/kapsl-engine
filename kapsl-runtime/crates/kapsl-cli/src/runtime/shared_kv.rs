@@ -43,6 +43,17 @@ pub(crate) struct SharedKvStateInner {
     /// engine's health changes, reclaiming a degraded/dead engine's block quota
     /// for healthy engines without waiting for a full detach.
     last_health_epoch: AtomicU64,
+    /// Live per-device *soft* KV ceiling in bytes, foreign-aware. Refreshed by
+    /// `refresh_ceilings` from the monitor loop: the declared budget minus VRAM
+    /// held by co-tenant processes (e.g. a training job on the same card) minus
+    /// a safety reserve. Drives `rebalance_kv_caps` so concurrency backs off
+    /// under a noisy neighbor instead of OOMing it. Empty until the first
+    /// refresh, and never populated when the co-tenancy path is disabled, so the
+    /// soft budget falls back to `device_bytes` and default behavior is
+    /// unchanged. Distinct from the *hard* arena in `get_or_create_pool`, which
+    /// stays sized off `device_bytes` because handed-out blocks can't be
+    /// reclaimed.
+    live_ceiling: Mutex<HashMap<usize, Arc<AtomicUsize>>>,
     /// Per-device GPU pool registry for gguf-native/native backends.
     /// Stores compatible pools and their members so quota caps can be
     /// rebalanced by model priority.
@@ -54,6 +65,41 @@ pub(crate) struct SharedKvStateInner {
 }
 
 pub(crate) type SharedKvState = Arc<SharedKvStateInner>;
+
+/// One device's ceiling arithmetic from a `refresh_ceilings` tick, surfaced so
+/// the monitor loop can export it (Prometheus gauges + transition logs) —
+/// otherwise the shrink-fast/recover-slow behavior is invisible from outside
+/// the process. `target_bytes` is the instantaneous foreign-aware ceiling;
+/// `smoothed_bytes` is the damped value that actually drives the KV caps, and
+/// during grow-slow recovery it lags `target_bytes` — that gap is the
+/// hysteresis, and it is exactly what a dashboard should show.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CeilingSample {
+    pub(crate) device_id: usize,
+    /// Co-tenant VRAM bytes observed on this device this tick.
+    pub(crate) foreign_bytes: usize,
+    /// Instantaneous ceiling: declared budget minus foreign minus reserve.
+    pub(crate) target_bytes: usize,
+    /// Damped live ceiling after shrink-fast/grow-slow smoothing.
+    pub(crate) smoothed_bytes: usize,
+    /// Live ceiling before this tick (equals `smoothed_bytes` when unchanged).
+    pub(crate) previous_bytes: usize,
+    /// Whether this device currently reads as squeezed by a co-tenant — the
+    /// same per-device predicate `foreign_pressure_active` ORs together, so a
+    /// dashboard can show exactly why the autoscaler is suppressed.
+    pub(crate) squeezed: bool,
+}
+
+/// The per-device squeeze predicate behind `foreign_pressure_active`: the live
+/// soft ceiling sits below 90% of the no-foreign target (the reserve alone
+/// keeps the idle ceiling under the declared bytes, so the baseline is the
+/// idle target, not the raw budget). Shared with `refresh_ceilings` so the
+/// exported `CeilingSample::squeezed` can never drift from the autoscaler's
+/// suppression signal.
+fn ceiling_is_squeezed(device_id: usize, declared: usize, live_bytes: usize) -> bool {
+    let idle_target = effective_ceiling_bytes(device_id, declared, 0);
+    live_bytes < idle_target.saturating_mul(9) / 10
+}
 
 impl SharedKvStateInner {
     pub(crate) fn new(device_info: &DeviceInfo) -> SharedKvState {
@@ -86,6 +132,7 @@ impl SharedKvStateInner {
             model_engine_ids: Mutex::new(HashMap::new()),
             live_kv_caps: Mutex::new(HashMap::new()),
             last_health_epoch: AtomicU64::new(0),
+            live_ceiling: Mutex::new(HashMap::new()),
             #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
             gpu_pools: Mutex::new(HashMap::new()),
             #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
@@ -288,6 +335,84 @@ impl SharedKvStateInner {
         }
     }
 
+    /// Recompute the live, foreign-aware soft ceiling for every device from a
+    /// fresh co-tenancy sample and, if any ceiling actually moved, rebalance the
+    /// per-engine KV caps so admission backs off (or recovers). Called from the
+    /// monitor loop next to `maybe_rebalance_for_health`.
+    ///
+    /// The per-device value is smoothed asymmetrically (shrink fast, grow slow)
+    /// so a trainer's sawtooth footprint doesn't make the KV batch width flap,
+    /// and the rebalance is gated on an actual change so an idle GPU costs only a
+    /// map read. A ceiling that floors to zero is stored as-is; the
+    /// `MIN_BLOCKS_PER_ENGINE` clamp in `rebalance_kv_caps` keeps each engine at
+    /// a minimal batch rather than fully stalling.
+    ///
+    /// Returns one `CeilingSample` per device so the caller can export the
+    /// arithmetic (metrics + logs) without re-deriving it.
+    pub(crate) fn refresh_ceilings(&self, foreign: &HashMap<usize, usize>) -> Vec<CeilingSample> {
+        let mut changed = false;
+        let mut samples = Vec::with_capacity(self.device_bytes.len());
+        {
+            let mut live = self.live_ceiling.lock();
+            for (&device_id, &declared) in &self.device_bytes {
+                let foreign_bytes = foreign.get(&device_id).copied().unwrap_or(0);
+                let target = effective_ceiling_bytes(device_id, declared, foreign_bytes);
+                let atom = live
+                    .entry(device_id)
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(declared)));
+                let previous = atom.load(Ordering::Relaxed);
+                let smoothed = smooth_ceiling_bytes(previous, target);
+                if smoothed != previous {
+                    atom.store(smoothed, Ordering::Relaxed);
+                    changed = true;
+                }
+                samples.push(CeilingSample {
+                    device_id,
+                    foreign_bytes,
+                    target_bytes: target,
+                    smoothed_bytes: smoothed,
+                    previous_bytes: previous,
+                    squeezed: ceiling_is_squeezed(device_id, declared, smoothed),
+                });
+            }
+        }
+        if changed {
+            self.rebalance_kv_caps();
+        }
+        samples
+    }
+
+    /// True while a co-tenant process is squeezing any device's KV ceiling:
+    /// the live soft ceiling sits below 90% of what it would be with no foreign
+    /// footprint (the reserve alone keeps the idle ceiling under the declared
+    /// bytes, so the comparison baseline is the no-foreign target, not the raw
+    /// budget). The autoscaler uses this to tell queue depth caused by a noisy
+    /// neighbor from real load growth — adding a replica on a starved GPU only
+    /// thrashes. The grow-slow smoothing keeps this true for a few ticks after
+    /// the neighbor exits, which doubles as scale-up hysteresis. Always false
+    /// when the co-tenancy guard is off (`live_ceiling` never populated).
+    pub(crate) fn foreign_pressure_active(&self) -> bool {
+        let live = self.live_ceiling.lock();
+        live.iter().any(|(device_id, atom)| {
+            let declared = self.device_bytes.get(device_id).copied().unwrap_or(0);
+            ceiling_is_squeezed(*device_id, declared, atom.load(Ordering::Relaxed))
+        })
+    }
+
+    /// The soft KV budget in bytes for a device: the live foreign-aware ceiling
+    /// when one has been refreshed, otherwise the static declared `device_bytes`.
+    /// A floored (zero) live ceiling is honored rather than falling back, so a
+    /// GPU fully claimed by a trainer shrinks engines to their block minimum
+    /// instead of resetting to the full budget.
+    fn device_soft_ceiling_bytes(&self, device_id: usize) -> usize {
+        self.live_ceiling
+            .lock()
+            .get(&device_id)
+            .map(|atom| atom.load(Ordering::Relaxed))
+            .or_else(|| self.device_bytes.get(&device_id).copied())
+            .unwrap_or(0)
+    }
+
     pub(crate) fn rebalance_kv_caps(&self) {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
@@ -317,7 +442,10 @@ impl SharedKvStateInner {
                     self.device_bytes.keys().next().copied()
                 })
                 .unwrap_or(0);
-            let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
+            // Soft budget: the live foreign-aware ceiling when refreshed, else the
+            // static declared bytes. The hard arena in get_or_create_pool keeps
+            // reading device_bytes so already-handed-out blocks are never revoked.
+            let total_bytes = self.device_soft_ceiling_bytes(device_id);
             let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
             let new_cap =
                 (total_blocks * budget.max_tokens / total_tokens).max(MIN_BLOCKS_PER_ENGINE);
@@ -444,6 +572,110 @@ mod vram_clamp_tests {
         let info = device_info(vec![cuda_device(4242, 24576)]);
         let state = SharedKvStateInner::new(&info);
         assert_eq!(state.device_bytes.get(&4242).copied(), Some(24 * GIB));
+    }
+
+    #[test]
+    fn refresh_ceilings_shrinks_fast_then_recovers_slowly() {
+        use std::collections::HashMap;
+        // 40 GiB card, no cap env → declared == physical.
+        let device_id = 4245;
+        let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
+        let state = SharedKvStateInner::new(&info);
+
+        // Before any refresh the soft ceiling is the full declared budget.
+        assert_eq!(state.device_soft_ceiling_bytes(device_id), 40 * GIB);
+
+        // A 6 GiB trainer appears: 40 - 6 - 4 (10% reserve) = 30 GiB, and a
+        // shrink is applied immediately (no damping on the safety side).
+        let mut foreign = HashMap::new();
+        foreign.insert(device_id, 6 * GIB);
+        state.refresh_ceilings(&foreign);
+        assert_eq!(state.device_soft_ceiling_bytes(device_id), 30 * GIB);
+
+        // Trainer exits: target recovers to 40 - 4 = 36 GiB but growth is damped
+        // to a quarter of the gap → 30 + (36 - 30)/4 = 31.5 GiB.
+        state.refresh_ceilings(&HashMap::new());
+        assert_eq!(
+            state.device_soft_ceiling_bytes(device_id),
+            30 * GIB + (6 * GIB) / 4
+        );
+    }
+
+    #[test]
+    fn refresh_ceilings_samples_expose_the_smoothing_gap_and_squeeze() {
+        use std::collections::HashMap;
+        // Same 40 GiB card as the shrink/recover test; the returned samples must
+        // mirror the stored arithmetic so metrics can't drift from behavior.
+        let device_id = 4247;
+        let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
+        let state = SharedKvStateInner::new(&info);
+
+        // A 12 GiB trainer: target = 40 - 12 - 4 (reserve) = 24 GiB, shrink is
+        // immediate so smoothed == target, and the device reads as squeezed —
+        // the same predicate the autoscaler suppression uses.
+        let mut foreign = HashMap::new();
+        foreign.insert(device_id, 12 * GIB);
+        let samples = state.refresh_ceilings(&foreign);
+        assert_eq!(samples.len(), 1);
+        let sample = samples[0];
+        assert_eq!(sample.device_id, device_id);
+        assert_eq!(sample.foreign_bytes, 12 * GIB);
+        assert_eq!(sample.target_bytes, 24 * GIB);
+        assert_eq!(sample.smoothed_bytes, 24 * GIB);
+        assert_eq!(sample.previous_bytes, 40 * GIB);
+        assert!(sample.squeezed);
+        assert_eq!(sample.squeezed, state.foreign_pressure_active());
+
+        // Trainer exits: target snaps back to the 36 GiB idle ceiling but the
+        // smoothed value only closes a quarter of the gap — the sample exposes
+        // exactly that lag (24 + 12/4 = 27 GiB) while still reading squeezed.
+        let samples = state.refresh_ceilings(&HashMap::new());
+        let sample = samples[0];
+        assert_eq!(sample.foreign_bytes, 0);
+        assert_eq!(sample.target_bytes, 36 * GIB);
+        assert_eq!(sample.previous_bytes, 24 * GIB);
+        assert_eq!(sample.smoothed_bytes, 24 * GIB + 3 * GIB);
+        assert!(sample.squeezed);
+
+        // Once recovery converges the squeeze clears in the sample and in the
+        // autoscaler signal together.
+        let mut last = sample;
+        for _ in 0..16 {
+            last = state.refresh_ceilings(&HashMap::new())[0];
+        }
+        assert!(!last.squeezed);
+        assert!(!state.foreign_pressure_active());
+    }
+
+    #[test]
+    fn foreign_pressure_tracks_the_squeeze_and_releases_with_hysteresis() {
+        use std::collections::HashMap;
+        let device_id = 4246;
+        let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
+        let state = SharedKvStateInner::new(&info);
+
+        // Guard off / never refreshed → never "under pressure".
+        assert!(!state.foreign_pressure_active());
+
+        // Idle refresh (no co-tenant): the reserve alone must not read as
+        // pressure, or the autoscaler would be permanently suppressed.
+        state.refresh_ceilings(&HashMap::new());
+        assert!(!state.foreign_pressure_active());
+
+        // A 12 GiB trainer squeezes the ceiling well below 90% of idle.
+        let mut foreign = HashMap::new();
+        foreign.insert(device_id, 12 * GIB);
+        state.refresh_ceilings(&foreign);
+        assert!(state.foreign_pressure_active());
+
+        // Trainer exits: grow-slow recovery keeps pressure asserted for a few
+        // ticks (scale-up hysteresis), then releases.
+        state.refresh_ceilings(&HashMap::new());
+        assert!(state.foreign_pressure_active());
+        for _ in 0..16 {
+            state.refresh_ceilings(&HashMap::new());
+        }
+        assert!(!state.foreign_pressure_active());
     }
 
     #[test]

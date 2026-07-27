@@ -658,6 +658,17 @@ Server pressure env vars:
 - `KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS`: max new tokens allowed per request in conserve state.
 - `KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS`: max new tokens allowed per request in emergency state.
 
+GPU co-tenancy env vars:
+
+- `KAPSL_COTENANCY_GUARD` (`1`/`true`/`on`, default off): probe each monitor tick (via `nvidia-smi --query-compute-apps`) for other processes using the GPU — e.g. a training job sharing the card. When enabled:
+  - The live KV block ceiling shrinks by the co-tenant's VRAM footprint (plus a safety reserve of 10% of the budget, 512 MiB minimum), so the scheduler admits fewer concurrent sequences instead of racing the neighbor into an OOM. The ceiling shrinks immediately but recovers gradually (a quarter of the gap per 2 s tick) so batch width doesn't flap with the trainer's allocation sawtooth. Excess requests queue and are subject to the normal `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY` ingress rejection.
+  - Co-tenant bytes are excluded from the GPU-memory pressure ratio, so a neighbor's usage no longer trips conserve/emergency and truncates request outputs — co-tenant pressure is answered with lower concurrency, not shorter answers.
+  - The auto-scaler suppresses queue-depth scale-ups while a co-tenant is squeezing the ceiling, since a new replica on the same starved device would thrash.
+  - Expected behavior under a squeezing neighbor: because the guard trades concurrency for a stable output length (and admission back-pressures rather than rejecting), the first symptom is **higher queueing latency (p99), not errors** — requests wait longer before `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY` rejects at ingress, and the SLO auto-scaler that would normally add replicas is intentionally suppressed. A p99 spike correlated with a co-tenant is the guard working as designed, not a regression; watch queue depth / co-tenant VRAM, not error rate.
+  - Observability: `/metrics` exports per-device gauges — `kapsl_cotenancy_kv_ceiling_bytes` (the smoothed live ceiling that drives the KV caps), `kapsl_cotenancy_kv_ceiling_target_bytes` (the instantaneous foreign-aware target; the live gauge lagging below it is the grow-slow recovery), `kapsl_cotenancy_foreign_vram_bytes` (the co-tenant footprint), and `kapsl_cotenancy_squeeze_active` (1 while scale-ups are suppressed — the same predicate the auto-scaler checks). A `WARN` fires when a device becomes squeezed and an `INFO` when it recovers; every intermediate ceiling step is logged at `DEBUG`. These series only exist when the guard is enabled.
+  - Composes with `CUDA_DEVICE_MEMORY_LIMIT[_<id>]` / `KAPSL_GPU_MEMORY_LIMIT_MB`: the co-tenant footprint is subtracted from the declared slice, not the physical card.
+  - Limitation: this is a VRAM-capacity control only; SM/HBM-bandwidth interference from the neighbor still needs MPS thread percentages or MIG partitioning. Under CUDA MPS, per-process attribution collapses to the MPS server PID, so the probe under-reports foreign usage — kapsl logs a one-time `WARN` ("CUDA MPS server detected…") when it sees `nvidia-cuda-mps-server` in the compute-apps list so this blind spot is visible; use MPS resource limits or MIG for isolation in that mode.
+
 Model cache / disk-check env vars (read by `kapsl-core` loader):
 
 - `KAPSL_MODEL_CACHE_DIR` (or `KAPSL_LITE_MODEL_CACHE_DIR`): override the model cache root directory (default: `.kapsl-model-cache/` next to the `.aimod` file).

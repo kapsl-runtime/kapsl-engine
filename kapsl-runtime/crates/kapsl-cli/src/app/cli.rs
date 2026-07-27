@@ -72,6 +72,14 @@ pub(crate) fn cli_after_help() -> String {
     let _ = writeln!(out, "  {}", cmd("kapsl login"));
     let _ = writeln!(out, "  {}", cmd("kapsl login --device-code"));
     let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "  {}",
+        comment("# Add optional Windows GPU acceleration")
+    );
+    let _ = writeln!(out, "  {}", cmd("kapsl provider install cuda12"));
+    let _ = writeln!(out, "  {}", cmd("kapsl provider install tensorrt10"));
+    let _ = writeln!(out);
     let _ = writeln!(out, "{}", header("Environment variables:"));
     for (name, desc) in [
         (
@@ -136,6 +144,8 @@ pub(crate) enum KapslCommand {
     Pull(PullCommandArgs),
     /// Log in to a remote registry and save credentials locally
     Login(LoginCommandArgs),
+    /// Install optional hardware acceleration support
+    Provider(ProviderCommandArgs),
     /// Hot-load a model into an already-running runtime (no restart required)
     AddModel(AddModelCommandArgs),
 }
@@ -678,6 +688,41 @@ pub(crate) struct AddModelCommandArgs {
     /// HTTP request timeout (ms) for the load call — large models may take longer to respond
     #[arg(long, default_value_t = 30000, value_name = "MS")]
     pub(crate) timeout_ms: u64,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct ProviderCommandArgs {
+    #[command(subcommand)]
+    pub(crate) command: ProviderSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProviderSubcommand {
+    /// Download and install a provider pack matching this Kapsl release
+    Install(ProviderInstallCommandArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct ProviderInstallCommandArgs {
+    /// Accelerator runtime to install
+    #[arg(value_enum)]
+    pub(crate) provider: ProviderPackage,
+
+    /// Reinstall the pack even when a complete matching pack is present
+    #[arg(long)]
+    pub(crate) force: bool,
+
+    /// Override the destination directory containing kapsl.exe
+    #[arg(long, value_name = "DIR", hide = true)]
+    pub(crate) install_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ProviderPackage {
+    #[value(name = "cuda12", alias = "cuda")]
+    Cuda12,
+    #[value(name = "tensorrt10", alias = "tensorrt")]
+    TensorRt10,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

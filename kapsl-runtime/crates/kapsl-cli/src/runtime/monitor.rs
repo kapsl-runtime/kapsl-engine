@@ -7,6 +7,14 @@ pub(crate) struct RuntimeSamples {
     pub(crate) gpu_utilization: f64,
     pub(crate) gpu_memory_bytes: Option<usize>,
     pub(crate) gpu_memory_total_bytes: Option<usize>,
+    /// VRAM held by co-tenant processes (summed across devices), from
+    /// `sample_foreign_vram`. Subtracted from `gpu_memory_bytes` in the pressure
+    /// calculation so a trainer sharing the GPU throttles kapsl's *concurrency*
+    /// (via the KV ceiling) rather than tripping Conserve/Emergency and
+    /// truncating every request's max_new_tokens. `None` when the co-tenancy
+    /// probe is disabled or unavailable, which leaves pressure behavior exactly
+    /// as before.
+    pub(crate) foreign_gpu_memory_bytes: Option<usize>,
     pub(crate) collected_at_ms: u64,
 }
 
@@ -112,9 +120,14 @@ pub(crate) fn evaluate_runtime_pressure_state(
         .map(|total| (samples.process_memory_bytes as f64 / total as f64).clamp(0.0, 1.0));
 
     let gpu_util_ratio = samples.gpu_utilization.clamp(0.0, 1.0);
+    // Pressure reasons about *our own* footprint: a co-tenant's bytes are
+    // subtracted so a trainer sharing the GPU is answered by the KV concurrency
+    // ceiling (smaller batches), not by truncating every request's output. With
+    // no probe data this is the historical device-wide ratio.
     let gpu_mem_ratio = match (samples.gpu_memory_bytes, samples.gpu_memory_total_bytes) {
         (Some(used), Some(total)) if total > 0 => {
-            Some((used as f64 / total as f64).clamp(0.0, 1.0))
+            let own = used.saturating_sub(samples.foreign_gpu_memory_bytes.unwrap_or(0));
+            Some((own as f64 / total as f64).clamp(0.0, 1.0))
         }
         _ => None,
     };
@@ -500,6 +513,270 @@ fn aggregate_gpu_samples(
     Some((avg_util, total_mem_bytes, total_mem_capacity_bytes))
 }
 
+/// Bytes of device VRAM held by compute processes that are NOT this engine,
+/// keyed by physical device index. Powers the co-tenancy ceiling: when another
+/// process (e.g. a training job) shares the GPU, its footprint is subtracted
+/// from the KV pool's effective ceiling so kapsl throttles concurrency instead
+/// of OOMing the neighbor.
+///
+/// Shells out to `nvidia-smi` twice: once to map each GPU's UUID to its device
+/// index (the compute-apps query reports UUID, not index), then to enumerate
+/// running compute apps. Our own PID is excluded. Returns an empty map on any
+/// failure so callers treat "no signal" as "no co-tenant" and default,
+/// single-tenant behavior is unchanged.
+///
+/// Caveat: under CUDA MPS every client's memory is attributed to the MPS server
+/// PID, so per-process filtering collapses. In that mode callers should fall
+/// back to device-wide `memory.used` minus kapsl's own known block bytes.
+pub(crate) fn sample_foreign_vram() -> HashMap<usize, usize> {
+    let uuid_to_index = query_gpu_uuid_index();
+    if uuid_to_index.is_empty() {
+        return HashMap::new();
+    }
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,process_name,used_memory,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let stdout = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => return HashMap::new(),
+    };
+    // Under CUDA MPS every client's memory is attributed to the MPS server
+    // process, so the per-PID split below cannot separate our own bytes from a
+    // neighbor's — the guard is effectively blind. Warn once so an operator does
+    // not mistake the over-subtracted ceiling (or an un-throttled neighbor) for
+    // a bug; MPS isolation needs MPS resource limits or MIG instead.
+    if compute_apps_show_mps(&stdout) {
+        static MPS_WARNED: std::sync::Once = std::sync::Once::new();
+        MPS_WARNED.call_once(|| {
+            log::warn!(
+                "co-tenancy guard: CUDA MPS server detected in nvidia-smi compute-apps; \
+                 per-process VRAM attribution collapses to the MPS server PID, so the \
+                 foreign-VRAM ceiling is unreliable under MPS (use MPS resource limits or \
+                 MIG for isolation in this mode)"
+            );
+        });
+    }
+    aggregate_foreign_vram(&stdout, &uuid_to_index, std::process::id())
+}
+
+/// Whether any `nvidia-smi --query-compute-apps` row is the CUDA MPS server,
+/// which signals that per-process VRAM attribution has collapsed. Split from the
+/// command invocation so it is unit-testable without a GPU. Expects the
+/// `pid,process_name,used_memory,gpu_uuid` column layout.
+fn compute_apps_show_mps(stdout: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.split(',')
+            .nth(1)
+            .is_some_and(|name| name.trim().contains("nvidia-cuda-mps-server"))
+    })
+}
+
+/// Map each GPU's UUID to its device index. The compute-apps query reports a
+/// UUID rather than the index the rest of the runtime keys on, so this bridges
+/// the two. Empty on any failure.
+fn query_gpu_uuid_index() -> HashMap<String, usize> {
+    let output = Command::new("nvidia-smi")
+        .args(["--query-gpu=uuid,index", "--format=csv,noheader,nounits"])
+        .output();
+    let stdout = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        _ => return HashMap::new(),
+    };
+    parse_uuid_index(&stdout)
+}
+
+/// Parse `nvidia-smi --query-gpu=uuid,index` CSV into a UUID→index map. Split
+/// from the command invocation so it is unit-testable without a GPU.
+fn parse_uuid_index(stdout: &str) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split(',');
+        let (Some(uuid), Some(index)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if let Ok(index) = index.trim().parse::<usize>() {
+            map.insert(uuid.trim().to_string(), index);
+        }
+    }
+    map
+}
+
+/// Sum per-process VRAM by device index, excluding `own_pid`. Split out from the
+/// `nvidia-smi` invocation so it is unit-testable without a GPU. Rows whose UUID
+/// is not in `uuid_to_index` are skipped rather than misattributed to device 0.
+/// Expects the `pid,process_name,used_memory,gpu_uuid` column layout; the
+/// process name is used only for MPS detection (see `compute_apps_show_mps`).
+fn aggregate_foreign_vram(
+    stdout: &str,
+    uuid_to_index: &HashMap<String, usize>,
+    own_pid: u32,
+) -> HashMap<usize, usize> {
+    let mut foreign: HashMap<usize, usize> = HashMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split(',');
+        let (Some(pid_str), Some(_name), Some(used_str), Some(uuid_str)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(used_mb)) = (
+            pid_str.trim().parse::<u32>(),
+            used_str.trim().parse::<f64>(),
+        ) else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let Some(&device) = uuid_to_index.get(uuid_str.trim()) else {
+            continue;
+        };
+        let used_bytes = (used_mb * 1024.0 * 1024.0) as usize;
+        let entry = foreign.entry(device).or_insert(0);
+        *entry = entry.saturating_add(used_bytes);
+    }
+    foreign
+}
+
+/// Prometheus gauges and transition logs for the co-tenancy KV ceiling, fed
+/// with the `CeilingSample`s returned by `refresh_ceilings` each monitor tick.
+/// Without this the shrink-fast/recover-slow behavior is invisible from outside
+/// the process: an operator sees throughput drop (or the autoscaler hold back)
+/// with nothing to correlate it against. Only constructed when the co-tenancy
+/// guard is enabled, so the default configuration exports no new series.
+pub(crate) struct CotenancyCeilingExporter {
+    /// Smoothed live ceiling — the value that actually drives per-engine caps.
+    ceiling_bytes: prometheus::IntGaugeVec,
+    /// Instantaneous target; the smoothed gauge lags it during recovery, and
+    /// that visible gap is the grow-slow hysteresis.
+    ceiling_target_bytes: prometheus::IntGaugeVec,
+    foreign_vram_bytes: prometheus::IntGaugeVec,
+    squeeze_active: prometheus::IntGaugeVec,
+    /// Last squeeze state per device, so the squeeze/recover log lines fire on
+    /// transitions only — a steady trainer produces one WARN, not one per tick.
+    squeezed_devices: HashMap<usize, bool>,
+}
+
+impl CotenancyCeilingExporter {
+    pub(crate) fn new(registry: &prometheus::Registry) -> Self {
+        let ceiling_bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_kv_ceiling_bytes",
+                "Live smoothed foreign-aware KV ceiling per device (bytes); drives per-engine \
+                 KV caps. Shrinks immediately under a co-tenant, recovers a quarter of the \
+                 remaining gap per tick.",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let ceiling_target_bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_kv_ceiling_target_bytes",
+                "Instantaneous foreign-aware KV ceiling per device (bytes): declared budget \
+                 minus co-tenant VRAM minus safety reserve. The smoothed ceiling lags this \
+                 while recovering.",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let foreign_vram_bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_foreign_vram_bytes",
+                "VRAM held by co-tenant (non-kapsl) compute processes per device (bytes).",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        let squeeze_active = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_cotenancy_squeeze_active",
+                "1 while a co-tenant is squeezing this device's KV ceiling (queue-depth \
+                 scale-ups suppressed), else 0.",
+            ),
+            &["device"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(ceiling_bytes.clone()))
+            .expect("Failed to register kapsl_cotenancy_kv_ceiling_bytes");
+        registry
+            .register(Box::new(ceiling_target_bytes.clone()))
+            .expect("Failed to register kapsl_cotenancy_kv_ceiling_target_bytes");
+        registry
+            .register(Box::new(foreign_vram_bytes.clone()))
+            .expect("Failed to register kapsl_cotenancy_foreign_vram_bytes");
+        registry
+            .register(Box::new(squeeze_active.clone()))
+            .expect("Failed to register kapsl_cotenancy_squeeze_active");
+        Self {
+            ceiling_bytes,
+            ceiling_target_bytes,
+            foreign_vram_bytes,
+            squeeze_active,
+            squeezed_devices: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, samples: &[CeilingSample]) {
+        for sample in samples {
+            let device = sample.device_id.to_string();
+            self.ceiling_bytes
+                .with_label_values(&[device.as_str()])
+                .set(sample.smoothed_bytes as i64);
+            self.ceiling_target_bytes
+                .with_label_values(&[device.as_str()])
+                .set(sample.target_bytes as i64);
+            self.foreign_vram_bytes
+                .with_label_values(&[device.as_str()])
+                .set(sample.foreign_bytes as i64);
+            self.squeeze_active
+                .with_label_values(&[device.as_str()])
+                .set(sample.squeezed as i64);
+
+            // Every ceiling step at debug so the shrink-fast/recover-slow ramp
+            // can be traced tick-by-tick; the operator-facing lines below fire
+            // only on squeeze transitions.
+            if sample.smoothed_bytes != sample.previous_bytes {
+                log::debug!(
+                    "co-tenancy guard: device {} KV ceiling {}B -> {}B (target {}B, foreign {}B)",
+                    sample.device_id,
+                    sample.previous_bytes,
+                    sample.smoothed_bytes,
+                    sample.target_bytes,
+                    sample.foreign_bytes,
+                );
+            }
+
+            let was_squeezed = self
+                .squeezed_devices
+                .insert(sample.device_id, sample.squeezed)
+                .unwrap_or(false);
+            if sample.squeezed && !was_squeezed {
+                log::warn!(
+                    "co-tenancy guard: device {} KV ceiling squeezed to {}B by {}B of foreign \
+                     VRAM (instantaneous target {}B); admission is backing off and queue-depth \
+                     scale-ups are suppressed",
+                    sample.device_id,
+                    sample.smoothed_bytes,
+                    sample.foreign_bytes,
+                    sample.target_bytes,
+                );
+            } else if !sample.squeezed && was_squeezed {
+                log::info!(
+                    "co-tenancy guard: device {} KV ceiling recovered to {}B (target {}B); \
+                     scale-up suppression released",
+                    sample.device_id,
+                    sample.smoothed_bytes,
+                    sample.target_bytes,
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod latency_window_tests {
     use super::LatencyWindow;
@@ -619,6 +896,7 @@ mod vram_clamp_tests {
             gpu_utilization: 0.1,
             gpu_memory_bytes: Some(used),
             gpu_memory_total_bytes: Some(physical_total),
+            foreign_gpu_memory_bytes: None,
             collected_at_ms: 0,
         };
         assert_eq!(
@@ -636,5 +914,181 @@ mod vram_clamp_tests {
             evaluate_runtime_pressure_state(&capped, &config),
             RuntimePressureState::Emergency
         );
+    }
+
+    #[test]
+    fn foreign_bytes_are_excluded_from_the_pressure_ratio() {
+        let config = RuntimePressureConfig {
+            memory_conserve_ratio: 0.7,
+            memory_emergency_ratio: 0.9,
+            gpu_util_conserve_ratio: 0.8,
+            gpu_util_emergency_ratio: 0.95,
+            gpu_mem_conserve_ratio: 0.8,
+            gpu_mem_emergency_ratio: 0.85,
+            conserve_max_new_tokens: Some(256),
+            emergency_max_new_tokens: Some(128),
+        };
+        // 22 of 24 GiB used device-wide (92% → Emergency), but 16 GiB of that
+        // belongs to a trainer. Our own 6 GiB is 25% — calm. The trainer must be
+        // answered by the KV concurrency ceiling, not output truncation.
+        let shared = RuntimeSamples {
+            gpu_memory_bytes: Some(22 * GIB),
+            gpu_memory_total_bytes: Some(24 * GIB),
+            foreign_gpu_memory_bytes: Some(16 * GIB),
+            ..RuntimeSamples::default()
+        };
+        assert_eq!(
+            evaluate_runtime_pressure_state(&shared, &config),
+            RuntimePressureState::Normal
+        );
+        // Without the probe (None) the historical device-wide behavior holds.
+        let unprobed = RuntimeSamples {
+            foreign_gpu_memory_bytes: None,
+            ..shared
+        };
+        assert_eq!(
+            evaluate_runtime_pressure_state(&unprobed, &config),
+            RuntimePressureState::Emergency
+        );
+    }
+}
+
+#[cfg(test)]
+mod foreign_vram_tests {
+    use super::{aggregate_foreign_vram, compute_apps_show_mps, parse_uuid_index};
+    use std::collections::HashMap;
+
+    const MIB: usize = 1024 * 1024;
+
+    fn uuid_index(pairs: &[(&str, usize)]) -> HashMap<String, usize> {
+        pairs.iter().map(|(u, i)| ((*u).to_string(), *i)).collect()
+    }
+
+    #[test]
+    fn parses_uuid_index_csv() {
+        let csv = "GPU-aaa, 0\nGPU-bbb, 1";
+        let map = parse_uuid_index(csv);
+        assert_eq!(map.get("GPU-aaa").copied(), Some(0));
+        assert_eq!(map.get("GPU-bbb").copied(), Some(1));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn sums_foreign_and_excludes_own_pid() {
+        // Our PID is 4242. A trainer (pid 99) holds 6 GiB; our own 2 GiB row is
+        // ignored so the ceiling only backs off for the neighbor's footprint.
+        // Column layout is pid,process_name,used_memory,gpu_uuid.
+        let csv = "99, python, 6144, GPU-aaa\n4242, kapsl, 2048, GPU-aaa";
+        let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
+        assert_eq!(foreign.get(&0).copied(), Some(6144 * MIB));
+    }
+
+    #[test]
+    fn attributes_by_device_and_sums_multiple_foreign_procs() {
+        let csv = "10, a, 1024, GPU-aaa\n11, b, 2048, GPU-aaa\n12, c, 4096, GPU-bbb";
+        let foreign =
+            aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0), ("GPU-bbb", 1)]), 4242);
+        assert_eq!(foreign.get(&0).copied(), Some(3072 * MIB));
+        assert_eq!(foreign.get(&1).copied(), Some(4096 * MIB));
+    }
+
+    #[test]
+    fn skips_rows_with_unknown_uuid_rather_than_misattributing() {
+        // A GPU not in the index map (e.g. a MIG child or a device kapsl doesn't
+        // manage) must not be folded into device 0.
+        let csv = "10, trainer, 4096, GPU-unknown";
+        let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
+        assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn empty_when_only_our_pid_present() {
+        let csv = "4242, kapsl, 8192, GPU-aaa";
+        let foreign = aggregate_foreign_vram(csv, &uuid_index(&[("GPU-aaa", 0)]), 4242);
+        assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn detects_mps_server_row_and_ignores_plain_processes() {
+        let plain = "99, python, 6144, GPU-aaa\n4242, kapsl, 2048, GPU-aaa";
+        assert!(!compute_apps_show_mps(plain));
+
+        let with_mps = "99, python, 6144, GPU-aaa\n77, nvidia-cuda-mps-server, 10240, GPU-aaa";
+        assert!(compute_apps_show_mps(with_mps));
+    }
+}
+
+#[cfg(test)]
+mod cotenancy_exporter_tests {
+    use super::CotenancyCeilingExporter;
+    use crate::runtime::shared_kv::CeilingSample;
+
+    const GIB: usize = 1024 * 1024 * 1024;
+
+    fn gauge_value(registry: &prometheus::Registry, name: &str, device: &str) -> Option<i64> {
+        registry
+            .gather()
+            .iter()
+            .find(|family| family.name() == name)?
+            .get_metric()
+            .iter()
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "device" && label.value() == device)
+            })
+            .map(|metric| metric.get_gauge().value() as i64)
+    }
+
+    #[test]
+    fn exports_ceiling_gauges_per_device_and_tracks_recovery() {
+        let registry = prometheus::Registry::new();
+        let mut exporter = CotenancyCeilingExporter::new(&registry);
+
+        // A 12 GiB trainer squeezes device 0 to a 24 GiB ceiling.
+        exporter.observe(&[CeilingSample {
+            device_id: 0,
+            foreign_bytes: 12 * GIB,
+            target_bytes: 24 * GIB,
+            smoothed_bytes: 24 * GIB,
+            previous_bytes: 40 * GIB,
+            squeezed: true,
+        }]);
+        let ceiling = |name: &str| gauge_value(&registry, name, "0");
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_bytes"),
+            Some((24 * GIB) as i64)
+        );
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_target_bytes"),
+            Some((24 * GIB) as i64)
+        );
+        assert_eq!(
+            ceiling("kapsl_cotenancy_foreign_vram_bytes"),
+            Some((12 * GIB) as i64)
+        );
+        assert_eq!(ceiling("kapsl_cotenancy_squeeze_active"), Some(1));
+
+        // Trainer exits: the smoothed gauge lags the target (grow-slow), which
+        // is exactly the gap a dashboard should show, and the squeeze clears.
+        exporter.observe(&[CeilingSample {
+            device_id: 0,
+            foreign_bytes: 0,
+            target_bytes: 36 * GIB,
+            smoothed_bytes: 27 * GIB,
+            previous_bytes: 24 * GIB,
+            squeezed: false,
+        }]);
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_bytes"),
+            Some((27 * GIB) as i64)
+        );
+        assert_eq!(
+            ceiling("kapsl_cotenancy_kv_ceiling_target_bytes"),
+            Some((36 * GIB) as i64)
+        );
+        assert_eq!(ceiling("kapsl_cotenancy_foreign_vram_bytes"), Some(0));
+        assert_eq!(ceiling("kapsl_cotenancy_squeeze_active"), Some(0));
     }
 }

@@ -71,6 +71,13 @@ pub(crate) const PRESSURE_CONSERVE_MAX_TOKENS_ENV: &str =
     "KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS";
 pub(crate) const PRESSURE_EMERGENCY_MAX_TOKENS_ENV: &str =
     "KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS";
+/// Opt-in co-tenancy guard: when truthy (`1`/`true`/`on`), the monitor loop
+/// probes for foreign GPU processes (e.g. a training job on the same card),
+/// shrinks the live KV ceiling by their footprint so batching backs off instead
+/// of OOMing the neighbor, and excludes their bytes from the runtime-pressure
+/// ratio so co-tenant load never truncates request outputs. Default off:
+/// single-tenant behavior is byte-for-byte unchanged.
+pub(crate) const COTENANCY_GUARD_ENV: &str = "KAPSL_COTENANCY_GUARD";
 /// HAMi's own per-process VRAM cap (software vGPU). A HAMi-managed pod sets this
 /// — or the per-device `CUDA_DEVICE_MEMORY_LIMIT_<id>` variant — so the engine
 /// self-limits its KV cache and reported total to the slice with zero extra

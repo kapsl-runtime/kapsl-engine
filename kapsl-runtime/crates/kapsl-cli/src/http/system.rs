@@ -60,6 +60,9 @@ pub(crate) fn build_system_routes(
                 gpu_utilization: f64,
                 gpu_memory_bytes: Option<usize>,
                 gpu_memory_total_bytes: Option<usize>,
+                /// VRAM held by co-tenant processes sharing the GPU. `None` when
+                /// the co-tenancy probe is disabled or unavailable.
+                foreign_gpu_memory_bytes: Option<usize>,
                 pressure_state: String,
                 collected_at_ms: u64,
             }
@@ -75,6 +78,7 @@ pub(crate) fn build_system_routes(
                 gpu_utilization: samples.gpu_utilization,
                 gpu_memory_bytes: samples.gpu_memory_bytes,
                 gpu_memory_total_bytes: samples.gpu_memory_total_bytes,
+                foreign_gpu_memory_bytes: samples.foreign_gpu_memory_bytes,
                 pressure_state: pressure_state.as_str().to_string(),
                 collected_at_ms: samples.collected_at_ms,
             })

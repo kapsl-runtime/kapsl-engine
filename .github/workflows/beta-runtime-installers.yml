@@ -36,6 +36,12 @@ jobs:
         with:
           toolchain: 1.92.0
 
+      - name: Set up Python for accelerator dependency collection
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install WiX Toolset
         if: runner.os == 'Windows'
         shell: pwsh
@@ -60,8 +66,12 @@ jobs:
           date_str="$(date -u +%Y%m%d)"
           raw_version="${manifest_version}-beta.${date_str}.${short_sha}"
 
+          if [ "${GITHUB_RUN_NUMBER}" -gt 65535 ]; then
+            echo "GITHUB_RUN_NUMBER exceeds Windows Installer's 65535 build-version limit." >&2
+            exit 1
+          fi
           if [[ "$manifest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${GITHUB_RUN_NUMBER}"
           else
             numeric_version="0.1.0"
           fi
@@ -82,8 +92,12 @@ jobs:
           $dateStr = (Get-Date -Format "yyyyMMdd")
           $rawVersion = "$manifestVersion-beta.$dateStr.$shortSha"
 
+          $runNumber = [int]$env:GITHUB_RUN_NUMBER
+          if ($runNumber -gt 65535) {
+            throw "GITHUB_RUN_NUMBER exceeds Windows Installer's 65535 build-version limit."
+          }
           if ($manifestVersion -match '^(\d+)\.(\d+)\.(\d+)') {
-            $numericVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            $numericVersion = "$($Matches[1]).$($Matches[2]).$runNumber"
           } else {
             $numericVersion = "0.1.0"
           }
@@ -107,11 +121,19 @@ jobs:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
+      - name: Collect ONNX Runtime sidecar libraries (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: .github/scripts/collect-ort-sidecars.sh
+
       - name: Package Debian installer (.deb)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist pkgroot/DEBIAN pkgroot/usr/local/bin
           install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+          if [ -d ort-core-libs ]; then
+            cp -L ort-core-libs/* pkgroot/usr/local/bin/ 2>/dev/null || true
+          fi
 
           arch="$(dpkg --print-architecture)"
 
@@ -129,6 +151,11 @@ jobs:
           dpkg-deb --build pkgroot "${deb_path}"
           sha256sum "${deb_path}" > "${deb_path}.sha256"
           ls -la dist
+
+      - name: Package Linux accelerator packs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: .github/scripts/package-linux-provider-packs.sh
 
       - name: Import Apple signing certificate
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.APPLE_TEAM_ID != ''
@@ -148,6 +175,9 @@ jobs:
         run: |
           mkdir -p dist pkgroot/usr/local/bin
           install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
+          if [ -d ort-core-libs ]; then
+            cp -L ort-core-libs/* pkgroot/usr/local/bin/ 2>/dev/null || true
+          fi
 
           arch_name="$(echo "${RUNNER_ARCH}" | tr '[:upper:]' '[:lower:]')"
           case "${arch_name}" in
@@ -159,6 +189,10 @@ jobs:
           pkg_path="dist/kapsl-runtime-${KAPSL_VERSION}-macos-${arch_name}.pkg"
 
           if [ -n "${APPLE_TEAM_ID:-}" ]; then
+            while IFS= read -r -d '' dylib_path; do
+              codesign --force --options runtime --sign "Developer ID Application: Kapsl ($APPLE_TEAM_ID)" \
+                "$dylib_path"
+            done < <(find pkgroot/usr/local/bin -type f -name 'libonnxruntime*.dylib*' -print0)
             codesign --force --options runtime --sign "Developer ID Application: Kapsl ($APPLE_TEAM_ID)" \
               pkgroot/usr/local/bin/kapsl
           else
@@ -197,71 +231,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          New-Item -ItemType Directory -Path wix -Force | Out-Null
-
-          $runnerArch = $env:RUNNER_ARCH.ToLower()
-          $arch = $runnerArch
-          if ($arch -eq "x64") { $arch = "x86_64" }
-          if ($arch -eq "arm64") { $arch = "aarch64" }
-
-          $wixArch = "x86"
-          $programFilesFolderId = "ProgramFilesFolder"
-          $win64 = "no"
-          if ($runnerArch -eq "x64") {
-            $wixArch = "x64"
-            $programFilesFolderId = "ProgramFiles64Folder"
-            $win64 = "yes"
-          }
-          if ($runnerArch -eq "arm64") {
-            $wixArch = "arm64"
-            $programFilesFolderId = "ProgramFiles64Folder"
-            $win64 = "yes"
-          }
-
-          $msiName = "kapsl-runtime-$($env:KAPSL_VERSION)-windows-$arch.msi"
-          Copy-Item "kapsl-runtime/target/release/kapsl.exe" "wix/kapsl.exe" -Force
-
-          $wxsLines = @(
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            '<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">'
-            '  <Product'
-            '    Id="*"'
-            '    Name="Kapsl Runtime (Beta)"'
-            '    Language="1033"'
-            "    Version=""$($env:KAPSL_NUMERIC_VERSION)"""
-            '    Manufacturer="Kapsl"'
-            '    UpgradeCode="{A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D}">'
-            '    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />'
-            '    <MajorUpgrade DowngradeErrorMessage="A newer version of Kapsl Runtime Beta is already installed." />'
-            '    <MediaTemplate EmbedCab="yes" />'
-            '    <Directory Id="TARGETDIR" Name="SourceDir">'
-            "      <Directory Id=""$programFilesFolderId"">"
-            '        <Directory Id="INSTALLFOLDER" Name="Kapsl">'
-            "          <Component Id=""KapslExeComponent"" Guid=""*"" Win64=""$win64"">"
-            '            <File Id="KapslExeFile" Source="kapsl.exe" KeyPath="yes" />'
-            '            <Environment Id="KapslPathEnv" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last" Permanent="no" System="yes" />'
-            '          </Component>'
-            '        </Directory>'
-            '      </Directory>'
-            '    </Directory>'
-            '    <Feature Id="MainFeature" Title="Kapsl Runtime Beta" Level="1">'
-            '      <ComponentRef Id="KapslExeComponent" />'
-            '    </Feature>'
-            '  </Product>'
-            '</Wix>'
-          )
-          $wxsLines | Set-Content -Path "wix/installer.wxs" -Encoding utf8
-
-          Push-Location "wix"
-          candle.exe -arch $wixArch installer.wxs
-          light.exe installer.wixobj -o "../dist/$msiName"
-          Pop-Location
-
-          $hash = (Get-FileHash -Path "dist/$msiName" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $msiName" | Set-Content -Path "dist/$msiName.sha256"
-
-          Get-ChildItem dist
+          .github/scripts/package-windows-runtime.ps1 `
+            -Version $env:KAPSL_VERSION `
+            -NumericVersion $env:KAPSL_NUMERIC_VERSION `
+            -ProductName "Kapsl Runtime (Beta)" `
+            -UpgradeCode "{A1B2C3D4-5E6F-7A8B-9C0D-1E2F3A4B5C6D}"
 
       - name: Sign Windows installer
         if: runner.os == 'Windows' && env.WINDOWS_CERTIFICATE != '' && env.WINDOWS_CERTIFICATE_PASSWORD != ''
@@ -271,14 +245,18 @@ jobs:
           $certPath = "$env:RUNNER_TEMP\cert.pfx"
           [IO.File]::WriteAllBytes($certPath, $certBytes)
 
-          $msiPath = (Get-ChildItem "dist\*.msi").FullName
-          & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign `
-            /fd sha256 `
-            /tr http://timestamp.digicert.com `
-            /td sha256 `
-            /f $certPath `
-            /p $env:WINDOWS_CERTIFICATE_PASSWORD `
-            $msiPath
+          foreach ($msi in (Get-ChildItem "dist\*.msi" -File)) {
+            & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\signtool.exe" sign `
+              /fd sha256 `
+              /tr http://timestamp.digicert.com `
+              /td sha256 `
+              /f $certPath `
+              /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+              $msi.FullName
+
+            $hash = (Get-FileHash -Path $msi.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($msi.Name)" | Set-Content -Path "dist\$($msi.Name).sha256"
+          }
 
           Remove-Item $certPath -Force
 
@@ -312,6 +290,60 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Prepare GitHub release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_limit_bytes=2147483648
+          mkdir -p github-release-assets
+          oversized_names="${RUNNER_TEMP}/oversized-release-assets.txt"
+          : > "$oversized_names"
+
+          while IFS= read -r -d '' file; do
+            size="$(stat -c '%s' "$file")"
+            name="$(basename "$file")"
+            if [ "$size" -ge "$release_limit_bytes" ]; then
+              echo "$name" >> "$oversized_names"
+              echo "::warning file=$file::Skipping GitHub release asset '$name' because it is ${size} bytes; GitHub requires each release asset to be under ${release_limit_bytes} bytes. The full file remains in workflow artifacts and R2 uploads."
+            fi
+          done < <(find release-assets -type f -print0)
+
+          while IFS= read -r -d '' file; do
+            size="$(stat -c '%s' "$file")"
+            name="$(basename "$file")"
+            if [ "$size" -ge "$release_limit_bytes" ]; then
+              continue
+            fi
+            if [[ "$name" == *.sha256 ]]; then
+              asset_name="${name%.sha256}"
+              if grep -Fxq "$asset_name" "$oversized_names"; then
+                echo "Skipping orphan checksum for oversized GitHub release asset: $name"
+                continue
+              fi
+            fi
+            cp "$file" "github-release-assets/$name"
+          done < <(find release-assets -type f -print0)
+
+          if [ -s "$oversized_names" ]; then
+            {
+              echo "The following assets exceeded GitHub Releases' 2 GiB per-file limit and were not attached to this GitHub release:"
+              echo
+              while IFS= read -r name; do
+                echo "- $name"
+              done < "$oversized_names"
+              echo
+              echo "Use the R2 release path or workflow artifacts for these files."
+            } > github-release-assets/OVERSIZED_RELEASE_ASSETS.txt
+          fi
+
+          if [ -z "$(find github-release-assets -type f -print -quit)" ]; then
+            echo "No GitHub release assets were prepared."
+            exit 1
+          fi
+
+          find github-release-assets -maxdepth 1 -type f -print | sort
+
       - name: Create GitHub pre-release
         uses: softprops/action-gh-release@v2
         with:
@@ -319,7 +351,7 @@ jobs:
           name: "Beta ${{ steps.version.outputs.version }}"
           prerelease: true
           generate_release_notes: true
-          files: release-assets/**
+          files: github-release-assets/**
 
       - name: Upload beta installers to R2
         env:
@@ -339,3 +371,24 @@ jobs:
             --recursive \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          echo -n "${{ steps.version.outputs.version }}" \
+            | aws s3 cp - \
+              s3://kapsl-installer/runtime/beta/latest.txt \
+              --content-type "text/plain" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          aws s3 cp install.ps1 \
+            s3://kapsl-installer/install-beta-base.ps1 \
+            --content-type "text/plain" \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          for script in install-beta.ps1 install-beta-cuda.ps1 install-beta-tensorrt.ps1; do
+            aws s3 cp "$script" \
+              "s3://kapsl-installer/$script" \
+              --content-type "text/plain" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done

@@ -27,6 +27,7 @@ class KapslApp {
       rssGiB: [],
       modelMemGiB: [],
       gpuUtilPct: [],
+      gpuMemPct: [],
       throughput: [],
       active: [],
       queue: [],
@@ -1060,10 +1061,55 @@ class KapslApp {
 
     document.getElementById("sys-pid").textContent =
       stats?.pid !== undefined && stats?.pid !== null ? String(stats.pid) : "-";
+
+    // Pressure state — color-coded dot mirrors the runtime's normal/conserve/
+    // emergency backpressure signal.
+    const pressure = String(stats?.pressure_state || "").toLowerCase();
+    const pressureDot = document.getElementById("sys-pressure-dot");
+    const pressureText = document.getElementById("sys-pressure-text");
+    const pressureClassByState = {
+      normal: "status-healthy",
+      conserve: "status-degraded",
+      emergency: "status-error",
+    };
+    pressureDot.className = `status-dot ${pressureClassByState[pressure] || "status-loading"}`;
+    pressureText.textContent = pressure || "-";
+
+    // Process memory, absolute and as a share of total system memory.
+    const totalMemBytes = Number(stats?.total_system_memory_bytes) || 0;
+    const memDetail =
+      totalMemBytes > 0
+        ? `${this.formatBytes(rssBytes)} (${this.formatPercent((rssBytes / totalMemBytes) * 100)})`
+        : this.formatBytes(rssBytes);
+    document.getElementById("sys-mem-detail").textContent = memDetail;
+    document.getElementById("sys-total-mem").textContent =
+      totalMemBytes > 0 ? this.formatBytes(totalMemBytes) : "n/a";
+
     const gpuMemBytes = stats?.gpu_memory_bytes ?? null;
-    document.getElementById("sys-gpu-mem").textContent = gpuMemBytes
-      ? this.formatBytes(Number(gpuMemBytes))
-      : "n/a";
+    const gpuMemTotalBytes = Number(stats?.gpu_memory_total_bytes) || 0;
+    let gpuMemPct = 0;
+    if (gpuMemBytes && gpuMemTotalBytes > 0) {
+      gpuMemPct = (Number(gpuMemBytes) / gpuMemTotalBytes) * 100;
+      document.getElementById("sys-gpu-mem").textContent =
+        `${this.formatBytes(Number(gpuMemBytes))} / ${this.formatBytes(gpuMemTotalBytes)} (${this.formatPercent(gpuMemPct)})`;
+    } else if (gpuMemBytes) {
+      document.getElementById("sys-gpu-mem").textContent = this.formatBytes(
+        Number(gpuMemBytes),
+      );
+    } else {
+      document.getElementById("sys-gpu-mem").textContent = "n/a";
+    }
+    document.getElementById("sys-gpu-mem-pct").textContent =
+      gpuMemTotalBytes > 0 ? this.formatPercent(gpuMemPct) : "n/a";
+
+    // Co-tenant (foreign) VRAM held by other processes sharing the GPU. `null`
+    // when the co-tenancy probe is disabled or unavailable.
+    const foreignGpuBytes = stats?.foreign_gpu_memory_bytes;
+    document.getElementById("sys-foreign-gpu-mem").textContent =
+      foreignGpuBytes === undefined || foreignGpuBytes === null
+        ? "n/a"
+        : this.formatBytes(Number(foreignGpuBytes));
+
     document.getElementById("sys-collected").textContent =
       stats?.collected_at_ms
         ? new Date(Number(stats.collected_at_ms)).toLocaleString()
@@ -1075,6 +1121,7 @@ class KapslApp {
     this.pushHistory(this.history.rssGiB, rssGiB);
     this.pushHistory(this.history.modelMemGiB, modelMemGiB);
     this.pushHistory(this.history.gpuUtilPct, gpuUtilPct);
+    this.pushHistory(this.history.gpuMemPct, gpuMemPct);
     this.pushHistory(this.history.throughput, totalThroughput);
     this.pushHistory(this.history.active, totalActive);
     this.pushHistory(this.history.queue, totalQueue);
@@ -1087,6 +1134,7 @@ class KapslApp {
       "#0a9b7c",
       100,
     );
+    this.drawSparkline("chart-gpu-mem", this.history.gpuMemPct, "#6a3ec2", 100);
     this.drawSparkline("chart-throughput", this.history.throughput, "#ef5b25");
     this.drawSparkline("chart-active", this.history.active, "#0b6bcb");
     this.drawSparkline("chart-queue", this.history.queue, "#b26a00");

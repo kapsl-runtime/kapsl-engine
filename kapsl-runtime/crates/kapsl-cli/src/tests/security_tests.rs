@@ -829,6 +829,7 @@ fn test_evaluate_runtime_pressure_state_transitions() {
         gpu_utilization: 0.2,
         gpu_memory_bytes: Some(100),
         gpu_memory_total_bytes: Some(1000),
+        foreign_gpu_memory_bytes: None,
         collected_at_ms: 0,
     };
     assert_eq!(

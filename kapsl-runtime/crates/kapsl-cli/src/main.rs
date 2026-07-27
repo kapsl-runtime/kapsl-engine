@@ -14,8 +14,8 @@ use kapsl_core::{
     AutoScaler, EngineKind, ModelInfo, ModelRegistry, ModelStatus, PackageLoader, ScalingPolicy,
 };
 use kapsl_engine_api::{
-    BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics, EngineModelInfo,
-    InferenceRequest, TensorDtype,
+    BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics,
+    EngineModelInfo, InferenceRequest, TensorDtype,
 };
 #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
 use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
@@ -98,6 +98,7 @@ async fn main() -> Result<(), DynError> {
         Some(KapslCommand::Push(args)) => return execute_push_command(args),
         Some(KapslCommand::Pull(args)) => return execute_pull_command(args),
         Some(KapslCommand::Login(args)) => return execute_login_command(args),
+        Some(KapslCommand::Provider(args)) => return execute_provider_command(args),
         Some(KapslCommand::AddModel(args)) => return execute_add_model_command(args),
         Some(KapslCommand::Run(_)) | None => {}
     }
@@ -308,6 +309,14 @@ async fn main() -> Result<(), DynError> {
     let runtime_pressure_config_for_sampler = runtime_pressure_config.clone();
     let runtime_pressure_state_for_sampler = runtime_pressure_state.clone();
     let shared_kv_for_rebalance = shared_kv.clone();
+    // Opt-in co-tenancy guard: probe for foreign GPU processes each tick,
+    // shrink the live KV ceiling by their footprint, and exclude their bytes
+    // from the pressure ratio. Default off — single-tenant behavior unchanged.
+    let cotenancy_guard = optional_env_var(COTENANCY_GUARD_ENV)
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on"));
+    // Ceiling observability exists only when the guard does, so the default
+    // configuration exports no new metric series and logs nothing new.
+    let mut cotenancy_exporter = cotenancy_guard.then(|| CotenancyCeilingExporter::new(&registry));
     tokio::spawn(async move {
         let pid = Pid::from_u32(std::process::id());
         let mut system = System::new();
@@ -315,7 +324,6 @@ async fn main() -> Result<(), DynError> {
         let mut nvidia_smi_retry_after: Option<Instant> = None;
         system.refresh_memory();
         let total_system_memory_bytes = Some(system.total_memory() as usize * 1024);
-
         loop {
             interval.tick().await;
 
@@ -351,6 +359,25 @@ async fn main() -> Result<(), DynError> {
                     (0.0, None, None)
                 };
 
+            // Co-tenancy: measure foreign VRAM, push it into the live KV
+            // ceiling (concurrency lever), and report it to the pressure split
+            // (so it never drives output truncation). Shares the nvidia-smi
+            // backoff above: while the sampler is backing off, skip the probe
+            // too rather than shelling out to a broken nvidia-smi twice.
+            let foreign_gpu_memory_bytes = if cotenancy_guard
+                && has_cuda_for_sampler
+                && !nvidia_smi_retry_after.is_some_and(|retry_after| now < retry_after)
+            {
+                let foreign = sample_foreign_vram();
+                let ceilings = shared_kv_for_rebalance.refresh_ceilings(&foreign);
+                if let Some(exporter) = cotenancy_exporter.as_mut() {
+                    exporter.observe(&ceilings);
+                }
+                Some(foreign.values().sum::<usize>())
+            } else {
+                None
+            };
+
             let collected_at_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -362,6 +389,7 @@ async fn main() -> Result<(), DynError> {
                 gpu_utilization,
                 gpu_memory_bytes,
                 gpu_memory_total_bytes,
+                foreign_gpu_memory_bytes,
                 collected_at_ms,
             };
             *runtime_samples_for_sampler.write() = snapshot.clone();
@@ -373,14 +401,15 @@ async fn main() -> Result<(), DynError> {
             let previous = RuntimePressureState::from_u8(previous_raw);
             if previous != next_state {
                 log::warn!(
-                    "Runtime pressure state changed: {} -> {} (rss={}B total_mem={}B gpu_util={:.2} gpu_mem={:?}/{:?})",
+                    "Runtime pressure state changed: {} -> {} (rss={}B total_mem={}B gpu_util={:.2} gpu_mem={:?}/{:?} foreign_gpu_mem={:?})",
                     previous.as_str(),
                     next_state.as_str(),
                     snapshot.process_memory_bytes,
                     snapshot.total_system_memory_bytes.unwrap_or(0),
                     snapshot.gpu_utilization,
                     snapshot.gpu_memory_bytes,
-                    snapshot.gpu_memory_total_bytes
+                    snapshot.gpu_memory_total_bytes,
+                    snapshot.foreign_gpu_memory_bytes
                 );
             }
         }

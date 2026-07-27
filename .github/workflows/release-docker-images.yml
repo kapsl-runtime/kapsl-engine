@@ -32,6 +32,11 @@ jobs:
             runner: ubuntu-latest
             suffix: cuda
             platforms: linux/amd64
+          - variant: tensorrt
+            dockerfile: docker/Dockerfile.tensorrt
+            runner: ubuntu-latest
+            suffix: tensorrt
+            platforms: linux/amd64
 
     steps:
       - name: Checkout
@@ -44,14 +49,46 @@ jobs:
           # runtime_version is the exact published binary version (no dev- prefix)
           # that the in-image install script downloads from downloads.kapsl.net.
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "runtime_version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            release_version="${GITHUB_REF_NAME#v}"
+            channel=stable
+            case "${release_version}" in
+              *-beta*) channel=beta ;;
+              *-*) channel=prerelease ;;
+            esac
+            echo "version=${release_version}" >> "$GITHUB_OUTPUT"
+            echo "runtime_version=${release_version}" >> "$GITHUB_OUTPUT"
+            echo "channel=${channel}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=dev-${cargo_version}" >> "$GITHUB_OUTPUT"
+            echo "version=dev-${cargo_version}-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
             echo "runtime_version=${cargo_version}" >> "$GITHUB_OUTPUT"
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "channel=development" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve image tags
+        id: tags
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ steps.version.outputs.channel }}
+          VARIANT: ${{ matrix.variant }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          {
+            echo "tags<<EOF"
+            echo "${image}:${VERSION}-${SUFFIX}"
+            if [ "${CHANNEL}" = "stable" ]; then
+              echo "${image}:latest-${SUFFIX}"
+              if [ "${VARIANT}" = "cpu" ]; then
+                echo "${image}:latest"
+              fi
+            elif [ "${CHANNEL}" = "beta" ]; then
+              echo "${image}:beta-${SUFFIX}"
+              if [ "${VARIANT}" = "cpu" ]; then
+                echo "${image}:beta"
+              fi
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -75,21 +112,6 @@ jobs:
           platforms: ${{ matrix.platforms }}
           build-args: |
             KAPSL_VERSION=${{ steps.version.outputs.runtime_version }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.suffix }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest-${{ matrix.suffix }}
+          tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Tag latest (CPU only, on release)
-        if: matrix.variant == 'cpu' && steps.version.outputs.is_release == 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          platforms: ${{ matrix.platforms }}
-          build-args: |
-            KAPSL_VERSION=${{ steps.version.outputs.runtime_version }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha

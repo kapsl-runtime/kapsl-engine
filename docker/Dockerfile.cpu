@@ -8,12 +8,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the pre-built kapsl binary, pinned to KAPSL_VERSION so this layer
-# cache-busts per release and never reuses a stale, binary-less layer.
-# Verify in the same RUN so a failed/empty install fails the build.
+# cache-busts per release. Retry because runtime artifacts and container builds
+# are published by separate tag-triggered workflows.
 ARG KAPSL_VERSION
-RUN curl -fsSL https://downloads.kapsl.net/install.sh \
-    | KAPSL_VERSION="${KAPSL_VERSION}" KAPSL_INSTALL_DIR=/usr/local/bin sh \
-    && kapsl --version
+RUN set -eux; \
+    test -n "${KAPSL_VERSION}"; \
+    attempt=1; \
+    until curl -fsSL https://downloads.kapsl.net/install.sh \
+        | KAPSL_VERSION="${KAPSL_VERSION}" KAPSL_INSTALL_DIR=/usr/local/bin \
+          sh -s -- --version "${KAPSL_VERSION}" --install-dir /usr/local/bin; do \
+        if [ "${attempt}" -ge 20 ]; then exit 1; fi; \
+        attempt=$((attempt + 1)); \
+        sleep 15; \
+    done; \
+    kapsl --version; \
+    test ! -e /usr/local/bin/libonnxruntime_providers_cuda.so; \
+    test ! -e /usr/local/bin/libonnxruntime_providers_tensorrt.so; \
+    test ! -e /usr/local/bin/kapsl-provider-cuda12.json; \
+    test ! -e /usr/local/bin/kapsl-provider-tensorrt10.json
 
 RUN mkdir -p /models /data
 ENV KAPSL_MODEL_DIR=/models
