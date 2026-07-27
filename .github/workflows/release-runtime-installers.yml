@@ -59,6 +59,12 @@ jobs:
         with:
           toolchain: 1.92.0
 
+      - name: Set up Python for Windows dependency collection
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install WiX Toolset
         if: runner.os == 'Windows'
         shell: pwsh
@@ -364,12 +370,59 @@ jobs:
             Copy-Item $dll.FullName (Join-Path "wix" $dll.Name) -Force
           }
 
+          $nvidiaDepsDir = Join-Path $env:RUNNER_TEMP "kapsl-nvidia-runtime-dlls"
+          if (Test-Path $nvidiaDepsDir) {
+            Remove-Item $nvidiaDepsDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $nvidiaDepsDir -Force | Out-Null
+
+          python -m pip install --upgrade pip
+          python -m pip install `
+            --target $nvidiaDepsDir `
+            --only-binary=:all: `
+            --extra-index-url https://pypi.nvidia.com `
+            "onnxruntime-gpu[cuda,cudnn]==1.23.2" `
+            "tensorrt-cu12-libs==10.16.1.11"
+
+          $nvidiaDlls = @(Get-ChildItem -Path $nvidiaDepsDir -Filter "*.dll" -Recurse -File |
+            Where-Object { $_.Name -notlike "onnxruntime*.dll" } |
+            Sort-Object Name -Unique)
+          if ($nvidiaDlls.Count -eq 0) {
+            throw "No NVIDIA runtime dependency DLLs found in $nvidiaDepsDir"
+          }
+
+          Write-Host "Bundling NVIDIA runtime dependency DLLs from $nvidiaDepsDir"
+          foreach ($dll in $nvidiaDlls) {
+            Write-Host "  $($dll.Name)"
+            Copy-Item $dll.FullName (Join-Path "wix" $dll.Name) -Force
+          }
+
+          $requiredNvidiaDlls = @(
+            "cublas64_12.dll",
+            "cublasLt64_12.dll",
+            "cudart64_12.dll",
+            "cudnn64_9.dll",
+            "cufft64_11.dll",
+            "curand64_10.dll",
+            "nvinfer_10.dll",
+            "nvinfer_plugin_10.dll"
+          )
+          $missingNvidiaDlls = @($requiredNvidiaDlls | Where-Object { -not (Test-Path (Join-Path "wix" $_)) })
+          if ($missingNvidiaDlls.Count -gt 0) {
+            throw "NVIDIA runtime dependency collection is missing required DLL(s): $($missingNvidiaDlls -join ', ')"
+          }
+
+          $bundledDlls = @(Get-ChildItem -Path "wix" -Filter "*.dll" -File | Sort-Object Name)
+          if ($bundledDlls.Count -eq 0) {
+            throw "No bundled DLLs found in wix"
+          }
+
           $ortDllComponentLines = @()
           $ortDllComponentRefLines = @()
-          for ($i = 0; $i -lt $ortDlls.Count; $i++) {
+          for ($i = 0; $i -lt $bundledDlls.Count; $i++) {
             $componentId = "OrtDllComponent$i"
             $fileId = "OrtDllFile$i"
-            $fileName = $ortDlls[$i].Name
+            $fileName = $bundledDlls[$i].Name
             $ortDllComponentLines += "          <Component Id=""$componentId"" Guid=""*"" Win64=""$win64"">"
             $ortDllComponentLines += "            <File Id=""$fileId"" Source=""$fileName"" KeyPath=""yes"" />"
             $ortDllComponentLines += '          </Component>'
