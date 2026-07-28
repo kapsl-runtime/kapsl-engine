@@ -26,11 +26,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-22.04 (not ubuntu-latest) so the linux-x86_64 binary links
-        # against glibc 2.35 instead of 24.04's 2.39 — ubuntu-latest moved to
-        # 24.04 and the resulting binary refused to run on 22.04 and other
-        # still-supported distros with older glibc.
-        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # Both Linux binaries build on 22.04 runners so they link against glibc
+        # 2.35 rather than 24.04's 2.39. Building on 24.04 produced references
+        # to __isoc23_* (GCC 14 defaults to C23) and pidfd_* (glibc 2.39), which
+        # made the binary refuse to start on 22.04 and other still-supported
+        # distros. See the arm64 libstdc++ step below for why arm64 also needs
+        # a static libstdc++.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -62,6 +64,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.92.0
+
+      # The prebuilt aarch64 ONNX Runtime is compiled with a newer GCC that
+      # emits calls to __cxa_call_terminate. That symbol is present in
+      # libstdc++.a but hidden in 22.04's libstdc++.so, so the dynamic link
+      # fails. Linking libstdc++ statically resolves it from the archive and
+      # also drops the runtime GLIBCXX version requirement.
+      - name: Link libstdc++ statically (Linux arm64)
+        if: matrix.os == 'ubuntu-22.04-arm'
+        shell: bash
+        run: echo "RUSTFLAGS=-C link-arg=-static-libstdc++" >> "$GITHUB_ENV"
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
