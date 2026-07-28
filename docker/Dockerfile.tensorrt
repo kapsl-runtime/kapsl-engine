@@ -25,18 +25,12 @@ RUN echo "/opt/kapsl/tensorrt-package/tensorrt_libs" > /etc/ld.so.conf.d/kapsl-t
     && test -e /opt/kapsl/tensorrt-package/tensorrt_libs/libnvonnxparser.so.10
 
 ARG KAPSL_VERSION
+COPY docker/install-release-assets.sh /tmp/install-release-assets.sh
 RUN set -eux; \
     test -n "${KAPSL_VERSION}"; \
-    attempt=1; \
-    until curl -fsSL https://downloads.kapsl.net/install.sh \
-        | KAPSL_VERSION="${KAPSL_VERSION}" KAPSL_INSTALL_DIR=/usr/local/bin \
-          KAPSL_ACCELERATOR=tensorrt \
-          sh -s -- --version "${KAPSL_VERSION}" --install-dir /usr/local/bin \
-          --accelerator tensorrt; do \
-        if [ "${attempt}" -ge 20 ]; then exit 1; fi; \
-        attempt=$((attempt + 1)); \
-        sleep 15; \
-    done; \
+    KAPSL_VERSION="${KAPSL_VERSION}" \
+        sh /tmp/install-release-assets.sh tensorrt; \
+    rm /tmp/install-release-assets.sh; \
     kapsl --version; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/kapsl-provider-tensorrt10.json; \

@@ -7,20 +7,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the pre-built kapsl binary, pinned to KAPSL_VERSION so this layer
-# cache-busts per release. Retry because runtime artifacts and container builds
-# are published by separate tag-triggered workflows.
+# Install the pre-built kapsl bundle from the matching GitHub Release. The
+# release-asset path stays reachable from GitHub-hosted container builders even
+# when the public download-domain WAF rejects their shared runner addresses.
+COPY docker/install-release-assets.sh /tmp/install-release-assets.sh
 ARG KAPSL_VERSION
 RUN set -eux; \
     test -n "${KAPSL_VERSION}"; \
-    attempt=1; \
-    until curl -fsSL https://downloads.kapsl.net/install.sh \
-        | KAPSL_VERSION="${KAPSL_VERSION}" KAPSL_INSTALL_DIR=/usr/local/bin \
-          sh -s -- --version "${KAPSL_VERSION}" --install-dir /usr/local/bin; do \
-        if [ "${attempt}" -ge 20 ]; then exit 1; fi; \
-        attempt=$((attempt + 1)); \
-        sleep 15; \
-    done; \
+    KAPSL_VERSION="${KAPSL_VERSION}" \
+        sh /tmp/install-release-assets.sh cpu; \
+    rm /tmp/install-release-assets.sh; \
     kapsl --version; \
     test ! -e /usr/local/bin/libonnxruntime_providers_cuda.so; \
     test ! -e /usr/local/bin/libonnxruntime_providers_tensorrt.so; \
