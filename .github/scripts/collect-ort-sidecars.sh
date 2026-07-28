@@ -11,6 +11,13 @@ search_roots=(
   "${HOME}/Library/Caches/ort.pyke.io/dfbin"
 )
 
+# When the build is pointed at a user-supplied ONNX Runtime (see
+# ORT_LIB_LOCATION in the release workflow), its shared libraries live outside
+# the cargo/ort caches and still need to ship alongside the binary.
+if [ -n "${ORT_LIB_LOCATION:-}" ]; then
+  search_roots+=("${ORT_LIB_LOCATION}")
+fi
+
 existing_roots=()
 for root in "${search_roots[@]}"; do
   if [ -d "$root" ]; then

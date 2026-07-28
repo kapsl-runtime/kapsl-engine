@@ -65,15 +65,37 @@ jobs:
         with:
           toolchain: 1.92.0
 
-      # The prebuilt aarch64 ONNX Runtime is compiled with a newer GCC that
-      # emits calls to __cxa_call_terminate. That symbol is present in
-      # libstdc++.a but hidden in 22.04's libstdc++.so, so the dynamic link
-      # fails. Linking libstdc++ statically resolves it from the archive and
-      # also drops the runtime GLIBCXX version requirement.
-      - name: Link libstdc++ statically (Linux arm64)
+      # ort's default aarch64 prebuilt (from pyke.io) is compiled against glibc
+      # 2.38+ and a newer libstdc++, so statically linking it forces the whole
+      # binary to require glibc 2.38 (__isoc23_*) regardless of runner. Use
+      # Microsoft's official aarch64 build instead, which targets glibc 2.27,
+      # and link it dynamically. ORT_API_VERSION 23 in ort-sys 2.0.0-rc.11
+      # corresponds to ONNX Runtime 1.22.x, so the versions must stay in sync.
+      - name: Use glibc-compatible ONNX Runtime (Linux arm64)
         if: matrix.os == 'ubuntu-22.04-arm'
         shell: bash
-        run: echo "RUSTFLAGS=-C link-arg=-static-libstdc++" >> "$GITHUB_ENV"
+        run: |
+          set -euo pipefail
+          ort_version=1.22.0
+          curl -fsSL -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ort_version}/onnxruntime-linux-aarch64-${ort_version}.tgz"
+          mkdir -p /tmp/ort
+          tar xzf /tmp/ort.tgz -C /tmp/ort --strip-components=1
+          test -e /tmp/ort/lib/libonnxruntime.so
+          test -e /tmp/ort/lib/libonnxruntime.so.1
+          # Upstream ships libonnxruntime.so -> .so.1 -> .so.<version>. Collapse
+          # the real file onto the SONAME name so sidecar staging (which uses
+          # cp -L) ships one copy instead of three of the same 17 MiB library.
+          rm /tmp/ort/lib/libonnxruntime.so.1
+          mv "/tmp/ort/lib/libonnxruntime.so.${ort_version}" /tmp/ort/lib/libonnxruntime.so.1
+          test -e "$(readlink -f /tmp/ort/lib/libonnxruntime.so)"
+          {
+            echo "ORT_LIB_LOCATION=/tmp/ort/lib"
+            echo "ORT_PREFER_DYNAMIC_LINK=1"
+            echo "ORT_SKIP_DOWNLOAD=1"
+            # $ORIGIN so the runtime finds the sidecar next to the binary.
+            echo 'RUSTFLAGS=-C link-arg=-Wl,-rpath,$ORIGIN'
+          } >> "$GITHUB_ENV"
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
