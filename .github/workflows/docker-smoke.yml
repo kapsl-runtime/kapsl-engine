@@ -1,0 +1,58 @@
+name: Docker Smoke Tests
+
+on:
+  pull_request:
+    paths:
+      - "docker/**"
+      - ".github/workflows/docker-smoke.yml"
+      - ".github/workflows/release-docker-images.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-scripts:
+    name: Test release asset scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        run: sh -n docker/*.sh
+
+      - name: Test readiness and checksum handling
+        run: docker/test-release-scripts.sh
+
+  cpu-image:
+    name: Build CPU image
+    runs-on: ubuntu-latest
+    env:
+      KAPSL_SMOKE_VERSION: "0.1.19"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build CPU image
+        run: |
+          for attempt in 1 2 3; do
+            if docker build \
+              --build-arg "KAPSL_VERSION=${KAPSL_SMOKE_VERSION}" \
+              --file docker/Dockerfile.cpu \
+              --tag kapsl-engine:pr-smoke \
+              .; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq 3 ]; then
+              echo "CPU image build failed after ${attempt} attempts." >&2
+              exit 1
+            fi
+
+            echo "CPU image build failed on attempt ${attempt}; retrying in 15 seconds."
+            sleep 15
+          done
+
+      - name: Run CPU image
+        run: docker run --rm kapsl-engine:pr-smoke --version
