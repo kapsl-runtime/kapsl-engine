@@ -176,6 +176,38 @@ jobs:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release
 
+      # Guard against the released Linux binaries silently regaining a newer
+      # glibc requirement. This has regressed twice: once when ubuntu-latest
+      # moved to 24.04, and once on arm64 via a dependency's own prebuilt.
+      # A binary requiring more than MAX_GLIBC won't start on Ubuntu 22.04,
+      # Debian 12, RHEL 9, or Amazon Linux 2023.
+      - name: Verify glibc compatibility (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          max_glibc="2.35"
+          binary="kapsl-runtime/target/release/kapsl"
+
+          required="$(objdump -T "$binary" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+            | sed 's/GLIBC_//' \
+            | sort -V -u)"
+          highest="$(echo "$required" | tail -n1)"
+
+          echo "Highest glibc version required: ${highest} (allowed: ${max_glibc})"
+          if [ "$(printf '%s\n%s\n' "$max_glibc" "$highest" | sort -V | tail -n1)" != "$max_glibc" ]; then
+            echo "::error::${binary} requires glibc ${highest}, above the ${max_glibc} baseline."
+            echo "Symbols forcing the higher requirement:"
+            objdump -T "$binary" | grep -E "GLIBC_[0-9]+\.[0-9]+" \
+              | awk -v m="$max_glibc" '{
+                  v=$(NF-1); gsub(/[()]|GLIBC_/, "", v);
+                  if (v != m) { split(v,a,"."); split(m,b,".");
+                    if (a[1]>b[1] || (a[1]==b[1] && a[2]>b[2])) print "  " $NF, "(GLIBC_" v ")" }
+                }' | sort -u
+            exit 1
+          fi
+
       - name: Collect ONNX Runtime sidecar libraries (Unix)
         if: runner.os != 'Windows'
         shell: bash
