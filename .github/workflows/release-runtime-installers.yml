@@ -26,11 +26,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-22.04 (not ubuntu-latest) so the linux-x86_64 binary links
-        # against glibc 2.35 instead of 24.04's 2.39 — ubuntu-latest moved to
-        # 24.04 and the resulting binary refused to run on 22.04 and other
-        # still-supported distros with older glibc.
-        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # Build both Linux binaries on 22.04 runners so they link against
+        # glibc 2.35 rather than 24.04's 2.39. A 2.39-linked binary refuses to
+        # start on 22.04 and other still-supported distros with older glibc.
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
