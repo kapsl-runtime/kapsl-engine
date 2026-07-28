@@ -25,7 +25,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # ubuntu-22.04 (not ubuntu-latest) so the linux-x86_64 binary links
+        # against glibc 2.35 instead of 24.04's 2.39 — see
+        # release-runtime-installers.yml for the full explanation.
+        os: [ubuntu-22.04, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
