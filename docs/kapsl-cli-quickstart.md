@@ -201,10 +201,21 @@ curl http://127.0.0.1:9095/api/models \
 
 If auth is disabled, API is loopback-only by default.
 
-## Extensions (via Runtime API)
+## Extensions
 
-`kapsl` CLI does not have dedicated extension subcommands.  
-Use the runtime API endpoints for extension lifecycle operations.
+Install an extension from Kapsl Hub into a running local engine:
+
+```bash
+kapsl extension install connector.echo
+```
+
+If runtime API authentication is enabled:
+
+```bash
+kapsl extension install connector.echo --auth-token "$KAPSL_API_TOKEN"
+```
+
+The runtime API remains available for the rest of the extension lifecycle.
 
 List installed extensions:
 
