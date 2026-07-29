@@ -86,6 +86,7 @@ Defaults:
 - `kapsl push ...`
 - `kapsl pull ...`
 - `kapsl login ...`
+- `kapsl extension install ...`
 - `kapsl control ...`
 - `kapsl --model ...` (legacy compatibility for `run`)
 
@@ -222,7 +223,19 @@ Flags:
 
 Credentials are stored in `~/.kapsl/tokens.json` (path overridable via `KAPSL_REMOTE_TOKEN_STORE_PATH`).
 
-### 4.5 Control Command
+### 4.5 Extension Command
+
+Install a marketplace extension into a running local engine:
+
+```bash
+kapsl extension install connector.s3
+```
+
+Use `--http-url`, `--http-host`, or `--http-port` to select another engine endpoint.
+If runtime authentication is enabled, pass its writer or admin token with `--auth-token`.
+Use `--marketplace-url` to override the Kapsl Hub marketplace endpoint.
+
+### 4.6 Control Command
 
 `kapsl control` runs a multi-runtime control loop that orchestrates cross-runtime weight distribution and scaling policy based on observed pressure and GPU utilization.
 
