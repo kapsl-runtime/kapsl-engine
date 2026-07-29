@@ -50,6 +50,8 @@ pub(crate) fn native_tls_http_agent() -> ureq::Agent {
         .tls_config(
             ureq::tls::TlsConfig::builder()
                 .provider(ureq::tls::TlsProvider::NativeTls)
+                // Ureq's WebPki default disables Schannel's trusted roots on Windows.
+                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
                 .build(),
         )
         .build()
@@ -448,4 +450,21 @@ pub(crate) fn pull_kapsl_from_http_remote(
 
     // Fallback: direct download from the API server.
     download_to_file(artifact_url, output_path, authorization_header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_tls_http_agent_uses_platform_roots() {
+        let agent = native_tls_http_agent();
+        let tls_config = agent.config().tls_config();
+
+        assert_eq!(tls_config.provider(), ureq::tls::TlsProvider::NativeTls);
+        assert!(matches!(
+            tls_config.root_certs(),
+            ureq::tls::RootCerts::PlatformVerifier
+        ));
+    }
 }
