@@ -199,3 +199,119 @@ pub(crate) fn install_extension_from_marketplace(
     let _ = fs::remove_dir_all(&temp_dir);
     install_result
 }
+
+pub(crate) fn execute_extension_command(args: ExtensionCommandArgs) -> Result<(), DynError> {
+    match args.command {
+        ExtensionSubcommand::Install(args) => execute_extension_install_command(args),
+    }
+}
+
+fn execute_extension_install_command(args: ExtensionInstallCommandArgs) -> Result<(), DynError> {
+    let extension_id = args.extension_id.trim();
+    if !is_valid_extension_id(extension_id) {
+        return Err(dyn_error_from_message(format!(
+            "Invalid extension ID `{}`. Use letters, numbers, dots, underscores, or hyphens.",
+            args.extension_id
+        )));
+    }
+
+    let base_url = match &args.http_url {
+        Some(url) => url.trim_end_matches('/').to_string(),
+        None => format!("http://{}:{}", args.http_host, args.http_port),
+    };
+    let install_url = format!("{}/api/extensions/install", base_url);
+    let timeout = std::time::Duration::from_millis(args.timeout_ms.max(1));
+    let agent_config = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_per_call(Some(timeout))
+        .build();
+    let agent: ureq::Agent = agent_config.into();
+
+    let mut payload = serde_json::json!({ "extension_id": extension_id });
+    if let Some(marketplace_url) = args.marketplace_url.as_deref() {
+        let marketplace_url = marketplace_url.trim();
+        if !marketplace_url.is_empty() {
+            payload["marketplace_url"] = serde_json::Value::String(marketplace_url.to_string());
+        }
+    }
+    let payload = serde_json::to_string(&payload)
+        .map_err(|e| dyn_error_from_message(format!("Failed to serialize request: {}", e)))?;
+
+    let mut request = agent
+        .post(&install_url)
+        .header("Content-Type", "application/json");
+    if let Some(token) = args.auth_token.as_deref() {
+        let token = token.trim();
+        if !token.is_empty() {
+            request = request.header("Authorization", &format!("Bearer {}", token));
+        }
+    }
+
+    let mut response = request.send(payload).map_err(|error| {
+        dyn_error_from_message(format!(
+            "Kapsl Engine could not install `{}` via {}: {}",
+            extension_id,
+            install_url,
+            format_remote_http_error(error)
+        ))
+    })?;
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .unwrap_or_else(|_| String::new());
+    let installed = serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default();
+    let manifest = installed
+        .get("extension")
+        .and_then(|extension| extension.get("manifest"));
+    let display_name = manifest
+        .and_then(|manifest| manifest.get("name"))
+        .and_then(|name| name.as_str())
+        .unwrap_or(extension_id);
+    let version = manifest
+        .and_then(|manifest| manifest.get("version"))
+        .and_then(|version| version.as_str());
+
+    let a = Ansi::new();
+    eprintln!();
+    eprintln!(
+        "  {}  {}{}",
+        a.green("✓"),
+        a.bold(display_name),
+        version
+            .map(|version| format!(" {}", a.dim(&format!("v{}", version))))
+            .unwrap_or_default()
+    );
+    eprintln!("     {}", a.dim("Installed in the running Kapsl Engine"));
+    eprintln!();
+    Ok(())
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn extension_install_command_parses_hub_extension_id() {
+        let cli = Cli::try_parse_from([
+            "kapsl",
+            "extension",
+            "install",
+            "connector.s3",
+            "--http-port",
+            "9195",
+        ])
+        .expect("parse extension install command");
+
+        assert!(matches!(
+            cli.command,
+            Some(KapslCommand::Extension(ExtensionCommandArgs {
+                command: ExtensionSubcommand::Install(ExtensionInstallCommandArgs {
+                    extension_id,
+                    http_port: 9195,
+                    ..
+                })
+            })) if extension_id == "connector.s3"
+        ));
+    }
+}
