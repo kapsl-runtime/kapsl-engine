@@ -4,6 +4,10 @@
 
 This repo owns the `kapsl` runtime CLI and local inference server.
 
+The runtime serves an OpenAI-compatible API at `/v1` alongside its native
+`/api` routes, so existing OpenAI clients work by changing only their base URL.
+See [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
+
 Shared Rust libraries are maintained in [`kapsl-sdk`](https://github.com/kapsl-runtime/kapsl-sdk).
 The runtime binary depends on those crates through normal Cargo dependencies.
 

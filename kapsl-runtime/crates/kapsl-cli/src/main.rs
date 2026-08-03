@@ -718,6 +718,17 @@ async fn main() -> Result<(), DynError> {
             log_sensitive_ids: log_sensitive_ids_for_api,
         });
 
+        // OpenAI-compatible surface. Reader-scoped like `/api/models/:id/infer`,
+        // which it delegates to.
+        let openai_routes = build_openai_routes(OpenAiRoutesConfig {
+            model_registry: model_registry_clone.clone(),
+            replica_pools: replica_pools_clone.clone(),
+            latency_samples: latency_samples_clone.clone(),
+            runtime_pressure_state: runtime_pressure_state.clone(),
+            runtime_pressure_config: runtime_pressure_config.clone(),
+            log_sensitive_ids: log_sensitive_ids_for_api,
+        });
+
         let system_routes = build_system_routes(
             model_registry_clone.clone(),
             replica_pools_clone.clone(),
@@ -745,6 +756,7 @@ async fn main() -> Result<(), DynError> {
             .or(system_routes)
             .or(engine_routes.reader)
             .or(rag_routes)
+            .or(openai_routes)
             .map(reply_into_response);
         let reader_api_routes = api_auth_filter(
             ApiRole::Reader,

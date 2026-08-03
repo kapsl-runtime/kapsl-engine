@@ -32,20 +32,42 @@ cargo run -p kapsl -- --help
 
 ## 60-Second Start
 
+Package a GGUF model you already have and serve it:
+
 ```bash
-cd kapsl-runtime
+# 1) Build an .aimod package from the model file
+kapsl build ./qwen2.5-7b-instruct-q4_k_m.gguf --output ./qwen.aimod
 
-# 1) Create sample model package
-./scripts/packages/mnist/create_package.sh
-
-# 2) Start runtime
-cargo run -p kapsl -- --model models/mnist/mnist.aimod
+# 2) Start the runtime
+kapsl run --model ./qwen.aimod
 ```
+
+Then talk to it with any OpenAI client — no Kapsl-specific code:
+
+```bash
+curl http://127.0.0.1:9095/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"Say hello in five words."}]}'
+```
+
+`GET /v1/models` lists the names you can put in that `model` field.
 
 Runtime endpoints (defaults):
 
-- API: `http://127.0.0.1:9095/api`
+- OpenAI-compatible API: `http://127.0.0.1:9095/v1` — see
+  [OpenAI-Compatible API](./openai-compatible-api.md)
+- Native API: `http://127.0.0.1:9095/api`
 - Metrics: `http://127.0.0.1:9095/metrics`
+
+### Non-LLM start
+
+For a non-LLM smoke test from a source checkout:
+
+```bash
+cd kapsl-runtime
+./scripts/packages/mnist/create_package.sh
+cargo run -p kapsl -- --model models/mnist/mnist.aimod
+```
 
 ## Core Commands
 
