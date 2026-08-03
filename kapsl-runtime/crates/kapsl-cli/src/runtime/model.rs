@@ -12,6 +12,23 @@ pub(crate) fn recycle_model_id(model_id: u32, recycled_ids: &Mutex<Vec<u32>>) {
     recycled_ids.lock().push(model_id);
 }
 
+/// Copy the manifest's input contract onto a registry entry so `GET /api/models`
+/// reports what a model consumes, not just which backend loaded it.
+///
+/// `framework` cannot answer that on its own: it reads `onnx` for an image
+/// classifier, an ASR front-end, and a raw tensor graph alike, while the three
+/// take encoded image bytes, a PCM waveform, and a ready-made tensor
+/// respectively. Callers that build a request — the console playground — need
+/// the axes to pick a form.
+fn with_manifest_axes(info: ModelInfo, manifest: &Manifest) -> ModelInfo {
+    info.with_model_axes(
+        manifest.format.clone(),
+        manifest.model_type.clone(),
+        manifest.task.clone(),
+        manifest.preprocess_kind(),
+    )
+}
+
 pub(crate) async fn run_worker(
     args: &Args,
     device_info: &DeviceInfo,
@@ -434,14 +451,17 @@ pub(crate) fn load_model_blocking(
         .unwrap_or_else(|| "basic".to_string());
 
     // Register model in the model registry
-    let model_info = ModelInfo::new(
-        model_id,
-        loader.manifest.project_name.clone(),
-        loader.manifest.version.clone(),
-        loader.manifest.framework.clone(),
-        device_str,
-        optimization_level,
-        absolute_path.to_string_lossy().to_string(), // Store absolute package path
+    let model_info = with_manifest_axes(
+        ModelInfo::new(
+            model_id,
+            loader.manifest.project_name.clone(),
+            loader.manifest.version.clone(),
+            loader.manifest.framework.clone(),
+            device_str,
+            optimization_level,
+            absolute_path.to_string_lossy().to_string(), // Store absolute package path
+        ),
+        &loader.manifest,
     );
     model_registry.upsert(model_info);
 
@@ -805,14 +825,17 @@ pub(crate) async fn load_model(
         .unwrap_or_else(|| "basic".to_string());
 
     // Register model in the model registry
-    let model_info = ModelInfo::new(
-        model_id,
-        loader.manifest.project_name.clone(),
-        loader.manifest.version.clone(),
-        loader.manifest.framework.clone(),
-        device_str,
-        optimization_level,
-        absolute_path.to_string_lossy().to_string(), // Store absolute package path
+    let model_info = with_manifest_axes(
+        ModelInfo::new(
+            model_id,
+            loader.manifest.project_name.clone(),
+            loader.manifest.version.clone(),
+            loader.manifest.framework.clone(),
+            device_str,
+            optimization_level,
+            absolute_path.to_string_lossy().to_string(), // Store absolute package path
+        ),
+        &loader.manifest,
     );
     model_registry.upsert(model_info);
 
@@ -967,16 +990,19 @@ pub(crate) async fn scale_up_model(
         .clone()
         .unwrap_or_else(|| "basic".to_string());
 
-    let model_info = ModelInfo::new_replica(
-        unique_id,
-        replica_id,
-        base_model_id,
-        loader.manifest.project_name.clone(),
-        loader.manifest.version.clone(),
-        loader.manifest.framework.clone(),
-        device.to_string(),
-        optimization_level,
-        absolute_path.to_string_lossy().to_string(),
+    let model_info = with_manifest_axes(
+        ModelInfo::new_replica(
+            unique_id,
+            replica_id,
+            base_model_id,
+            loader.manifest.project_name.clone(),
+            loader.manifest.version.clone(),
+            loader.manifest.framework.clone(),
+            device.to_string(),
+            optimization_level,
+            absolute_path.to_string_lossy().to_string(),
+        ),
+        &loader.manifest,
     );
     model_registry.upsert(model_info);
 
