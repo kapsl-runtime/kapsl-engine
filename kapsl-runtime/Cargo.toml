@@ -10,17 +10,17 @@ resolver = "2"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
-llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f8462e170cc539b9aa0ff08d309f9e5d507d908a" }
+kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-ipc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-monitor = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-shm = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+kapsl-transport = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
+llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "0e74d8505d11469f569e5087a2b0d2ce6b50da93" }
