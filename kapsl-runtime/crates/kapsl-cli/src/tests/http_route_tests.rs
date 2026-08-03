@@ -199,3 +199,96 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
         serde_json::from_slice(response.body()).expect("infer-stream json");
     assert_eq!(body["error"], "Model 0 not found");
 }
+
+fn test_openai_routes() -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
+    build_openai_routes(OpenAiRoutesConfig {
+        model_registry: Arc::new(ModelRegistry::new()),
+        replica_pools: Arc::new(RwLock::new(HashMap::new())),
+        latency_samples: Arc::new(RwLock::new(HashMap::new())),
+        runtime_pressure_state: Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+        runtime_pressure_config: Arc::new(RuntimePressureConfig {
+            memory_conserve_ratio: 0.7,
+            memory_emergency_ratio: 0.9,
+            gpu_util_conserve_ratio: 0.8,
+            gpu_util_emergency_ratio: 0.95,
+            gpu_mem_conserve_ratio: 0.8,
+            gpu_mem_emergency_ratio: 0.95,
+            conserve_max_new_tokens: Some(256),
+            emergency_max_new_tokens: Some(128),
+        }),
+        log_sensitive_ids: false,
+    })
+}
+
+async fn post_chat_completion(body: &str) -> warp::http::Response<warp::hyper::body::Bytes> {
+    warp::test::request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(body)
+        .reply(&test_openai_routes())
+        .await
+}
+
+#[tokio::test]
+async fn test_openai_models_route_returns_an_empty_list_shape() {
+    let response = warp::test::request()
+        .path("/v1/models")
+        .reply(&test_openai_routes())
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("models json");
+    assert_eq!(body["object"], "list");
+    assert_eq!(
+        body["data"].as_array().expect("data array").len(),
+        0,
+        "no pools are registered, so nothing should be advertised"
+    );
+}
+
+#[tokio::test]
+async fn test_openai_chat_rejects_malformed_json_in_openai_error_shape() {
+    let response = post_chat_completion("{ not json").await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+    // The official SDKs read the nested object, not a bare string.
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("Invalid chat completion payload"));
+}
+
+#[tokio::test]
+async fn test_openai_chat_returns_not_found_for_unknown_model() {
+    let response =
+        post_chat_completion(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#)
+            .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("no models are currently loaded"));
+}
+
+#[tokio::test]
+async fn test_openai_chat_rejects_multiple_choices_before_touching_the_pool() {
+    let response = post_chat_completion(
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"n":3}"#,
+    )
+    .await;
+
+    // `n` is rejected rather than silently honoured as n=1, and it is checked
+    // before model resolution so the message is about the real problem.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+    assert!(body["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("n=3 is not supported"));
+}
