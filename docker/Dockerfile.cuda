@@ -9,6 +9,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install the pre-built runtime and CUDA provider pack from the matching GitHub
 # Release, pinned to KAPSL_VERSION so this layer cache-busts per release.
+#
+# The provider pack unpacks next to the binary, but ONNX Runtime reaches
+# libonnxruntime_providers_shared.so through dlopen() on the bare file name, and
+# /usr/local/bin is not a loader search path. Registering it with ldconfig is
+# what makes the CUDA provider resolvable; without it the provider fails to
+# register and the engine quietly serves every request from the CPU while still
+# holding the GPU. ldd cannot catch that regression, because the bridge is not a
+# DT_NEEDED of the provider, so assert the loader can find it by name.
 COPY docker/install-release-assets.sh /tmp/install-release-assets.sh
 ARG KAPSL_VERSION
 RUN set -eux; \
@@ -19,10 +27,13 @@ RUN set -eux; \
     kapsl --version; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \
+    echo "/usr/local/bin" > /etc/ld.so.conf.d/kapsl-runtime.conf; \
+    ldconfig; \
     if ldd /usr/local/bin/libonnxruntime_providers_cuda.so | grep -q "not found"; then \
         ldd /usr/local/bin/libonnxruntime_providers_cuda.so; \
         exit 1; \
-    fi
+    fi; \
+    ldconfig -p | grep -q "libonnxruntime_providers_shared.so"
 
 RUN mkdir -p /models /data
 ENV KAPSL_MODEL_DIR=/models
