@@ -26,6 +26,10 @@ RUN echo "/opt/kapsl/tensorrt-package/tensorrt_libs" > /etc/ld.so.conf.d/kapsl-t
 
 ARG KAPSL_VERSION
 COPY docker/install-release-assets.sh /tmp/install-release-assets.sh
+# ONNX Runtime dlopen()s libonnxruntime_providers_shared.so by bare name, so the
+# install directory has to be a loader search path or both providers fall back
+# to CPU at runtime. ldd cannot catch that, because the bridge is not a
+# DT_NEEDED of either provider; assert the loader can find it by name instead.
 RUN set -eux; \
     test -n "${KAPSL_VERSION}"; \
     KAPSL_VERSION="${KAPSL_VERSION}" \
@@ -36,12 +40,15 @@ RUN set -eux; \
     test -f /usr/local/bin/kapsl-provider-tensorrt10.json; \
     test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \
     test -f /usr/local/bin/libonnxruntime_providers_tensorrt.so; \
+    echo "/usr/local/bin" > /etc/ld.so.conf.d/kapsl-runtime.conf; \
+    ldconfig; \
     if ldd /usr/local/bin/libonnxruntime_providers_cuda.so \
         /usr/local/bin/libonnxruntime_providers_tensorrt.so | grep -q "not found"; then \
         ldd /usr/local/bin/libonnxruntime_providers_cuda.so \
             /usr/local/bin/libonnxruntime_providers_tensorrt.so; \
         exit 1; \
-    fi
+    fi; \
+    ldconfig -p | grep -q "libonnxruntime_providers_shared.so"
 
 RUN mkdir -p /models /data
 ENV KAPSL_MODEL_DIR=/models
