@@ -150,11 +150,17 @@ jobs:
       - name: Package Debian installer (.deb)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p dist pkgroot/DEBIAN pkgroot/usr/local/bin
+          mkdir -p dist pkgroot/DEBIAN pkgroot/usr/local/bin pkgroot/etc/ld.so.conf.d
           install -m 755 kapsl-runtime/target/release/kapsl pkgroot/usr/local/bin/kapsl
           if [ -d ort-core-libs ]; then
             cp -L ort-core-libs/* pkgroot/usr/local/bin/ 2>/dev/null || true
           fi
+
+          # ONNX Runtime dlopen()s libonnxruntime_providers_shared.so by bare
+          # name, and /usr/local/bin is not a loader search path. Without this
+          # the accelerator packs register no provider and the runtime serves
+          # every request from the CPU while holding the GPU.
+          echo "/usr/local/bin" > pkgroot/etc/ld.so.conf.d/kapsl-runtime.conf
 
           arch="$(dpkg --print-architecture)"
 
@@ -167,6 +173,17 @@ jobs:
             echo "Maintainer: Kapsl Team <support@kapsl.ai>"
             echo "Description: Kapsl runtime CLI and local inference server."
           } > pkgroot/DEBIAN/control
+
+          # The conf file only takes effect once the cache is rebuilt, and dpkg
+          # triggers ldconfig on its own only for standard library directories.
+          for script in postinst postrm; do
+            {
+              echo "#!/bin/sh"
+              echo "set -e"
+              echo "ldconfig"
+            } > "pkgroot/DEBIAN/${script}"
+            chmod 755 "pkgroot/DEBIAN/${script}"
+          done
 
           deb_path="dist/kapsl-runtime_${KAPSL_DEB_VERSION}_${arch}.deb"
           dpkg-deb --build pkgroot "${deb_path}"
