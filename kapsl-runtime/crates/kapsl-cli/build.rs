@@ -7,6 +7,17 @@ fn main() {
         cc::Build::new()
             .file("compat_glibc.c")
             .compile("compat_glibc");
+
+        // ONNX Runtime loads its provider bridge with a bare-name dlopen(), so
+        // the loader searches this binary's own DT_RUNPATH for it. ORT is
+        // linked into this executable, which makes the executable the calling
+        // object, and $ORIGIN then resolves to wherever the binary was
+        // installed. Without it the sidecar libraries that ship beside the
+        // binary are invisible unless the directory happens to be a system
+        // library path, and every accelerator silently degrades to CPU.
+        // Windows needs no equivalent: its search order already includes the
+        // directory the executable was loaded from.
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
     }
 
     // On Windows, provide a posix_memalign shim for llama-cpp-sys-2
