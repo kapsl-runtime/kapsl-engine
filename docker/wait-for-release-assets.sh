@@ -4,7 +4,10 @@ set -eu
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 
 release_base="${KAPSL_RELEASE_BASE_URL:-https://github.com/kapsl-runtime/kapsl-engine/releases/download/v${KAPSL_VERSION}}"
-max_attempts="${KAPSL_WAIT_ATTEMPTS:-180}"
+# A clean CUDA runtime build can take over an hour on the hosted two-job
+# release worker. Keep the Docker release waiting long enough for that artifact
+# and its checksum to finish publishing.
+max_attempts="${KAPSL_WAIT_ATTEMPTS:-720}"
 retry_delay="${KAPSL_WAIT_DELAY_SECONDS:-10}"
 
 case "${max_attempts}" in
