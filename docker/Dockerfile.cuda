@@ -19,12 +19,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # DT_NEEDED of the provider, so assert the loader can find it by name.
 COPY docker/install-release-assets.sh /tmp/install-release-assets.sh
 ARG KAPSL_VERSION
+# libcuda is mounted by the NVIDIA container runtime, so validate the binary's
+# dependency without executing it while BuildKit is constructing the image.
 RUN set -eux; \
     test -n "${KAPSL_VERSION}"; \
     KAPSL_VERSION="${KAPSL_VERSION}" \
         sh /tmp/install-release-assets.sh cuda; \
     rm /tmp/install-release-assets.sh; \
-    kapsl --version; \
     readelf -d /usr/local/bin/kapsl | grep -q 'libcuda.so.1'; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \

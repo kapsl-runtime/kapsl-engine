@@ -30,12 +30,13 @@ COPY docker/install-release-assets.sh /tmp/install-release-assets.sh
 # install directory has to be a loader search path or both providers fall back
 # to CPU at runtime. ldd cannot catch that, because the bridge is not a
 # DT_NEEDED of either provider; assert the loader can find it by name instead.
+# libcuda is mounted by the NVIDIA container runtime, so validate the binary's
+# dependency without executing it while BuildKit is constructing the image.
 RUN set -eux; \
     test -n "${KAPSL_VERSION}"; \
     KAPSL_VERSION="${KAPSL_VERSION}" \
         sh /tmp/install-release-assets.sh tensorrt; \
     rm /tmp/install-release-assets.sh; \
-    kapsl --version; \
     readelf -d /usr/local/bin/kapsl | grep -q 'libcuda.so.1'; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/kapsl-provider-tensorrt10.json; \
