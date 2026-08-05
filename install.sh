@@ -167,7 +167,30 @@ if [ -z "$VERSION" ]; then
     echo "$VERSION"
 fi
 
-BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+# GGUF/llama.cpp only gets GPU support if the binary was compiled with
+# --features cuda, and that build links libcuda.so.1 directly (not dlopen'd),
+# so it cannot exec at all on a host with no NVIDIA driver loaded. Only reach
+# for it when the driver is confirmed working; otherwise keep installing the
+# portable build so `kapsl` still runs, and say so.
+USE_CUDA_RUNTIME=0
+case "$ACCELERATOR" in
+    cuda | cuda12 | tensorrt | tensorrt10)
+        if [ "$PLATFORM" = "linux-x86_64" ]; then
+            if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+                USE_CUDA_RUNTIME=1
+            else
+                echo "Warning: no working NVIDIA driver detected (nvidia-smi missing or failed)." >&2
+                echo "Installing the portable runtime instead; GGUF models will run on CPU until a driver is available. ONNX models still get the ${ACCELERATOR} provider pack." >&2
+            fi
+        fi
+        ;;
+esac
+
+if [ "$USE_CUDA_RUNTIME" = "1" ]; then
+    BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}-cuda12.tar.gz"
+else
+    BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+fi
 BUNDLE_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BUNDLE_FILE}"
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
 DOWNLOAD_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BIN_FILE}"
@@ -238,5 +261,10 @@ echo ""
 if [ "$ACCELERATOR" != "cpu" ]; then
     echo "Installed accelerator profile: ${ACCELERATOR}"
     echo "Linux accelerator packs require compatible NVIDIA system runtime libraries."
+    if [ "$USE_CUDA_RUNTIME" = "1" ]; then
+        echo "GGUF models: GPU-accelerated (CUDA compiled into this runtime build)."
+    else
+        echo "GGUF models: CPU only for this install (ONNX models still get the ${ACCELERATOR} provider pack)."
+    fi
 fi
 echo "Run 'kapsl --help' to get started."
