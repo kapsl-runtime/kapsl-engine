@@ -538,10 +538,19 @@ pub(crate) fn resolve_effective_topology_choice(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct MeshDeviceSelection {
+    pub(crate) devices: Vec<kapsl_hal::device::Device>,
+    /// Execution provider requested by policy/manifest. This is deliberately
+    /// separate from the physical device backend: TensorRT executes on CUDA
+    /// devices and CoreML executes on Metal devices.
+    pub(crate) logical_provider: String,
+}
+
 pub(crate) fn select_mesh_devices(
     requirements: &kapsl_core::HardwareRequirements,
     device_info: &DeviceInfo,
-) -> Result<Vec<kapsl_hal::device::Device>, String> {
+) -> Result<MeshDeviceSelection, String> {
     let strategy = requirements
         .strategy
         .as_deref()
@@ -599,9 +608,10 @@ pub(crate) fn select_mesh_devices(
     }
 
     let mut selected: Vec<kapsl_hal::device::Device> = Vec::new();
+    let mut selected_provider: Option<String> = None;
     if !providers.is_empty() {
         for provider in &providers {
-            let provider_lower = provider.to_lowercase();
+            let provider_lower = provider.trim().to_ascii_lowercase();
             let backend_key = match provider_lower.as_str() {
                 "tensorrt" => "cuda".to_string(),
                 "coreml" => "metal".to_string(),
@@ -635,11 +645,13 @@ pub(crate) fn select_mesh_devices(
             }
             if !matches.is_empty() {
                 selected = matches;
+                selected_provider = Some(provider_lower);
                 break;
             }
         }
     } else {
         let best_provider = device_info.get_best_provider().to_ascii_lowercase();
+        selected_provider = Some(best_provider.clone());
         selected = device_info
             .devices
             .iter()
@@ -672,5 +684,22 @@ pub(crate) fn select_mesh_devices(
         selected = device_info.devices.clone();
     }
 
-    Ok(selected)
+    let logical_provider = selected_provider
+        .or_else(|| {
+            providers
+                .iter()
+                .find(|provider| !provider.trim().is_empty())
+                .map(|provider| provider.trim().to_ascii_lowercase())
+        })
+        .or_else(|| {
+            selected
+                .first()
+                .map(|device| device.backend.to_string().to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "cpu".to_string());
+
+    Ok(MeshDeviceSelection {
+        devices: selected,
+        logical_provider,
+    })
 }

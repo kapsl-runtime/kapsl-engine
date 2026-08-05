@@ -158,18 +158,20 @@ pub(crate) fn load_model_blocking(
         pipeline_stages.as_deref(),
     );
 
-    let devices = select_mesh_devices(&loader.manifest.hardware_requirements, device_info)
+    let selected_mesh = select_mesh_devices(&loader.manifest.hardware_requirements, device_info)
         .map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to select devices for model {}: {}", model_id, e).into();
             err
         })?;
+    let logical_provider = selected_mesh.logical_provider;
 
-    let device_mesh = DeviceMesh::with_topology(devices, mesh_topology).map_err(|e| {
-        let err: Box<dyn std::error::Error + Send + Sync> =
-            format!("Failed to create device mesh: {}", e).into();
-        err
-    })?;
+    let device_mesh =
+        DeviceMesh::with_topology(selected_mesh.devices, mesh_topology).map_err(|e| {
+            let err: Box<dyn std::error::Error + Send + Sync> =
+                format!("Failed to create device mesh: {}", e).into();
+            err
+        })?;
 
     log::info!(
         "✓ Device Mesh initialized: {} devices, topology: {:?}",
@@ -264,11 +266,7 @@ pub(crate) fn load_model_blocking(
                 .collect();
             let provider_policy = provider_policy();
             let mut backend = if provider_policy == "manifest" {
-                let provider = device_mesh
-                    .get_device(0)
-                    .map(|d| d.backend.to_string())
-                    .unwrap_or_else(|| "cpu".to_string());
-                LLMBackend::with_devices(provider, device_ids.clone())
+                LLMBackend::with_devices(logical_provider.clone(), device_ids.clone())
             } else {
                 LLMBackend::with_device_ids(device_ids.clone())
             };
@@ -321,8 +319,6 @@ pub(crate) fn load_model_blocking(
                     engines.push(engine_arc);
                     continue;
                 }
-                let provider = device.backend.to_string();
-
                 #[cfg(feature = "gguf-native")]
                 if EngineKind::resolve(&loader.manifest).is_gguf() {
                     let existing_handle = shared_kv.get_gpu_pool(device.id);
@@ -390,7 +386,7 @@ pub(crate) fn load_model_blocking(
                 // Create backend for this specific device
                 let mut backend = BackendFactory::create_backend_for_device_with_tuning(
                     &loader.manifest,
-                    &provider,
+                    &logical_provider,
                     device.id,
                     device_info,
                     &onnx_tuning,
@@ -567,18 +563,20 @@ pub(crate) async fn load_model(
         pipeline_stages.as_deref(),
     );
 
-    let devices = select_mesh_devices(&loader.manifest.hardware_requirements, device_info)
+    let selected_mesh = select_mesh_devices(&loader.manifest.hardware_requirements, device_info)
         .map_err(|e| {
             let err: Box<dyn std::error::Error + Send + Sync> =
                 format!("Failed to select devices for model {}: {}", model_id, e).into();
             err
         })?;
+    let logical_provider = selected_mesh.logical_provider;
 
-    let device_mesh = DeviceMesh::with_topology(devices, mesh_topology).map_err(|e| {
-        let err: Box<dyn std::error::Error + Send + Sync> =
-            format!("Failed to create device mesh: {}", e).into();
-        err
-    })?;
+    let device_mesh =
+        DeviceMesh::with_topology(selected_mesh.devices, mesh_topology).map_err(|e| {
+            let err: Box<dyn std::error::Error + Send + Sync> =
+                format!("Failed to create device mesh: {}", e).into();
+            err
+        })?;
 
     log::info!(
         "✓ Device Mesh initialized: {} devices, topology: {:?}",
@@ -674,11 +672,7 @@ pub(crate) async fn load_model(
                 .collect();
             let provider_policy = provider_policy();
             let mut backend = if provider_policy == "manifest" {
-                let provider = device_mesh
-                    .get_device(0)
-                    .map(|d| d.backend.to_string())
-                    .unwrap_or_else(|| "cpu".to_string());
-                LLMBackend::with_devices(provider, device_ids.clone())
+                LLMBackend::with_devices(logical_provider.clone(), device_ids.clone())
             } else {
                 LLMBackend::with_device_ids(device_ids.clone())
             };
@@ -729,8 +723,6 @@ pub(crate) async fn load_model(
                     engines.push(engine_arc);
                     continue;
                 }
-                let provider = device.backend.to_string();
-
                 #[cfg(feature = "gguf-native")]
                 if EngineKind::resolve(&loader.manifest).is_gguf() {
                     let existing_handle = shared_kv.get_gpu_pool(device.id);
@@ -763,7 +755,7 @@ pub(crate) async fn load_model(
                 // Create backend for this specific device
                 let mut backend = BackendFactory::create_backend_for_device_with_tuning(
                     &loader.manifest,
-                    &provider,
+                    &logical_provider,
                     device.id,
                     device_info,
                     &onnx_tuning,
@@ -990,7 +982,7 @@ pub(crate) async fn scale_up_model(
         );
         Arc::new(monitored_backend)
     } else if use_pipeline_backend {
-        let pipeline_devices =
+        let pipeline_selection =
             select_mesh_devices(&loader.manifest.hardware_requirements, device_info).map_err(
                 |e| {
                     let err: Box<dyn std::error::Error + Send + Sync> = format!(
@@ -1001,14 +993,14 @@ pub(crate) async fn scale_up_model(
                     err
                 },
             )?;
-        let device_ids: Vec<i32> = pipeline_devices.iter().map(|d| d.id as i32).collect();
+        let device_ids: Vec<i32> = pipeline_selection
+            .devices
+            .iter()
+            .map(|d| d.id as i32)
+            .collect();
         let provider_policy = provider_policy();
         let mut backend = if provider_policy == "manifest" {
-            let provider = pipeline_devices
-                .first()
-                .map(|d| d.backend.to_string())
-                .unwrap_or_else(|| "cpu".to_string());
-            LLMBackend::with_devices(provider, device_ids.clone())
+            LLMBackend::with_devices(pipeline_selection.logical_provider, device_ids.clone())
         } else {
             LLMBackend::with_device_ids(device_ids.clone())
         };

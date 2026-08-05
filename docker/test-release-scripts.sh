@@ -4,7 +4,10 @@ set -eu
 version="9.9.9"
 test_root="$(mktemp -d)"
 release_dir="${test_root}/release"
-payload_dir="${test_root}/payload"
+portable_payload_dir="${test_root}/payload-portable"
+cuda_payload_dir="${test_root}/payload-cuda"
+cuda_provider_payload_dir="${test_root}/payload-provider-cuda"
+tensorrt_provider_payload_dir="${test_root}/payload-provider-tensorrt"
 server_log="${test_root}/http-server.log"
 server_pid=""
 base_url="http://127.0.0.1:18080"
@@ -18,12 +21,24 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-mkdir -p "${release_dir}" "${payload_dir}"
-cat > "${payload_dir}/kapsl" <<'EOF'
+mkdir -p \
+    "${release_dir}" \
+    "${portable_payload_dir}" \
+    "${cuda_payload_dir}" \
+    "${cuda_provider_payload_dir}" \
+    "${tensorrt_provider_payload_dir}"
+cat > "${portable_payload_dir}/kapsl" <<'EOF'
 #!/bin/sh
-echo "kapsl release-script test"
+echo "kapsl portable release-script test"
 EOF
-chmod +x "${payload_dir}/kapsl"
+chmod +x "${portable_payload_dir}/kapsl"
+cat > "${cuda_payload_dir}/kapsl" <<'EOF'
+#!/bin/sh
+echo "kapsl cuda release-script test"
+EOF
+chmod +x "${cuda_payload_dir}/kapsl"
+echo '{}' > "${cuda_provider_payload_dir}/kapsl-provider-cuda12.json"
+echo '{}' > "${tensorrt_provider_payload_dir}/kapsl-provider-tensorrt10.json"
 
 assert_output() {
     expected_line="$1"
@@ -81,17 +96,18 @@ if GITHUB_OUTPUT="${test_root}/invalid-output" \
     exit 1
 fi
 
-assets="
-kapsl-${version}-linux-x86_64.tar.gz
-kapsl-${version}-linux-aarch64.tar.gz
-kapsl-provider-cuda12-${version}-linux-x86_64.tar.gz
-kapsl-provider-tensorrt10-${version}-linux-x86_64.tar.gz
-"
-
-for asset in ${assets}; do
-    tar -czf "${release_dir}/${asset}" -C "${payload_dir}" kapsl
+create_asset() {
+    asset="$1"
+    source_dir="$2"
+    tar -czf "${release_dir}/${asset}" -C "${source_dir}" .
     sha256sum "${release_dir}/${asset}" > "${release_dir}/${asset}.sha256"
-done
+}
+
+create_asset "kapsl-${version}-linux-x86_64.tar.gz" "${portable_payload_dir}"
+create_asset "kapsl-${version}-linux-aarch64.tar.gz" "${portable_payload_dir}"
+create_asset "kapsl-${version}-linux-x86_64-cuda12.tar.gz" "${cuda_payload_dir}"
+create_asset "kapsl-provider-cuda12-${version}-linux-x86_64.tar.gz" "${cuda_provider_payload_dir}"
+create_asset "kapsl-provider-tensorrt10-${version}-linux-x86_64.tar.gz" "${tensorrt_provider_payload_dir}"
 
 python3 -m http.server 18080 \
     --bind 127.0.0.1 \
@@ -116,7 +132,7 @@ KAPSL_WAIT_ATTEMPTS=1 \
 KAPSL_WAIT_DELAY_SECONDS=0 \
     docker/wait-for-release-assets.sh
 
-rm "${release_dir}/kapsl-provider-tensorrt10-${version}-linux-x86_64.tar.gz.sha256"
+rm "${release_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz.sha256"
 if KAPSL_VERSION="${version}" \
     KAPSL_RELEASE_BASE_URL="${base_url}" \
     KAPSL_WAIT_ATTEMPTS=1 \
@@ -127,15 +143,45 @@ if KAPSL_VERSION="${version}" \
 fi
 
 sha256sum \
-    "${release_dir}/kapsl-provider-tensorrt10-${version}-linux-x86_64.tar.gz" \
-    >"${release_dir}/kapsl-provider-tensorrt10-${version}-linux-x86_64.tar.gz.sha256"
+    "${release_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz" \
+    >"${release_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz.sha256"
 
 install_dir="${test_root}/install"
 KAPSL_VERSION="${version}" \
 KAPSL_RELEASE_BASE_URL="${base_url}" \
 KAPSL_INSTALL_DIR="${install_dir}" \
     sh docker/install-release-assets.sh cpu
-"${install_dir}/kapsl"
+if [ "$("${install_dir}/kapsl")" != "kapsl portable release-script test" ]; then
+    echo "CPU installer did not select the portable runtime asset." >&2
+    exit 1
+fi
+
+case "$(uname -m)" in
+    x86_64 | amd64)
+        cuda_install_dir="${test_root}/install-cuda"
+        KAPSL_VERSION="${version}" \
+        KAPSL_RELEASE_BASE_URL="${base_url}" \
+        KAPSL_INSTALL_DIR="${cuda_install_dir}" \
+            sh docker/install-release-assets.sh cuda
+        if [ "$("${cuda_install_dir}/kapsl")" != "kapsl cuda release-script test" ]; then
+            echo "CUDA installer did not select the CUDA-enabled runtime asset." >&2
+            exit 1
+        fi
+        test -f "${cuda_install_dir}/kapsl-provider-cuda12.json"
+
+        tensorrt_install_dir="${test_root}/install-tensorrt"
+        KAPSL_VERSION="${version}" \
+        KAPSL_RELEASE_BASE_URL="${base_url}" \
+        KAPSL_INSTALL_DIR="${tensorrt_install_dir}" \
+            sh docker/install-release-assets.sh tensorrt
+        if [ "$("${tensorrt_install_dir}/kapsl")" != "kapsl cuda release-script test" ]; then
+            echo "TensorRT installer did not select the CUDA-enabled runtime asset." >&2
+            exit 1
+        fi
+        test -f "${tensorrt_install_dir}/kapsl-provider-cuda12.json"
+        test -f "${tensorrt_install_dir}/kapsl-provider-tensorrt10.json"
+        ;;
+esac
 
 case "$(uname -m)" in
     x86_64 | amd64) runtime_platform="linux-x86_64" ;;

@@ -810,6 +810,71 @@ fn test_effective_topology_choice_falls_back_without_pipeline_metadata() {
     ));
 }
 
+fn test_device(id: usize, backend: kapsl_hal::device::DeviceBackend) -> kapsl_hal::device::Device {
+    kapsl_hal::device::Device {
+        id,
+        name: format!("test-{backend}"),
+        backend,
+        memory_mb: 16 * 1024,
+        compute_units: 1,
+        pci_bus_id: None,
+        partition_id: None,
+        driver_version: None,
+        cuda_version: Some("12.6".to_string()),
+        compute_capability: Some("8.6".to_string()),
+        utilization_gpu_pct: None,
+        temperature_c: None,
+        supports_fp16: true,
+        supports_int8: true,
+    }
+}
+
+#[test]
+fn test_mesh_selection_preserves_tensorrt_on_cuda_device() {
+    let mut requirements = kapsl_core::HardwareRequirements::default();
+    requirements.preferred_provider = Some("tensorrt".to_string());
+    let device_info = DeviceInfo {
+        cpu_cores: 8,
+        total_memory: 32 * 1024 * 1024 * 1024,
+        os_type: "linux".to_string(),
+        os_release: "test".to_string(),
+        has_cuda: true,
+        has_metal: false,
+        has_rocm: false,
+        has_directml: false,
+        devices: vec![test_device(0, kapsl_hal::device::DeviceBackend::Cuda)],
+    };
+
+    let selection = select_mesh_devices(&requirements, &device_info).expect("select CUDA GPU");
+
+    assert_eq!(selection.logical_provider, "tensorrt");
+    assert_eq!(selection.devices.len(), 1);
+    assert_eq!(selection.devices[0].backend.to_string(), "cuda");
+}
+
+#[test]
+fn test_mesh_selection_preserves_coreml_on_metal_device() {
+    let mut requirements = kapsl_core::HardwareRequirements::default();
+    requirements.preferred_provider = Some("coreml".to_string());
+    let device_info = DeviceInfo {
+        cpu_cores: 8,
+        total_memory: 32 * 1024 * 1024 * 1024,
+        os_type: "macos".to_string(),
+        os_release: "test".to_string(),
+        has_cuda: false,
+        has_metal: true,
+        has_rocm: false,
+        has_directml: false,
+        devices: vec![test_device(0, kapsl_hal::device::DeviceBackend::Metal)],
+    };
+
+    let selection = select_mesh_devices(&requirements, &device_info).expect("select Metal GPU");
+
+    assert_eq!(selection.logical_provider, "coreml");
+    assert_eq!(selection.devices.len(), 1);
+    assert_eq!(selection.devices[0].backend.to_string(), "metal");
+}
+
 #[test]
 fn test_evaluate_runtime_pressure_state_transitions() {
     let config = RuntimePressureConfig {

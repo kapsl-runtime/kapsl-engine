@@ -24,6 +24,7 @@ esac
 assets="
 kapsl-${KAPSL_VERSION}-linux-x86_64.tar.gz
 kapsl-${KAPSL_VERSION}-linux-aarch64.tar.gz
+kapsl-${KAPSL_VERSION}-linux-x86_64-cuda12.tar.gz
 kapsl-provider-cuda12-${KAPSL_VERSION}-linux-x86_64.tar.gz
 kapsl-provider-tensorrt10-${KAPSL_VERSION}-linux-x86_64.tar.gz
 "

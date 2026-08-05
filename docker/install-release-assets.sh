@@ -72,7 +72,16 @@ extract_asset() {
 
 mkdir -p "$install_dir"
 
-runtime_asset="kapsl-${KAPSL_VERSION}-${platform}.tar.gz"
+case "$accelerator" in
+    cpu)
+        runtime_asset="kapsl-${KAPSL_VERSION}-${platform}.tar.gz"
+        ;;
+    cuda | tensorrt)
+        # GGUF CUDA is statically compiled into this runtime. ONNX accelerator
+        # providers remain separate packs installed below.
+        runtime_asset="kapsl-${KAPSL_VERSION}-${platform}-cuda12.tar.gz"
+        ;;
+esac
 extract_asset "$runtime_asset"
 
 case "$accelerator" in

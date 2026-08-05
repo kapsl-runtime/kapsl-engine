@@ -15,7 +15,7 @@ RUN python -m pip install --no-cache-dir \
 FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates ffmpeg \
+    binutils curl ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=tensorrt-libs /opt/tensorrt /opt/kapsl/tensorrt-package
@@ -36,6 +36,7 @@ RUN set -eux; \
         sh /tmp/install-release-assets.sh tensorrt; \
     rm /tmp/install-release-assets.sh; \
     kapsl --version; \
+    readelf -d /usr/local/bin/kapsl | grep -q 'libcuda.so.1'; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/kapsl-provider-tensorrt10.json; \
     test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \
