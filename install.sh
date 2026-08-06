@@ -130,6 +130,36 @@ download() {
     fi
 }
 
+# Install a bundle tarball into "$INSTALL_DIR". Returns non-zero (after
+# reporting why) if it could not be downloaded, unpacked, or did not carry the
+# binary, so the caller can try a different bundle.
+install_bundle() {
+    bundle_file="$1"
+    bundle_url="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${bundle_file}"
+    bundle_tmp="${TMP_DIR}/${bundle_file}"
+    extract_dir="${TMP_DIR}/extract-${bundle_file}"
+
+    if ! download "$bundle_url" "$bundle_tmp"; then
+        echo "Bundle ${bundle_file} is unavailable." >&2
+        return 1
+    fi
+
+    mkdir -p "$extract_dir"
+    if ! tar -xzf "$bundle_tmp" -C "$extract_dir"; then
+        echo "Failed to extract ${bundle_file}." >&2
+        return 1
+    fi
+
+    bundle_bin="$(find "$extract_dir" -type f -name "$BIN_NAME" | head -n 1)"
+    if [ -z "$bundle_bin" ]; then
+        echo "Bundle ${bundle_file} does not contain ${BIN_NAME}." >&2
+        return 1
+    fi
+
+    cp -R "$(dirname "$bundle_bin")/." "$INSTALL_DIR/"
+    chmod +x "${INSTALL_DIR}/${BIN_NAME}"
+}
+
 install_provider_pack() {
     provider="$1"
     provider_version="$2"
@@ -186,12 +216,8 @@ case "$ACCELERATOR" in
         ;;
 esac
 
-if [ "$USE_CUDA_RUNTIME" = "1" ]; then
-    BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}-cuda12.tar.gz"
-else
-    BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
-fi
-BUNDLE_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BUNDLE_FILE}"
+PORTABLE_BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+CUDA_BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}-cuda12.tar.gz"
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
 DOWNLOAD_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BIN_FILE}"
 
@@ -202,32 +228,29 @@ mkdir -p "$INSTALL_DIR"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-BUNDLE_TMP="${TMP_DIR}/${BUNDLE_FILE}"
-EXTRACT_DIR="${TMP_DIR}/bundle"
+INSTALLED=0
 
-if download "$BUNDLE_URL" "$BUNDLE_TMP"; then
-    mkdir -p "$EXTRACT_DIR"
-    if tar -xzf "$BUNDLE_TMP" -C "$EXTRACT_DIR"; then
-        BUNDLE_BIN="$(find "$EXTRACT_DIR" -type f -name "$BIN_NAME" | head -n 1)"
-        if [ -n "$BUNDLE_BIN" ]; then
-            cp -R "$(dirname "$BUNDLE_BIN")/." "$INSTALL_DIR/"
-            chmod +x "${INSTALL_DIR}/${BIN_NAME}"
-        else
-            echo "Downloaded bundle does not contain ${BIN_NAME}; falling back to single executable." >&2
-            TMP="${TMP_DIR}/${BIN_FILE}"
-            download "$DOWNLOAD_URL" "$TMP"
-            chmod +x "$TMP"
-            mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
-        fi
+# Prefer the CUDA-compiled runtime when the driver check passed, but never let
+# a missing -cuda12 asset (older releases predate it) cost the user the ORT
+# sidecars that the portable bundle carries — degrade to it instead.
+if [ "$USE_CUDA_RUNTIME" = "1" ]; then
+    if install_bundle "$CUDA_BUNDLE_FILE"; then
+        INSTALLED=1
     else
-        echo "Failed to extract bundle; falling back to single executable." >&2
-        TMP="${TMP_DIR}/${BIN_FILE}"
-        download "$DOWNLOAD_URL" "$TMP"
-        chmod +x "$TMP"
-        mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+        echo "Falling back to the portable runtime; GGUF models will run on CPU." >&2
+        USE_CUDA_RUNTIME=0
     fi
-else
-    echo "Bundle unavailable; falling back to single executable." >&2
+fi
+
+if [ "$INSTALLED" = "0" ] && install_bundle "$PORTABLE_BUNDLE_FILE"; then
+    INSTALLED=1
+fi
+
+# Last resort: the bare executable, which ships without the ORT sidecars and is
+# never the CUDA build, so GGUF stays on the CPU whatever was requested.
+if [ "$INSTALLED" = "0" ]; then
+    echo "Falling back to single executable." >&2
+    USE_CUDA_RUNTIME=0
     TMP="${TMP_DIR}/${BIN_FILE}"
     download "$DOWNLOAD_URL" "$TMP"
     chmod +x "$TMP"
