@@ -164,9 +164,15 @@ install_bundle() {
 # carries DT_NEEDED entries the driver does not provide (libnccl.so.2 among
 # them, which ships in the CUDA container images but is a separate package on
 # a bare host), so it can install cleanly and still fail to load. Prove the
-# binary starts before committing to it.
+# binary starts before committing to it, and surface the loader's own error —
+# it names the missing library, which is the one thing that tells the user how
+# to get the GPU back.
 runtime_starts() {
-    "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1
+    start_error="$("${INSTALL_DIR}/${BIN_NAME}" --version 2>&1 >/dev/null)" && return 0
+    if [ -n "$start_error" ]; then
+        echo "  ${start_error}" >&2
+    fi
+    return 1
 }
 
 install_provider_pack() {
