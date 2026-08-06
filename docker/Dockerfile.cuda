@@ -29,6 +29,10 @@ RUN set -eux; \
     readelf -d /usr/local/bin/kapsl | grep -q 'libcuda.so.1'; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \
+    if ldd /usr/local/bin/kapsl | grep -v 'libcuda\.so\.1' | grep -q 'not found'; then \
+        ldd /usr/local/bin/kapsl; \
+        exit 1; \
+    fi; \
     echo "/usr/local/bin" > /etc/ld.so.conf.d/kapsl-runtime.conf; \
     ldconfig; \
     if ldd /usr/local/bin/libonnxruntime_providers_cuda.so | grep -q "not found"; then \
