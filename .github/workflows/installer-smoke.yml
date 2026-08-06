@@ -1,0 +1,31 @@
+name: Installer Smoke Tests
+
+on:
+  pull_request:
+    paths:
+      - "install.sh"
+      - ".github/scripts/test-install-script.sh"
+      - ".github/scripts/package-linux-cuda-runtime.sh"
+      - ".github/workflows/installer-smoke.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-script:
+    name: Test install.sh
+    # Must be Linux x86_64: install.sh gates the CUDA runtime on that platform,
+    # so nothing else exercises the paths this covers.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        run: |
+          sh -n install.sh
+          sh -n .github/scripts/test-install-script.sh
+
+      - name: Test accelerator selection and fallbacks
+        run: .github/scripts/test-install-script.sh
