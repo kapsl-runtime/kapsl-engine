@@ -64,17 +64,6 @@ pub(crate) struct ApiRoleTokenConfig {
 }
 
 impl ApiRoleTokenConfig {
-    pub(crate) fn normalize_token(value: Option<String>) -> Option<String> {
-        value.and_then(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-    }
-
     pub(crate) fn from_env() -> Self {
         let shared_token = optional_env_var(API_TOKEN_ENV);
         Self {
@@ -134,9 +123,9 @@ impl ApiRoleTokenConfig {
         &mut self,
         payload: ApiRoleTokenConfig,
     ) -> Result<(), String> {
-        self.reader_token = Self::normalize_token(payload.reader_token);
-        self.writer_token = Self::normalize_token(payload.writer_token);
-        self.admin_token = Self::normalize_token(payload.admin_token);
+        self.reader_token = normalize_optional_text(payload.reader_token);
+        self.writer_token = normalize_optional_text(payload.writer_token);
+        self.admin_token = normalize_optional_text(payload.admin_token);
         if self.auth_enabled() && self.admin_token.is_none() {
             return Err("admin_token is required when role auth is enabled".to_string());
         }
