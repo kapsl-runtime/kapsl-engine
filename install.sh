@@ -160,6 +160,15 @@ install_bundle() {
     chmod +x "${INSTALL_DIR}/${BIN_NAME}"
 }
 
+# A working driver is necessary but not sufficient for the CUDA build: it also
+# carries DT_NEEDED entries the driver does not provide (libnccl.so.2 among
+# them, which ships in the CUDA container images but is a separate package on
+# a bare host), so it can install cleanly and still fail to load. Prove the
+# binary starts before committing to it.
+runtime_starts() {
+    "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1
+}
+
 install_provider_pack() {
     provider="$1"
     provider_version="$2"
@@ -234,10 +243,10 @@ INSTALLED=0
 # a missing -cuda12 asset (older releases predate it) cost the user the ORT
 # sidecars that the portable bundle carries — degrade to it instead.
 if [ "$USE_CUDA_RUNTIME" = "1" ]; then
-    if install_bundle "$CUDA_BUNDLE_FILE"; then
+    if install_bundle "$CUDA_BUNDLE_FILE" && runtime_starts; then
         INSTALLED=1
     else
-        echo "Falling back to the portable runtime; GGUF models will run on CPU." >&2
+        echo "The CUDA runtime is unusable on this host; falling back to the portable runtime, so GGUF models will run on CPU." >&2
         USE_CUDA_RUNTIME=0
     fi
 fi
