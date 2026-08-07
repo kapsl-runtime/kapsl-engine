@@ -12,6 +12,65 @@ pub(crate) fn kapsl_help_styles() -> clap::builder::Styles {
         .valid(AnsiColor::Green.on_default())
 }
 
+/// Worked examples shown under `Examples:` in `--help`, as
+/// `(explanation, commands)` groups rendered in order.
+const HELP_EXAMPLES: &[(&str, &[&str])] = &[
+    (
+        "# Start the runtime with one model",
+        &["kapsl run --model models/gpt2/gpt2.aimod"],
+    ),
+    (
+        "# Load an extra model into an already-running runtime (no restart)",
+        &["kapsl add-model --model models/llama/llama.aimod"],
+    ),
+    (
+        "# Package a model directory or single file",
+        &[
+            "kapsl build ./models/gpt-llm",
+            "kapsl build ./model.onnx --output ./model.aimod",
+        ],
+    ),
+    (
+        "# Push / pull packages to/from a remote registry",
+        &[
+            "kapsl push acme/gpt2:prod ./model.aimod",
+            "kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io",
+            "kapsl pull acme/gpt2:prod --destination-dir ./models",
+        ],
+    ),
+    (
+        "# Authenticate (opens browser; use --device-code for SSH/headless)",
+        &["kapsl login", "kapsl login --device-code"],
+    ),
+    (
+        "# Add optional Windows GPU acceleration",
+        &[
+            "kapsl provider install cuda12",
+            "kapsl provider install tensorrt10",
+        ],
+    ),
+];
+
+/// Environment variables documented under `Environment variables:` in `--help`.
+const HELP_ENV_VARS: &[(&str, &str)] = &[
+    (
+        "KAPSL_API_TOKEN",
+        "Shared fallback bearer token for /api routes",
+    ),
+    ("KAPSL_API_TOKEN_READER", "Read-only API token"),
+    ("KAPSL_API_TOKEN_WRITER", "Writer API token"),
+    ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),
+    ("KAPSL_REMOTE_URL", "Default remote registry URL"),
+    ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
+    (
+        "KAPSL_SHM_SIZE_MB",
+        "Shared-memory pool size (MiB) for shm/hybrid transport",
+    ),
+];
+
+/// Column width the environment-variable names are padded to.
+const HELP_ENV_NAME_WIDTH: usize = 26;
+
 pub(crate) fn cli_after_help() -> String {
     use std::fmt::Write as _;
     let a = Ansi::new();
@@ -20,86 +79,23 @@ pub(crate) fn cli_after_help() -> String {
     let comment = |s: &str| a.dim(s).into_owned();
 
     let mut out = String::new();
+
     let _ = writeln!(out, "{}", header("Examples:"));
-    let _ = writeln!(out, "  {}", comment("# Start the runtime with one model"));
-    let _ = writeln!(out, "  {}", cmd("kapsl run --model models/gpt2/gpt2.aimod"));
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Load an extra model into an already-running runtime (no restart)")
-    );
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl add-model --model models/llama/llama.aimod")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Package a model directory or single file")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl build ./models/gpt-llm"));
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl build ./model.onnx --output ./model.aimod")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Push / pull packages to/from a remote registry")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl push acme/gpt2:prod ./model.aimod"));
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io")
-    );
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl pull acme/gpt2:prod --destination-dir ./models")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Authenticate (opens browser; use --device-code for SSH/headless)")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl login"));
-    let _ = writeln!(out, "  {}", cmd("kapsl login --device-code"));
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Add optional Windows GPU acceleration")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl provider install cuda12"));
-    let _ = writeln!(out, "  {}", cmd("kapsl provider install tensorrt10"));
-    let _ = writeln!(out);
+    for (explanation, commands) in HELP_EXAMPLES {
+        let _ = writeln!(out, "  {}", comment(explanation));
+        for command in *commands {
+            let _ = writeln!(out, "  {}", cmd(command));
+        }
+        let _ = writeln!(out);
+    }
+
     let _ = writeln!(out, "{}", header("Environment variables:"));
-    for (name, desc) in [
-        (
-            "KAPSL_API_TOKEN",
-            "Shared fallback bearer token for /api routes",
-        ),
-        ("KAPSL_API_TOKEN_READER", "Read-only API token"),
-        ("KAPSL_API_TOKEN_WRITER", "Writer API token"),
-        ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),
-        ("KAPSL_REMOTE_URL", "Default remote registry URL"),
-        ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
-        (
-            "KAPSL_SHM_SIZE_MB",
-            "Shared-memory pool size (MiB) for shm/hybrid transport",
-        ),
-    ] {
-        let padded = format!("{:<26}", name);
+    for (name, desc) in HELP_ENV_VARS {
+        let padded = format!("{:<width$}", name, width = HELP_ENV_NAME_WIDTH);
         let _ = writeln!(out, "  {}{}", a.teal(&padded), a.dim(desc));
     }
     let _ = writeln!(out);
+
     let _ = writeln!(out, "{}", header("Compatibility:"));
     let _ = writeln!(out, "  {}", cmd("kapsl --model models/gpt2/gpt2.aimod"));
     let _ = write!(
@@ -331,6 +327,22 @@ impl OnnxTuningProfile {
     }
 }
 
+/// Parse a positive integer tuning value, clamping to at least 1.
+///
+/// `label` names the setting in the error message -- the canonical key for a
+/// `--onnx-model-tuning` pair, or the variable name for an env override.
+fn parse_positive_setting<T>(label: &str, value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr + Ord + From<u8>,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    value
+        .trim()
+        .parse::<T>()
+        .map(|parsed| parsed.max(T::from(1u8)))
+        .map_err(|e| format!("invalid {} '{}': {}", label, value, e))
+}
+
 pub(crate) fn parse_bool_literal(value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -353,32 +365,17 @@ pub(crate) fn apply_onnx_tuning_pair(
             target.disable_cpu_mem_arena = Some(parse_bool_literal(value)?);
         }
         "session_buckets" => {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| format!("invalid session_buckets '{}': {}", value, e))?;
-            target.session_buckets = Some(parsed.max(1));
+            target.session_buckets = Some(parse_positive_setting("session_buckets", value)?);
         }
         "bucket_dim_granularity" => {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| format!("invalid bucket_dim_granularity '{}': {}", value, e))?;
-            target.bucket_dim_granularity = Some(parsed.max(1));
+            target.bucket_dim_granularity =
+                Some(parse_positive_setting("bucket_dim_granularity", value)?);
         }
         "bucket_max_dims" => {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| format!("invalid bucket_max_dims '{}': {}", value, e))?;
-            target.bucket_max_dims = Some(parsed.max(1));
+            target.bucket_max_dims = Some(parse_positive_setting("bucket_max_dims", value)?);
         }
         "peak_concurrency" | "peak_concurrency_hint" => {
-            let parsed = value
-                .trim()
-                .parse::<u32>()
-                .map_err(|e| format!("invalid peak_concurrency '{}': {}", value, e))?;
-            target.peak_concurrency_hint = Some(parsed.max(1));
+            target.peak_concurrency_hint = Some(parse_positive_setting("peak_concurrency", value)?);
         }
         other => {
             return Err(format!(
@@ -398,23 +395,13 @@ pub(crate) fn parse_env_bool_override(name: &str) -> Result<Option<bool>, String
 
 pub(crate) fn parse_env_usize_override(name: &str) -> Result<Option<usize>, String> {
     optional_env_var(name)
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map(|parsed| parsed.max(1))
-                .map_err(|e| format!("invalid {} '{}': {}", name, value, e))
-        })
+        .map(|value| parse_positive_setting(name, &value))
         .transpose()
 }
 
 pub(crate) fn parse_env_u32_override(name: &str) -> Result<Option<u32>, String> {
     optional_env_var(name)
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .map(|parsed| parsed.max(1))
-                .map_err(|e| format!("invalid {} '{}': {}", name, value, e))
-        })
+        .map(|value| parse_positive_setting(name, &value))
         .transpose()
 }
 
