@@ -1,45 +1,29 @@
 use super::*;
 
-pub(crate) fn resolved_remote_url(custom_url: Option<&str>) -> String {
+/// The remote URL sources both resolvers share, in precedence order: an
+/// explicit non-blank argument, then `REMOTE_URL_ENV`, then
+/// `REMOTE_PLACEHOLDER_URL_ENV`.
+fn remote_url_from_arg_or_env(custom_url: Option<&str>) -> Option<String> {
     if let Some(url) = custom_url {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Some(trimmed.to_string());
         }
     }
 
-    if let Some(url) = optional_env_var(REMOTE_URL_ENV) {
-        return url;
-    }
-
-    if let Some(url) = optional_env_var(REMOTE_PLACEHOLDER_URL_ENV) {
-        return url;
-    }
-
-    DEFAULT_REMOTE_URL.to_string()
+    optional_env_var(REMOTE_URL_ENV).or_else(|| optional_env_var(REMOTE_PLACEHOLDER_URL_ENV))
 }
 
+pub(crate) fn resolved_remote_url(custom_url: Option<&str>) -> String {
+    remote_url_from_arg_or_env(custom_url).unwrap_or_else(|| DEFAULT_REMOTE_URL.to_string())
+}
+
+/// As [`resolved_remote_url`], but falls back to the last remote recorded by a
+/// previous login before giving up on the default.
 pub(crate) fn resolved_login_remote_url(custom_url: Option<&str>) -> String {
-    if let Some(url) = custom_url {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    if let Some(url) = optional_env_var(REMOTE_URL_ENV) {
-        return url;
-    }
-
-    if let Some(url) = optional_env_var(REMOTE_PLACEHOLDER_URL_ENV) {
-        return url;
-    }
-
-    if let Some(url) = read_last_remote_url_from_store() {
-        return url;
-    }
-
-    DEFAULT_REMOTE_URL.to_string()
+    remote_url_from_arg_or_env(custom_url)
+        .or_else(read_last_remote_url_from_store)
+        .unwrap_or_else(|| DEFAULT_REMOTE_URL.to_string())
 }
 
 pub(crate) fn auth_base_url_from_remote_url(remote_url: &str) -> Result<String, String> {
