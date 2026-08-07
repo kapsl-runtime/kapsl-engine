@@ -250,30 +250,6 @@ pub(crate) fn spawn_worker_process(
     }
 }
 
-pub(crate) fn wait_for_worker_ready(
-    worker: &WorkerProcess,
-    timeout: Duration,
-) -> Result<(), EngineError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = worker.try_wait() {
-            return Err(EngineError::backend(format!(
-                "Worker exited before ready: {}",
-                status
-            )));
-        }
-        if socket_ready(&worker.socket_path) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(EngineError::backend(
-                "Timed out waiting for worker socket".to_string(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 pub(crate) async fn wait_for_worker_ready_async(
     worker: &WorkerProcess,
     timeout: Duration,
