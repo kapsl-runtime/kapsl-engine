@@ -308,12 +308,49 @@ pub(crate) fn maybe_export_gguf_prefill_chunk_hint(
     );
 }
 
+/// Set once the runtime is serving, after which the GGUF auto-sizing hints must
+/// not touch the process environment.
+static ENV_AUTO_SIZING_SEALED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Close the window in which GGUF auto-sizing may write to the environment.
+///
+/// The GGUF knobs are published to `kapsl-llm` as environment variables rather
+/// than passed as config, so exporting them means calling `std::env::set_var`.
+/// That is not thread-safe: a write racing another thread's `std::env::var` is
+/// undefined behaviour (hence `unsafe` in edition 2024). Startup is the only
+/// point where the runtime controls which threads exist, so once the model-load
+/// phase is done we seal the environment and later loads inherit whatever
+/// startup resolved.
+pub(crate) fn seal_env_auto_sizing() {
+    ENV_AUTO_SIZING_SEALED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn env_auto_sizing_sealed() -> bool {
+    ENV_AUTO_SIZING_SEALED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Reopen the window. Tests share a process, so a test that seals would
+/// otherwise poison every test that runs after it.
+#[cfg(test)]
+pub(crate) fn unseal_env_auto_sizing() {
+    ENV_AUTO_SIZING_SEALED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub(crate) fn export_gguf_auto_sizing_hint(
     manifest: &Manifest,
     batch_size: usize,
     model_file_path: Option<&Path>,
 ) {
     if !EngineKind::resolve(manifest).is_gguf() {
+        return;
+    }
+    if env_auto_sizing_sealed() {
+        log::debug!(
+            "Framework=gguf: runtime already serving, keeping the startup {} / {} values.",
+            GGUF_PREFILL_CHUNK_SIZE_ENV,
+            GGUF_TARGET_CONCURRENCY_ENV
+        );
         return;
     }
     maybe_export_gguf_prefill_chunk_hint(model_file_path, batch_size);

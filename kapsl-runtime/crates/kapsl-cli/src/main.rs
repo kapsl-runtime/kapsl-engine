@@ -506,6 +506,12 @@ async fn main() -> Result<(), DynError> {
         return Err(error);
     }
 
+    // Startup loading is done, so no further `std::env::set_var` is sound: from
+    // here on the transport server and inference threads are live and may be
+    // reading these vars. Models hot-loaded over HTTP inherit the values
+    // resolved above instead of re-deriving them. See seal_env_auto_sizing.
+    seal_env_auto_sizing();
+
     log::info!("=== Starting Transport Server ===");
     log::info!("Transport mode: {}", args.transport);
 
