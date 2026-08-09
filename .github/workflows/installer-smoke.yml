@@ -4,8 +4,11 @@ on:
   pull_request:
     paths:
       - "install.sh"
+      - "install-cuda.sh"
+      - "install-beta-cuda.sh"
       - ".github/scripts/test-install-script.sh"
       - ".github/scripts/package-linux-cuda-runtime.sh"
+      - ".github/scripts/test-package-linux-cuda-runtime.sh"
       - ".github/workflows/installer-smoke.yml"
   workflow_dispatch:
 
@@ -25,7 +28,14 @@ jobs:
       - name: Check shell syntax
         run: |
           sh -n install.sh
+          sh -n install-cuda.sh
+          sh -n install-beta-cuda.sh
           sh -n .github/scripts/test-install-script.sh
+          bash -n .github/scripts/package-linux-cuda-runtime.sh
+          bash -n .github/scripts/test-package-linux-cuda-runtime.sh
 
-      - name: Test accelerator selection and fallbacks
+      - name: Test merged accelerator selection and compatibility
         run: .github/scripts/test-install-script.sh
+
+      - name: Test merged CUDA archive contents
+        run: .github/scripts/test-package-linux-cuda-runtime.sh
