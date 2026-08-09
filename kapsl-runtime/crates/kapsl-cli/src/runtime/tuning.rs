@@ -57,7 +57,7 @@ fn resolve_vram_cap_bytes(
 /// byte count or a value with a binary unit suffix (`k`/`m`/`g`, optionally
 /// followed by `b`, case-insensitive — e.g. `2560m`, `4g`, `8gb`). Returns
 /// `None` for empty, zero, or otherwise malformed input.
-fn parse_cuda_memory_limit(value: &str) -> Option<usize> {
+pub(crate) fn parse_cuda_memory_limit(value: &str) -> Option<usize> {
     let lowered = value.trim().to_ascii_lowercase();
     if lowered.is_empty() {
         return None;

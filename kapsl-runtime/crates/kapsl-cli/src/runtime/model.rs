@@ -1,5 +1,118 @@
 use super::*;
 
+fn create_runtime_backend_for_device(
+    manifest: &Manifest,
+    provider: &str,
+    device_id: usize,
+    device_info: &DeviceInfo,
+    tuning: &OnnxRuntimeTuning,
+    shared_kv: &SharedKvState,
+    model_id: u32,
+) -> Result<Box<dyn kapsl_engine_api::Engine>, String> {
+    #[cfg(not(any(
+        feature = "native",
+        feature = "gguf-native",
+        feature = "gguf-cuda-shared-kv"
+    )))]
+    let _ = (shared_kv, model_id);
+    #[cfg(any(
+        feature = "native",
+        feature = "gguf-native",
+        feature = "gguf-cuda-shared-kv"
+    ))]
+    let kind = EngineKind::resolve(manifest);
+
+    #[cfg(feature = "gguf-native")]
+    if kind.is_gguf() {
+        let backend = if let Some(pool) = shared_kv.device_pool(device_id) {
+            BackendFactory::create_gguf_native_device_pool(device_id as i32, pool, model_id)?
+        } else {
+            BackendFactory::create_gguf_native(device_id as i32, None)?
+        };
+        return Ok(Box::new(backend));
+    }
+
+    #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
+    if kind.is_gguf() {
+        let backend = if let Some(pool) = shared_kv.device_pool(device_id) {
+            BackendFactory::create_gguf_cuda_device_pool(device_id as i32, pool, model_id)?
+        } else {
+            BackendFactory::create_gguf_cuda_shared_kv(device_id as i32, None)?
+        };
+        return Ok(Box::new(backend));
+    }
+
+    #[cfg(feature = "native")]
+    if kind == EngineKind::Native {
+        if let Some(pool) = shared_kv.device_pool(device_id) {
+            return BackendFactory::create_native_device_pool(device_id as i32, pool, model_id)
+                .map(|backend| Box::new(backend) as Box<dyn kapsl_engine_api::Engine>);
+        }
+    }
+
+    BackendFactory::create_backend_for_device_with_tuning(
+        manifest,
+        provider,
+        device_id,
+        device_info,
+        tuning,
+    )
+}
+
+fn create_runtime_best_backend(
+    manifest: &Manifest,
+    device_info: &DeviceInfo,
+    tuning: &OnnxRuntimeTuning,
+    shared_kv: &SharedKvState,
+    model_id: u32,
+) -> Result<Box<dyn kapsl_engine_api::Engine>, String> {
+    #[cfg(not(any(
+        feature = "native",
+        feature = "gguf-native",
+        feature = "gguf-cuda-shared-kv"
+    )))]
+    let _ = (shared_kv, model_id);
+    #[cfg(any(
+        feature = "native",
+        feature = "gguf-native",
+        feature = "gguf-cuda-shared-kv"
+    ))]
+    {
+        let kind = EngineKind::resolve(manifest);
+        let device_id = manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
+
+        #[cfg(feature = "gguf-native")]
+        if kind.is_gguf() {
+            let backend = if let Some(pool) = shared_kv.device_pool(device_id) {
+                BackendFactory::create_gguf_native_device_pool(device_id as i32, pool, model_id)?
+            } else {
+                BackendFactory::create_gguf_native(device_id as i32, None)?
+            };
+            return Ok(Box::new(backend));
+        }
+
+        #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
+        if kind.is_gguf() {
+            let backend = if let Some(pool) = shared_kv.device_pool(device_id) {
+                BackendFactory::create_gguf_cuda_device_pool(device_id as i32, pool, model_id)?
+            } else {
+                BackendFactory::create_gguf_cuda_shared_kv(device_id as i32, None)?
+            };
+            return Ok(Box::new(backend));
+        }
+
+        #[cfg(feature = "native")]
+        if kind == EngineKind::Native {
+            if let Some(pool) = shared_kv.device_pool(device_id) {
+                return BackendFactory::create_native_device_pool(device_id as i32, pool, model_id)
+                    .map(|backend| Box::new(backend) as Box<dyn kapsl_engine_api::Engine>);
+            }
+        }
+    }
+
+    BackendFactory::create_best_backend_with_tuning(manifest, device_info, tuning)
+}
+
 pub(crate) fn allocate_model_id(counter: &AtomicU32, recycled_ids: &Mutex<Vec<u32>>) -> u32 {
     if let Some(id) = recycled_ids.lock().pop() {
         id
@@ -33,7 +146,7 @@ pub(crate) async fn run_worker(
         model_id,
         model_path,
         device_info,
-        SharedKvStateInner::new(device_info),
+        SharedKvStateInner::new_runtime(device_info)?,
         args.batch_size,
         args.scheduler_queue_size,
         args.scheduler_max_micro_batch,
@@ -156,6 +269,8 @@ pub(crate) async fn load_model(
             scheduler_queue_delay_ms,
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, model_id);
+    #[cfg(feature = "gpu-device-pool")]
+    let engine_kind = EngineKind::resolve(&loader.manifest);
     log::info!("  Priority weight: {}", priority_weight);
 
     let model_file_path = loader.get_model_path();
@@ -312,6 +427,25 @@ pub(crate) async fn load_model(
             } else {
                 LLMBackend::with_device_ids(device_ids.clone())
             };
+            #[cfg(feature = "gpu-device-pool")]
+            let device_memory_admissions = {
+                let mut admissions = Vec::new();
+                for &device_id in &device_ids {
+                    if let Some(admission) = shared_kv.begin_device_memory_admission(
+                        device_id as usize,
+                        model_id,
+                        engine_kind,
+                    )? {
+                        admissions.push(admission);
+                    }
+                }
+                backend = backend.with_env_allocators(
+                    device_ids
+                        .iter()
+                        .any(|&device_id| shared_kv.uses_env_allocators(device_id as usize)),
+                );
+                admissions
+            };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
             let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) =
                 shared_kv.attach_engine(primary_device, model_id, priority_weight);
@@ -329,6 +463,10 @@ pub(crate) async fn load_model(
                     format!("Failed to load pipeline model {}: {}", model_id, e).into();
                 err
             })?;
+            #[cfg(feature = "gpu-device-pool")]
+            for admission in device_memory_admissions {
+                admission.commit();
+            }
 
             let monitored_backend = MonitoringMiddleware::new_with_metrics(
                 backend,
@@ -359,42 +497,19 @@ pub(crate) async fn load_model(
                     engines.push(engine_arc);
                     continue;
                 }
-                #[cfg(feature = "gguf-native")]
-                if EngineKind::resolve(&loader.manifest).is_gguf() {
-                    let existing_handle = shared_kv.get_gpu_pool(device.id);
-                    let mut b =
-                        BackendFactory::create_gguf_native(device.id as i32, existing_handle)?;
-                    b.load(&model_file_path).await.map_err(|e| {
-                        let err: Box<dyn std::error::Error + Send + Sync> = format!(
-                            "Failed to load gguf-native model {} on device {}: {}",
-                            model_id, device.id, e
-                        )
-                        .into();
-                        err
-                    })?;
-                    if let Some(handle) = b.pool_handle() {
-                        shared_kv.attach_gpu_pool(device.id, model_id, priority_weight, handle);
-                    }
-                    let monitored = MonitoringMiddleware::new_with_metrics(
-                        b,
-                        model_id.to_string(),
-                        loader.manifest.version.clone(),
-                        shared_metrics.clone(),
-                    );
-                    let arc: EngineHandle =
-                        Arc::from(Box::new(monitored) as Box<dyn kapsl_engine_api::Engine>);
-                    swap_handles.push(arc.clone());
-                    engines.push(arc);
-                    continue;
-                }
+                #[cfg(feature = "gpu-device-pool")]
+                let device_memory_admission =
+                    shared_kv.begin_device_memory_admission(device.id, model_id, engine_kind)?;
 
-                // Create backend for this specific device
-                let mut backend = BackendFactory::create_backend_for_device_with_tuning(
+                // Create a backend as a client of the runtime-owned pool when enabled.
+                let mut backend = create_runtime_backend_for_device(
                     &loader.manifest,
                     &logical_provider,
                     device.id,
                     device_info,
                     &onnx_tuning,
+                    &shared_kv,
+                    model_id,
                 )?;
 
                 backend.load(&model_file_path).await.map_err(|e| {
@@ -405,6 +520,10 @@ pub(crate) async fn load_model(
                     .into();
                     err
                 })?;
+                #[cfg(feature = "gpu-device-pool")]
+                if let Some(admission) = device_memory_admission {
+                    admission.commit();
+                }
 
                 let monitored_backend = MonitoringMiddleware::new_with_metrics(
                     backend,
@@ -508,6 +627,8 @@ pub(crate) async fn scale_up_model(
             scheduler_queue_delay_ms,
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, base_model_id);
+    #[cfg(feature = "gpu-device-pool")]
+    let engine_kind = EngineKind::resolve(&loader.manifest);
     let pipeline_stages = manifest_llm_pipeline_stages(&loader.manifest);
     let EffectiveTopologyChoice {
         mesh_topology: _,
@@ -640,6 +761,25 @@ pub(crate) async fn scale_up_model(
         } else {
             LLMBackend::with_device_ids(device_ids.clone())
         };
+        #[cfg(feature = "gpu-device-pool")]
+        let device_memory_admissions = {
+            let mut admissions = Vec::new();
+            for &device_id in &device_ids {
+                if let Some(admission) = shared_kv.begin_device_memory_admission(
+                    device_id as usize,
+                    base_model_id,
+                    engine_kind,
+                )? {
+                    admissions.push(admission);
+                }
+            }
+            backend = backend.with_env_allocators(
+                device_ids
+                    .iter()
+                    .any(|&device_id| shared_kv.uses_env_allocators(device_id as usize)),
+            );
+            admissions
+        };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
         let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) =
             shared_kv.attach_engine(primary_device, base_model_id, priority_weight);
@@ -657,6 +797,10 @@ pub(crate) async fn scale_up_model(
                 format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
             err
         })?;
+        #[cfg(feature = "gpu-device-pool")]
+        for admission in device_memory_admissions {
+            admission.commit();
+        }
 
         let monitored_backend = MonitoringMiddleware::new_with_metrics(
             backend,
@@ -666,50 +810,34 @@ pub(crate) async fn scale_up_model(
         );
         Arc::new(monitored_backend)
     } else {
-        #[allow(unused_labels)]
-        'engine: {
-            #[cfg(feature = "gguf-native")]
-            if EngineKind::resolve(&loader.manifest).is_gguf() {
-                let device_id =
-                    loader.manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
-                let existing_handle = shared_kv.get_gpu_pool(device_id);
-                let mut b = BackendFactory::create_gguf_native(device_id as i32, existing_handle)?;
-                b.load(&model_file_path).await.map_err(|e| {
-                    let err: Box<dyn std::error::Error + Send + Sync> =
-                        format!("Failed to load gguf-native replica {}: {}", replica_id, e).into();
-                    err
-                })?;
-                if let Some(handle) = b.pool_handle() {
-                    shared_kv.attach_gpu_pool(device_id, base_model_id, priority_weight, handle);
-                }
-                let monitored = MonitoringMiddleware::new_with_metrics(
-                    b,
-                    base_model_id.to_string(),
-                    loader.manifest.version.clone(),
-                    shared_metrics.clone(),
-                );
-                #[allow(clippy::needless_break)]
-                break 'engine Arc::new(monitored);
-            }
-
-            let mut backend = BackendFactory::create_best_backend_with_tuning(
-                &loader.manifest,
-                device_info,
-                &onnx_tuning,
-            )?;
-            backend.load(&model_file_path).await.map_err(|e| {
-                let err: Box<dyn std::error::Error + Send + Sync> =
-                    format!("Failed to load replica {}: {}", replica_id, e).into();
-                err
-            })?;
-            let monitored_backend = MonitoringMiddleware::new_with_metrics(
-                backend,
-                base_model_id.to_string(),
-                loader.manifest.version.clone(),
-                shared_metrics.clone(),
-            );
-            Arc::new(monitored_backend)
+        #[cfg(feature = "gpu-device-pool")]
+        let device_id = loader.manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
+        #[cfg(feature = "gpu-device-pool")]
+        let device_memory_admission =
+            shared_kv.begin_device_memory_admission(device_id, base_model_id, engine_kind)?;
+        let mut backend = create_runtime_best_backend(
+            &loader.manifest,
+            device_info,
+            &onnx_tuning,
+            &shared_kv,
+            base_model_id,
+        )?;
+        backend.load(&model_file_path).await.map_err(|e| {
+            let err: Box<dyn std::error::Error + Send + Sync> =
+                format!("Failed to load replica {}: {}", replica_id, e).into();
+            err
+        })?;
+        #[cfg(feature = "gpu-device-pool")]
+        if let Some(admission) = device_memory_admission {
+            admission.commit();
         }
+        let monitored_backend = MonitoringMiddleware::new_with_metrics(
+            backend,
+            base_model_id.to_string(),
+            loader.manifest.version.clone(),
+            shared_metrics.clone(),
+        );
+        Arc::new(monitored_backend)
     };
     let swap_handle = engine.clone();
     let scheduler = Arc::new(
@@ -819,8 +947,8 @@ pub(crate) fn force_stop_model_before_remove(
     replica_pools.write().remove(&base_model_id);
     swap_map.write().remove(&base_model_id);
     shared_kv.detach_engine_for_model(base_model_id);
-    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-    shared_kv.detach_gpu_pool(base_model_id);
+    #[cfg(feature = "gpu-device-pool")]
+    shared_kv.release_device_memory(base_model_id);
 
     for replica in replicas {
         if let Err(e) = model_registry.set_status(replica.id, ModelStatus::Inactive) {

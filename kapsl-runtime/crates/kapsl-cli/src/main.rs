@@ -17,11 +17,7 @@ use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics,
     EngineModelInfo, InferenceRequest, TensorDtype,
 };
-#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-use kapsl_hal::cross_device_scheduler::CrossDevicePoolScheduler;
 use kapsl_hal::device::DeviceInfo;
-#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-use kapsl_hal::gpu_arena::GpuPoolHandle;
 use kapsl_ipc::{
     IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
     STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
@@ -264,7 +260,7 @@ async fn main() -> Result<(), DynError> {
     }
 
     // Unified shared KV cache pool and cross-model token budget coordinator.
-    let shared_kv = SharedKvStateInner::new(&device_info);
+    let shared_kv = SharedKvStateInner::new_runtime(&device_info)?;
 
     // Use Arc<RwLock<>> for thread-safe dynamic scheduler management
     let replica_pools: Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>> =
