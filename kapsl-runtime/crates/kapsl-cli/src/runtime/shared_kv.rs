@@ -1,20 +1,5 @@
 use super::*;
 
-#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-#[derive(Clone)]
-pub(crate) struct GpuPoolMember {
-    model_id: u32,
-    weight: u32,
-    cap: Arc<AtomicUsize>,
-}
-
-#[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-#[derive(Clone)]
-pub(crate) struct DeviceGpuPoolState {
-    handle: GpuPoolHandle,
-    members: Vec<GpuPoolMember>,
-}
-
 /// Shared KV cache pool registry and cross-model token-budget coordinator.
 ///
 /// Always held behind `Arc` (`type SharedKvState = Arc<SharedKvStateInner>`)
@@ -54,14 +39,9 @@ pub(crate) struct SharedKvStateInner {
     /// stays sized off `device_bytes` because handed-out blocks can't be
     /// reclaimed.
     live_ceiling: Mutex<HashMap<usize, Arc<AtomicUsize>>>,
-    /// Per-device GPU pool registry for gguf-native/native backends.
-    /// Stores compatible pools and their members so quota caps can be
-    /// rebalanced by model priority.
-    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-    gpu_pools: Mutex<HashMap<usize, Vec<DeviceGpuPoolState>>>,
-    /// GPU-wide session-level block admission and cross-device migration.
-    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-    cross_device_sched: Mutex<CrossDevicePoolScheduler>,
+    /// Stable runtime-owned byte pools, initialized before model loading.
+    #[cfg(feature = "gpu-device-pool")]
+    device_memory: std::sync::OnceLock<Arc<DeviceMemoryManager>>,
 }
 
 pub(crate) type SharedKvState = Arc<SharedKvStateInner>;
@@ -133,95 +113,68 @@ impl SharedKvStateInner {
             live_kv_caps: Mutex::new(HashMap::new()),
             last_health_epoch: AtomicU64::new(0),
             live_ceiling: Mutex::new(HashMap::new()),
-            #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-            gpu_pools: Mutex::new(HashMap::new()),
-            #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-            cross_device_sched: Mutex::new(CrossDevicePoolScheduler::new(0.85, 2048)),
+            #[cfg(feature = "gpu-device-pool")]
+            device_memory: std::sync::OnceLock::new(),
         })
     }
 
-    /// Return the existing pool handle for `device_id` so a new backend can
-    /// attach to it before calling load().
-    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-    pub(crate) fn get_gpu_pool(&self, device_id: usize) -> Option<GpuPoolHandle> {
-        self.gpu_pools
-            .lock()
-            .get(&device_id)
-            .and_then(|pools| pools.first())
-            .map(|state| state.handle.for_engine(state.handle.cap()))
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn new_runtime(device_info: &DeviceInfo) -> Result<SharedKvState, String> {
+        let state = Self::new(device_info);
+        if let Some(manager) = DeviceMemoryManager::from_env(device_info)? {
+            state
+                .device_memory
+                .set(manager)
+                .map_err(|_| "device memory manager initialized twice".to_string())?;
+        }
+        Ok(state)
     }
 
-    /// Register (or re-register) a pool handle after a backend finishes load().
-    /// Rebalances per-engine caps by model priority weight. If load created a
-    /// private pool due to incompatible geometry, it becomes a separate pool
-    /// group for future compatible models.
-    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-    pub(crate) fn attach_gpu_pool(
+    #[cfg(not(feature = "gpu-device-pool"))]
+    pub(crate) fn new_runtime(device_info: &DeviceInfo) -> Result<SharedKvState, String> {
+        Ok(Self::new(device_info))
+    }
+
+    #[cfg(any(
+        feature = "native",
+        feature = "gguf-native",
+        feature = "gguf-cuda-shared-kv"
+    ))]
+    pub(crate) fn device_pool(
+        &self,
+        device_id: usize,
+    ) -> Option<Arc<kapsl_hal::gpu_arena::GpuDevicePool>> {
+        self.device_memory
+            .get()
+            .and_then(|manager| manager.pool(device_id))
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn uses_env_allocators(&self, device_id: usize) -> bool {
+        self.device_memory
+            .get()
+            .is_some_and(|manager| manager.has_pool(device_id))
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn begin_device_memory_admission(
         &self,
         device_id: usize,
         model_id: u32,
-        weight: u32,
-        handle: GpuPoolHandle,
-    ) {
-        const MIN_BLOCKS_PER_ENGINE: usize = 64;
-        let mut pools = self.gpu_pools.lock();
-        let device_pools = pools.entry(device_id).or_default();
-        let pool_index = device_pools
-            .iter()
-            .position(|state| Arc::ptr_eq(&state.handle.pool, &handle.pool));
+        kind: EngineKind,
+    ) -> Result<Option<DeviceMemoryAdmission>, String> {
+        self.device_memory
+            .get()
+            .map(|manager| manager.begin_admission(device_id, model_id, kind))
+            .transpose()
+            .map(Option::flatten)
+    }
 
-        let state = if let Some(index) = pool_index {
-            &mut device_pools[index]
-        } else {
-            device_pools.push(DeviceGpuPoolState {
-                handle: GpuPoolHandle::with_cap(handle.pool.clone(), handle.pool.total_blocks()),
-                members: Vec::new(),
-            });
-            device_pools.last_mut().expect("inserted pool state")
-        };
-
-        state.members.push(GpuPoolMember {
-            model_id,
-            weight: weight.max(1),
-            cap: handle.blocks_per_engine.clone(),
-        });
-
-        let total_weight = state
-            .members
-            .iter()
-            .map(|member| member.weight as usize)
-            .sum::<usize>()
-            .max(1);
-        let total_blocks = state.handle.pool.total_blocks();
-        for member in &state.members {
-            let weighted_cap = total_blocks.saturating_mul(member.weight as usize) / total_weight;
-            member
-                .cap
-                .store(weighted_cap.max(MIN_BLOCKS_PER_ENGINE), Ordering::Relaxed);
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn release_device_memory(&self, model_id: u32) {
+        if let Some(manager) = self.device_memory.get() {
+            manager.release_model(model_id);
         }
-        log::info!(
-            "[gpu-pool] device {}: {} model(s) sharing {} blocks with weighted caps: {}",
-            device_id,
-            state.members.len(),
-            total_blocks,
-            state
-                .members
-                .iter()
-                .map(|member| format!(
-                    "model={} weight={} cap={}",
-                    member.model_id,
-                    member.weight,
-                    member.cap.load(Ordering::Relaxed)
-                ))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-
-        // Also register with the cross-device scheduler so session-level
-        // admission and migration can see this pool.
-        self.cross_device_sched
-            .lock()
-            .register_pool(device_id, handle.pool.clone());
     }
 
     /// Return (or lazily create) the shared block allocator for `device_id`.
@@ -450,75 +403,6 @@ impl SharedKvStateInner {
             let new_cap =
                 (total_blocks * budget.max_tokens / total_tokens).max(MIN_BLOCKS_PER_ENGINE);
             cap_atom.store(new_cap, Ordering::Relaxed);
-        }
-    }
-
-    /// Remove a model from the GPU block pool registry and rebalance remaining
-    /// members' quota caps.  No-op if the model is not registered.
-    #[cfg(any(feature = "gguf-native", feature = "gguf-cuda-shared-kv"))]
-    pub(crate) fn detach_gpu_pool(&self, model_id: u32) {
-        const MIN_BLOCKS_PER_ENGINE: usize = 64;
-        let emptied_devices: Vec<usize> = {
-            let mut pools = self.gpu_pools.lock();
-            for device_pools in pools.values_mut() {
-                for state in device_pools.iter_mut() {
-                    let before = state.members.len();
-                    state.members.retain(|m| m.model_id != model_id);
-                    if state.members.len() == before {
-                        continue;
-                    }
-                    if state.members.is_empty() {
-                        log::info!("[gpu-pool] model {} detached; pool now empty", model_id);
-                        continue;
-                    }
-                    let total_weight = state
-                        .members
-                        .iter()
-                        .map(|m| m.weight as usize)
-                        .sum::<usize>()
-                        .max(1);
-                    let total_blocks = state.handle.pool.total_blocks();
-                    for member in &state.members {
-                        let weighted_cap =
-                            total_blocks.saturating_mul(member.weight as usize) / total_weight;
-                        member
-                            .cap
-                            .store(weighted_cap.max(MIN_BLOCKS_PER_ENGINE), Ordering::Relaxed);
-                    }
-                    log::info!(
-                        "[gpu-pool] model {} detached; {} member(s) remaining, caps rebalanced: {}",
-                        model_id,
-                        state.members.len(),
-                        state
-                            .members
-                            .iter()
-                            .map(|m| format!(
-                                "model={} cap={}",
-                                m.model_id,
-                                m.cap.load(Ordering::Relaxed)
-                            ))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
-                }
-                device_pools.retain(|state| !state.members.is_empty());
-            }
-            // Collect device IDs whose last pool was just removed before we release
-            // the lock, so we can clean up the cross-device scheduler outside it.
-            pools
-                .iter()
-                .filter(|(_, v)| v.is_empty())
-                .map(|(&k, _)| k)
-                .collect()
-        };
-
-        // Unregister fully-empty devices from the cross-device scheduler now
-        // that gpu_pools lock is released.
-        if !emptied_devices.is_empty() {
-            let mut sched = self.cross_device_sched.lock();
-            for dev_id in emptied_devices {
-                sched.unregister_device(dev_id);
-            }
         }
     }
 }

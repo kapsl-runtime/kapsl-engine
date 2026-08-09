@@ -6,10 +6,16 @@ edition = "2021"
 [features]
 # Default build is portable: CPU/standard backends only, no CUDA toolkit required.
 default = []
-native = ["kapsl-backends/native"]
-gguf-native = ["kapsl-backends/gguf-native"]
+gpu-device-pool = [
+    "dep:cudarc",
+    "cudarc/cuda-version-from-build-system",
+    "kapsl-backends/onnx-cuda-pool",
+    "kapsl-hal/cuda",
+]
+native = ["gpu-device-pool", "kapsl-backends/native"]
+gguf-native = ["gpu-device-pool", "kapsl-backends/gguf-native"]
 gguf-cuda = ["kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
-gguf-cuda-shared-kv = ["kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
+gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
 cuda = ["gguf-cuda"]
 infer-adapter-echo = []
 
@@ -53,3 +59,4 @@ sha2 = "0.10"
 rust-embed = "8.0"
 mime_guess = "2.0"
 dirs = "6.0.0"
+cudarc = { version = "0.12", optional = true }
