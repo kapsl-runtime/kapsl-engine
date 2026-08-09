@@ -1,5 +1,5 @@
 # Kapsl Runtime — TensorRT image
-# CUDA 12 + cuDNN + TensorRT 10 with matching Kapsl provider packs.
+# CUDA 12 + cuDNN + TensorRT 10 with a merged Kapsl CUDA runtime and TensorRT add-on.
 
 FROM python:3.12-slim AS tensorrt-libs
 

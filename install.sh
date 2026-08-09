@@ -1,14 +1,14 @@
 #!/usr/bin/env sh
 # Kapsl CLI installer
 # Usage: curl -fsSL https://downloads.kapsl.net/install.sh | sh
-# CUDA: curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator cuda
+# CUDA: curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
 set -e
 
 BASE_URL="${KAPSL_BASE_URL:-https://downloads.kapsl.net}"
 BIN_NAME="kapsl"
 INSTALL_DIR="${KAPSL_INSTALL_DIR:-$HOME/.local/bin}"
 ACCELERATOR="${KAPSL_ACCELERATOR:-cpu}"
-CHANNEL="stable"
+CHANNEL="${KAPSL_CHANNEL:-stable}"
 VERSION="${KAPSL_VERSION:-}"
 
 usage() {
@@ -21,7 +21,7 @@ Usage:
 
 Examples:
   curl -fsSL https://downloads.kapsl.net/install.sh | sh
-  curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator cuda
+  curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
   curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator tensorrt
 EOF
 }
@@ -158,21 +158,7 @@ install_bundle() {
 
     cp -R "$(dirname "$bundle_bin")/." "$INSTALL_DIR/"
     chmod +x "${INSTALL_DIR}/${BIN_NAME}"
-}
-
-# A working driver is necessary but not sufficient for the CUDA build: it also
-# carries DT_NEEDED entries the driver does not provide (libnccl.so.2 among
-# them, which ships in the CUDA container images but is a separate package on
-# a bare host), so it can install cleanly and still fail to load. Prove the
-# binary starts before committing to it, and surface the loader's own error —
-# it names the missing library, which is the one thing that tells the user how
-# to get the GPU back.
-runtime_starts() {
-    start_error="$("${INSTALL_DIR}/${BIN_NAME}" --version 2>&1 >/dev/null)" && return 0
-    if [ -n "$start_error" ]; then
-        echo "  ${start_error}" >&2
-    fi
-    return 1
+    INSTALLED_BUNDLE_DIR="$(dirname "$bundle_bin")"
 }
 
 install_provider_pack() {
@@ -206,33 +192,33 @@ case "$ACCELERATOR" in
         ;;
 esac
 
+case "$ACCELERATOR" in
+    cuda | cuda12 | tensorrt | tensorrt10)
+        if [ "$PLATFORM" != "linux-x86_64" ]; then
+            echo "The ${ACCELERATOR} runtime is currently available only for Linux x86_64." >&2
+            exit 1
+        fi
+        ;;
+esac
+
 if [ -z "$VERSION" ]; then
     printf "Fetching latest version... "
     VERSION="$(latest_version)"
     echo "$VERSION"
 fi
 
-# GGUF/llama.cpp only gets GPU support if the binary was compiled with
-# --features cuda, and that build links libcuda.so.1 directly (not dlopen'd),
-# so it cannot exec at all on a host with no NVIDIA driver loaded. Only reach
-# for it when the driver is confirmed working; otherwise keep installing the
-# portable build so `kapsl` still runs, and say so.
-USE_CUDA_RUNTIME=0
 case "$ACCELERATOR" in
+    cpu)
+        BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+        ;;
     cuda | cuda12 | tensorrt | tensorrt10)
-        if [ "$PLATFORM" = "linux-x86_64" ]; then
-            if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-                USE_CUDA_RUNTIME=1
-            else
-                echo "Warning: no working NVIDIA driver detected (nvidia-smi missing or failed)." >&2
-                echo "Installing the portable runtime instead; GGUF models will run on CPU until a driver is available. ONNX models still get the ${ACCELERATOR} provider pack." >&2
-            fi
-        fi
+        # One archive contains the CUDA-compiled GGUF runtime, the ONNX CUDA
+        # provider, and their user-space CUDA dependencies. Only the matching
+        # NVIDIA driver remains a host prerequisite.
+        BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}-cuda12.tar.gz"
         ;;
 esac
 
-PORTABLE_BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
-CUDA_BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}-cuda12.tar.gz"
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
 DOWNLOAD_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BIN_FILE}"
 
@@ -243,38 +229,29 @@ mkdir -p "$INSTALL_DIR"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-INSTALLED=0
-
-# Prefer the CUDA-compiled runtime when the driver check passed, but never let
-# a missing -cuda12 asset (older releases predate it) cost the user the ORT
-# sidecars that the portable bundle carries — degrade to it instead.
-if [ "$USE_CUDA_RUNTIME" = "1" ]; then
-    if install_bundle "$CUDA_BUNDLE_FILE" && runtime_starts; then
-        INSTALLED=1
-    else
-        echo "The CUDA runtime is unusable on this host; falling back to the portable runtime, so GGUF models will run on CPU." >&2
-        USE_CUDA_RUNTIME=0
+if ! install_bundle "$BUNDLE_FILE"; then
+    if [ "$ACCELERATOR" != "cpu" ]; then
+        echo "The requested ${ACCELERATOR} runtime is unavailable; no CPU runtime was substituted." >&2
+        exit 1
     fi
-fi
 
-if [ "$INSTALLED" = "0" ] && install_bundle "$PORTABLE_BUNDLE_FILE"; then
-    INSTALLED=1
-fi
-
-# Last resort: the bare executable, which ships without the ORT sidecars and is
-# never the CUDA build, so GGUF stays on the CPU whatever was requested.
-if [ "$INSTALLED" = "0" ]; then
+    # Old CPU releases may only have the bare executable. Accelerator installs
+    # deliberately do not use this fallback because it cannot run GGUF on CUDA.
     echo "Falling back to single executable." >&2
-    USE_CUDA_RUNTIME=0
-    TMP="${TMP_DIR}/${BIN_FILE}"
-    download "$DOWNLOAD_URL" "$TMP"
-    chmod +x "$TMP"
-    mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+    tmp="${TMP_DIR}/${BIN_FILE}"
+    download "$DOWNLOAD_URL" "$tmp"
+    chmod +x "$tmp"
+    mv "$tmp" "${INSTALL_DIR}/${BIN_NAME}"
 fi
 
 case "$ACCELERATOR" in
     cuda | cuda12 | tensorrt | tensorrt10)
-        install_provider_pack "cuda" "12"
+        # Compatibility for pre-merged releases: new CUDA archives already
+        # contain this marker and need no second download.
+        if [ ! -f "${INSTALLED_BUNDLE_DIR}/kapsl-provider-cuda12.json" ]; then
+            echo "Installing legacy split ONNX CUDA provider pack..."
+            install_provider_pack "cuda" "12"
+        fi
         ;;
 esac
 case "$ACCELERATOR" in
@@ -298,11 +275,8 @@ esac
 echo ""
 if [ "$ACCELERATOR" != "cpu" ]; then
     echo "Installed accelerator profile: ${ACCELERATOR}"
-    echo "Linux accelerator packs require compatible NVIDIA system runtime libraries."
-    if [ "$USE_CUDA_RUNTIME" = "1" ]; then
-        echo "GGUF models: GPU-accelerated (CUDA compiled into this runtime build)."
-    else
-        echo "GGUF models: CPU only for this install (ONNX models still get the ${ACCELERATOR} provider pack)."
-    fi
+    echo "GGUF models: CUDA compiled into this runtime build."
+    echo "ONNX models: CUDA execution provider installed."
+    echo "A compatible NVIDIA driver is required."
 fi
 echo "Run 'kapsl --help' to get started."

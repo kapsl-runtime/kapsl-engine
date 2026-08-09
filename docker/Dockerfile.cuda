@@ -1,5 +1,5 @@
 # Kapsl Runtime — CUDA image
-# CUDA 12 + cuDNN runtime with the matching Kapsl CUDA provider pack.
+# CUDA 12 + cuDNN runtime with one Kapsl GGUF + ONNX CUDA bundle.
 
 FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 
@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     binutils curl ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install the pre-built runtime and CUDA provider pack from the matching GitHub
+# Install the pre-built GGUF + ONNX CUDA runtime from the matching GitHub
 # Release, pinned to KAPSL_VERSION so this layer cache-busts per release.
 #
 # The provider pack unpacks next to the binary, but ONNX Runtime reaches

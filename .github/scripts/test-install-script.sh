@@ -1,22 +1,13 @@
 #!/bin/sh
-# Exercises install.sh against a local fixture release.
-#
-# The interesting behavior is all on the failure paths: which runtime actually
-# lands, and whether the closing summary describes it honestly. Three separate
-# bugs have shipped here — a stale "GPU-accelerated" message over a CPU-only
-# install, a missing -cuda12 asset skipping the portable bundle, and a CUDA
-# binary that installs cleanly and then cannot load — so each case below
-# asserts the binary *and* the message, not just a zero exit.
-#
-# Runs unmodified on a Linux x86_64 runner, which is the only platform where
-# install.sh reaches the CUDA path.
+# Exercise the public installers against a local fixture release.
 set -eu
 
 version="9.9.9"
 test_root="$(mktemp -d)"
 release_dir="${test_root}/release"
 asset_dir="${release_dir}/runtime/v${version}"
-fake_bin_dir="${test_root}/fake-bin"
+beta_asset_dir="${release_dir}/runtime/beta/v${version}"
+fake_bin="${test_root}/bin"
 server_log="${test_root}/http-server.log"
 server_pid=""
 base_url="http://127.0.0.1:18081"
@@ -31,52 +22,54 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
-    echo "This test must run on Linux x86_64; install.sh gates the CUDA path on it." >&2
-    exit 1
-fi
+mkdir -p "${asset_dir}" "${beta_asset_dir}" "${fake_bin}"
 
-mkdir -p "${asset_dir}" "${fake_bin_dir}"
+# Keep the test runnable on developer Macs while exercising the production
+# Linux x86_64 selection path byte-for-byte.
+cat > "${fake_bin}/uname" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+    -s) echo Linux ;;
+    -m) echo x86_64 ;;
+    *) echo Linux ;;
+esac
+EOF
+chmod +x "${fake_bin}/uname"
 
 # --- fixture payloads -------------------------------------------------------
 make_bundle() {
     bundle_asset="$1"
     marker="$2"
+    accelerator="$3"
     payload="${test_root}/payload-${marker}"
+    rm -rf "${payload}"
     mkdir -p "${payload}"
     cat > "${payload}/kapsl" <<EOF
 #!/bin/sh
 echo "${marker}"
 EOF
     chmod +x "${payload}/kapsl"
-    # Stands in for the ONNX Runtime core libraries the real bundles carry;
-    # its presence is how we tell a bundle install from the bare executable.
-    echo "sidecar" > "${payload}/libonnxruntime.so.1"
+    echo "core sidecar" > "${payload}/libonnxruntime.so.1"
+    if [ "${accelerator}" = "cuda" ]; then
+        echo '{}' > "${payload}/kapsl-provider-cuda12.json"
+        echo "cuda provider" > "${payload}/libonnxruntime_providers_cuda.so"
+        echo "cudnn" > "${payload}/libcudnn.so.9"
+    fi
     tar -czf "${asset_dir}/${bundle_asset}" -C "${payload}" .
 }
 
-make_bundle "kapsl-${version}-linux-x86_64.tar.gz" "portable"
-make_bundle "kapsl-${version}-linux-x86_64-cuda12.tar.gz" "cuda12"
-
-# A CUDA bundle that installs cleanly and then refuses to load, which is what a
-# host missing libnccl.so.2 actually looks like.
-broken_payload="${test_root}/payload-broken"
-mkdir -p "${broken_payload}"
-cat > "${broken_payload}/kapsl" <<'EOF'
-#!/bin/sh
-echo "kapsl: error while loading shared libraries: libnccl.so.2: cannot open shared object file" >&2
-exit 127
-EOF
-chmod +x "${broken_payload}/kapsl"
-echo "sidecar" > "${broken_payload}/libonnxruntime.so.1"
-tar -czf "${test_root}/cuda12-broken.tar.gz" -C "${broken_payload}" .
+portable_asset="kapsl-${version}-linux-x86_64.tar.gz"
+cuda_asset="kapsl-${version}-linux-x86_64-cuda12.tar.gz"
+make_bundle "${portable_asset}" "portable" cpu
+make_bundle "${cuda_asset}" "cuda12" cuda
 
 for provider in cuda12 tensorrt10; do
-    # Distinct from the runtime bundle payloads: a provider pack that also
-    # carried a kapsl binary would overwrite the one under test.
     provider_payload="${test_root}/payload-provider-${provider}"
     mkdir -p "${provider_payload}"
     echo '{}' > "${provider_payload}/kapsl-provider-${provider}.json"
+    if [ "${provider}" = "cuda12" ]; then
+        echo "legacy cuda provider" > "${provider_payload}/libonnxruntime_providers_cuda.so"
+    fi
     tar -czf "${asset_dir}/kapsl-provider-${provider}-${version}-linux-x86_64.tar.gz" \
         -C "${provider_payload}" .
 done
@@ -86,14 +79,10 @@ cat > "${asset_dir}/kapsl-${version}-linux-x86_64" <<'EOF'
 echo "single-exe"
 EOF
 
-cat > "${fake_bin_dir}/nvidia-smi" <<'EOF'
-#!/bin/sh
-if [ "$1" = "-L" ]; then
-    echo "GPU 0: Fixture GPU (UUID: GPU-00000000)"
-fi
-exit 0
-EOF
-chmod +x "${fake_bin_dir}/nvidia-smi"
+# install-cuda.sh fetches the general installer from the same origin.
+cp install.sh "${release_dir}/install.sh"
+cp install.sh "${release_dir}/install-beta-base.sh"
+cp "${asset_dir}/${cuda_asset}" "${beta_asset_dir}/${cuda_asset}"
 
 # --- fixture server ---------------------------------------------------------
 python3 -m http.server 18081 \
@@ -103,7 +92,7 @@ python3 -m http.server 18081 \
 server_pid="$!"
 
 attempt=1
-while ! curl -fsSLI "${base_url}/runtime/v${version}/kapsl-${version}-linux-x86_64.tar.gz" >/dev/null; do
+while ! curl -fsSLI "${base_url}/runtime/v${version}/${portable_asset}" >/dev/null; do
     if [ "${attempt}" -ge 20 ]; then
         cat "${server_log}" >&2
         echo "Timed out waiting for the fixture HTTP server." >&2
@@ -114,12 +103,10 @@ while ! curl -fsSLI "${base_url}/runtime/v${version}/kapsl-${version}-linux-x86_
 done
 
 # --- harness ----------------------------------------------------------------
-# run_install <name> <driver:yes|no> <accelerator|-> ; sets install_dir/log
+# run_install <name> <accelerator|->; sets install_dir/log_file/install_status.
 run_install() {
     case_name="$1"
-    with_driver="$2"
-    accelerator="$3"
-
+    accelerator="$2"
     install_dir="${test_root}/install-${case_name}"
     log_file="${test_root}/log-${case_name}"
     rm -rf "${install_dir}"
@@ -129,11 +116,27 @@ run_install() {
         set -- "$@" --accelerator "${accelerator}"
     fi
 
-    if [ "${with_driver}" = "yes" ]; then
-        PATH="${fake_bin_dir}:${PATH}" sh install.sh "$@" >"${log_file}" 2>&1 || true
-    else
-        sh install.sh "$@" >"${log_file}" 2>&1 || true
-    fi
+    set +e
+    PATH="${fake_bin}:${PATH}" sh install.sh "$@" >"${log_file}" 2>&1
+    install_status=$?
+    set -e
+}
+
+run_cuda_wrapper() {
+    case_name="$1"
+    wrapper="$2"
+    install_dir="${test_root}/install-${case_name}"
+    log_file="${test_root}/log-${case_name}"
+    rm -rf "${install_dir}"
+
+    set +e
+    KAPSL_BASE_URL="${base_url}" \
+    KAPSL_VERSION="${version}" \
+    KAPSL_INSTALL_DIR="${install_dir}" \
+    PATH="${fake_bin}:${PATH}" \
+        sh "${wrapper}" >"${log_file}" 2>&1
+    install_status=$?
+    set -e
 }
 
 fail() {
@@ -142,6 +145,13 @@ fail() {
         sed 's/^/        /' "${log_file}" >&2
     fi
     failures=$((failures + 1))
+}
+
+expect_status() {
+    expected="$1"
+    if [ "${install_status}" -ne "${expected}" ]; then
+        fail "installer exited ${install_status}; expected ${expected}"
+    fi
 }
 
 expect_binary() {
@@ -174,72 +184,90 @@ expect_file() {
     fi
 }
 
-gpu_claim="GGUF models: GPU-accelerated"
-cpu_claim="GGUF models: CPU only"
-
 # --- cases ------------------------------------------------------------------
-echo "case: driver present installs the CUDA runtime"
-run_install "cuda-driver" yes cuda
+echo "case: CUDA installs one merged GGUF + ONNX bundle"
+run_install "cuda" cuda
+expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
-expect_log "${gpu_claim}"
+expect_file "libonnxruntime_providers_cuda.so"
+expect_file "libcudnn.so.9"
+expect_log "GGUF models: CUDA compiled"
+expect_log "ONNX models: CUDA execution provider installed"
+reject_log "legacy split"
 
-echo "case: no driver falls back and says so"
-run_install "cuda-nodriver" no cuda
-expect_binary "portable"
-expect_file "kapsl-provider-cuda12.json"
-expect_log "no working NVIDIA driver detected"
-expect_log "${cpu_claim}"
-reject_log "${gpu_claim}"
-
-echo "case: tensorrt also gets the CUDA runtime and both packs"
-run_install "tensorrt-driver" yes tensorrt
+echo "case: direct CUDA wrapper selects the same merged bundle"
+run_cuda_wrapper "cuda-wrapper" install-cuda.sh
+expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
+expect_file "libonnxruntime_providers_cuda.so"
+
+echo "case: beta CUDA wrapper selects the merged beta bundle"
+run_cuda_wrapper "beta-cuda-wrapper" install-beta-cuda.sh
+expect_status 0
+expect_binary "cuda12"
+expect_file "kapsl-provider-cuda12.json"
+expect_file "libonnxruntime_providers_cuda.so"
+
+echo "case: TensorRT adds only its provider to the merged CUDA bundle"
+run_install "tensorrt" tensorrt
+expect_status 0
+expect_binary "cuda12"
+expect_file "kapsl-provider-cuda12.json"
+expect_file "libonnxruntime_providers_cuda.so"
 expect_file "kapsl-provider-tensorrt10.json"
-expect_log "${gpu_claim}"
+reject_log "legacy split"
 
-echo "case: cpu accelerator is untouched by the CUDA path"
-run_install "cpu" yes cpu
+echo "case: CPU and the default install remain portable"
+run_install "cpu" cpu
+expect_status 0
 expect_binary "portable"
-reject_log "${gpu_claim}"
-reject_log "nvidia"
-
-echo "case: default install is untouched by the CUDA path"
-run_install "default" yes -
+reject_log "CUDA compiled"
+run_install "default" -
+expect_status 0
 expect_binary "portable"
-reject_log "${gpu_claim}"
+reject_log "CUDA compiled"
 
-# A CUDA binary that cannot load must not be left in place, and must not be
-# reported as GPU-accelerated.
-echo "case: unusable CUDA runtime falls back to the portable bundle"
-cp "${asset_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz" "${test_root}/cuda12-good.tar.gz"
-cp "${test_root}/cuda12-broken.tar.gz" "${asset_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz"
-run_install "cuda-unusable" yes cuda
-expect_binary "portable"
-expect_log "libnccl.so.2"
-expect_log "${cpu_claim}"
-reject_log "${gpu_claim}"
-cp "${test_root}/cuda12-good.tar.gz" "${asset_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz"
+echo "case: an older split CUDA release remains installable"
+cp "${asset_dir}/${cuda_asset}" "${test_root}/merged-cuda.tar.gz"
+make_bundle "${cuda_asset}" "legacy-cuda12" cpu
+run_install "legacy-cuda" cuda
+expect_status 0
+expect_binary "legacy-cuda12"
+expect_file "kapsl-provider-cuda12.json"
+expect_file "libonnxruntime_providers_cuda.so"
+expect_log "legacy split ONNX CUDA provider pack"
+cp "${test_root}/merged-cuda.tar.gz" "${asset_dir}/${cuda_asset}"
 
-# Releases older than the -cuda12 artifact must still get the portable bundle,
-# with its sidecars, rather than dropping to the bare executable.
-echo "case: missing CUDA asset degrades to the portable bundle"
-mv "${asset_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz" "${test_root}/held-cuda12.tar.gz"
-run_install "cuda-missing" yes cuda
-expect_binary "portable"
-expect_file "libonnxruntime.so.1"
-expect_log "${cpu_claim}"
-reject_log "${gpu_claim}"
+echo "case: missing CUDA bundle fails instead of silently installing CPU"
+mv "${asset_dir}/${cuda_asset}" "${test_root}/held-cuda.tar.gz"
+run_install "cuda-missing" cuda
+if [ "${install_status}" -eq 0 ]; then
+    fail "missing CUDA bundle unexpectedly succeeded"
+fi
+expect_log "no CPU runtime was substituted"
+if [ -e "${install_dir}/kapsl" ]; then
+    fail "missing CUDA bundle installed a runtime"
+fi
+mv "${test_root}/held-cuda.tar.gz" "${asset_dir}/${cuda_asset}"
 
-echo "case: no bundles at all still installs the bare executable"
-mv "${asset_dir}/kapsl-${version}-linux-x86_64.tar.gz" "${test_root}/held-portable.tar.gz"
-run_install "no-bundles" yes cuda
+echo "case: corrupt CUDA bundle fails instead of silently installing CPU"
+cp "${asset_dir}/${cuda_asset}" "${test_root}/valid-cuda.tar.gz"
+printf 'corrupt' > "${asset_dir}/${cuda_asset}"
+run_install "cuda-corrupt" cuda
+if [ "${install_status}" -eq 0 ]; then
+    fail "corrupt CUDA bundle unexpectedly succeeded"
+fi
+expect_log "no CPU runtime was substituted"
+cp "${test_root}/valid-cuda.tar.gz" "${asset_dir}/${cuda_asset}"
+
+echo "case: old CPU release without a bundle uses the bare executable"
+mv "${asset_dir}/${portable_asset}" "${test_root}/held-portable.tar.gz"
+run_install "cpu-no-bundle" cpu
+expect_status 0
 expect_binary "single-exe"
-expect_log "${cpu_claim}"
-reject_log "${gpu_claim}"
-mv "${test_root}/held-cuda12.tar.gz" "${asset_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz"
-mv "${test_root}/held-portable.tar.gz" "${asset_dir}/kapsl-${version}-linux-x86_64.tar.gz"
+mv "${test_root}/held-portable.tar.gz" "${asset_dir}/${portable_asset}"
 
 if [ "${failures}" -ne 0 ]; then
     echo "${failures} install.sh case(s) failed." >&2
