@@ -3,6 +3,10 @@ use cudarc::driver::CudaDevice;
 use kapsl_hal::gpu_arena::{GpuDevicePool, PoolOwner};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const RELEASE_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const RELEASE_RETRY_ATTEMPTS: usize = 400;
 
 /// Runtime owner of the one stable backing allocation created for each CUDA
 /// device. Backends receive cloned pool handles; none of them may replace or
@@ -123,7 +127,7 @@ impl DeviceMemoryManager {
         }))
     }
 
-    pub(crate) fn release_model(&self, model_id: u32) {
+    pub(crate) fn release_model(self: &Arc<Self>, model_id: u32) {
         let admissions = self
             .model_admissions
             .lock()
@@ -144,7 +148,7 @@ impl DeviceMemoryManager {
             .push((device_id, owner));
     }
 
-    fn release_one(&self, device_id: usize, owner: PoolOwner) {
+    fn release_one(self: &Arc<Self>, device_id: usize, owner: PoolOwner) {
         let key = (device_id, owner);
         let should_unadmit = {
             let mut refs = self.admission_refs.lock().unwrap();
@@ -153,7 +157,6 @@ impl DeviceMemoryManager {
             };
             *count = count.saturating_sub(1);
             if *count == 0 {
-                refs.remove(&key);
                 true
             } else {
                 false
@@ -162,21 +165,80 @@ impl DeviceMemoryManager {
         if !should_unadmit {
             return;
         }
-        let Some(pool) = self.pools.get(&device_id) else {
+
+        if self.try_finish_release(device_id, owner) {
             return;
-        };
-        match pool.set_owner_admitted(owner, false) {
-            Ok(()) => log::info!(
-                "[device-memory] released {:?} admission on CUDA device {}",
-                owner,
-                device_id
-            ),
-            Err(error) => log::warn!(
-                "[device-memory] retaining {:?} reservation on CUDA device {} while allocations remain: {}",
+        }
+
+        let usage = self
+            .pools
+            .get(&device_id)
+            .map(|pool| pool.owner_usage_bytes(owner))
+            .unwrap_or(0);
+        log::info!(
+            "[device-memory] deferring {:?} admission release on CUDA device {} until {} live bytes are freed",
+            owner,
+            device_id,
+            usage
+        );
+        let manager = Arc::clone(self);
+        std::thread::spawn(move || {
+            for _ in 0..RELEASE_RETRY_ATTEMPTS {
+                std::thread::sleep(RELEASE_RETRY_INTERVAL);
+                if manager.try_finish_release(device_id, owner) {
+                    return;
+                }
+            }
+            let usage = manager
+                .pools
+                .get(&device_id)
+                .map(|pool| pool.owner_usage_bytes(owner))
+                .unwrap_or(0);
+            log::warn!(
+                "[device-memory] timed out releasing {:?} admission on CUDA device {}; {} bytes remain live",
                 owner,
                 device_id,
-                error
-            ),
+                usage
+            );
+        });
+    }
+
+    /// Complete a pending release once backend teardown has returned every
+    /// allocation. The admission-ref lock serializes this with re-admission of
+    /// the same model ID, preventing a delayed cleanup from unprotecting a
+    /// newly started workload.
+    fn try_finish_release(&self, device_id: usize, owner: PoolOwner) -> bool {
+        let key = (device_id, owner);
+        let mut refs = self.admission_refs.lock().unwrap();
+        if refs.get(&key).copied().unwrap_or(0) != 0 {
+            return true;
+        }
+        let Some(pool) = self.pools.get(&device_id) else {
+            refs.remove(&key);
+            return true;
+        };
+        if pool.owner_usage_bytes(owner) != 0 {
+            return false;
+        }
+        match pool.set_owner_admitted(owner, false) {
+            Ok(()) => {
+                refs.remove(&key);
+                log::info!(
+                    "[device-memory] released {:?} admission on CUDA device {}",
+                    owner,
+                    device_id
+                );
+                true
+            }
+            Err(error) => {
+                log::warn!(
+                    "[device-memory] failed to release {:?} admission on CUDA device {}: {}",
+                    owner,
+                    device_id,
+                    error
+                );
+                false
+            }
         }
     }
 }
