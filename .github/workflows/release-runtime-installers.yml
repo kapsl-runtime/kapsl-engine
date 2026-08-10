@@ -400,7 +400,7 @@ jobs:
           echo "KAPSL_VERSION=$runtime_version" >> "$GITHUB_ENV"
 
       - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --features cuda
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
 
       - name: Collect ONNX Runtime sidecars
         shell: bash
