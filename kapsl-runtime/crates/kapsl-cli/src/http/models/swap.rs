@@ -1,13 +1,13 @@
 use super::*;
 
 pub(crate) struct ModelSwapRoutesConfig {
-    pub(crate) swap_map: Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>>,
+    pub(crate) models: Arc<ModelManager>,
 }
 
 pub(crate) fn build_model_swap_routes(
     config: ModelSwapRoutesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let swap_map = config.swap_map;
+    let models = config.models;
 
     // Shared response types for the three hot-swap endpoints.
     #[derive(Serialize)]
@@ -27,12 +27,11 @@ pub(crate) fn build_model_swap_routes(
 
     // Returns the engine handles for a model, or an error reply if not found.
     fn lookup_swap_handles(
-        swap_map: &Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>>,
+        models: &ModelManager,
         model_id: u32,
     ) -> Result<Vec<EngineHandle>, warp::reply::WithStatus<warp::reply::Json>> {
-        let g = swap_map.read();
-        match g.get(&model_id) {
-            Some(v) => Ok(v.clone()),
+        match models.swap_handles(model_id) {
+            Some(handles) => Ok(handles),
             None => Err(warp::reply::with_status(
                 warp::reply::json(&SwapErrResp {
                     error: format!("model {} not found", model_id),
@@ -43,14 +42,15 @@ pub(crate) fn build_model_swap_routes(
     }
 
     // POST /api/models/:id/stage - Pre-load next model weights into CPU RAM
-    let swap_map_for_stage = swap_map.clone();
+    let models_for_stage = models.clone();
     let stage_model_route = warp::path!("api" / "models" / u32 / "stage")
         .and(warp::post())
         .and(warp::body::json())
         .then(move |model_id: u32, body: serde_json::Value| {
-            let swap_map = swap_map_for_stage.clone();
+            let models = models_for_stage.clone();
             async move {
                 use warp::http::StatusCode;
+                let _operation = models.lock_lifecycle(model_id).await;
                 let path_str = match body.get("model_path").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
                     None => {
@@ -62,7 +62,7 @@ pub(crate) fn build_model_swap_routes(
                         )
                     }
                 };
-                let handles = match lookup_swap_handles(&swap_map, model_id) {
+                let handles = match lookup_swap_handles(&models, model_id) {
                     Ok(h) => h,
                     Err(r) => return r,
                 };
@@ -98,14 +98,15 @@ pub(crate) fn build_model_swap_routes(
         });
 
     // POST /api/models/:id/swap - Activate staged weights (PCIe transfer only)
-    let swap_map_for_swap = swap_map.clone();
+    let models_for_swap = models.clone();
     let swap_model_route = warp::path!("api" / "models" / u32 / "swap")
         .and(warp::post())
         .then(move |model_id: u32| {
-            let swap_map = swap_map_for_swap.clone();
+            let models = models_for_swap.clone();
             async move {
                 use warp::http::StatusCode;
-                let handles = match lookup_swap_handles(&swap_map, model_id) {
+                let _operation = models.lock_lifecycle(model_id).await;
+                let handles = match lookup_swap_handles(&models, model_id) {
                     Ok(h) => h,
                     Err(r) => return r,
                 };
@@ -129,14 +130,14 @@ pub(crate) fn build_model_swap_routes(
         });
 
     // GET /api/models/:id/swap-status - Check hot-swap staging readiness
-    let swap_map_for_status = swap_map.clone();
+    let models_for_status = models.clone();
     let swap_status_route = warp::path!("api" / "models" / u32 / "swap-status")
         .and(warp::get())
         .then(move |model_id: u32| {
-            let swap_map = swap_map_for_status.clone();
+            let models = models_for_status.clone();
             async move {
                 use warp::http::StatusCode;
-                let handles = match lookup_swap_handles(&swap_map, model_id) {
+                let handles = match lookup_swap_handles(&models, model_id) {
                     Ok(h) => h,
                     Err(r) => return r,
                 };

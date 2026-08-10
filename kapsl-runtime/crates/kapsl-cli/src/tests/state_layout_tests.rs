@@ -29,7 +29,7 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         onnx_peak_concurrency_hint: None,
         onnx_model_tuning: Vec::new(),
         shm_size_mb: None,
-        kv_compression_bits: Some(3 as u8),
+        kv_compression_bits: Some(3_u8),
     };
 
     let layout = resolve_runtime_state_layout(&args);

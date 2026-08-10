@@ -2,14 +2,10 @@ use super::*;
 
 pub(crate) struct AutoScalerTaskConfig {
     pub(crate) auto_scaler: Arc<RwLock<AutoScaler>>,
-    pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) replica_pools: ReplicaPools,
-    pub(crate) swap_map: Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>>,
-    pub(crate) model_paths: Arc<RwLock<HashMap<u32, PathBuf>>>,
+    pub(crate) models: Arc<ModelManager>,
     pub(crate) device_info: Arc<DeviceInfo>,
-    pub(crate) unique_id_counter: Arc<AtomicU32>,
     pub(crate) shared_metrics: kapsl_monitor::metrics::KapslMetrics,
-    pub(crate) shared_kv: SharedKvState,
+    pub(crate) resources: Arc<RuntimeResources>,
     pub(crate) batch_size: usize,
     pub(crate) scheduler_queue_size: usize,
     pub(crate) scheduler_max_micro_batch: usize,
@@ -22,14 +18,10 @@ pub(crate) struct AutoScalerTaskConfig {
 pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
     let AutoScalerTaskConfig {
         auto_scaler: auto_scaler_clone,
-        model_registry: model_registry_for_scaler,
-        replica_pools: replica_pools_for_scaler,
-        swap_map: swap_map_for_scaler,
-        model_paths: model_paths_for_scaler,
+        models: models_for_scaler,
         device_info: device_info_for_scaler,
-        unique_id_counter: unique_id_counter_for_scaler,
         shared_metrics: shared_metrics_for_scaler,
-        shared_kv: shared_kv_for_scaler,
+        resources: resources_for_scaler,
         batch_size: batch_size_for_scaler,
         scheduler_queue_size: scheduler_queue_size_for_scaler,
         scheduler_max_micro_batch: scheduler_max_micro_batch_for_scaler,
@@ -50,7 +42,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
             last_check = std::time::Instant::now();
 
             // Check each model for scaling needs
-            for model_info in model_registry_for_scaler.list() {
+            for model_info in models_for_scaler.registry().list() {
                 let base_model_id = model_info.base_model_id;
 
                 // Only process primary models (not replicas)
@@ -58,8 +50,10 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     continue;
                 }
 
-                let current_replicas =
-                    model_registry_for_scaler.count_active_replicas(base_model_id) as u32;
+                let current_replicas = models_for_scaler
+                    .registry()
+                    .count_active_replicas(base_model_id)
+                    as u32;
 
                 // Calculate pool state and update metrics.
                 let (
@@ -67,7 +61,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     healthy_replicas,
                     metrics_available,
                     total_model_memory_bytes,
-                ) = if let Some(pool) = replica_pools_for_scaler.read().get(&base_model_id) {
+                ) = if let Some(pool) = models_for_scaler.pool(base_model_id) {
                     let (high, low) = pool.get_queue_depth();
                     let healthy = pool.get_healthy_replica_count();
                     let metrics = pool.get_metrics();
@@ -192,7 +186,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     // load growth: a new replica would land on the same starved
                     // device and thrash. Skip and re-evaluate next tick — the
                     // ceiling's grow-slow recovery provides the hysteresis.
-                    if shared_kv_for_scaler.foreign_pressure_active() {
+                    if resources_for_scaler.kv().foreign_pressure_active() {
                         log::warn!(
                             "Auto-scaler: model {} queue depth {} exceeds threshold, but a \
                              co-tenant GPU process is limiting the KV ceiling; suppressing \
@@ -231,22 +225,25 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                 );
 
                     for _ in 0..replicas_to_add {
-                        let model_path =
-                            if let Some(path) = model_paths_for_scaler.read().get(&base_model_id) {
-                                path.clone()
-                            } else {
-                                continue;
-                            };
+                        // Lifecycle operations for one model are serialized so
+                        // stop/remove/swap cannot interleave with replica load.
+                        let _operation = models_for_scaler.lock_lifecycle(base_model_id).await;
+                        let Some(model_path) = models_for_scaler.model_path(base_model_id) else {
+                            continue;
+                        };
+                        if models_for_scaler.pool(base_model_id).is_none() {
+                            continue;
+                        }
 
                         // Get existing replica IDs to avoid collision
-                        let replicas = model_registry_for_scaler.list_replicas(base_model_id);
+                        let replicas = models_for_scaler.registry().list_replicas(base_model_id);
                         let existing_replica_ids: Vec<u32> =
                             replicas.iter().map(|r| r.replica_id).collect();
 
                         let next_replica_id = auto_scaler_clone
                             .read()
                             .get_next_replica_id(base_model_id, &existing_replica_ids);
-                        let unique_id = unique_id_counter_for_scaler.fetch_add(1, Ordering::SeqCst);
+                        let unique_id = models_for_scaler.next_replica_unique_id();
 
                         match scale_up_model(
                             base_model_id,
@@ -254,14 +251,14 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                             unique_id,
                             &model_path,
                             &device_info_for_scaler,
-                            shared_kv_for_scaler.clone(),
+                            resources_for_scaler.clone(),
                             batch_size_for_scaler,
                             scheduler_queue_size_for_scaler,
                             scheduler_max_micro_batch_for_scaler,
                             scheduler_queue_delay_ms_for_scaler,
                             topology_for_scaler.as_str(),
                             tp_degree_for_scaler,
-                            &model_registry_for_scaler,
+                            models_for_scaler.registry(),
                             &shared_metrics_for_scaler,
                             onnx_tuning.clone(),
                         )
@@ -270,17 +267,12 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                             Ok((scheduler, handle)) => {
                                 // Add new replica to the pool
                                 // Clone the pool to avoid holding the lock across await
-                                let pool =
-                                    replica_pools_for_scaler.read().get(&base_model_id).cloned();
+                                let pool = models_for_scaler.pool(base_model_id);
                                 if let Some(pool) = pool {
                                     pool.add_replica(next_replica_id, scheduler);
                                 }
                                 // Register engine handle for hot-swap
-                                swap_map_for_scaler
-                                    .write()
-                                    .entry(base_model_id)
-                                    .or_default()
-                                    .push(handle);
+                                models_for_scaler.add_swap_handle(base_model_id, handle);
                             }
                             Err(e) => {
                                 log::error!("Failed to scale up model {}: {}", base_model_id, e);
@@ -310,7 +302,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                 );
 
                     // Remove replicas (highest replica_id first)
-                    let replicas = model_registry_for_scaler.list_replicas(base_model_id);
+                    let replicas = models_for_scaler.registry().list_replicas(base_model_id);
                     let mut replica_ids: Vec<_> = replicas
                         .iter()
                         .filter(|r| r.replica_id > 0 && r.status == ModelStatus::Active)
@@ -321,13 +313,12 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     for (replica_id, unique_id) in
                         replica_ids.iter().take(replicas_to_remove as usize)
                     {
+                        let _operation = models_for_scaler.lock_lifecycle(base_model_id).await;
                         if let Err(e) = scale_down_model(
                             base_model_id,
                             *replica_id,
                             *unique_id,
-                            &model_registry_for_scaler,
-                            &replica_pools_for_scaler,
-                            &swap_map_for_scaler,
+                            &models_for_scaler,
                         )
                         .await
                         {

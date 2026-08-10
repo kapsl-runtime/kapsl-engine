@@ -4,19 +4,28 @@ version = "0.2.1"
 edition = "2021"
 
 [features]
-# Default build is portable: CPU/standard backends only, no CUDA toolkit required.
+# Release profiles. Portable installers use `default`; the Linux CUDA bundle
+# uses the stable `cuda` alias below.
 default = []
+cuda = ["gguf-cuda"]
+
+# Shared implementation switch for runtime-owned CUDA memory. It remains a
+# separate feature so CI can type-check the memory authority without compiling
+# a GGUF CUDA backend.
 gpu-device-pool = [
     "dep:cudarc",
     "cudarc/cuda-version-from-build-system",
     "kapsl-backends/onnx-cuda-pool",
     "kapsl-hal/cuda",
 ]
+
+# Advanced backend profiles used by development and targeted deployments.
 native = ["gpu-device-pool", "kapsl-backends/native"]
 gguf-native = ["gpu-device-pool", "kapsl-backends/gguf-native"]
 gguf-cuda = ["gpu-device-pool", "kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
 gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
-cuda = ["gguf-cuda"]
+
+# Test-only deterministic inference adapter.
 infer-adapter-echo = []
 
 [build-dependencies]

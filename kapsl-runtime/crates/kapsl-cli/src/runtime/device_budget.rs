@@ -266,6 +266,38 @@ mod tests {
     }
 
     #[test]
+    fn swap_peak_requires_room_for_active_and_target_weights() {
+        let mut ledger = ledger();
+        ledger
+            .reserve_external(DEVICE, "active-weights", 7 * GIB)
+            .expect("active model plan");
+        ledger
+            .reconcile_external(DEVICE, "active-weights", 7 * GIB)
+            .expect("active model actual");
+
+        assert!(ledger
+            .reserve_external(DEVICE, "swap-peak-1", 6 * GIB)
+            .is_err());
+        let snapshot = ledger.snapshot(DEVICE).expect("device");
+        assert_eq!(snapshot.external_bytes, 7 * GIB);
+        assert_eq!(snapshot.planned_external_bytes, 0);
+
+        let (snapshot, owns_charge) = ledger
+            .reserve_external(DEVICE, "swap-peak-2", 5 * GIB)
+            .expect("active plus target is an exact fit");
+        assert!(owns_charge);
+        assert_eq!(snapshot.external_bytes, 7 * GIB);
+        assert_eq!(snapshot.planned_external_bytes, 5 * GIB);
+        assert_eq!(snapshot.available_bytes(), 0);
+
+        ledger.release_external(DEVICE, "swap-peak-2");
+        assert_eq!(
+            ledger.snapshot(DEVICE).expect("device").available_bytes(),
+            5 * GIB
+        );
+    }
+
+    #[test]
     fn rejects_a_pool_larger_than_the_device_budget() {
         let mut ledger = DeviceBudgetLedger::default();
         assert!(ledger.insert_device(DEVICE, 4 * GIB, 5 * GIB).is_err());

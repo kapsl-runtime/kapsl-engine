@@ -16,6 +16,30 @@ fn test_device_info() -> Arc<DeviceInfo> {
     })
 }
 
+fn test_pressure_config() -> Arc<RuntimePressureConfig> {
+    Arc::new(RuntimePressureConfig {
+        memory_conserve_ratio: 0.7,
+        memory_emergency_ratio: 0.9,
+        gpu_util_conserve_ratio: 0.8,
+        gpu_util_emergency_ratio: 0.95,
+        gpu_mem_conserve_ratio: 0.8,
+        gpu_mem_emergency_ratio: 0.95,
+        conserve_max_new_tokens: Some(256),
+        emergency_max_new_tokens: Some(128),
+    })
+}
+
+fn test_inference_service(models: Arc<ModelManager>) -> Arc<InferenceService> {
+    InferenceService::new(
+        models,
+        ResourcePressure::new(
+            Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+            test_pressure_config(),
+        ),
+        Arc::new(RwLock::new(HashMap::new())),
+    )
+}
+
 fn unique_temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kapsl-route-test-{}-{}", name, std::process::id()))
 }
@@ -33,8 +57,7 @@ async fn test_static_routes_serve_embedded_index() {
 
 #[tokio::test]
 async fn test_system_routes_report_health_and_pressure_state() {
-    let model_registry = Arc::new(ModelRegistry::new());
-    let replica_pools: ReplicaPools = Arc::new(RwLock::new(HashMap::new()));
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     let runtime_samples = Arc::new(RwLock::new(RuntimeSamples {
         process_memory_bytes: 123,
         total_system_memory_bytes: Some(456),
@@ -45,13 +68,7 @@ async fn test_system_routes_report_health_and_pressure_state() {
         collected_at_ms: 789,
     }));
     let pressure_state = Arc::new(AtomicU8::new(RuntimePressureState::Conserve as u8));
-    let routes = build_system_routes(
-        model_registry,
-        replica_pools,
-        test_device_info(),
-        runtime_samples,
-        pressure_state,
-    );
+    let routes = build_system_routes(models, test_device_info(), runtime_samples, pressure_state);
 
     let health = warp::test::request()
         .path("/api/health")
@@ -168,22 +185,12 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
         doc_store: FsDocStore::new(&docs_root),
     };
 
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     let route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
-        replica_pools: Arc::new(RwLock::new(HashMap::new())),
-        model_registry: Arc::new(ModelRegistry::new()),
+        models: models.clone(),
+        inference: test_inference_service(models),
         log_sensitive_ids: false,
         rag_state,
-        runtime_pressure_state: Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
-        runtime_pressure_config: Arc::new(RuntimePressureConfig {
-            memory_conserve_ratio: 0.7,
-            memory_emergency_ratio: 0.9,
-            gpu_util_conserve_ratio: 0.8,
-            gpu_util_emergency_ratio: 0.95,
-            gpu_mem_conserve_ratio: 0.8,
-            gpu_mem_emergency_ratio: 0.95,
-            conserve_max_new_tokens: Some(256),
-            emergency_max_new_tokens: Some(128),
-        }),
     });
 
     let response = warp::test::request()
@@ -201,21 +208,10 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
 }
 
 fn test_openai_routes() -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     build_openai_routes(OpenAiRoutesConfig {
-        model_registry: Arc::new(ModelRegistry::new()),
-        replica_pools: Arc::new(RwLock::new(HashMap::new())),
-        latency_samples: Arc::new(RwLock::new(HashMap::new())),
-        runtime_pressure_state: Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
-        runtime_pressure_config: Arc::new(RuntimePressureConfig {
-            memory_conserve_ratio: 0.7,
-            memory_emergency_ratio: 0.9,
-            gpu_util_conserve_ratio: 0.8,
-            gpu_util_emergency_ratio: 0.95,
-            gpu_mem_conserve_ratio: 0.8,
-            gpu_mem_emergency_ratio: 0.95,
-            conserve_max_new_tokens: Some(256),
-            emergency_max_new_tokens: Some(128),
-        }),
+        models: models.clone(),
+        inference: test_inference_service(models),
         log_sensitive_ids: false,
     })
 }

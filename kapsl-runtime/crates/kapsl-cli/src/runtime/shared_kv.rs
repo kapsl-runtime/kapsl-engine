@@ -1,28 +1,31 @@
 use super::*;
 
-/// Shared KV cache pool registry and cross-model token-budget coordinator.
+struct KvEngineRecord {
+    model_id: u32,
+    device_id: usize,
+    live_cap: Arc<AtomicUsize>,
+}
+
+/// Logical KV cache registry and cross-model token-budget coordinator.
 ///
-/// Always held behind `Arc` (`type SharedKvState = Arc<SharedKvStateInner>`)
+/// Always held behind `Arc` (`type KvCoordinator = Arc<KvCoordinatorInner>`)
 /// so cloning is a single atomic reference-count increment with no heap
 /// allocation.  All `LLMBackend` instances on the same physical GPU share the
 /// same `SharedBlockAllocator`, enforcing a single unified block budget.
-pub(crate) struct SharedKvStateInner {
+pub(crate) struct KvCoordinatorInner {
     /// Total VRAM bytes per device ID — used to size pools on first access.
     device_bytes: HashMap<usize, usize>,
     /// Per-device shared KV block allocators (lazily created).
-    pools: Mutex<HashMap<usize, SharedBlockAllocator>>,
+    logical_block_allocators: Mutex<HashMap<usize, SharedBlockAllocator>>,
     /// Cross-model token-budget coordinator (hard admission gate in Phase 2).
     /// Uses parking_lot::Mutex so a panic in one engine's thread cannot poison
     /// the lock and propagate to all other engines.
     scheduler: Arc<parking_lot::Mutex<GlobalKvScheduler>>,
     /// Monotonically increasing counter for stable engine IDs.
     next_engine_id: AtomicU32,
-    /// model_id → engine_ids assigned by attach_engine (supports multiple replicas).
-    model_engine_ids: Mutex<HashMap<u32, Vec<u32>>>,
-    /// Live per-engine KV block caps shared with LLMBackend instances.
-    /// Updated by rebalance_kv_caps() on every engine attach / detach so that
-    /// backends read the current fair-share cap without needing a restart.
-    live_kv_caps: Mutex<HashMap<u32, Arc<AtomicUsize>>>,
+    /// Explicit engine identity and placement. Keeping device identity here is
+    /// what lets cap rebalancing operate independently on each device.
+    engine_records: Mutex<HashMap<u32, KvEngineRecord>>,
     /// Last `GlobalKvScheduler::health_epoch` we rebalanced KV caps for. The
     /// periodic loop compares against the live epoch and rebalances when an
     /// engine's health changes, reclaiming a degraded/dead engine's block quota
@@ -39,12 +42,9 @@ pub(crate) struct SharedKvStateInner {
     /// stays sized off `device_bytes` because handed-out blocks can't be
     /// reclaimed.
     live_ceiling: Mutex<HashMap<usize, Arc<AtomicUsize>>>,
-    /// Stable runtime-owned byte pools, initialized before model loading.
-    #[cfg(feature = "gpu-device-pool")]
-    device_memory: std::sync::OnceLock<Arc<DeviceMemoryManager>>,
 }
 
-pub(crate) type SharedKvState = Arc<SharedKvStateInner>;
+pub(crate) type KvCoordinator = Arc<KvCoordinatorInner>;
 
 /// One device's ceiling arithmetic from a `refresh_ceilings` tick, surfaced so
 /// the monitor loop can export it (Prometheus gauges + transition logs) —
@@ -81,8 +81,8 @@ fn ceiling_is_squeezed(device_id: usize, declared: usize, live_bytes: usize) -> 
     live_bytes < idle_target.saturating_mul(9) / 10
 }
 
-impl SharedKvStateInner {
-    pub(crate) fn new(device_info: &DeviceInfo) -> SharedKvState {
+impl KvCoordinatorInner {
+    pub(crate) fn new(device_info: &DeviceInfo) -> KvCoordinator {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const KV_BLOCK_SIZE: usize = 16;
         let mut device_bytes = HashMap::new();
@@ -104,88 +104,21 @@ impl SharedKvStateInner {
         }
         Arc::new(Self {
             device_bytes,
-            pools: Mutex::new(HashMap::new()),
+            logical_block_allocators: Mutex::new(HashMap::new()),
             scheduler: Arc::new(parking_lot::Mutex::new(GlobalKvScheduler::new(
                 estimated_kv_tokens.max(16_384),
             ))),
             next_engine_id: AtomicU32::new(1),
-            model_engine_ids: Mutex::new(HashMap::new()),
-            live_kv_caps: Mutex::new(HashMap::new()),
+            engine_records: Mutex::new(HashMap::new()),
             last_health_epoch: AtomicU64::new(0),
             live_ceiling: Mutex::new(HashMap::new()),
-            #[cfg(feature = "gpu-device-pool")]
-            device_memory: std::sync::OnceLock::new(),
         })
-    }
-
-    #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn new_runtime(device_info: &DeviceInfo) -> Result<SharedKvState, String> {
-        let state = Self::new(device_info);
-        if let Some(manager) = DeviceMemoryManager::from_env(device_info)? {
-            state
-                .device_memory
-                .set(manager)
-                .map_err(|_| "device memory manager initialized twice".to_string())?;
-        }
-        Ok(state)
-    }
-
-    #[cfg(not(feature = "gpu-device-pool"))]
-    pub(crate) fn new_runtime(device_info: &DeviceInfo) -> Result<SharedKvState, String> {
-        Ok(Self::new(device_info))
-    }
-
-    #[cfg(any(
-        feature = "native",
-        feature = "gguf-native",
-        feature = "gguf-cuda-shared-kv"
-    ))]
-    pub(crate) fn device_pool(
-        &self,
-        device_id: usize,
-    ) -> Option<Arc<kapsl_hal::gpu_arena::GpuDevicePool>> {
-        self.device_memory
-            .get()
-            .and_then(|manager| manager.pool(device_id))
-    }
-
-    #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn uses_env_allocators(&self, device_id: usize) -> bool {
-        self.device_memory
-            .get()
-            .is_some_and(|manager| manager.has_pool(device_id))
-    }
-
-    #[cfg(feature = "gpu-device-pool")]
-    pub(crate) async fn begin_device_memory_admission(
-        &self,
-        device_id: usize,
-        model_id: u32,
-        kind: EngineKind,
-        planned_report: &ExternalDeviceMemoryReport,
-    ) -> Result<Option<DeviceMemoryAdmission>, String> {
-        let Some(manager) = self.device_memory.get() else {
-            return Ok(None);
-        };
-        manager
-            .begin_admission(device_id, model_id, kind, planned_report)
-            .await
-    }
-
-    #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn attach_device_memory_metrics(
-        &self,
-        metrics: kapsl_monitor::metrics::KapslMetrics,
-    ) {
-        if let Some(manager) = self.device_memory.get() {
-            manager.attach_metrics(metrics);
-        }
     }
 
     /// Return (or lazily create) the shared block allocator for `device_id`.
     pub(crate) fn get_or_create_pool(&self, device_id: usize) -> SharedBlockAllocator {
-        let mut pools = self.pools.lock();
-        if let Some(existing) = pools.get(&device_id) {
+        let mut allocators = self.logical_block_allocators.lock();
+        if let Some(existing) = allocators.get(&device_id) {
             return existing.clone();
         }
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
@@ -193,7 +126,7 @@ impl SharedKvStateInner {
         let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
         let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(256);
         let allocator = new_shared_allocator(total_blocks, KV_BLOCK_SIZE, device_id);
-        pools.insert(device_id, allocator.clone());
+        allocators.insert(device_id, allocator.clone());
         allocator
     }
 
@@ -223,20 +156,29 @@ impl SharedKvStateInner {
             guaranteed_min_tokens: 0,
             max_tokens: None,
         });
-        self.model_engine_ids
-            .lock()
-            .entry(model_id)
-            .or_default()
-            .push(engine_id);
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const MIN_BLOCKS_PER_ENGINE: usize = 256;
         let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
         let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
-        let engine_count = (engine_id + 1) as usize;
-        let initial_cap = (total_blocks / engine_count).max(MIN_BLOCKS_PER_ENGINE);
-        // Register live-cap atomic and trigger rebalancing across all engines.
-        let live_cap = Arc::new(AtomicUsize::new(initial_cap));
-        self.live_kv_caps.lock().insert(engine_id, live_cap.clone());
+        let (initial_cap, live_cap) = {
+            let mut records = self.engine_records.lock();
+            let engine_count = records
+                .values()
+                .filter(|record| record.device_id == device_id)
+                .count()
+                + 1;
+            let initial_cap = (total_blocks / engine_count).max(MIN_BLOCKS_PER_ENGINE);
+            let live_cap = Arc::new(AtomicUsize::new(initial_cap));
+            records.insert(
+                engine_id,
+                KvEngineRecord {
+                    model_id,
+                    device_id,
+                    live_cap: live_cap.clone(),
+                },
+            );
+            (initial_cap, live_cap)
+        };
         self.rebalance_kv_caps();
         (
             allocator,
@@ -253,25 +195,29 @@ impl SharedKvStateInner {
     /// call for an already-detached engine is a no-op.
     pub(crate) fn detach_engine(&self, engine_id: u32) {
         self.scheduler.lock().deregister(engine_id);
-        self.live_kv_caps.lock().remove(&engine_id);
-        {
-            let mut map = self.model_engine_ids.lock();
-            map.retain(|_, ids| {
-                ids.retain(|&id| id != engine_id);
-                !ids.is_empty()
-            });
-        }
+        self.engine_records.lock().remove(&engine_id);
         self.rebalance_kv_caps();
     }
 
     /// Deregister all engines for a model (call on full model stop/remove).
     pub(crate) fn detach_engine_for_model(&self, model_id: u32) {
-        if let Some(ids) = self.model_engine_ids.lock().remove(&model_id) {
+        let engine_ids = {
+            let mut records = self.engine_records.lock();
+            let ids: Vec<_> = records
+                .iter()
+                .filter_map(|(&engine_id, record)| {
+                    (record.model_id == model_id).then_some(engine_id)
+                })
+                .collect();
+            for engine_id in &ids {
+                records.remove(engine_id);
+            }
+            ids
+        };
+        if !engine_ids.is_empty() {
             let mut sched = self.scheduler.lock();
-            let mut caps = self.live_kv_caps.lock();
-            for id in ids {
-                sched.deregister(id);
-                caps.remove(&id);
+            for engine_id in engine_ids {
+                sched.deregister(engine_id);
             }
         }
         self.rebalance_kv_caps();
@@ -380,41 +326,39 @@ impl SharedKvStateInner {
             return;
         }
 
-        let total_tokens: usize = budgets.iter().map(|b| b.max_tokens).sum::<usize>().max(1);
-        let caps = self.live_kv_caps.lock();
+        let records = self.engine_records.lock();
+        let mut device_token_totals = HashMap::<usize, usize>::new();
+        for budget in &budgets {
+            if let Some(record) = records.get(&budget.engine_id) {
+                *device_token_totals.entry(record.device_id).or_default() += budget.max_tokens;
+            }
+        }
 
         for budget in &budgets {
-            let Some(cap_atom) = caps.get(&budget.engine_id) else {
+            let Some(record) = records.get(&budget.engine_id) else {
                 continue;
             };
-            // Translate token fraction → block fraction using the device's
-            // total block pool for this engine's device.
-            let device_id = self
-                .model_engine_ids
-                .lock()
-                .values()
-                .find(|ids| ids.contains(&budget.engine_id))
-                .and_then(|_| {
-                    // We don't track engine_id→device_id directly; use device_bytes
-                    // to get the first device that has memory configured.
-                    self.device_bytes.keys().next().copied()
-                })
-                .unwrap_or(0);
+            let device_id = record.device_id;
+            let device_tokens = device_token_totals
+                .get(&device_id)
+                .copied()
+                .unwrap_or(1)
+                .max(1);
             // Soft budget: the live foreign-aware ceiling when refreshed, else the
             // static declared bytes. The hard arena in get_or_create_pool keeps
             // reading device_bytes so already-handed-out blocks are never revoked.
             let total_bytes = self.device_soft_ceiling_bytes(device_id);
             let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
             let new_cap =
-                (total_blocks * budget.max_tokens / total_tokens).max(MIN_BLOCKS_PER_ENGINE);
-            cap_atom.store(new_cap, Ordering::Relaxed);
+                (total_blocks * budget.max_tokens / device_tokens).max(MIN_BLOCKS_PER_ENGINE);
+            record.live_cap.store(new_cap, Ordering::Relaxed);
         }
     }
 }
 
 #[cfg(test)]
 mod vram_clamp_tests {
-    use super::SharedKvStateInner;
+    use super::KvCoordinatorInner;
     use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
     use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
 
@@ -459,8 +403,27 @@ mod vram_clamp_tests {
         // CUDA_DEVICE_MEMORY_LIMIT / KAPSL_GPU_MEMORY_LIMIT_MB globals are never
         // set by any test, so the cooperative clamp is a no-op here.
         let info = device_info(vec![cuda_device(4242, 24576)]);
-        let state = SharedKvStateInner::new(&info);
+        let state = KvCoordinatorInner::new(&info);
         assert_eq!(state.device_bytes.get(&4242).copied(), Some(24 * GIB));
+    }
+
+    #[test]
+    fn kv_caps_are_rebalanced_independently_per_device() {
+        let first_device = 4250;
+        let second_device = 4251;
+        let info = device_info(vec![
+            cuda_device(first_device, 8 * 1024),
+            cuda_device(second_device, 16 * 1024),
+        ]);
+        let state = KvCoordinatorInner::new(&info);
+
+        let (_, _, _, _, first_cap) = state.attach_engine(first_device, 10, 1);
+        let (_, _, _, _, second_cap) = state.attach_engine(second_device, 20, 1);
+
+        // Each device has one engine, so each receives its own full logical KV
+        // budget: half of VRAM divided into 2 MiB blocks.
+        assert_eq!(first_cap.load(std::sync::atomic::Ordering::Relaxed), 2_048);
+        assert_eq!(second_cap.load(std::sync::atomic::Ordering::Relaxed), 4_096);
     }
 
     #[test]
@@ -469,7 +432,7 @@ mod vram_clamp_tests {
         // 40 GiB card, no cap env → declared == physical.
         let device_id = 4245;
         let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
-        let state = SharedKvStateInner::new(&info);
+        let state = KvCoordinatorInner::new(&info);
 
         // Before any refresh the soft ceiling is the full declared budget.
         assert_eq!(state.device_soft_ceiling_bytes(device_id), 40 * GIB);
@@ -497,7 +460,7 @@ mod vram_clamp_tests {
         // mirror the stored arithmetic so metrics can't drift from behavior.
         let device_id = 4247;
         let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
-        let state = SharedKvStateInner::new(&info);
+        let state = KvCoordinatorInner::new(&info);
 
         // A 12 GiB trainer: target = 40 - 12 - 4 (reserve) = 24 GiB, shrink is
         // immediate so smoothed == target, and the device reads as squeezed —
@@ -541,7 +504,7 @@ mod vram_clamp_tests {
         use std::collections::HashMap;
         let device_id = 4246;
         let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
-        let state = SharedKvStateInner::new(&info);
+        let state = KvCoordinatorInner::new(&info);
 
         // Guard off / never refreshed → never "under pressure".
         assert!(!state.foreign_pressure_active());
@@ -575,7 +538,7 @@ mod vram_clamp_tests {
         let var = format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_{device_id}");
         std::env::set_var(&var, "8g");
         let info = device_info(vec![cuda_device(device_id, 24576)]);
-        let state = SharedKvStateInner::new(&info);
+        let state = KvCoordinatorInner::new(&info);
         std::env::remove_var(&var);
         // The KV budget sizes to the 8 GiB slice, not the 24 GiB physical card,
         // so the whole downstream KV chain (pools, per-engine caps, rebalancing)

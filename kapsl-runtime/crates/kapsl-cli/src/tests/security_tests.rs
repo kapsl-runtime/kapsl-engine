@@ -191,6 +191,17 @@ fn test_loopback_remote_detection() {
 }
 
 #[test]
+fn test_native_tcp_non_loopback_requires_authentication() {
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    let wildcard: IpAddr = "0.0.0.0".parse().unwrap();
+
+    assert!(validate_native_tcp_exposure(loopback, None).is_ok());
+    assert!(validate_native_tcp_exposure(wildcard, Some("native-secret")).is_ok());
+    let error = validate_native_tcp_exposure(wildcard, None).unwrap_err();
+    assert!(error.contains(TCP_AUTH_TOKEN_ENV));
+}
+
+#[test]
 fn test_api_role_update_requires_admin_token_when_enabled() {
     let mut config = ApiRoleTokenConfig::default();
 
@@ -831,8 +842,10 @@ fn test_device(id: usize, backend: kapsl_hal::device::DeviceBackend) -> kapsl_ha
 
 #[test]
 fn test_mesh_selection_preserves_tensorrt_on_cuda_device() {
-    let mut requirements = kapsl_core::HardwareRequirements::default();
-    requirements.preferred_provider = Some("tensorrt".to_string());
+    let requirements = kapsl_core::HardwareRequirements {
+        preferred_provider: Some("tensorrt".to_string()),
+        ..kapsl_core::HardwareRequirements::default()
+    };
     let device_info = DeviceInfo {
         cpu_cores: 8,
         total_memory: 32 * 1024 * 1024 * 1024,
@@ -854,8 +867,10 @@ fn test_mesh_selection_preserves_tensorrt_on_cuda_device() {
 
 #[test]
 fn test_mesh_selection_preserves_coreml_on_metal_device() {
-    let mut requirements = kapsl_core::HardwareRequirements::default();
-    requirements.preferred_provider = Some("coreml".to_string());
+    let requirements = kapsl_core::HardwareRequirements {
+        preferred_provider: Some("coreml".to_string()),
+        ..kapsl_core::HardwareRequirements::default()
+    };
     let device_info = DeviceInfo {
         cpu_cores: 8,
         total_memory: 32 * 1024 * 1024 * 1024,

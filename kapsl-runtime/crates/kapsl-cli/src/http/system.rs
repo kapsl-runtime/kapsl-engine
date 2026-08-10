@@ -1,21 +1,19 @@
 use super::*;
 
 pub(crate) fn build_system_routes(
-    model_registry_clone: Arc<ModelRegistry>,
-    replica_pools_clone: ReplicaPools,
+    models: Arc<ModelManager>,
     device_info_for_api: Arc<DeviceInfo>,
     runtime_samples_clone: Arc<RwLock<RuntimeSamples>>,
     runtime_pressure_state: Arc<AtomicU8>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let model_registry_for_health = model_registry_clone.clone();
-    let replica_pools_for_health = replica_pools_clone.clone();
+    let models_for_health = models.clone();
     let health = warp::path!("api" / "health").and(warp::get()).map(move || {
-        let total = model_registry_for_health.count();
+        let total = models_for_health.registry().count();
         let mut healthy = 0;
         let mut unhealthy = 0;
 
-        for model in model_registry_for_health.list() {
-            if let Some(pool) = replica_pools_for_health.read().get(&model.id) {
+        for model in models_for_health.registry().list() {
+            if let Some(pool) = models_for_health.pool(model.id) {
                 if pool.is_healthy() {
                     healthy += 1;
                 } else {

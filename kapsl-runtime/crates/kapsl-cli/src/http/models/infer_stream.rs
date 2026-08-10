@@ -2,12 +2,10 @@ use super::*;
 use futures::StreamExt;
 
 pub(crate) struct ModelInferStreamRouteConfig {
-    pub(crate) replica_pools: ReplicaPools,
-    pub(crate) model_registry: Arc<ModelRegistry>,
+    pub(crate) models: Arc<ModelManager>,
+    pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
     pub(crate) rag_state: RagRuntimeState,
-    pub(crate) runtime_pressure_state: Arc<AtomicU8>,
-    pub(crate) runtime_pressure_config: Arc<RuntimePressureConfig>,
 }
 
 /// `POST /api/models/:id/infer/stream` — Server-Sent Events token streaming.
@@ -22,12 +20,10 @@ pub(crate) fn build_model_infer_stream_route(
     config: ModelInferStreamRouteConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let ModelInferStreamRouteConfig {
-        replica_pools,
-        model_registry,
+        models,
+        inference,
         log_sensitive_ids,
         rag_state,
-        runtime_pressure_state,
-        runtime_pressure_config,
     } = config;
 
     let request_adapters = Arc::new(default_request_adapter_registry());
@@ -36,12 +32,10 @@ pub(crate) fn build_model_infer_stream_route(
         .and(warp::post())
         .and(warp::body::bytes())
         .and_then(move |model_id: u32, body: warp::hyper::body::Bytes| {
-            let pools = replica_pools.clone();
-            let model_registry = model_registry.clone();
+            let models = models.clone();
+            let inference = inference.clone();
             let request_adapters = request_adapters.clone();
             let rag_state = rag_state.clone();
-            let runtime_pressure_state = runtime_pressure_state.clone();
-            let runtime_pressure_config = runtime_pressure_config.clone();
             async move {
                 use warp::http::StatusCode;
 
@@ -54,31 +48,16 @@ pub(crate) fn build_model_infer_stream_route(
                     ))
                 };
 
-                let pool = {
-                    let p = pools.read();
-                    p.get(&model_id).cloned()
-                };
-                let Some(pool) = pool else {
+                if models.pool(model_id).is_none() {
                     log::warn!("Infer-stream request received for unknown model_id={}", model_id);
                     return Ok::<_, warp::Rejection>(json_error(
                         StatusCode::NOT_FOUND,
                         format!("Model {model_id} not found"),
                     ));
-                };
-
-                if !pool.is_healthy() {
-                    let overload = EngineError::overloaded("Model pool is overloaded".to_string());
-                    let status = status_code_for_engine_error(&overload);
-                    log::warn!(
-                        "Infer-stream request rejected: model_id={} status={} reason={}",
-                        model_id,
-                        status.as_u16(),
-                        overload
-                    );
-                    return Ok(json_error(status, overload.to_string()));
                 }
 
-                let model_framework = model_registry
+                let model_framework = models
+                    .registry()
                     .get(model_id)
                     .map(|model| model.framework.clone())
                     .unwrap_or_else(|| "unknown".to_string());
@@ -183,63 +162,15 @@ pub(crate) fn build_model_infer_stream_route(
                 let request_id_for_log = redact_identifier_for_logs(request_id, log_sensitive_ids);
                 let session_id_for_log = redact_identifier_for_logs(session_id, log_sensitive_ids);
 
-                let scheduler_priority = scheduler_priority_for_request(&request);
+                let scheduler_priority = inference.priority_for_request(&request);
                 let force_cpu = request
                     .metadata
                     .as_ref()
                     .and_then(|metadata| metadata.force_cpu)
                     .unwrap_or(false);
 
-                // Same runtime-pressure shedding as `/infer`: drop throughput work
-                // under emergency pressure and clamp generation length.
-                let pressure_state =
-                    RuntimePressureState::from_u8(runtime_pressure_state.load(Ordering::Relaxed));
-                if pressure_state == RuntimePressureState::Emergency
-                    && matches!(scheduler_priority, kapsl_scheduler::Priority::Throughput)
-                {
-                    let error = EngineError::resource_exhausted(format!(
-                        "runtime pressure {}: throughput requests are temporarily rejected",
-                        pressure_state.as_str()
-                    ));
-                    let status = status_code_for_engine_error(&error);
-                    log::warn!(
-                        "Infer-stream execution rejected: model_id={} framework={} request_id={} session_id={} status={} error={}",
-                        model_id,
-                        model_framework,
-                        request_id_for_log,
-                        session_id_for_log,
-                        status.as_u16(),
-                        error
-                    );
-                    return Ok(json_error(status, error.to_string()));
-                }
-                if let Some(cap) = runtime_pressure_config.max_new_tokens_cap(pressure_state) {
-                    let metadata = request
-                        .metadata
-                        .get_or_insert_with(kapsl_engine_api::RequestMetadata::default);
-                    metadata.max_new_tokens = Some(
-                        metadata
-                            .max_new_tokens
-                            .map(|existing| existing.min(cap))
-                            .unwrap_or(cap),
-                    );
-                }
-
-                // Cancellation token: dropping the SSE response stream (client
-                // disconnect or completion) cancels any queued/in-flight work.
-                struct CancelOnDrop(kapsl_engine_api::CancellationToken);
-                impl Drop for CancelOnDrop {
-                    fn drop(&mut self) {
-                        self.0.cancel();
-                    }
-                }
-                let cancellation_token = request
-                    .cancellation
-                    .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
-                    .clone();
-
-                let stream = match pool
-                    .infer_stream(request, scheduler_priority, force_cpu)
+                let stream = match inference
+                    .infer_stream(model_id, request, scheduler_priority, force_cpu)
                     .await
                 {
                     Ok(stream) => stream,
@@ -258,13 +189,9 @@ pub(crate) fn build_model_infer_stream_route(
                     }
                 };
 
-                // Hold the cancellation guard inside the response stream so a
-                // client disconnect (which drops the stream) cancels the work.
-                let guard = CancelOnDrop(cancellation_token);
                 let worker_label = format!("model-{model_id}");
                 let sse = stream
                     .map(move |item| {
-                        let _hold = &guard;
                         let payload = match item {
                             // Emit the decoded token text under `text` rather than the
                             // raw packet: `BinaryTensorPacket`'s JSON form carries bytes

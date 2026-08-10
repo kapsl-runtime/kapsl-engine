@@ -318,8 +318,8 @@ pub(crate) fn maybe_publish_inter_model_relays(
     source_model_name: &str,
     request_is_relay: bool,
     output: &BinaryTensorPacket,
-    replica_pools: &ReplicaPools,
-    model_registry: &ModelRegistry,
+    models: &ModelManager,
+    inference: &Arc<InferenceService>,
 ) {
     if request_is_relay {
         return;
@@ -342,7 +342,7 @@ pub(crate) fn maybe_publish_inter_model_relays(
         }
 
         let Some(target_base_model_id) =
-            resolve_target_base_model_id(model_registry, target_model_name)
+            resolve_target_base_model_id(models.registry(), target_model_name)
         else {
             log::warn!(
                 "Inter-model relay target not found: source={} target={}",
@@ -352,11 +352,7 @@ pub(crate) fn maybe_publish_inter_model_relays(
             continue;
         };
 
-        let target_pool = {
-            let pools = replica_pools.read();
-            pools.get(&target_base_model_id).cloned()
-        };
-        let Some(target_pool) = target_pool else {
+        if !models.contains_pool(target_base_model_id) {
             log::warn!(
                 "Inter-model relay pool missing: source={} target={} base_model_id={}",
                 source_model_name,
@@ -364,7 +360,7 @@ pub(crate) fn maybe_publish_inter_model_relays(
                 target_base_model_id
             );
             continue;
-        };
+        }
 
         let data = prompt.clone().into_bytes();
         let relay_request = InferenceRequest {
@@ -396,9 +392,15 @@ pub(crate) fn maybe_publish_inter_model_relays(
 
         let source_model_name = source_model_name.to_string();
         let target_model_name = target_model_name.clone();
+        let inference = inference.clone();
         tokio::spawn(async move {
-            if let Err(error) = target_pool
-                .infer(&relay_request, kapsl_scheduler::Priority::Throughput, false)
+            if let Err(error) = inference
+                .infer(
+                    target_base_model_id,
+                    relay_request,
+                    kapsl_scheduler::Priority::Throughput,
+                    false,
+                )
                 .await
             {
                 log::warn!(
@@ -498,8 +500,7 @@ fn aggregate_gpu_samples(
             let capped_total = cap_for_device(device_index)
                 .map_or(mem_total_bytes, |cap| mem_total_bytes.min(cap));
             total_util += util;
-            total_mem_bytes =
-                total_mem_bytes.saturating_add((mem_mb * 1024.0 * 1024.0) as usize);
+            total_mem_bytes = total_mem_bytes.saturating_add((mem_mb * 1024.0 * 1024.0) as usize);
             total_mem_capacity_bytes = total_mem_capacity_bytes.saturating_add(capped_total);
             count += 1.0;
         }

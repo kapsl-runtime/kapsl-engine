@@ -167,6 +167,10 @@ kapsl pull alice/model:prod
 - `--state-dir <dir>`
 - `--performance-profile <standard|balanced|throughput|latency>`
 
+`hybrid` is the same-host Unix socket + SHM mode. It does not expose TCP.
+Non-loopback `tcp` requires `KAPSL_TCP_AUTH_TOKEN` and should be carried over a
+trusted network or TLS tunnel because the native protocol is plaintext.
+
 Example:
 
 ```bash

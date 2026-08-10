@@ -132,6 +132,19 @@ pub(crate) fn parse_bind_ip(raw: &str, fallback: IpAddr, field_name: &str) -> Ip
     }
 }
 
+pub(crate) fn validate_native_tcp_exposure(
+    bind_ip: IpAddr,
+    auth_token: Option<&str>,
+) -> Result<(), String> {
+    if bind_ip.is_loopback() || auth_token.is_some_and(|token| !token.trim().is_empty()) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Refusing unauthenticated TCP inference on non-loopback address {bind_ip}. Set {TCP_AUTH_TOKEN_ENV} to a dedicated native-transport token, or bind --bind to a loopback address. Raw TCP is plaintext; use a trusted network or TLS tunnel for cross-host serving."
+    ))
+}
+
 pub(crate) fn preflight_http_bind(http_bind: IpAddr, port: u16) -> Result<(), DynError> {
     use std::net::{SocketAddr, TcpListener};
 

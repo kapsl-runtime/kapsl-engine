@@ -124,15 +124,30 @@ Useful run options:
 - `--state-dir <dir>` (namespaces rag-data, extensions, extensions-config, auth-store.json)
 - `--performance-profile <standard|balanced|throughput|latency>`
 
+`hybrid` means Unix socket plus shared-memory tensor transfer; it does not open
+a TCP listener. SHM and `auto` use the live model registry, so models added at
+runtime are immediately addressable through SHM.
+
 Example with TCP transport:
 
 ```bash
+export KAPSL_TCP_AUTH_TOKEN="replace-with-a-dedicated-token"
 kapsl run \
   --model models/mnist/mnist.aimod \
   --transport tcp \
   --bind 0.0.0.0 \
   --port 9096
 ```
+
+Loopback TCP does not require a token. Non-loopback TCP does, and the protocol
+is still plaintext; use it only on a trusted network or through a TLS tunnel.
+
+Physical CUDA device pooling is process-owned. Isolated model workers disable
+their local CUDA arena by default, even when `KAPSL_GPU_DEVICE_POOL_BYTES` is
+set in the parent. Enable it only when every worker has an exclusive GPU/MIG
+slice or an explicit `CUDA_DEVICE_MEMORY_LIMIT[_N]`/
+`KAPSL_GPU_MEMORY_LIMIT_MB` quota; `KAPSL_ISOLATED_WORKER_GPU_POOL=true` is an
+operator attestation of an exclusive boundary.
 
 Example tuned for low latency:
 

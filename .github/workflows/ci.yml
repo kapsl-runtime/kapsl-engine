@@ -47,6 +47,15 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace
 
+      # Type-check the optional CUDA memory authority without requiring nvcc
+      # or a GPU on the hosted runner. The fixed cudarc API feature takes
+      # precedence over cuda-version-from-build-system for this compile only.
+      - name: Check GPU device pool feature
+        if: runner.os == 'Linux'
+        run: >-
+          cargo check --manifest-path kapsl-runtime/Cargo.toml -p kapsl
+          --features gpu-device-pool,cudarc/cuda-12040
+
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

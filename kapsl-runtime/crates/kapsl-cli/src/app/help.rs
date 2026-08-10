@@ -66,13 +66,17 @@ const HELP_ENV_VARS: &[(&str, &str)] = &[
     ("KAPSL_REMOTE_URL", "Default remote registry URL"),
     ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
     (
+        "KAPSL_TCP_AUTH_TOKEN",
+        "Required native-inference token for non-loopback TCP",
+    ),
+    (
         "KAPSL_SHM_SIZE_MB",
         "Shared-memory pool size (MiB) for shm/hybrid transport",
     ),
 ];
 
 /// Column width the environment-variable names are padded to.
-const HELP_ENV_NAME_WIDTH: usize = 26;
+const HELP_ENV_NAME_WIDTH: usize = 28;
 
 pub(crate) fn cli_after_help() -> String {
     use std::fmt::Write as _;

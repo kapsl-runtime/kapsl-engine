@@ -18,6 +18,7 @@ pub(crate) const REMOTE_PLACEHOLDER_URL_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_UR
 pub(crate) const REMOTE_PLACEHOLDER_DIR_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_DIR";
 pub(crate) const EXTENSION_MARKETPLACE_URL_ENV: &str = "KAPSL_EXTENSION_MARKETPLACE_URL";
 pub(crate) const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
+pub(crate) const TCP_AUTH_TOKEN_ENV: &str = "KAPSL_TCP_AUTH_TOKEN";
 pub(crate) const OCI_REMOTE_PREFIX: &str = "oci://";
 pub(crate) const KAPSL_OCI_ARTIFACT_TYPE: &str = "application/vnd.kapsl.aimod.v1";
 pub(crate) const KAPSL_OCI_LAYER_TYPE: &str = "application/vnd.kapsl.aimod.v1";
@@ -86,6 +87,13 @@ pub(crate) const CUDA_DEVICE_MEMORY_LIMIT_ENV: &str = "CUDA_DEVICE_MEMORY_LIMIT"
 /// kapsl alias for the per-device VRAM cap, in plain MiB, for non-HAMi
 /// deployments that still want cooperative self-limiting.
 pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_MB";
+/// Internal worker override used to keep process-local CUDA arenas from each
+/// claiming the parent process's full configured pool.
+pub(crate) const GPU_DEVICE_POOL_DISABLED_ENV: &str = "KAPSL_GPU_DEVICE_POOL_DISABLED";
+/// Explicit operator attestation that each isolated worker receives an
+/// exclusive GPU/MIG slice. A configured per-process VRAM cap is also accepted
+/// as an isolation boundary.
+pub(crate) const ISOLATED_WORKER_GPU_POOL_ENV: &str = "KAPSL_ISOLATED_WORKER_GPU_POOL";
 /// Enables the runtime-owned elastic CUDA pool and gives its exact backing
 /// allocation size. The full backing capacity is charged against the same safe
 /// device budget as backend-owned external weights, so this must leave room for

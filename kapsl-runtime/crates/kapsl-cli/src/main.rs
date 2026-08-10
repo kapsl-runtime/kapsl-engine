@@ -45,9 +45,8 @@ use kapsl_scheduler::{
     RequestMetadata as SchedulerRequestMetadata, Scheduler,
 };
 use kapsl_shm::memory::ShmManager;
-use kapsl_shm::ShmServer;
+use kapsl_shm::{SchedulerSnapshot, ShmServer};
 use kapsl_transport::TransportServer;
-use mime_guess;
 use parking_lot::{Mutex, RwLock};
 use prometheus::Registry;
 use rand::rngs::OsRng;
@@ -79,8 +78,6 @@ use http::*;
 use runtime::*;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
-type ReplicaPools = Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>>;
-
 #[cfg(test)]
 mod tests;
 
@@ -150,6 +147,17 @@ async fn main() -> Result<(), DynError> {
             "HTTP API is bound to {}. Traffic is plaintext HTTP; place runtime behind TLS and network ACLs.",
             http_bind_addr
         );
+    }
+    let tcp_auth_token = optional_env_var(TCP_AUTH_TOKEN_ENV);
+    if args.transport == "tcp" {
+        let tcp_bind_addr = parse_bind_ip(&args.bind, IpAddr::from([127, 0, 0, 1]), "bind");
+        validate_native_tcp_exposure(tcp_bind_addr, tcp_auth_token.as_deref())?;
+        if !tcp_bind_addr.is_loopback() {
+            log::warn!(
+                "Native TCP inference is bound to {} with token authentication. Traffic remains plaintext; use a trusted network or TLS tunnel.",
+                tcp_bind_addr
+            );
+        }
     }
 
     print_startup_banner();
@@ -261,23 +269,14 @@ async fn main() -> Result<(), DynError> {
         _ => {}
     }
 
-    // Unified shared KV cache pool and cross-model token budget coordinator.
-    let shared_kv = SharedKvStateInner::new_runtime(&device_info)?;
-
-    // Use Arc<RwLock<>> for thread-safe dynamic scheduler management
-    let replica_pools: Arc<RwLock<HashMap<u32, Arc<ReplicaPool<Scheduler>>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    // Per-model engine handles for hot-swap stage/swap operations.
-    let swap_map: Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    // One process-owned facade for logical KV, physical device memory, and
+    // pressure state. Its components remain independently testable.
+    let resources = RuntimeResources::new(&device_info)?;
 
     let registry = Arc::new(Registry::new());
     let model_registry = Arc::new(ModelRegistry::new());
+    let models = ModelManager::new(model_registry.clone());
     let auto_scaler = Arc::new(RwLock::new(AutoScaler::new()));
-    let unique_id_counter = Arc::new(AtomicU32::new(1000)); // Start replica IDs from 1000
-    let model_id_counter = Arc::new(AtomicU32::new(0)); // ID counter for models
-    let recycled_model_ids = Arc::new(Mutex::new(Vec::new()));
-    let model_paths: Arc<RwLock<HashMap<u32, PathBuf>>> = Arc::new(RwLock::new(HashMap::new()));
     let runtime_samples = Arc::new(RwLock::new(RuntimeSamples::default()));
     let throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -297,8 +296,13 @@ async fn main() -> Result<(), DynError> {
             LEGACY_INTER_MODEL_ROUTES_ENV
         );
     }
-    let runtime_pressure_config = Arc::new(RuntimePressureConfig::from_env());
-    let runtime_pressure_state = Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8));
+    let runtime_pressure_config = resources.pressure().config();
+    let runtime_pressure_state = resources.pressure().state();
+    let inference_service = InferenceService::new(
+        models.clone(),
+        resources.pressure().clone(),
+        latency_samples.clone(),
+    );
 
     // Create shared metrics instance ONCE for all models
     let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
@@ -307,7 +311,7 @@ async fn main() -> Result<(), DynError> {
     let has_cuda_for_sampler = device_info.has_cuda;
     let runtime_pressure_config_for_sampler = runtime_pressure_config.clone();
     let runtime_pressure_state_for_sampler = runtime_pressure_state.clone();
-    let shared_kv_for_rebalance = shared_kv.clone();
+    let kv_for_rebalance = resources.kv().clone();
     // Opt-in co-tenancy guard: probe for foreign GPU processes each tick,
     // shrink the live KV ceiling by their footprint, and exclude their bytes
     // from the pressure ratio. Default off — single-tenant behavior unchanged.
@@ -329,7 +333,7 @@ async fn main() -> Result<(), DynError> {
             // Reclaim KV block quota from any engine whose health changed
             // (e.g. tripped circuit breaker / stalled watchdog), redistributing
             // it to healthy engines.
-            shared_kv_for_rebalance.maybe_rebalance_for_health();
+            kv_for_rebalance.maybe_rebalance_for_health();
 
             system.refresh_process(pid);
             let process_memory_bytes = system
@@ -365,10 +369,10 @@ async fn main() -> Result<(), DynError> {
             // too rather than shelling out to a broken nvidia-smi twice.
             let foreign_gpu_memory_bytes = if cotenancy_guard
                 && has_cuda_for_sampler
-                && !nvidia_smi_retry_after.is_some_and(|retry_after| now < retry_after)
+                && nvidia_smi_retry_after.is_none_or(|retry_after| now >= retry_after)
             {
                 let foreign = sample_foreign_vram();
-                let ceilings = shared_kv_for_rebalance.refresh_ceilings(&foreign);
+                let ceilings = kv_for_rebalance.refresh_ceilings(&foreign);
                 if let Some(exporter) = cotenancy_exporter.as_mut() {
                     exporter.observe(&ceilings);
                 }
@@ -428,17 +432,12 @@ async fn main() -> Result<(), DynError> {
     let load_specs = args
         .model
         .iter()
-        .map(|model_path| {
-            (
-                allocate_model_id(&model_id_counter, &recycled_model_ids),
-                model_path.clone(),
-            )
-        })
+        .map(|model_path| (models.allocate_model_id(), model_path.clone()))
         .collect::<Vec<_>>();
 
     let load_results = run_with_loading_async("Loading model packages", {
         let device_info = device_info.clone();
-        let shared_kv = shared_kv.clone();
+        let resources = resources.clone();
         let model_registry = model_registry.clone();
         let shared_metrics = shared_metrics.clone();
         let topology = args.topology.clone();
@@ -446,7 +445,7 @@ async fn main() -> Result<(), DynError> {
         async move {
             let results = stream::iter(load_specs.into_iter().map(|(model_id, model_path)| {
                 let device_info = device_info.clone();
-                let shared_kv = shared_kv.clone();
+                let resources = resources.clone();
                 let model_registry = model_registry.clone();
                 let shared_metrics = shared_metrics.clone();
                 let topology = topology.clone();
@@ -456,7 +455,7 @@ async fn main() -> Result<(), DynError> {
                         model_id,
                         &model_path,
                         &device_info,
-                        shared_kv,
+                        resources,
                         args.batch_size,
                         args.scheduler_queue_size,
                         args.scheduler_max_micro_batch,
@@ -483,9 +482,7 @@ async fn main() -> Result<(), DynError> {
     for (model_id, model_path, result) in load_results {
         match result {
             Ok((pool, handles)) => {
-                replica_pools.write().insert(model_id, pool);
-                swap_map.write().insert(model_id, handles);
-                model_paths.write().insert(model_id, model_path);
+                models.install_loaded(model_id, model_path, pool, handles);
 
                 // Register default scaling policy for each model
                 auto_scaler
@@ -493,7 +490,7 @@ async fn main() -> Result<(), DynError> {
                     .register_policy(model_id, ScalingPolicy::default());
             }
             Err(error) => {
-                recycle_model_id(model_id, &recycled_model_ids);
+                models.release_model_id(model_id);
                 if first_load_error.is_none() {
                     first_load_error = Some(error);
                 }
@@ -513,25 +510,14 @@ async fn main() -> Result<(), DynError> {
     log::info!("=== Starting Transport Server ===");
     log::info!("Transport mode: {}", args.transport);
 
-    let replica_pools_clone = replica_pools.clone();
-
-    // Convert concrete pools to trait objects for TransportServer
-    let get_trait_schedulers = |pools: &HashMap<u32, Arc<ReplicaPool<Scheduler>>>| {
-        let mut map = HashMap::new();
-        for (k, v) in pools {
-            map.insert(*k, v.clone() as Arc<dyn ReplicaScheduler + Send + Sync>);
-        }
-        map
-    };
     let get_scheduler_lookup = || {
-        let pools = replica_pools_clone.clone();
-        Arc::new(move |model_id: u32| {
-            pools
-                .read()
-                .get(&model_id)
-                .map(|pool| pool.clone() as Arc<dyn ReplicaScheduler + Send + Sync>)
-        })
+        let inference_service = inference_service.clone();
+        Arc::new(move |model_id: u32| inference_service.scheduler_for_transport(model_id))
             as Arc<dyn Fn(u32) -> Option<Arc<dyn ReplicaScheduler + Send + Sync>> + Send + Sync>
+    };
+    let get_scheduler_snapshot = || {
+        let inference_service = inference_service.clone();
+        Arc::new(move || inference_service.scheduler_snapshot()) as SchedulerSnapshot
     };
 
     let shm_size: usize = args
@@ -560,25 +546,24 @@ async fn main() -> Result<(), DynError> {
             }
             "tcp" => {
                 log::info!("TCP Address: {}:{}", args.bind, args.port);
-                (
-                    Box::new(TcpServer::new_with_lookup(
-                        &args.bind,
-                        args.port,
-                        get_scheduler_lookup(),
-                    )),
-                    format!("{}:{}", args.bind, args.port),
-                )
+                let tcp_server =
+                    TcpServer::new_with_lookup(&args.bind, args.port, get_scheduler_lookup());
+                let tcp_server = match tcp_auth_token.as_deref() {
+                    Some(token) => tcp_server.with_auth_token(token.to_owned()),
+                    None => tcp_server,
+                };
+                (Box::new(tcp_server), format!("{}:{}", args.bind, args.port))
             }
             "shm" => {
                 log::info!("Using shared memory transport");
                 let shm_name = format!("/kapsl_shm_{}", std::process::id());
                 log::info!("Shared memory: {}", shm_name);
-                let pools = replica_pools.read();
                 (
-                    Box::new(ShmServer::new_with_registry(
+                    Box::new(ShmServer::new_with_lookup_and_registry(
                         &shm_name,
                         shm_size,
-                        get_trait_schedulers(&pools),
+                        get_scheduler_lookup(),
+                        get_scheduler_snapshot(),
                         Some(registry.clone()),
                     )),
                     shm_name,
@@ -609,12 +594,12 @@ async fn main() -> Result<(), DynError> {
                     log::info!("Auto-selecting transport: shared memory");
                     let shm_name = format!("/kapsl_shm_{}", std::process::id());
                     log::info!("Shared memory: {}", shm_name);
-                    let pools = replica_pools.read();
                     (
-                        Box::new(ShmServer::new_with_registry(
+                        Box::new(ShmServer::new_with_lookup_and_registry(
                             &shm_name,
                             shm_size,
-                            get_trait_schedulers(&pools),
+                            get_scheduler_lookup(),
+                            get_scheduler_snapshot(),
                             Some(registry.clone()),
                         )),
                         shm_name,
@@ -646,14 +631,13 @@ async fn main() -> Result<(), DynError> {
     log::info!("════════════════════════════════════════\n");
 
     let registry_arc = registry.clone();
-    let model_registry_clone = model_registry.clone();
+    let models_for_api = models.clone();
     let shared_metrics_clone = shared_metrics.clone();
     let metrics_port = args.metrics_port;
     let http_bind_addr_for_api = http_bind_addr;
     let api_auth_state_for_api = api_auth_state.clone();
     let log_sensitive_ids_for_api = log_sensitive_ids;
     let device_info_for_api = device_info.clone(); // Clone Arc for API endpoints
-    let model_paths_clone = model_paths.clone();
     let auto_scaler_api = auto_scaler.clone();
     let runtime_samples_clone = runtime_samples.clone();
     let throughput_samples_clone = throughput_samples.clone();
@@ -687,8 +671,8 @@ async fn main() -> Result<(), DynError> {
         tokio::sync::oneshot::channel::<Result<std::net::SocketAddr, String>>();
 
     // Clone before the API server spawn so the auto-scaler task can use the same state.
-    let shared_kv_for_autoscaler = shared_kv.clone();
-    let swap_map_for_autoscaler = swap_map.clone();
+    let resources_for_api = resources.clone();
+    let resources_for_autoscaler = resources.clone();
 
     tokio::spawn(async move {
         let metrics_route =
@@ -696,8 +680,8 @@ async fn main() -> Result<(), DynError> {
 
         // API routes
         let model_routes = build_model_routes(ModelRoutesConfig {
-            model_registry: model_registry_clone.clone(),
-            replica_pools: replica_pools_clone.clone(),
+            models: models_for_api.clone(),
+            inference: inference_service.clone(),
             shared_metrics: shared_metrics_clone.clone(),
             throughput_samples: throughput_samples_clone.clone(),
             generated_token_samples: generated_token_samples_clone.clone(),
@@ -708,16 +692,10 @@ async fn main() -> Result<(), DynError> {
             scheduler_queue_size: args.scheduler_queue_size,
             scheduler_max_micro_batch: args.scheduler_max_micro_batch,
             scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
-            model_id_counter: model_id_counter.clone(),
-            recycled_model_ids: recycled_model_ids.clone(),
-            model_paths: model_paths_clone.clone(),
             onnx_tuning_profile: onnx_tuning_profile_for_api.clone(),
-            shared_kv: shared_kv.clone(),
-            swap_map: swap_map.clone(),
+            resources: resources_for_api.clone(),
             rag_state: rag_state.clone(),
             inter_model_relay_state: inter_model_relay_state.clone(),
-            runtime_pressure_state: runtime_pressure_state.clone(),
-            runtime_pressure_config: runtime_pressure_config.clone(),
             auto_scaler: auto_scaler_api.clone(),
             log_sensitive_ids: log_sensitive_ids_for_api,
         });
@@ -725,17 +703,13 @@ async fn main() -> Result<(), DynError> {
         // OpenAI-compatible surface. Reader-scoped like `/api/models/:id/infer`,
         // which it delegates to.
         let openai_routes = build_openai_routes(OpenAiRoutesConfig {
-            model_registry: model_registry_clone.clone(),
-            replica_pools: replica_pools_clone.clone(),
-            latency_samples: latency_samples_clone.clone(),
-            runtime_pressure_state: runtime_pressure_state.clone(),
-            runtime_pressure_config: runtime_pressure_config.clone(),
+            models: models_for_api.clone(),
+            inference: inference_service.clone(),
             log_sensitive_ids: log_sensitive_ids_for_api,
         });
 
         let system_routes = build_system_routes(
-            model_registry_clone.clone(),
-            replica_pools_clone.clone(),
+            models_for_api.clone(),
             device_info_for_api.clone(),
             runtime_samples_clone.clone(),
             runtime_pressure_state.clone(),
@@ -890,14 +864,10 @@ async fn main() -> Result<(), DynError> {
 
     spawn_auto_scaler_task(AutoScalerTaskConfig {
         auto_scaler: auto_scaler.clone(),
-        model_registry: model_registry.clone(),
-        replica_pools: replica_pools.clone(),
-        swap_map: swap_map_for_autoscaler.clone(),
-        model_paths: model_paths.clone(),
+        models: models.clone(),
         device_info: device_info.clone(),
-        unique_id_counter: unique_id_counter.clone(),
         shared_metrics: shared_metrics.clone(),
-        shared_kv: shared_kv_for_autoscaler,
+        resources: resources_for_autoscaler,
         batch_size: args.batch_size,
         scheduler_queue_size: args.scheduler_queue_size,
         scheduler_max_micro_batch: args.scheduler_max_micro_batch,

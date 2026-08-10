@@ -53,7 +53,7 @@ pub(crate) struct Args {
     /// socket — Unix domain socket (lowest latency, same host only).
     /// tcp    — TCP socket (cross-host).
     /// shm    — Shared memory (highest throughput, same host only).
-    /// hybrid — shm for local clients, tcp for remote.
+    /// hybrid — Unix socket control/data path with shared-memory tensor transfer.
     /// auto   — picks the best available transport automatically.
     #[arg(long, default_value = "socket")]
     pub(crate) transport: String,
@@ -63,7 +63,8 @@ pub(crate) struct Args {
     #[cfg_attr(windows, arg(short, long, default_value = r"\\.\pipe\kapsl"))]
     pub(crate) socket: String,
 
-    /// Bind address for the TCP inference server (used when --transport=tcp|hybrid|auto)
+    /// Bind address for the TCP inference server (used when --transport=tcp).
+    /// Non-loopback binds require KAPSL_TCP_AUTH_TOKEN.
     #[arg(long, default_value = "127.0.0.1")]
     pub(crate) bind: String,
 

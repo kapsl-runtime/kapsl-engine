@@ -1,5 +1,29 @@
 use super::*;
 
+fn is_explicit_worker_gpu_boundary(name: &str, value: &str) -> bool {
+    let is_positive_mb = || value.trim().parse::<usize>().is_ok_and(|mb| mb > 0);
+    let is_cuda_cap = || parse_cuda_memory_limit(value).is_some();
+
+    if name == ISOLATED_WORKER_GPU_POOL_ENV {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if name == KAPSL_GPU_MEMORY_LIMIT_MB_ENV {
+        return is_positive_mb();
+    }
+    if name == CUDA_DEVICE_MEMORY_LIMIT_ENV {
+        return is_cuda_cap();
+    }
+    name.strip_prefix(&format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_"))
+        .is_some_and(|device_id| !device_id.is_empty() && is_cuda_cap())
+}
+
+fn isolated_worker_gpu_pool_allowed() -> bool {
+    std::env::vars().any(|(name, value)| is_explicit_worker_gpu_boundary(&name, &value))
+}
+
 /// Everything needed to (re)spawn an isolated worker child for a model, so the
 /// supervisor can restart a dead worker without re-deriving arguments.
 #[derive(Clone)]
@@ -176,6 +200,12 @@ pub(crate) fn build_worker_command(
         .arg("--tp-degree")
         .arg(spec.tp_degree.to_string())
         .env(LLM_ISOLATE_PROCESS_ENV, "0");
+    if !isolated_worker_gpu_pool_allowed() {
+        // DeviceMemoryManager still runs in the child for planned-vs-actual
+        // accounting, but no process-local arena may reserve the same global
+        // pool capacity as its siblings.
+        command.env(GPU_DEVICE_POOL_DISABLED_ENV, "1");
+    }
     let onnx_tuning = &spec.onnx_tuning;
     if let Some(value) = onnx_tuning.memory_pattern {
         command.arg("--onnx-memory-pattern").arg(value.to_string());
@@ -204,6 +234,9 @@ pub(crate) fn build_worker_command(
     Ok(command)
 }
 
+// Keep the worker command's launch settings explicit at this process boundary;
+// they are immediately captured in `WorkerSpec` for supervision and restart.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_worker_process(
     model_id: u32,
     model_path: &Path,
@@ -575,5 +608,33 @@ mod remote_engine_tests {
         assert_eq!(policy.mode, BatchingMode::Delegated);
         assert_eq!(policy.max_requests, 1);
         assert!(policy.supports_priority);
+    }
+
+    #[test]
+    fn isolated_worker_pool_requires_an_explicit_device_boundary() {
+        assert!(!is_explicit_worker_gpu_boundary(
+            "KAPSL_GPU_DEVICE_POOL_BYTES",
+            "8g"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            CUDA_DEVICE_MEMORY_LIMIT_ENV,
+            "8g"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            "CUDA_DEVICE_MEMORY_LIMIT_0",
+            "8589934592"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            KAPSL_GPU_MEMORY_LIMIT_MB_ENV,
+            "8192"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            ISOLATED_WORKER_GPU_POOL_ENV,
+            "true"
+        ));
+        assert!(!is_explicit_worker_gpu_boundary(
+            ISOLATED_WORKER_GPU_POOL_ENV,
+            "false"
+        ));
     }
 }

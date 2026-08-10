@@ -45,6 +45,13 @@ impl DeviceMemoryManager {
         let mut devices = HashMap::new();
         let mut pools = HashMap::new();
         let mut budget = DeviceBudgetLedger::default();
+        let pooling_disabled = env_flag(GPU_DEVICE_POOL_DISABLED_ENV);
+        if pooling_disabled {
+            log::info!(
+                "[device-memory] physical CUDA pooling disabled for this process by {} (admission accounting remains enabled)",
+                GPU_DEVICE_POOL_DISABLED_ENV
+            );
+        }
         for device in &device_info.devices {
             if !device.backend.to_string().eq_ignore_ascii_case("cuda") {
                 continue;
@@ -54,7 +61,11 @@ impl DeviceMemoryManager {
 
             let cuda = CudaDevice::new(device.id)
                 .map_err(|error| format!("failed to open CUDA device {}: {error}", device.id))?;
-            let configured_pool = configured_bytes(GPU_DEVICE_POOL_BYTES_ENV, device.id)?;
+            let configured_pool = if pooling_disabled {
+                None
+            } else {
+                configured_bytes(GPU_DEVICE_POOL_BYTES_ENV, device.id)?
+            };
             if let Some(raw_capacity) = configured_pool {
                 if raw_capacity > safe_budget {
                     return Err(format!(
@@ -241,6 +252,83 @@ impl DeviceMemoryManager {
             _load_guard: Some(load_guard),
             reconciled: false,
             committed: false,
+        }))
+    }
+
+    /// Reserve the target model's full external footprint while a hot-swap
+    /// uploads it alongside the active model. The temporary allocation IDs
+    /// intentionally differ from the backend's stable weight IDs: during
+    /// activation both copies are live, so shared-allocation de-duplication
+    /// must not hide the peak.
+    pub(crate) async fn begin_swap_admission(
+        self: &Arc<Self>,
+        device_id: usize,
+        model_id: u32,
+        planned_report: &ExternalDeviceMemoryReport,
+    ) -> Result<Option<DeviceMemorySwapAdmission>, String> {
+        let Some(authority) = self.devices.get(&device_id) else {
+            return Ok(None);
+        };
+        let planned_allocations: Vec<_> = planned_report
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.device_id == device_id)
+            .collect();
+        if planned_allocations.is_empty() {
+            return Ok(None);
+        }
+
+        let load_guard = Arc::clone(&authority.load_lock).lock_owned().await;
+        let swap_id = self
+            .next_fallback_allocation
+            .fetch_add(1, Ordering::Relaxed);
+        let mut reservations = Vec::with_capacity(planned_allocations.len());
+        let snapshot = {
+            let mut budget = self.budget.lock().unwrap();
+            let mut current = budget.snapshot(device_id).ok_or_else(|| {
+                format!("CUDA device {device_id} has no runtime memory authority")
+            })?;
+            for (index, allocation) in planned_allocations.iter().enumerate() {
+                let allocation_id =
+                    format!("runtime-swap-peak:{model_id}:{device_id}:{swap_id}:{index}");
+                match budget.reserve_external(device_id, &allocation_id, allocation.bytes) {
+                    Ok((snapshot, owns_charge)) => {
+                        debug_assert!(owns_charge);
+                        current = snapshot;
+                        reservations.push(ExternalReservation {
+                            allocation_id,
+                            owns_charge,
+                        });
+                    }
+                    Err(error) => {
+                        for reservation in &reservations {
+                            budget.release_external(device_id, &reservation.allocation_id);
+                        }
+                        return Err(format!(
+                            "hot-swap memory admission for model {model_id} failed: {error}"
+                        ));
+                    }
+                }
+            }
+            current
+        };
+        self.publish_metrics(device_id, snapshot);
+        log::info!(
+            "[device-memory] admitted hot-swap peak for model {} on CUDA device {}: target_external={} global_used={} global_available={} bytes",
+            model_id,
+            device_id,
+            planned_allocations
+                .iter()
+                .map(|allocation| allocation.bytes)
+                .sum::<usize>(),
+            snapshot.used_bytes(),
+            snapshot.available_bytes()
+        );
+        Ok(Some(DeviceMemorySwapAdmission {
+            manager: Arc::clone(self),
+            device_id,
+            reservations,
+            _load_guard: load_guard,
         }))
     }
 
@@ -580,6 +668,24 @@ impl Drop for DeviceMemoryAdmission {
             self.manager
                 .release_one(self.device_id, self.owner, &self.reservations);
         }
+    }
+}
+
+/// Short-lived reservation for the second set of weights that exists during
+/// hot-swap activation. Dropping it releases both the peak charge and the
+/// per-device load/swap serialization guard.
+#[must_use = "hold the swap admission until backend activation finishes"]
+pub(crate) struct DeviceMemorySwapAdmission {
+    manager: Arc<DeviceMemoryManager>,
+    device_id: usize,
+    reservations: Vec<ExternalReservation>,
+    _load_guard: OwnedMutexGuard<()>,
+}
+
+impl Drop for DeviceMemorySwapAdmission {
+    fn drop(&mut self) {
+        self.manager
+            .release_external_reservations(self.device_id, &self.reservations);
     }
 }
 
