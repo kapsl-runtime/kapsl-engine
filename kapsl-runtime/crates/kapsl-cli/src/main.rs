@@ -17,6 +17,8 @@ use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics,
     EngineModelInfo, InferenceRequest, TensorDtype,
 };
+#[cfg(feature = "gpu-device-pool")]
+use kapsl_engine_api::{EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport};
 use kapsl_hal::device::DeviceInfo;
 use kapsl_ipc::{
     IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,

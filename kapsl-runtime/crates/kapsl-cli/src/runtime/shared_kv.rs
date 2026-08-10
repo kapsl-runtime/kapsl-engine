@@ -157,23 +157,28 @@ impl SharedKvStateInner {
     }
 
     #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn begin_device_memory_admission(
+    pub(crate) async fn begin_device_memory_admission(
         &self,
         device_id: usize,
         model_id: u32,
         kind: EngineKind,
+        planned_report: &ExternalDeviceMemoryReport,
     ) -> Result<Option<DeviceMemoryAdmission>, String> {
-        self.device_memory
-            .get()
-            .map(|manager| manager.begin_admission(device_id, model_id, kind))
-            .transpose()
-            .map(Option::flatten)
+        let Some(manager) = self.device_memory.get() else {
+            return Ok(None);
+        };
+        manager
+            .begin_admission(device_id, model_id, kind, planned_report)
+            .await
     }
 
     #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn release_device_memory(&self, model_id: u32) {
+    pub(crate) fn attach_device_memory_metrics(
+        &self,
+        metrics: kapsl_monitor::metrics::KapslMetrics,
+    ) {
         if let Some(manager) = self.device_memory.get() {
-            manager.release_model(model_id);
+            manager.attach_metrics(metrics);
         }
     }
 

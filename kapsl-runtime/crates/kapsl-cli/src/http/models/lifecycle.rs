@@ -334,8 +334,6 @@ pub(crate) fn build_model_lifecycle_routes(
             replica_pools_for_stop.write().remove(&model_id);
             swap_map_for_stop.write().remove(&model_id);
             shared_kv_for_stop.detach_engine_for_model(model_id);
-            #[cfg(feature = "gpu-device-pool")]
-            shared_kv_for_stop.release_device_memory(model_id);
 
             // Update status to Inactive
             if let Err(e) = model_registry_for_stop.set_status(model_id, ModelStatus::Inactive) {

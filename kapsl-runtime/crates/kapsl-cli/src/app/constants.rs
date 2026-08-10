@@ -86,8 +86,11 @@ pub(crate) const CUDA_DEVICE_MEMORY_LIMIT_ENV: &str = "CUDA_DEVICE_MEMORY_LIMIT"
 /// kapsl alias for the per-device VRAM cap, in plain MiB, for non-HAMi
 /// deployments that still want cooperative self-limiting.
 pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_MB";
-/// Enables the runtime-owned CUDA pool and gives its exact backing allocation
-/// size. A per-device `_<device_id>` suffix takes precedence.
+/// Enables the runtime-owned elastic CUDA pool and gives its exact backing
+/// allocation size. The full backing capacity is charged against the same safe
+/// device budget as backend-owned external weights, so this must leave room for
+/// any GGUF/native weights that remain outside the pool. A per-device
+/// `_<device_id>` suffix takes precedence.
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) const GPU_DEVICE_POOL_BYTES_ENV: &str = "KAPSL_GPU_DEVICE_POOL_BYTES";
 #[cfg(feature = "gpu-device-pool")]

@@ -327,6 +327,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                             *unique_id,
                             &model_registry_for_scaler,
                             &replica_pools_for_scaler,
+                            &swap_map_for_scaler,
                         )
                         .await
                         {

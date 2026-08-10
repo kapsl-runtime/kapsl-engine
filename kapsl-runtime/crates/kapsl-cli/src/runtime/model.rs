@@ -1,5 +1,132 @@
 use super::*;
 
+#[cfg(feature = "gpu-device-pool")]
+struct DeviceMemoryTrackedEngine {
+    // Keep the backend before its leases so backend resources are torn down
+    // before a lease can return admission budget.
+    inner: Box<dyn kapsl_engine_api::Engine>,
+    leases: std::sync::Mutex<Vec<DeviceMemoryLease>>,
+}
+
+#[cfg(feature = "gpu-device-pool")]
+impl DeviceMemoryTrackedEngine {
+    fn new(inner: Box<dyn kapsl_engine_api::Engine>, leases: Vec<DeviceMemoryLease>) -> Self {
+        Self {
+            inner,
+            leases: std::sync::Mutex::new(leases),
+        }
+    }
+
+    fn unload_and_release(&mut self) {
+        self.inner.unload();
+        self.leases.get_mut().unwrap().clear();
+    }
+}
+
+#[cfg(feature = "gpu-device-pool")]
+impl Drop for DeviceMemoryTrackedEngine {
+    fn drop(&mut self) {
+        self.unload_and_release();
+    }
+}
+
+#[cfg(feature = "gpu-device-pool")]
+#[async_trait::async_trait]
+impl kapsl_engine_api::Engine for DeviceMemoryTrackedEngine {
+    fn planned_external_device_memory(
+        &self,
+        model_path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        self.inner.planned_external_device_memory(model_path)
+    }
+
+    async fn load(&mut self, model_path: &Path) -> Result<(), EngineError> {
+        self.inner.load(model_path).await
+    }
+
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        self.inner.actual_external_device_memory()
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.inner.infer(request)
+    }
+
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        self.inner.infer_batch(requests)
+    }
+
+    fn max_batch(&self) -> usize {
+        self.inner.max_batch()
+    }
+
+    fn self_batches(&self) -> bool {
+        self.inner.self_batches()
+    }
+
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.inner.batching_policy()
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        self.inner.infer_stream(request)
+    }
+
+    async fn warmup(&self) -> Result<(), EngineError> {
+        self.inner.warmup().await
+    }
+
+    fn unload(&mut self) {
+        self.unload_and_release();
+    }
+
+    fn metrics(&self) -> EngineMetrics {
+        self.inner.metrics()
+    }
+
+    fn model_info(&self) -> Option<EngineModelInfo> {
+        self.inner.model_info()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        self.inner.health_check()
+    }
+
+    fn supports_swap(&self) -> bool {
+        self.inner.supports_swap()
+    }
+
+    fn is_staged(&self) -> bool {
+        self.inner.is_staged()
+    }
+
+    async fn stage(&self, path: &Path) -> Result<(), EngineError> {
+        self.inner.stage(path).await
+    }
+
+    async fn swap(&self) -> Result<(), EngineError> {
+        self.inner.swap().await?;
+        let report = self.inner.actual_external_device_memory();
+        for lease in self.leases.lock().unwrap().iter_mut() {
+            lease
+                .reconcile_report(&report)
+                .map_err(EngineError::backend)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "gpu-device-pool")]
+fn track_device_memory(
+    engine: Box<dyn kapsl_engine_api::Engine>,
+    leases: Vec<DeviceMemoryLease>,
+) -> Box<dyn kapsl_engine_api::Engine> {
+    Box::new(DeviceMemoryTrackedEngine::new(engine, leases))
+}
+
 fn create_runtime_backend_for_device(
     manifest: &Manifest,
     provider: &str,
@@ -233,6 +360,8 @@ pub(crate) async fn load_model(
     (Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
+    #[cfg(feature = "gpu-device-pool")]
+    shared_kv.attach_device_memory_metrics(shared_metrics.clone());
     log::info!(
         "Current directory: {:?}",
         std::env::current_dir().unwrap_or_default()
@@ -428,22 +557,32 @@ pub(crate) async fn load_model(
                 LLMBackend::with_device_ids(device_ids.clone())
             };
             #[cfg(feature = "gpu-device-pool")]
-            let device_memory_admissions = {
-                let mut admissions = Vec::new();
-                for &device_id in &device_ids {
-                    if let Some(admission) = shared_kv.begin_device_memory_admission(
-                        device_id as usize,
-                        model_id,
-                        engine_kind,
-                    )? {
-                        admissions.push(admission);
-                    }
-                }
+            let mut device_memory_admissions = {
+                let mut admission_device_ids = device_ids.clone();
+                admission_device_ids.sort_unstable();
+                admission_device_ids.dedup();
                 backend = backend.with_env_allocators(
                     device_ids
                         .iter()
                         .any(|&device_id| shared_kv.uses_env_allocators(device_id as usize)),
                 );
+                let planned_report = backend
+                    .planned_external_device_memory(&model_file_path)
+                    .map_err(|error| format!("backend memory plan failed: {error}"))?;
+                let mut admissions = Vec::new();
+                for &device_id in &admission_device_ids {
+                    if let Some(admission) = shared_kv
+                        .begin_device_memory_admission(
+                            device_id as usize,
+                            model_id,
+                            engine_kind,
+                            &planned_report,
+                        )
+                        .await?
+                    {
+                        admissions.push(admission);
+                    }
+                }
                 admissions
             };
             let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
@@ -458,15 +597,28 @@ pub(crate) async fn load_model(
                     let sk = shared_kv.clone();
                     std::sync::Arc::new(move |eid| sk.detach_engine(eid))
                 });
-            backend.load(&model_file_path).await.map_err(|e| {
-                let err: Box<dyn std::error::Error + Send + Sync> =
-                    format!("Failed to load pipeline model {}: {}", model_id, e).into();
-                err
-            })?;
-            #[cfg(feature = "gpu-device-pool")]
-            for admission in device_memory_admissions {
-                admission.commit();
+            if let Err(error) = backend.load(&model_file_path).await {
+                backend.unload();
+                return Err(format!("Failed to load pipeline model {model_id}: {error}").into());
             }
+            #[cfg(feature = "gpu-device-pool")]
+            let actual_report = backend.actual_external_device_memory();
+            #[cfg(feature = "gpu-device-pool")]
+            for admission in &mut device_memory_admissions {
+                if let Err(error) = admission.reconcile(&actual_report) {
+                    backend.unload();
+                    return Err(error.into());
+                }
+            }
+            #[cfg(feature = "gpu-device-pool")]
+            let device_memory_leases = device_memory_admissions
+                .into_iter()
+                .map(DeviceMemoryAdmission::commit)
+                .collect();
+
+            let backend: Box<dyn kapsl_engine_api::Engine> = Box::new(backend);
+            #[cfg(feature = "gpu-device-pool")]
+            let backend = track_device_memory(backend, device_memory_leases);
 
             let monitored_backend = MonitoringMiddleware::new_with_metrics(
                 backend,
@@ -497,10 +649,6 @@ pub(crate) async fn load_model(
                     engines.push(engine_arc);
                     continue;
                 }
-                #[cfg(feature = "gpu-device-pool")]
-                let device_memory_admission =
-                    shared_kv.begin_device_memory_admission(device.id, model_id, engine_kind)?;
-
                 // Create a backend as a client of the runtime-owned pool when enabled.
                 let mut backend = create_runtime_backend_for_device(
                     &loader.manifest,
@@ -512,18 +660,44 @@ pub(crate) async fn load_model(
                     model_id,
                 )?;
 
-                backend.load(&model_file_path).await.map_err(|e| {
-                    let err: Box<dyn std::error::Error + Send + Sync> = format!(
-                        "Failed to load model {} on device {}: {}",
-                        model_id, device.id, e
-                    )
-                    .into();
-                    err
-                })?;
                 #[cfg(feature = "gpu-device-pool")]
-                if let Some(admission) = device_memory_admission {
-                    admission.commit();
+                let device_memory_admission = {
+                    let planned_report =
+                        backend
+                            .planned_external_device_memory(&model_file_path)
+                            .map_err(|error| format!("backend memory plan failed: {error}"))?;
+                    shared_kv
+                        .begin_device_memory_admission(
+                            device.id,
+                            model_id,
+                            engine_kind,
+                            &planned_report,
+                        )
+                        .await?
+                };
+
+                if let Err(error) = backend.load(&model_file_path).await {
+                    backend.unload();
+                    return Err(format!(
+                        "Failed to load model {} on device {}: {}",
+                        model_id, device.id, error
+                    )
+                    .into());
                 }
+                #[cfg(feature = "gpu-device-pool")]
+                let actual_report = backend.actual_external_device_memory();
+                #[cfg(feature = "gpu-device-pool")]
+                let device_memory_leases = if let Some(mut admission) = device_memory_admission {
+                    if let Err(error) = admission.reconcile(&actual_report) {
+                        backend.unload();
+                        return Err(error.into());
+                    }
+                    vec![admission.commit()]
+                } else {
+                    Vec::new()
+                };
+                #[cfg(feature = "gpu-device-pool")]
+                let backend = track_device_memory(backend, device_memory_leases);
 
                 let monitored_backend = MonitoringMiddleware::new_with_metrics(
                     backend,
@@ -606,6 +780,8 @@ pub(crate) async fn scale_up_model(
     shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
     onnx_tuning: OnnxRuntimeTuning,
 ) -> Result<(Arc<Scheduler>, EngineHandle), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "gpu-device-pool")]
+    shared_kv.attach_device_memory_metrics(shared_metrics.clone());
     log::info!(
         "Scaling up Model ID {} - Creating replica #{}",
         base_model_id,
@@ -762,22 +938,32 @@ pub(crate) async fn scale_up_model(
             LLMBackend::with_device_ids(device_ids.clone())
         };
         #[cfg(feature = "gpu-device-pool")]
-        let device_memory_admissions = {
-            let mut admissions = Vec::new();
-            for &device_id in &device_ids {
-                if let Some(admission) = shared_kv.begin_device_memory_admission(
-                    device_id as usize,
-                    base_model_id,
-                    engine_kind,
-                )? {
-                    admissions.push(admission);
-                }
-            }
+        let mut device_memory_admissions = {
+            let mut admission_device_ids = device_ids.clone();
+            admission_device_ids.sort_unstable();
+            admission_device_ids.dedup();
             backend = backend.with_env_allocators(
                 device_ids
                     .iter()
                     .any(|&device_id| shared_kv.uses_env_allocators(device_id as usize)),
             );
+            let planned_report = backend
+                .planned_external_device_memory(&model_file_path)
+                .map_err(|error| format!("backend memory plan failed: {error}"))?;
+            let mut admissions = Vec::new();
+            for &device_id in &admission_device_ids {
+                if let Some(admission) = shared_kv
+                    .begin_device_memory_admission(
+                        device_id as usize,
+                        base_model_id,
+                        engine_kind,
+                        &planned_report,
+                    )
+                    .await?
+                {
+                    admissions.push(admission);
+                }
+            }
             admissions
         };
         let primary_device = device_ids.first().copied().unwrap_or(0) as usize;
@@ -792,15 +978,28 @@ pub(crate) async fn scale_up_model(
                 let sk = shared_kv.clone();
                 std::sync::Arc::new(move |eid| sk.detach_engine(eid))
             });
-        backend.load(&model_file_path).await.map_err(|e| {
-            let err: Box<dyn std::error::Error + Send + Sync> =
-                format!("Failed to load pipeline replica {}: {}", replica_id, e).into();
-            err
-        })?;
-        #[cfg(feature = "gpu-device-pool")]
-        for admission in device_memory_admissions {
-            admission.commit();
+        if let Err(error) = backend.load(&model_file_path).await {
+            backend.unload();
+            return Err(format!("Failed to load pipeline replica {replica_id}: {error}").into());
         }
+        #[cfg(feature = "gpu-device-pool")]
+        let actual_report = backend.actual_external_device_memory();
+        #[cfg(feature = "gpu-device-pool")]
+        for admission in &mut device_memory_admissions {
+            if let Err(error) = admission.reconcile(&actual_report) {
+                backend.unload();
+                return Err(error.into());
+            }
+        }
+        #[cfg(feature = "gpu-device-pool")]
+        let device_memory_leases = device_memory_admissions
+            .into_iter()
+            .map(DeviceMemoryAdmission::commit)
+            .collect();
+
+        let backend: Box<dyn kapsl_engine_api::Engine> = Box::new(backend);
+        #[cfg(feature = "gpu-device-pool")]
+        let backend = track_device_memory(backend, device_memory_leases);
 
         let monitored_backend = MonitoringMiddleware::new_with_metrics(
             backend,
@@ -812,9 +1011,6 @@ pub(crate) async fn scale_up_model(
     } else {
         #[cfg(feature = "gpu-device-pool")]
         let device_id = loader.manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
-        #[cfg(feature = "gpu-device-pool")]
-        let device_memory_admission =
-            shared_kv.begin_device_memory_admission(device_id, base_model_id, engine_kind)?;
         let mut backend = create_runtime_best_backend(
             &loader.manifest,
             device_info,
@@ -822,15 +1018,38 @@ pub(crate) async fn scale_up_model(
             &shared_kv,
             base_model_id,
         )?;
-        backend.load(&model_file_path).await.map_err(|e| {
-            let err: Box<dyn std::error::Error + Send + Sync> =
-                format!("Failed to load replica {}: {}", replica_id, e).into();
-            err
-        })?;
         #[cfg(feature = "gpu-device-pool")]
-        if let Some(admission) = device_memory_admission {
-            admission.commit();
+        let device_memory_admission = {
+            let planned_report = backend
+                .planned_external_device_memory(&model_file_path)
+                .map_err(|error| format!("backend memory plan failed: {error}"))?;
+            shared_kv
+                .begin_device_memory_admission(
+                    device_id,
+                    base_model_id,
+                    engine_kind,
+                    &planned_report,
+                )
+                .await?
+        };
+        if let Err(error) = backend.load(&model_file_path).await {
+            backend.unload();
+            return Err(format!("Failed to load replica {replica_id}: {error}").into());
         }
+        #[cfg(feature = "gpu-device-pool")]
+        let actual_report = backend.actual_external_device_memory();
+        #[cfg(feature = "gpu-device-pool")]
+        let device_memory_leases = if let Some(mut admission) = device_memory_admission {
+            if let Err(error) = admission.reconcile(&actual_report) {
+                backend.unload();
+                return Err(error.into());
+            }
+            vec![admission.commit()]
+        } else {
+            Vec::new()
+        };
+        #[cfg(feature = "gpu-device-pool")]
+        let backend = track_device_memory(backend, device_memory_leases);
         let monitored_backend = MonitoringMiddleware::new_with_metrics(
             backend,
             base_model_id.to_string(),
@@ -870,6 +1089,7 @@ pub(crate) async fn scale_down_model(
     unique_id: u32,
     model_registry: &ModelRegistry,
     replica_pools: &ReplicaPools,
+    swap_map: &Arc<RwLock<HashMap<u32, Vec<EngineHandle>>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!(
         "Scaling down Model ID {} - Removing replica #{}",
@@ -897,6 +1117,12 @@ pub(crate) async fn scale_down_model(
     } else {
         let _ = model_registry.set_status(unique_id, ModelStatus::Active);
         return Err(format!("Replica pool not found for model {}", base_model_id).into());
+    }
+
+    // Scale-up appends one hot-swap handle per replica; scale-down removes
+    // replicas in descending ID order, so the matching handle is the tail.
+    if let Some(handles) = swap_map.write().get_mut(&base_model_id) {
+        handles.pop();
     }
 
     // Update status to Inactive
@@ -947,8 +1173,6 @@ pub(crate) fn force_stop_model_before_remove(
     replica_pools.write().remove(&base_model_id);
     swap_map.write().remove(&base_model_id);
     shared_kv.detach_engine_for_model(base_model_id);
-    #[cfg(feature = "gpu-device-pool")]
-    shared_kv.release_device_memory(base_model_id);
 
     for replica in replicas {
         if let Err(e) = model_registry.set_status(replica.id, ModelStatus::Inactive) {

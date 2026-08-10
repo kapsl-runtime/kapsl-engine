@@ -7,6 +7,8 @@ use std::os::unix::net::UnixStream;
 
 pub(crate) mod autoscaler;
 pub(crate) mod config;
+#[cfg(any(feature = "gpu-device-pool", test))]
+mod device_budget;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) mod device_memory;
 pub(crate) mod model;
