@@ -16,16 +16,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
-const OPTIONAL_ADAPTERS_ENV: &str = "KAPSL_INFER_ADAPTERS";
-const LEGACY_OPTIONAL_ADAPTERS_ENV: &str = "KAPSL_INFER_ADAPTERS";
 const DISABLE_INLINE_MEDIA_PREPROCESS_ENV: &str = "KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS";
-const LEGACY_DISABLE_INLINE_MEDIA_PREPROCESS_ENV: &str = "KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS";
-
-fn env_var_alias(primary: &str, legacy: &str) -> Option<String> {
-    std::env::var(primary)
-        .ok()
-        .or_else(|| std::env::var(legacy).ok())
-}
 
 #[derive(Debug, Clone)]
 pub(crate) enum InferRequestError {
@@ -276,54 +267,6 @@ impl ModelRequestAdapter for MediaRequestAdapter {
     }
 }
 
-#[cfg(feature = "infer-adapter-echo")]
-#[derive(Debug, Clone, Deserialize)]
-struct EchoTensorInferenceRequest {
-    echo_input: BinaryTensorPacket,
-    #[serde(default)]
-    additional_inputs: Vec<NamedTensor>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    metadata: Option<EngineRequestMetadata>,
-}
-
-#[cfg(feature = "infer-adapter-echo")]
-struct EchoTensorRequestAdapter;
-
-#[cfg(feature = "infer-adapter-echo")]
-impl ModelRequestAdapter for EchoTensorRequestAdapter {
-    fn name(&self) -> &'static str {
-        "echo_tensor"
-    }
-
-    fn supports_payload(&self, payload: &serde_json::Value) -> bool {
-        payload.get("echo_input").is_some()
-    }
-
-    fn adapt(&self, payload: serde_json::Value) -> InferResult<InferenceRequest> {
-        let request =
-            serde_json::from_value::<EchoTensorInferenceRequest>(payload).map_err(|e| {
-                InferRequestError::bad_request(format!("Invalid echo tensor payload: {}", e))
-            })?;
-        Ok(InferenceRequest {
-            input: request.echo_input,
-            additional_inputs: request.additional_inputs,
-            session_id: request.session_id,
-            metadata: request.metadata,
-            cancellation: None,
-        })
-    }
-}
-
-#[allow(dead_code)]
-enum OptionalAdapterRegistrationOutcome {
-    Registered,
-    AlreadyRegistered,
-    FeatureDisabled,
-    Unknown,
-}
-
 pub(crate) struct RequestAdapterRegistry {
     adapters: Vec<Box<dyn ModelRequestAdapter>>,
 }
@@ -355,7 +298,6 @@ impl RequestAdapterRegistry {
         let mut registry = Self::new();
         registry.register_if_missing(Box::new(TensorRequestAdapter));
         registry.register_if_missing(Box::new(MediaRequestAdapter));
-        register_optional_adapters_from_env(&mut registry);
         registry
     }
 
@@ -413,81 +355,6 @@ impl RequestAdapterRegistry {
     }
 }
 
-fn register_optional_adapters_from_env(registry: &mut RequestAdapterRegistry) {
-    let Some(spec) = env_var_alias(OPTIONAL_ADAPTERS_ENV, LEGACY_OPTIONAL_ADAPTERS_ENV) else {
-        return;
-    };
-
-    apply_optional_adapter_spec(registry, &spec);
-}
-
-fn apply_optional_adapter_spec(registry: &mut RequestAdapterRegistry, spec: &str) {
-    for token in spec
-        .split(',')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        match register_optional_adapter_token(registry, token) {
-            OptionalAdapterRegistrationOutcome::Registered => {
-                log::info!(
-                    "Enabled optional infer adapter `{}` via {}",
-                    token,
-                    OPTIONAL_ADAPTERS_ENV
-                );
-            }
-            OptionalAdapterRegistrationOutcome::AlreadyRegistered => {
-                log::debug!(
-                    "Optional infer adapter `{}` already registered (from {})",
-                    token,
-                    OPTIONAL_ADAPTERS_ENV
-                );
-            }
-            OptionalAdapterRegistrationOutcome::FeatureDisabled => {
-                log::warn!(
-                    "Adapter `{}` requested via {}, but this binary was built without required feature support",
-                    token,
-                    OPTIONAL_ADAPTERS_ENV
-                );
-            }
-            OptionalAdapterRegistrationOutcome::Unknown => {
-                log::warn!(
-                    "Unknown adapter token `{}` in {}. Known optional adapters: `echo_tensor`",
-                    token,
-                    OPTIONAL_ADAPTERS_ENV
-                );
-            }
-        }
-    }
-}
-
-fn register_optional_adapter_token(
-    registry: &mut RequestAdapterRegistry,
-    token: &str,
-) -> OptionalAdapterRegistrationOutcome {
-    match token.to_ascii_lowercase().as_str() {
-        "echo_tensor" => register_echo_tensor_adapter(registry),
-        _ => OptionalAdapterRegistrationOutcome::Unknown,
-    }
-}
-
-#[cfg(feature = "infer-adapter-echo")]
-fn register_echo_tensor_adapter(
-    registry: &mut RequestAdapterRegistry,
-) -> OptionalAdapterRegistrationOutcome {
-    if registry.register_if_missing(Box::new(EchoTensorRequestAdapter)) {
-        OptionalAdapterRegistrationOutcome::Registered
-    } else {
-        OptionalAdapterRegistrationOutcome::AlreadyRegistered
-    }
-}
-
-#[cfg(not(feature = "infer-adapter-echo"))]
-fn register_echo_tensor_adapter(
-    _registry: &mut RequestAdapterRegistry,
-) -> OptionalAdapterRegistrationOutcome {
-    OptionalAdapterRegistrationOutcome::FeatureDisabled
-}
-
 pub(crate) fn default_request_adapter_registry() -> RequestAdapterRegistry {
     RequestAdapterRegistry::new_default()
 }
@@ -533,17 +400,15 @@ fn media_infer_request_to_inference_request(
 }
 
 fn inline_media_preprocess_disabled() -> bool {
-    env_var_alias(
-        DISABLE_INLINE_MEDIA_PREPROCESS_ENV,
-        LEGACY_DISABLE_INLINE_MEDIA_PREPROCESS_ENV,
-    )
-    .map(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-    .unwrap_or(false)
+    std::env::var(DISABLE_INLINE_MEDIA_PREPROCESS_ENV)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn media_payload_to_tensor_packet(

@@ -3,9 +3,6 @@ use super::*;
 #[path = "security_tests.rs"]
 mod security_tests;
 
-#[path = "inter_model_relay_tests.rs"]
-mod inter_model_relay_tests;
-
 #[path = "http_route_tests.rs"]
 mod http_route_tests;
 

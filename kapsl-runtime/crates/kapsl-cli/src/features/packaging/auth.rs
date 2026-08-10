@@ -1,8 +1,7 @@
 use super::*;
 
 /// The remote URL sources both resolvers share, in precedence order: an
-/// explicit non-blank argument, then `REMOTE_URL_ENV`, then
-/// `REMOTE_PLACEHOLDER_URL_ENV`.
+/// explicit non-blank argument, then `REMOTE_URL_ENV`.
 fn remote_url_from_arg_or_env(custom_url: Option<&str>) -> Option<String> {
     if let Some(url) = custom_url {
         let trimmed = url.trim();
@@ -11,7 +10,7 @@ fn remote_url_from_arg_or_env(custom_url: Option<&str>) -> Option<String> {
         }
     }
 
-    optional_env_var(REMOTE_URL_ENV).or_else(|| optional_env_var(REMOTE_PLACEHOLDER_URL_ENV))
+    optional_env_var(REMOTE_URL_ENV)
 }
 
 pub(crate) fn resolved_remote_url(custom_url: Option<&str>) -> String {

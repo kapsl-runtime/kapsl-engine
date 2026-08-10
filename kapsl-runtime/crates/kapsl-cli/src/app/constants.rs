@@ -1,24 +1,28 @@
+// Hosted service defaults.
 pub(crate) const DEFAULT_REMOTE_URL: &str = "https://api.kapsl.net/v1";
-pub(crate) const REMOTE_PLACEHOLDER_URL: &str = "https://placeholder-kapsl-registry.example.com/v1";
-pub(crate) const REMOTE_PLACEHOLDER_DIR: &str = ".kapsl-remote-placeholder";
 pub(crate) const EXTENSION_MARKETPLACE_URL: &str =
     "https://api.kapsl.net/api/v1/extensions/marketplace";
-pub(crate) const API_TOKEN_ENV: &str = "KAPSL_API_TOKEN";
+
+// HTTP and native transport authentication.
 pub(crate) const API_READER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_READER";
 pub(crate) const API_WRITER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_WRITER";
 pub(crate) const API_ADMIN_TOKEN_ENV: &str = "KAPSL_API_TOKEN_ADMIN";
 pub(crate) const AUTH_STORE_PATH_ENV: &str = "KAPSL_AUTH_STORE_PATH";
 pub(crate) const DEFAULT_AUTH_STORE_FILENAME: &str = "auth-store.json";
 pub(crate) const LOG_SENSITIVE_IDS_ENV: &str = "KAPSL_LOG_SENSITIVE_IDS";
+pub(crate) const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
+pub(crate) const TCP_AUTH_TOKEN_ENV: &str = "KAPSL_TCP_AUTH_TOKEN";
+
+// Runtime storage and external services.
 pub(crate) const RAG_STORAGE_ROOT_ENV: &str = "KAPSL_RAG_STORAGE_ROOT";
 pub(crate) const REMOTE_URL_ENV: &str = "KAPSL_REMOTE_URL";
 pub(crate) const REMOTE_TOKEN_ENV: &str = "KAPSL_REMOTE_TOKEN";
 pub(crate) const REMOTE_TOKEN_STORE_PATH_ENV: &str = "KAPSL_REMOTE_TOKEN_STORE_PATH";
-pub(crate) const REMOTE_PLACEHOLDER_URL_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_URL";
-pub(crate) const REMOTE_PLACEHOLDER_DIR_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_DIR";
 pub(crate) const EXTENSION_MARKETPLACE_URL_ENV: &str = "KAPSL_EXTENSION_MARKETPLACE_URL";
-pub(crate) const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
-pub(crate) const TCP_AUTH_TOKEN_ENV: &str = "KAPSL_TCP_AUTH_TOKEN";
+pub(crate) const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
+pub(crate) const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
+
+// Inference backend tuning.
 pub(crate) const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
 pub(crate) const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 pub(crate) const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
@@ -34,20 +38,10 @@ pub(crate) const MODEL_PEAK_CONCURRENCY_ENV: &str = "KAPSL_MODEL_PEAK_CONCURRENC
 pub(crate) const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
 pub(crate) const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
 pub(crate) const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
-pub(crate) const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
-pub(crate) const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
+
+// Scheduling and runtime pressure policy.
 pub(crate) const SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV: &str =
     "KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY";
-pub(crate) const LEGACY_SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV: &str =
-    "KAPSL_LITE_INGRESS_BACKPRESSURE";
-pub(crate) const INTER_MODEL_ROUTES_ENV: &str = "KAPSL_INTER_MODEL_ROUTES";
-pub(crate) const LEGACY_INTER_MODEL_ROUTES_ENV: &str = "KAPSL_LITE_INTER_MODEL_ROUTES";
-pub(crate) const INTER_MODEL_RELAY_MIN_INTERVAL_MS_ENV: &str =
-    "KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS";
-pub(crate) const LEGACY_INTER_MODEL_RELAY_MIN_INTERVAL_MS_ENV: &str =
-    "KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS";
-pub(crate) const INTER_MODEL_RELAY_SESSION_PREFIX: &str = "relay/";
-pub(crate) const DEFAULT_INTER_MODEL_RELAY_MIN_INTERVAL_MS: u64 = 2000;
 pub(crate) const PRESSURE_MEMORY_CONSERVE_PCT_ENV: &str =
     "KAPSL_SERVER_PRESSURE_MEMORY_CONSERVE_PCT";
 pub(crate) const PRESSURE_MEMORY_EMERGENCY_PCT_ENV: &str =

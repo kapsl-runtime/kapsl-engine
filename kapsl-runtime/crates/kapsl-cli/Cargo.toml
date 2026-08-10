@@ -25,9 +25,6 @@ gguf-native = ["gpu-device-pool", "kapsl-backends/gguf-native"]
 gguf-cuda = ["gpu-device-pool", "kapsl-backends/gguf-cuda", "kapsl-llm/gguf-cuda"]
 gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", "kapsl-llm/gguf-cuda-shared-kv"]
 
-# Test-only deterministic inference adapter.
-infer-adapter-echo = []
-
 [build-dependencies]
 cc = "1"
 

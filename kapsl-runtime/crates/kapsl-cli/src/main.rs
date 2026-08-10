@@ -203,14 +203,12 @@ async fn main() -> Result<(), DynError> {
         log::info!("   - Reader token env: {}", API_READER_TOKEN_ENV);
         log::info!("   - Writer token env: {}", API_WRITER_TOKEN_ENV);
         log::info!("   - Admin token env: {}", API_ADMIN_TOKEN_ENV);
-        log::info!("   - Shared fallback token env: {}", API_TOKEN_ENV);
     } else {
         log::warn!(
-            "API authentication is disabled. /api routes are restricted to loopback clients only. Create an API key via /api/auth/access/* or set {} / {} / {} (shared fallback {} is also supported).",
+            "API authentication is disabled. /api routes are restricted to loopback clients only. Create an API key via /api/auth/access/* or set {} / {} / {}.",
             API_READER_TOKEN_ENV,
             API_WRITER_TOKEN_ENV,
-            API_ADMIN_TOKEN_ENV,
-            API_TOKEN_ENV
+            API_ADMIN_TOKEN_ENV
         );
     }
     if !log_sensitive_ids {
@@ -286,16 +284,6 @@ async fn main() -> Result<(), DynError> {
         Arc::new(RwLock::new(HashMap::new()));
     let latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>> =
         Arc::new(RwLock::new(HashMap::new()));
-    let inter_model_relay_state = Arc::new(InterModelRelayState::from_env());
-    if inter_model_relay_state.has_routes() {
-        log::info!(
-            "Inter-model relay enabled: routes={} min_interval_ms={} env={} (legacy {})",
-            inter_model_relay_state.routes.len(),
-            inter_model_relay_state.min_interval.as_millis(),
-            INTER_MODEL_ROUTES_ENV,
-            LEGACY_INTER_MODEL_ROUTES_ENV
-        );
-    }
     let runtime_pressure_config = resources.pressure().config();
     let runtime_pressure_state = resources.pressure().state();
     let inference_service = InferenceService::new(
@@ -695,7 +683,6 @@ async fn main() -> Result<(), DynError> {
             onnx_tuning_profile: onnx_tuning_profile_for_api.clone(),
             resources: resources_for_api.clone(),
             rag_state: rag_state.clone(),
-            inter_model_relay_state: inter_model_relay_state.clone(),
             auto_scaler: auto_scaler_api.clone(),
             log_sensitive_ids: log_sensitive_ids_for_api,
         });

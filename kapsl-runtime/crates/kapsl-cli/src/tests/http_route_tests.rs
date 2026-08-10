@@ -96,7 +96,7 @@ async fn test_system_routes_report_health_and_pressure_state() {
 #[tokio::test]
 async fn test_auth_login_route_allows_local_loopback_when_auth_disabled() {
     let auth_state = Arc::new(RwLock::new(ApiAuthState {
-        legacy_tokens: ApiRoleTokenConfig::default(),
+        role_tokens: ApiRoleTokenConfig::default(),
         store_path: unique_temp_path("auth-store").join("auth-store.json"),
         store: ApiAuthStoreFile::default(),
         key_hash_index: HashMap::new(),

@@ -5,7 +5,6 @@ pub(crate) struct ModelInferRouteConfig {
     pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
     pub(crate) rag_state: RagRuntimeState,
-    pub(crate) inter_model_relay_state: Arc<InterModelRelayState>,
 }
 
 pub(crate) fn build_model_infer_route(
@@ -16,7 +15,6 @@ pub(crate) fn build_model_infer_route(
         inference,
         log_sensitive_ids: log_sensitive_ids_for_api,
         rag_state: rag_state_for_api,
-        inter_model_relay_state,
     } = config;
 
     // POST /api/models/:id/infer - Synchronous inference
@@ -25,7 +23,6 @@ pub(crate) fn build_model_infer_route(
     let request_adapters_for_infer = Arc::new(default_request_adapter_registry());
     let log_sensitive_ids_for_infer = log_sensitive_ids_for_api;
     let rag_state_for_infer = rag_state_for_api.clone();
-    let inter_model_relay_for_infer = inter_model_relay_state.clone();
     let infer_route = warp::path!("api" / "models" / u32 / "infer")
     .and(warp::post())
     .and(warp::body::bytes())
@@ -35,7 +32,6 @@ pub(crate) fn build_model_infer_route(
         let request_adapters = request_adapters_for_infer.clone();
         let log_sensitive_ids = log_sensitive_ids_for_infer;
         let rag_state = rag_state_for_infer.clone();
-        let inter_model_relay = inter_model_relay_for_infer.clone();
         async move {
             use warp::http::StatusCode;
             let scheduler = models.pool(model_id);
@@ -47,10 +43,6 @@ pub(crate) fn build_model_infer_route(
                         .as_ref()
                         .map(|model| model.framework.clone())
                         .unwrap_or_else(|| "unknown".to_string());
-                    let source_model_name = source_model_info
-                        .as_ref()
-                        .map(|model| model.name.clone())
-                        .unwrap_or_else(|| format!("model-{model_id}"));
                     // Fast-path tensor JSON inference: avoid an intermediate `serde_json::Value`
                     // for huge tensors (ex: `[1,3,224,224]` float32 represented as a JSON byte
                     // array). Falling back keeps support for other adapters.
@@ -236,7 +228,6 @@ pub(crate) fn build_model_infer_route(
                         .and_then(|metadata| metadata.request_id.as_deref())
                         .unwrap_or("-");
                     let session_id = request.session_id.as_deref().unwrap_or("-");
-                    let request_is_relay = session_id.starts_with(INTER_MODEL_RELAY_SESSION_PREFIX);
                     let request_id_for_log =
                         redact_identifier_for_logs(request_id, log_sensitive_ids);
                     let session_id_for_log =
@@ -252,21 +243,10 @@ pub(crate) fn build_model_infer_route(
                         .await;
 
                     match infer_result {
-                        Ok(output) => {
-                            maybe_publish_inter_model_relays(
-                                &inter_model_relay,
-                                model_id,
-                                &source_model_name,
-                                request_is_relay,
-                                &output,
-                                &models,
-                                &inference,
-                            );
-                            Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&output),
-                                StatusCode::OK,
-                            ))
-                        }
+                        Ok(output) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&output),
+                            StatusCode::OK,
+                        )),
                         Err(e) => {
                             let status = status_code_for_engine_error(&e);
                             if status == StatusCode::INTERNAL_SERVER_ERROR {

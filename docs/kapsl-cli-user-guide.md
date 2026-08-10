@@ -182,7 +182,7 @@ kapsl add-model --model ./model.aimod --http-port 9100
 Authenticated runtime:
 
 ```bash
-kapsl add-model --model ./model.aimod --auth-token "$KAPSL_API_TOKEN"
+kapsl add-model --model ./model.aimod --auth-token "$KAPSL_API_TOKEN_ADMIN"
 ```
 
 Full URL override (e.g. remote host):
@@ -373,7 +373,7 @@ If you do not pass `--remote-url`, `push`/`pull` use `https://api.kapsl.net/v1` 
 
 - This is useful when you want to use the shared hosted backend without passing `--remote-url` explicitly.
 - For production sharing across users/machines, use a dedicated remote URL via `--remote-url` (or set `KAPSL_REMOTE_URL`).
-- For authenticated remotes, use `--remote-token` or set `KAPSL_REMOTE_TOKEN` (`KAPSL_REMOTE_TOKEN` legacy).
+- For authenticated remotes, use `--remote-token` or set `KAPSL_REMOTE_TOKEN`.
 - If you install the CLI with Cargo, prefer `cargo install --path crates/kapsl-cli --locked` so the binary matches the checked-in lockfile and dependency feature set.
 
 ## Authentication (API)
@@ -382,7 +382,6 @@ When API auth is enabled, requests to `/api/*` and `/metrics` require a bearer t
 
 Common environment variables:
 
-- `KAPSL_API_TOKEN` (shared fallback token)
 - `KAPSL_API_TOKEN_READER`
 - `KAPSL_API_TOKEN_WRITER`
 - `KAPSL_API_TOKEN_ADMIN`
@@ -390,10 +389,10 @@ Common environment variables:
 Example:
 
 ```bash
-export KAPSL_API_TOKEN="your-token"
+export KAPSL_API_TOKEN_ADMIN="your-token"
 
 curl http://127.0.0.1:9095/api/models \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN"
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN"
 ```
 
 If auth is disabled, API access is loopback-only by default.
@@ -409,7 +408,7 @@ kapsl extension install connector.echo
 If runtime API authentication is enabled:
 
 ```bash
-kapsl extension install connector.echo --auth-token "$KAPSL_API_TOKEN"
+kapsl extension install connector.echo --auth-token "$KAPSL_API_TOKEN_ADMIN"
 ```
 
 Use runtime API endpoints for the rest of the extension lifecycle tasks.
@@ -418,7 +417,7 @@ List installed extensions:
 
 ```bash
 curl http://127.0.0.1:9095/api/extensions \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN"
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN"
 ```
 
 Install from a local extension directory:
@@ -426,7 +425,7 @@ Install from a local extension directory:
 ```bash
 curl -X POST http://127.0.0.1:9095/api/extensions/install \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"path":"./extensions/my-extension"}'
 ```
 
@@ -435,7 +434,7 @@ Set extension config for a workspace:
 ```bash
 curl -X POST http://127.0.0.1:9095/api/extensions/connector.echo/config \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"workspace_id":"default","config":{"api_key":"...","project":"..."}}'
 ```
 
@@ -444,12 +443,12 @@ Launch and sync:
 ```bash
 curl -X POST http://127.0.0.1:9095/api/extensions/connector.echo/launch \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"workspace_id":"default"}'
 
 curl -X POST http://127.0.0.1:9095/api/extensions/connector.echo/sync \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"workspace_id":"default"}'
 ```
 

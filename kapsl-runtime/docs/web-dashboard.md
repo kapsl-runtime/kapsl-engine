@@ -67,7 +67,7 @@ Admin-only section for managing authentication:
 |------|--------------|
 | `local-loopback` | Auth disabled; loopback access automatically granted with admin privileges |
 | `api-key` | Authenticated with a user API key |
-| `legacy-token` | Authenticated with an older role-token (`KAPSL_API_TOKEN_*`) |
+| `role-token` | Authenticated with a configured role token (`KAPSL_API_TOKEN_*`) |
 
 The current session mode and role are shown in the top status bar.
 

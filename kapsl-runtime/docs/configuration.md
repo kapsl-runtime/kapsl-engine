@@ -25,7 +25,6 @@ Options:
 
 | Variable | Description |
 |----------|-------------|
-| `KAPSL_API_TOKEN` | Shared admin token (legacy fallback) |
 | `KAPSL_API_TOKEN_READER` | Reader role token |
 | `KAPSL_API_TOKEN_WRITER` | Writer role token |
 | `KAPSL_API_TOKEN_ADMIN` | Admin role token |
@@ -62,8 +61,8 @@ Options:
 | Variable | Description |
 |----------|-------------|
 | `KAPSL_REMOTE_URL` | Default remote registry URL |
-| `KAPSL_REMOTE_PLACEHOLDER_URL` | Placeholder URL displayed in the dashboard |
-| `KAPSL_REMOTE_PLACEHOLDER_DIR` | Default remote directory shown in the dashboard |
+| `KAPSL_REMOTE_TOKEN` | Bearer token for remote push/pull |
+| `KAPSL_REMOTE_TOKEN_STORE_PATH` | Path to the OAuth token store |
 
 ### Backend and inference
 

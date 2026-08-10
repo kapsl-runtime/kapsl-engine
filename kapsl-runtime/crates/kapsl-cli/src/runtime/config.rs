@@ -454,10 +454,7 @@ pub(crate) fn manifest_queue_overflow_policy(
 pub(crate) fn resolve_queue_overflow_policy(
     manifest: &Manifest,
 ) -> kapsl_scheduler::QueueOverflowPolicy {
-    if let Some(value) = optional_env_var_alias(
-        SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV,
-        LEGACY_SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV,
-    ) {
+    if let Some(value) = optional_env_var(SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV) {
         if let Some(policy) = parse_queue_overflow_policy_literal(&value) {
             return policy;
         }

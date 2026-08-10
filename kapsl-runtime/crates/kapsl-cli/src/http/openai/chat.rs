@@ -93,7 +93,7 @@ async fn handle_chat_completion(
     };
 
     // A UTF-8 prompt tensor is shaped `[1, byte_len]`, matching the RAG and
-    // inter-model relay paths. `[1]` only validates for a one-byte prompt.
+    // native inference path. `[1]` only validates for a one-byte prompt.
     let data = prompt.as_bytes().to_vec();
     let input = match BinaryTensorPacket::new(
         vec![1, data.len() as i64],

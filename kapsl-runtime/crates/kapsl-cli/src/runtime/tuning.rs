@@ -10,10 +10,6 @@ pub(crate) fn optional_env_var(name: &str) -> Option<String> {
     }
 }
 
-pub(crate) fn optional_env_var_alias(primary: &str, legacy: &str) -> Option<String> {
-    optional_env_var(primary).or_else(|| optional_env_var(legacy))
-}
-
 /// Resolve the per-device VRAM cap (bytes) for cooperative software-vGPU
 /// self-limiting, reading the environment so a HAMi-capped pod self-configures
 /// with zero model metadata. Returns `None` when nothing is configured (every
@@ -428,11 +424,7 @@ mod vram_cap_tests {
     #[test]
     fn malformed_higher_priority_source_falls_through() {
         // A malformed per-device value defers to the process-wide cap.
-        let cap = resolve_vram_cap_bytes(
-            Some("garbage".to_string()),
-            Some("8g".to_string()),
-            None,
-        );
+        let cap = resolve_vram_cap_bytes(Some("garbage".to_string()), Some("8g".to_string()), None);
         assert_eq!(cap, Some(8 * GIB));
     }
 
@@ -441,8 +433,14 @@ mod vram_cap_tests {
         let cap = resolve_vram_cap_bytes(None, None, Some("2048".to_string()));
         assert_eq!(cap, Some(2048 * MIB));
         // Non-positive / malformed MiB is ignored.
-        assert_eq!(resolve_vram_cap_bytes(None, None, Some("0".to_string())), None);
-        assert_eq!(resolve_vram_cap_bytes(None, None, Some("x".to_string())), None);
+        assert_eq!(
+            resolve_vram_cap_bytes(None, None, Some("0".to_string())),
+            None
+        );
+        assert_eq!(
+            resolve_vram_cap_bytes(None, None, Some("x".to_string())),
+            None
+        );
     }
 
     #[test]

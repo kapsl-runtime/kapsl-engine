@@ -37,8 +37,7 @@ class KapslApp {
 
     this.extensionsDeveloperMode =
       localStorage.getItem("kapsl_extensions_dev") === "1";
-    this.remotePlaceholderUrl =
-      localStorage.getItem("kapsl_remote_placeholder_url") || "";
+    this.remoteUrl = localStorage.getItem("kapsl_remote_url") || "";
     this.extensions = [];
     this.marketplaceExtensions = [];
 
@@ -401,73 +400,12 @@ class KapslApp {
         return { ok: true, session: body || null };
       }
 
-      // Backward compatibility for runtimes that do not implement /api/auth/login.
-      if (response.status === 404) {
-        return this.verifyReaderAccessLegacyHealth(authHeader);
-      }
-
       if (response.status === 401 || response.status === 403) {
         return {
           ok: false,
           message:
             bodyError ||
             "Access denied. Provide a valid reader/writer/admin API key.",
-        };
-      }
-
-      return {
-        ok: false,
-        message:
-          bodyError ||
-          `Sign in failed while validating access (HTTP ${response.status}).`,
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        message: `Unable to reach runtime API: ${error.message}`,
-      };
-    }
-  }
-
-  async verifyReaderAccessLegacyHealth(authHeader) {
-    const headers = {};
-    if (authHeader) {
-      headers.Authorization = authHeader;
-    }
-
-    try {
-      const response = await fetch(`${this.apiBaseUrl}/api/health`, {
-        headers,
-      });
-      const body = await this.parseResponseBody(response);
-      const bodyError = body?.error || body?.detail || "";
-
-      if (response.ok) {
-        return {
-          ok: true,
-          session: {
-            role: authHeader ? "reader" : "admin",
-            mode: authHeader ? "legacy-token" : "local-loopback",
-            scopes: [],
-          },
-        };
-      }
-
-      if (response.status === 401 || response.status === 403) {
-        return {
-          ok: false,
-          message:
-            bodyError ||
-            "Access denied. Provide a valid reader/writer/admin API key.",
-        };
-      }
-
-      if (response.status === 404) {
-        return {
-          ok: false,
-          message:
-            bodyError ||
-            "Runtime API endpoint not found (HTTP 404). Use the runtime base URL (for example, http://localhost:8080), then restart with the latest binary.",
         };
       }
 
@@ -685,9 +623,9 @@ class KapslApp {
     this.renderRecentPathsDatalist();
 
     const remoteUrlInput = document.getElementById("engine-remote-url");
-    remoteUrlInput.value = this.remotePlaceholderUrl;
+    remoteUrlInput.value = this.remoteUrl;
     remoteUrlInput.addEventListener("change", () => {
-      this.persistRemotePlaceholderUrl(remoteUrlInput.value);
+      this.persistRemoteUrl(remoteUrlInput.value);
       this.refreshRemoteArtifacts();
     });
 
@@ -2880,21 +2818,21 @@ class KapslApp {
     this.setAccessFeedback("start-model-feedback", "", false);
   }
 
-  persistRemotePlaceholderUrl(value) {
+  persistRemoteUrl(value) {
     const trimmed = String(value || "").trim();
-    this.remotePlaceholderUrl = trimmed;
+    this.remoteUrl = trimmed;
     if (trimmed) {
-      localStorage.setItem("kapsl_remote_placeholder_url", trimmed);
+      localStorage.setItem("kapsl_remote_url", trimmed);
     } else {
-      localStorage.removeItem("kapsl_remote_placeholder_url");
+      localStorage.removeItem("kapsl_remote_url");
     }
   }
 
-  currentRemotePlaceholderUrl() {
+  currentRemoteUrl() {
     const input = document.getElementById("engine-remote-url");
-    const value = input ? input.value : this.remotePlaceholderUrl;
+    const value = input ? input.value : this.remoteUrl;
     const trimmed = String(value || "").trim();
-    this.persistRemotePlaceholderUrl(trimmed);
+    this.persistRemoteUrl(trimmed);
     return trimmed;
   }
 
@@ -2903,7 +2841,7 @@ class KapslApp {
       return;
     }
 
-    const remoteUrl = this.currentRemotePlaceholderUrl();
+    const remoteUrl = this.currentRemoteUrl();
     const params = new URLSearchParams();
     if (remoteUrl) {
       params.set("remote_url", remoteUrl);
@@ -3153,7 +3091,7 @@ class KapslApp {
           <div class="info-row"><div class="info-label">Repository</div><div class="info-value">${this.escapeHtml(this.remoteArtifacts.repo || "-")}</div></div>
           <div class="info-row"><div class="info-label">Model</div><div class="info-value">${this.escapeHtml(model.name || "-")}</div></div>
           <div class="info-row"><div class="info-label">Artifacts</div><div class="info-value">${Number(model.artifact_count || labels.length || 0)}</div></div>
-          <div class="info-row"><div class="info-label">Remote URL</div><div class="info-value">${this.escapeHtml(this.remoteArtifacts.remote_url || this.currentRemotePlaceholderUrl() || "-")}</div></div>
+          <div class="info-row"><div class="info-label">Remote URL</div><div class="info-value">${this.escapeHtml(this.remoteArtifacts.remote_url || this.currentRemoteUrl() || "-")}</div></div>
         </div>
       </div>
 
@@ -3200,7 +3138,7 @@ class KapslApp {
       return;
     }
 
-    const remoteUrl = this.currentRemotePlaceholderUrl();
+    const remoteUrl = this.currentRemoteUrl();
     const destinationDir = document
       .getElementById("engine-pull-destination")
       .value.trim();
@@ -3263,7 +3201,7 @@ class KapslApp {
       return;
     }
 
-    const remoteUrl = this.currentRemotePlaceholderUrl();
+    const remoteUrl = this.currentRemoteUrl();
     const payload = { kapsl_path: kapslPath, target };
     if (remoteUrl) {
       payload.remote_url = remoteUrl;
@@ -3321,7 +3259,7 @@ class KapslApp {
       return;
     }
 
-    const remoteUrl = this.currentRemotePlaceholderUrl();
+    const remoteUrl = this.currentRemoteUrl();
     const payload = { target };
     if (destinationDir) {
       payload.destination_dir = destinationDir;

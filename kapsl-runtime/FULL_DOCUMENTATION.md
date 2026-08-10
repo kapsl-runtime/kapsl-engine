@@ -198,8 +198,8 @@ Target format:
 Default remote behavior:
 
 - Uses `https://api.kapsl.net/v1` by default.
-- If remote URL resolves to the legacy placeholder URL, mirrors artifacts to a local directory (configurable env var).
-- If `remote_url` is overridden, uses HTTP PUT/GET remote backend.
+- Uses HTTP upload/download endpoints for all remote transfers.
+- Override the endpoint with `remote_url` or `KAPSL_REMOTE_URL`.
 
 ### 4.4 Login Command
 
@@ -368,7 +368,7 @@ Auth store:
 
 By default runtime refuses non-loopback HTTP bind unless:
 
-- `KAPSL_ALLOW_INSECURE_HTTP=1` (or legacy alias).
+- `KAPSL_ALLOW_INSECURE_HTTP=1`.
 
 This is a guard against exposing plaintext API directly.
 
@@ -398,7 +398,7 @@ Writer endpoints:
 
 Unauthenticated endpoints:
 
-- `POST /api/auth/login`: probe auth status or validate a token. Request body: `{"token": "<optional>"}`. Response: `{"authenticated": bool, "auth_enabled": bool, "legacy_auth_enabled": bool, "role": "...", "scopes": [...], "mode": "...", "access": {"read": bool, "write": bool, "admin": bool}}`.
+- `POST /api/auth/login`: probe auth status or validate a token. Request body: `{"token": "<optional>"}`. Response: `{"authenticated": bool, "auth_enabled": bool, "role_token_auth_enabled": bool, "role": "...", "scopes": [...], "mode": "...", "access": {"read": bool, "write": bool, "admin": bool}}`.
 
 Admin endpoints:
 
@@ -619,7 +619,6 @@ See `kapsl-sdk/docs` for installation, API reference, and Python examples.
 
 Primary runtime env vars:
 
-- `KAPSL_API_TOKEN`
 - `KAPSL_API_TOKEN_READER`
 - `KAPSL_API_TOKEN_WRITER`
 - `KAPSL_API_TOKEN_ADMIN`
@@ -634,18 +633,11 @@ Primary runtime env vars:
 - `KAPSL_EXT_CONFIG_ROOT`
 - `KAPSL_EXTENSION_MARKETPLACE_URL`
 - `KAPSL_REMOTE_URL`
-- `KAPSL_REMOTE_PLACEHOLDER_URL`
-- `KAPSL_REMOTE_PLACEHOLDER_DIR`
+- `KAPSL_REMOTE_TOKEN`
 - `KAPSL_REMOTE_TOKEN_STORE_PATH`: path to the OAuth token store file (default `~/.kapsl/tokens.json`).
 - `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS`
-- `KAPSL_INFER_ADAPTERS` (optional adapters; e.g. `echo_tensor` when built with feature)
 - `KAPSL_SHM_SIZE_MB`: size of the shared memory segment in MiB (default `256`).
-- `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY` (legacy alias `KAPSL_LITE_INGRESS_BACKPRESSURE`): sets the queue overflow policy (`block|drop_newest|drop_oldest`).
-
-Inter-model relay env vars:
-
-- `KAPSL_INTER_MODEL_ROUTES` (legacy alias `KAPSL_LITE_INTER_MODEL_ROUTES`): JSON-encoded map of source model ID to list of destination model IDs for automatic inter-model relay.
-- `KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS` (legacy alias `KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS`): minimum interval in ms between relay publishes (default `2000`).
+- `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY`: sets the queue overflow policy (`block|drop_newest|drop_oldest`).
 
 Server pressure env vars:
 
@@ -671,28 +663,12 @@ GPU co-tenancy env vars:
 
 Model cache / disk-check env vars (read by `kapsl-core` loader):
 
-- `KAPSL_MODEL_CACHE_DIR` (or `KAPSL_LITE_MODEL_CACHE_DIR`): override the model cache root directory (default: `.kapsl-model-cache/` next to the `.aimod` file).
+- `KAPSL_MODEL_CACHE_DIR`: override the model cache root directory (default: `.kapsl-model-cache/` next to the `.aimod` file).
 - `KAPSL_MODEL_CACHE_MAX_BYTES` / `KAPSL_MODEL_CACHE_MAX_MIB`: cap the total size of the model cache; the loader will evict least-recently-used entries to stay within limit.
 - `KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` / `KAPSL_MODEL_CACHE_RESERVED_FREE_MIB`: minimum free disk space that must remain after a model cache copy; the loader will evict LRU entries until the constraint is satisfied (or fail with `InsufficientDiskSpace`).
-- `KAPSL_PACKAGE_TMP_DIR` (or `KAPSL_LITE_PACKAGE_TMP_DIR`): override the temporary directory used when unpacking an `.aimod` archive.
+- `KAPSL_PACKAGE_TMP_DIR`: override the temporary directory used when unpacking an `.aimod` archive.
 
-All above support legacy `KAPSL_*` aliases in runtime code.
-
-## 13. Inter-Model Relay
-
-The runtime supports routing inference outputs from one model as inputs to one or more downstream models within the same process.
-
-Configuration is via `KAPSL_INTER_MODEL_ROUTES` (or legacy `KAPSL_LITE_INTER_MODEL_ROUTES`): a JSON map from source model ID to a list of destination model IDs.
-
-Example:
-
-```json
-{"encoder": ["decoder-a", "decoder-b"]}
-```
-
-Relay sessions are prefixed with `relay/` internally. The relay publishes at most once every `KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS` (default `2000 ms`).
-
-## 13a. Runtime Pressure Management
+## 13. Runtime Pressure Management
 
 The runtime monitors system resource utilization and adjusts inference behavior when under pressure. There are three pressure states:
 
@@ -704,7 +680,7 @@ The runtime monitors system resource utilization and adjusts inference behavior 
 
 Thresholds are configured via env vars (see Section 12). The runtime evaluates pressure state continuously using `evaluate_runtime_pressure_state()`.
 
-## 13b. LLM Shared KV Cache
+## 14. LLM Shared KV Cache
 
 For multi-model deployments with LLM backends, the runtime coordinates a shared KV cache block pool across all LLM engine instances on the same device.
 
@@ -716,7 +692,7 @@ Key details:
 - Each LLM engine attaches to the shared pool on startup and detaches on shutdown.
 - Cross-model token-budget coordination prevents any single engine from monopolising device memory.
 
-## 14. Example API Calls
+## 15. Example API Calls
 
 Health:
 
@@ -755,7 +731,7 @@ curl -X POST http://127.0.0.1:9095/api/engine/package \
   }'
 ```
 
-## 15. Testing and Benchmarks
+## 16. Testing and Benchmarks
 
 Run runtime checks from `kapsl-runtime/`:
 
@@ -778,7 +754,7 @@ engine/kapsl-benchmarks/run_kapsl_vs_vllm_qwen.sh
 The script starts a tuned kapsl instance, waits for vLLM to be ready on its own port, runs throughput/latency sweeps against both, and prints a concise summary table.
 See `engine/kapsl-benchmarks/README.md` for reproducible usage and common options.
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 Common issues:
 
@@ -791,7 +767,7 @@ Common issues:
 - `InsufficientDiskSpace` on load: the loader could not free enough cache space. Either set `KAPSL_MODEL_CACHE_MAX_BYTES`/`KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` to a larger threshold, point `KAPSL_MODEL_CACHE_DIR` at a volume with more space, or remove stale entries from the cache directory manually.
 - `kapsl control` not shifting weights: check that each `--runtime` URL is reachable and that `--auth-token` / `--runtime-token` are set if auth is enabled. Use `--dry-run` to validate decisions without applying them.
 
-## 17. Known Constraints
+## 18. Known Constraints
 
 - HTTP infer is synchronous; token streaming is available on IPC protocol/Python stream client path.
 - RAG embeddings are currently lightweight hash-based embeddings (not external embedding model-backed).

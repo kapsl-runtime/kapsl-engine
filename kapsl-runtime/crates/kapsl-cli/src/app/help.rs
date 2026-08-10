@@ -55,10 +55,6 @@ const HELP_EXAMPLES: &[(&str, &[&str])] = &[
 
 /// Environment variables documented under `Environment variables:` in `--help`.
 const HELP_ENV_VARS: &[(&str, &str)] = &[
-    (
-        "KAPSL_API_TOKEN",
-        "Shared fallback bearer token for /api routes",
-    ),
     ("KAPSL_API_TOKEN_READER", "Read-only API token"),
     ("KAPSL_API_TOKEN_WRITER", "Writer API token"),
     ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),

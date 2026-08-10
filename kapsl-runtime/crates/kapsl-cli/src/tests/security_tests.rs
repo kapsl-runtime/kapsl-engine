@@ -54,13 +54,11 @@ fn test_auth_base_url_from_remote_url() {
 fn test_resolved_login_remote_url_uses_store_fallback() {
     let old_home = std::env::var_os("HOME");
     let old_remote_url = std::env::var_os(REMOTE_URL_ENV);
-    let old_placeholder_url = std::env::var_os(REMOTE_PLACEHOLDER_URL_ENV);
     let unique = format!("test-home-{}", std::process::id());
     let temp_home = std::env::temp_dir().join(unique);
     fs::create_dir_all(&temp_home).expect("create temp home");
     std::env::set_var("HOME", &temp_home);
     std::env::remove_var(REMOTE_URL_ENV);
-    std::env::remove_var(REMOTE_PLACEHOLDER_URL_ENV);
 
     let expected = "https://idx.example.com/v1";
     store_remote_token_for_remote(expected, "Bearer abc").expect("store token");
@@ -76,11 +74,6 @@ fn test_resolved_login_remote_url_uses_store_fallback() {
         std::env::set_var(REMOTE_URL_ENV, value);
     } else {
         std::env::remove_var(REMOTE_URL_ENV);
-    }
-    if let Some(value) = old_placeholder_url {
-        std::env::set_var(REMOTE_PLACEHOLDER_URL_ENV, value);
-    } else {
-        std::env::remove_var(REMOTE_PLACEHOLDER_URL_ENV);
     }
 }
 
@@ -244,7 +237,7 @@ fn make_test_auth_state() -> ApiAuthState {
         .collect::<String>();
     let store_path = std::env::temp_dir().join(format!("kapsl-auth-state-{}.json", unique_suffix));
     ApiAuthState {
-        legacy_tokens: ApiRoleTokenConfig::default(),
+        role_tokens: ApiRoleTokenConfig::default(),
         store_path,
         store: ApiAuthStoreFile {
             users: vec![

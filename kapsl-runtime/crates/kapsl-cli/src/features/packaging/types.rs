@@ -42,7 +42,6 @@ pub(crate) struct PushKapslResponse {
     pub(crate) status: String,
     pub(crate) remote_url: String,
     pub(crate) artifact_url: String,
-    pub(crate) mirrored_path: String,
     pub(crate) bytes_uploaded: u64,
 }
 

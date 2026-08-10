@@ -37,7 +37,6 @@ pub(crate) struct ModelRoutesConfig {
     pub(crate) onnx_tuning_profile: Arc<OnnxTuningProfile>,
     pub(crate) resources: Arc<RuntimeResources>,
     pub(crate) rag_state: RagRuntimeState,
-    pub(crate) inter_model_relay_state: Arc<InterModelRelayState>,
     pub(crate) auto_scaler: Arc<RwLock<AutoScaler>>,
     pub(crate) log_sensitive_ids: bool,
 }
@@ -59,7 +58,6 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         onnx_tuning_profile: onnx_tuning_profile_for_api,
         resources,
         rag_state: rag_state_for_api,
-        inter_model_relay_state,
         auto_scaler: auto_scaler_api,
         log_sensitive_ids: log_sensitive_ids_for_api,
     } = config;
@@ -94,7 +92,6 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         inference: inference.clone(),
         log_sensitive_ids: log_sensitive_ids_for_api,
         rag_state: rag_state_for_api.clone(),
-        inter_model_relay_state: inter_model_relay_state.clone(),
     });
 
     let infer_stream_route = build_model_infer_stream_route(ModelInferStreamRouteConfig {

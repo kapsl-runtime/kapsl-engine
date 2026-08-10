@@ -416,12 +416,12 @@ Revoke an API key.
 
 ### GET /api/auth/roles
 
-Read legacy role-token configuration.
+Read role-token configuration.
 
 **Auth**: admin
 
 ### POST /api/auth/roles
 
-Update legacy role-token configuration.
+Update role-token configuration.
 
 **Auth**: admin

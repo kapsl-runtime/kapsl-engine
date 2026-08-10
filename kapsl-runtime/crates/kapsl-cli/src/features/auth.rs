@@ -65,11 +65,10 @@ pub(crate) struct ApiRoleTokenConfig {
 
 impl ApiRoleTokenConfig {
     pub(crate) fn from_env() -> Self {
-        let shared_token = optional_env_var(API_TOKEN_ENV);
         Self {
-            reader_token: optional_env_var(API_READER_TOKEN_ENV).or(shared_token.clone()),
-            writer_token: optional_env_var(API_WRITER_TOKEN_ENV).or(shared_token.clone()),
-            admin_token: optional_env_var(API_ADMIN_TOKEN_ENV).or(shared_token),
+            reader_token: optional_env_var(API_READER_TOKEN_ENV),
+            writer_token: optional_env_var(API_WRITER_TOKEN_ENV),
+            admin_token: optional_env_var(API_ADMIN_TOKEN_ENV),
         }
     }
 
@@ -210,7 +209,7 @@ impl ApiAuthStoreFile {
 #[derive(Debug, Serialize)]
 pub(crate) struct ApiAuthStatusResponse {
     pub(crate) auth_enabled: bool,
-    pub(crate) legacy_auth_enabled: bool,
+    pub(crate) role_token_auth_enabled: bool,
     pub(crate) store_path: String,
     pub(crate) user_count: usize,
     pub(crate) key_count: usize,
@@ -313,7 +312,7 @@ pub(crate) struct ApiAuthLoginAccess {
 pub(crate) struct ApiAuthLoginResponse {
     pub(crate) authenticated: bool,
     pub(crate) auth_enabled: bool,
-    pub(crate) legacy_auth_enabled: bool,
+    pub(crate) role_token_auth_enabled: bool,
     pub(crate) role: ApiRole,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) scopes: Vec<String>,
@@ -323,7 +322,7 @@ pub(crate) struct ApiAuthLoginResponse {
 
 #[derive(Debug)]
 pub(crate) struct ApiAuthState {
-    pub(crate) legacy_tokens: ApiRoleTokenConfig,
+    pub(crate) role_tokens: ApiRoleTokenConfig,
     pub(crate) store_path: PathBuf,
     pub(crate) store: ApiAuthStoreFile,
     pub(crate) key_hash_index: HashMap<String, usize>,
@@ -343,10 +342,10 @@ pub(crate) struct ApiAuthGrantMatch {
 
 impl ApiAuthState {
     pub(crate) fn from_store_path(store_path: PathBuf) -> Self {
-        let legacy_tokens = ApiRoleTokenConfig::from_env();
+        let role_tokens = ApiRoleTokenConfig::from_env();
         let store = ApiAuthStoreFile::load(&store_path);
         let mut state = Self {
-            legacy_tokens,
+            role_tokens,
             key_hash_index: Self::build_key_hash_index(&store),
             store,
             store_path,
@@ -445,7 +444,7 @@ impl ApiAuthState {
     }
 
     pub(crate) fn auth_enabled(&self) -> bool {
-        self.legacy_tokens.auth_enabled() || self.active_key_count() > 0
+        self.role_tokens.auth_enabled() || self.active_key_count() > 0
     }
 
     pub(crate) fn active_key_count(&self) -> usize {
@@ -513,7 +512,7 @@ impl ApiAuthState {
                 matched_key_index: Some(key_index),
             });
         }
-        self.legacy_tokens
+        self.role_tokens
             .role_from_authorization_header(authorization)
             .map(|role| ApiAuthGrantMatch {
                 grant: ApiAuthGrant { role, scopes: None },
@@ -560,22 +559,22 @@ impl ApiAuthState {
         }
     }
 
-    pub(crate) fn legacy_token_config(&self) -> ApiRoleTokenConfig {
-        self.legacy_tokens.clone()
+    pub(crate) fn role_token_config(&self) -> ApiRoleTokenConfig {
+        self.role_tokens.clone()
     }
 
-    pub(crate) fn update_legacy_token_config(
+    pub(crate) fn update_role_token_config(
         &mut self,
         payload: ApiRoleTokenConfig,
     ) -> Result<ApiRoleTokenConfig, String> {
-        self.legacy_tokens.update_from_payload(payload)?;
-        Ok(self.legacy_tokens.clone())
+        self.role_tokens.update_from_payload(payload)?;
+        Ok(self.role_tokens.clone())
     }
 
     pub(crate) fn status_response(&self) -> ApiAuthStatusResponse {
         ApiAuthStatusResponse {
             auth_enabled: self.auth_enabled(),
-            legacy_auth_enabled: self.legacy_tokens.auth_enabled(),
+            role_token_auth_enabled: self.role_tokens.auth_enabled(),
             store_path: self.store_path.to_string_lossy().to_string(),
             user_count: self.store.users.len(),
             key_count: self.store.api_keys.len(),
