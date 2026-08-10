@@ -58,12 +58,6 @@ pub(crate) fn perform_browser_login_flow(
     timeout_seconds: u64,
     no_browser: bool,
 ) -> Result<LoginResponse, String> {
-    if is_oci_remote_url(remote_url) {
-        return Err(
-            "Login is only supported for HTTP(S) remote backends, not oci:// remotes.".to_string(),
-        );
-    }
-
     let auth_base_url = auth_base_url_from_remote_url(remote_url)?;
     let callback_addr = format!("{}:{}", callback_host.trim(), callback_port);
     let listener = TcpListener::bind(&callback_addr).map_err(|e| {
@@ -123,11 +117,6 @@ pub(crate) fn perform_device_code_login_flow(
     timeout_seconds: u64,
     no_browser: bool,
 ) -> Result<LoginResponse, String> {
-    if is_oci_remote_url(remote_url) {
-        return Err(
-            "Login is only supported for HTTP(S) remote backends, not oci:// remotes.".to_string(),
-        );
-    }
     if provider != OAuthProvider::GitHub {
         return Err("Device code flow currently supports only --provider github.".to_string());
     }

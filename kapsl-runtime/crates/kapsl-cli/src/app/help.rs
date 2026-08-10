@@ -37,7 +37,6 @@ const HELP_EXAMPLES: &[(&str, &[&str])] = &[
         "# Push / pull packages to/from a remote registry",
         &[
             "kapsl push acme/gpt2:prod ./model.aimod",
-            "kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io",
             "kapsl pull acme/gpt2:prod --destination-dir ./models",
         ],
     ),

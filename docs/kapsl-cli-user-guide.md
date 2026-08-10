@@ -306,23 +306,6 @@ In SSH sessions, plain `kapsl login` automatically prefers device-code flow (Git
 
 If no token is configured and the remote returns `401`, `kapsl push`/`kapsl pull` will automatically start browser login and retry once.
 
-### OCI Remote (ORAS)
-
-If `--remote-url` starts with `oci://`, `kapsl` uses ORAS to push/pull the `.aimod` as an OCI artifact.
-
-Prerequisites:
-- Install `oras` and make it available on `PATH` (or set `KAPSL_ORAS_BIN`).
-
-Push to an OCI registry:
-
-```bash
-kapsl push alice/mnist:prod ./mnist.aimod --remote-url oci://ghcr.io
-```
-
-Optional CI auth (otherwise use `oras login` / docker credential store):
-- `KAPSL_OCI_USERNAME`
-- `KAPSL_OCI_PASSWORD`
-
 ## 6) Pull Packages (`kapsl pull`)
 
 Pull by target:
@@ -358,22 +341,6 @@ kapsl pull \
 ```
 
 If you already ran `kapsl login`, you can omit `--remote-token`.
-
-Pull from an OCI registry:
-
-```bash
-kapsl pull alice/mnist:prod --destination-dir ./models --remote-url oci://ghcr.io
-```
-
-Pull by OCI manifest digest (reproducible):
-
-```bash
-kapsl pull \
-  alice/mnist:prod \
-  --destination-dir ./models \
-  --remote-url oci://ghcr.io \
-  --ref sha256:<manifestDigest>
-```
 
 ## Common Workflows
 

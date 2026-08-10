@@ -1,9 +1,11 @@
 use super::*;
 
+#[cfg(test)]
 pub(crate) struct TempDirGuard {
     pub(crate) path: PathBuf,
 }
 
+#[cfg(test)]
 impl TempDirGuard {
     pub(crate) fn new(prefix: &str) -> Result<Self, String> {
         Self::new_in(&std::env::temp_dir(), prefix)
@@ -31,6 +33,7 @@ impl TempDirGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);

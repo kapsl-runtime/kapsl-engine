@@ -76,12 +76,6 @@ pub(crate) fn fetch_remote_artifact_inventory(
     custom_remote_url: Option<&str>,
 ) -> Result<RuntimeRemoteArtifactInventoryResponse, String> {
     let remote_url = resolved_login_remote_url(custom_remote_url);
-    if is_oci_remote_url(&remote_url) {
-        return Err(
-            "Remote artifact browsing is not available for oci:// remotes yet.".to_string(),
-        );
-    }
-
     let inventory_url = remote_inventory_url_for_remote(&remote_url);
     let authorization_header = resolved_remote_token(&remote_url, None);
     let agent = native_tls_http_agent();

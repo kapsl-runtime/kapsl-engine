@@ -9,9 +9,6 @@ mod inter_model_relay_tests;
 #[path = "http_route_tests.rs"]
 mod http_route_tests;
 
-#[path = "oci_remote_tests.rs"]
-mod oci_remote_tests;
-
 #[path = "packaging_tests.rs"]
 mod packaging_tests;
 

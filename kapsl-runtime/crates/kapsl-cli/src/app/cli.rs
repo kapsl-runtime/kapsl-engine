@@ -247,8 +247,7 @@ pub(crate) struct PushCommandArgs {
     #[arg(long, alias = "kapsl-path", value_name = "PATH")]
     pub(crate) model: Option<PathBuf>,
 
-    /// Remote registry URL — overrides KAPSL_REMOTE_URL for this call.
-    /// Use an oci:// prefix to push to an OCI-compatible registry (e.g. oci://ghcr.io).
+    /// Remote registry URL — overrides KAPSL_REMOTE_URL for this call
     #[arg(long, value_name = "URL")]
     pub(crate) remote_url: Option<String>,
 
@@ -274,11 +273,6 @@ pub(crate) struct PullCommandArgs {
     /// Package to download (alternative to the positional argument)
     #[arg(long, alias = "target-ref", value_name = "TARGET")]
     pub(crate) model: Option<String>,
-
-    /// Pin to a specific OCI content digest when using an oci:// remote.
-    /// Accepts sha256:<hex> or @sha256:<hex>.
-    #[arg(long = "ref", value_name = "REF")]
-    pub(crate) reference: Option<String>,
 
     /// Directory where the downloaded .aimod file will be saved (defaults to current directory)
     #[arg(long, value_name = "DIR")]

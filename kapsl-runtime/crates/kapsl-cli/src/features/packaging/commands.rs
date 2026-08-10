@@ -115,9 +115,7 @@ pub(crate) fn format_elapsed(duration: Duration) -> String {
 }
 
 pub(crate) fn transfer_backend_label(remote_url: &str) -> &'static str {
-    if is_oci_remote_url(remote_url) {
-        "oci"
-    } else if is_default_placeholder_remote(remote_url) {
+    if is_default_placeholder_remote(remote_url) {
         "placeholder"
     } else {
         "http"
@@ -346,7 +344,6 @@ pub(crate) fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError
 
     let request = PullKapslRequest {
         target: target.as_string(),
-        reference: args.reference,
         destination_dir: args
             .destination_dir
             .map(|p| p.to_string_lossy().to_string()),

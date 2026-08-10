@@ -47,7 +47,7 @@ fn test_auth_base_url_from_remote_url() {
         auth_base_url_from_remote_url("https://idx.example.com/api/v1").expect("valid"),
         "https://idx.example.com"
     );
-    assert!(auth_base_url_from_remote_url("oci://ghcr.io").is_err());
+    assert!(auth_base_url_from_remote_url("ftp://registry.example.com").is_err());
 }
 
 #[test]

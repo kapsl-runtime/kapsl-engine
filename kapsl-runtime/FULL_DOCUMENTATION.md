@@ -190,12 +190,6 @@ Pull:
 kapsl pull acme/model:prod --destination-dir ./models
 ```
 
-OCI pull with digest ref:
-
-```bash
-kapsl pull acme/model:prod --ref sha256:abc123... --destination-dir ./models
-```
-
 Target format:
 
 - Required for push and pull: `<repo_name>/<model>:<label>`
@@ -206,7 +200,6 @@ Default remote behavior:
 - Uses `https://api.kapsl.net/v1` by default.
 - If remote URL resolves to the legacy placeholder URL, mirrors artifacts to a local directory (configurable env var).
 - If `remote_url` is overridden, uses HTTP PUT/GET remote backend.
-- If `remote_url` starts with `oci://`, uses ORAS to push/pull the `.aimod` as an OCI artifact (MIME type `application/vnd.kapsl.aimod.v1`). Requires the `oras` binary (path configurable via `KAPSL_ORAS_BIN`). Credentials use `KAPSL_OCI_USERNAME` and `KAPSL_OCI_PASSWORD`.
 
 ### 4.4 Login Command
 
@@ -649,12 +642,6 @@ Primary runtime env vars:
 - `KAPSL_SHM_SIZE_MB`: size of the shared memory segment in MiB (default `256`).
 - `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY` (legacy alias `KAPSL_LITE_INGRESS_BACKPRESSURE`): sets the queue overflow policy (`block|drop_newest|drop_oldest`).
 
-OCI / ORAS env vars:
-
-- `KAPSL_ORAS_BIN`: path to the `oras` binary used for OCI push/pull (defaults to `oras` on `PATH`).
-- `KAPSL_OCI_USERNAME`: username for OCI registry authentication.
-- `KAPSL_OCI_PASSWORD`: password for OCI registry authentication.
-
 Inter-model relay env vars:
 
 - `KAPSL_INTER_MODEL_ROUTES` (legacy alias `KAPSL_LITE_INTER_MODEL_ROUTES`): JSON-encoded map of source model ID to list of destination model IDs for automatic inter-model relay.
@@ -802,7 +789,6 @@ Common issues:
 - Push/pull placeholder error: ensure pushed artifact exists in placeholder mirror dir.
 - Unauthorized/forbidden API: verify role token/api key and required route scope.
 - `InsufficientDiskSpace` on load: the loader could not free enough cache space. Either set `KAPSL_MODEL_CACHE_MAX_BYTES`/`KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` to a larger threshold, point `KAPSL_MODEL_CACHE_DIR` at a volume with more space, or remove stale entries from the cache directory manually.
-- OCI push/pull fails: ensure `oras` is on `PATH` (or set `KAPSL_ORAS_BIN`), and that `KAPSL_OCI_USERNAME`/`KAPSL_OCI_PASSWORD` are set correctly.
 - `kapsl control` not shifting weights: check that each `--runtime` URL is reachable and that `--auth-token` / `--runtime-token` are set if auth is enabled. Use `--dry-run` to validate decisions without applying them.
 
 ## 17. Known Constraints

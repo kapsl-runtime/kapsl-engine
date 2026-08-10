@@ -198,13 +198,6 @@ kapsl pull alice/model:prod --destination-dir ./models --remote-url https://your
 kapsl run --model ./models/model.aimod
 ```
 
-OCI registry alternative (requires `oras`):
-
-```bash
-kapsl push alice/model:prod ./model.aimod --remote-url oci://ghcr.io
-kapsl pull alice/model:prod --destination-dir ./models --remote-url oci://ghcr.io
-```
-
 ## Authentication (API)
 
 When API auth is enabled, calls to `/api/*` and `/metrics` must include a bearer token.

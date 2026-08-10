@@ -32,16 +32,7 @@ pub(crate) fn push_kapsl_to_placeholder_remote(
             e
         )
     })?;
-    let filename = absolute_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("Invalid kapsl filename: {}", absolute_path.display()))?
-        .to_string();
-
     let remote_url = resolved_remote_url(request.remote_url.as_deref());
-    if is_oci_remote_url(&remote_url) {
-        return push_kapsl_to_oci_remote(&remote_url, &absolute_path, &target, &filename);
-    }
     let artifact_url = artifact_url_for_remote(&remote_url, &target);
     let mut remote_token = resolved_remote_token(&remote_url, request.remote_token.as_deref());
     let request_has_explicit_token = request
@@ -110,7 +101,6 @@ pub(crate) fn push_kapsl_to_placeholder_remote(
         artifact_url,
         mirrored_path,
         bytes_uploaded,
-        manifest_digest: None,
     })
 }
 
@@ -134,14 +124,6 @@ pub(crate) fn pull_kapsl_from_placeholder_remote(
     })?;
 
     let remote_url = resolved_remote_url(request.remote_url.as_deref());
-    if is_oci_remote_url(&remote_url) {
-        return pull_kapsl_from_oci_remote(
-            &remote_url,
-            &target,
-            request.reference.as_deref(),
-            &destination_dir,
-        );
-    }
     let output_path = destination_dir.join(&filename);
     let artifact_url = artifact_url_for_remote(&remote_url, &target);
     let mut remote_token = resolved_remote_token(&remote_url, request.remote_token.as_deref());
