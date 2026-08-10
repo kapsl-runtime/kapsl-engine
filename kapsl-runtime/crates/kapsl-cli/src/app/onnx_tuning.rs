@@ -124,7 +124,7 @@ pub(crate) fn parse_env_u32_override(name: &str) -> Result<Option<u32>, String> 
 pub(crate) fn auto_onnx_runtime_tuning(args: &Args) -> OnnxRuntimeTuning {
     let batch_size = args.batch_size.max(1);
     let session_pool = batch_size.min(logical_cpu_cores().max(1)).clamp(1, 4);
-    let session_buckets = batch_size.max(4).min(8);
+    let session_buckets = batch_size.clamp(4, 8);
     OnnxRuntimeTuning {
         memory_pattern: Some(true),
         disable_cpu_mem_arena: Some(false),

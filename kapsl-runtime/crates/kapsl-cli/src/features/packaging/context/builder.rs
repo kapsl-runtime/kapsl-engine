@@ -1,5 +1,8 @@
 use super::*;
 
+// Package construction receives independently optional manifest overrides;
+// grouping them would obscure their precedence without reducing call state.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_kapsl_package_from_context(
     context_path: &Path,
     model_override: Option<&Path>,

@@ -188,7 +188,7 @@ pub(crate) fn auto_tuned_gguf_prefill_chunk_size(
     };
 
     let estimated_scratch_per_token_mb = (model_size_mb / 256).clamp(4, 64);
-    let concurrency_divisor = ((batch_size.max(1) + 1) / 2).clamp(1, 4) as u64;
+    let concurrency_divisor = batch_size.max(1).div_ceil(2).clamp(1, 4) as u64;
     let raw_chunk = (scratch_budget_mb / concurrency_divisor) / estimated_scratch_per_token_mb;
     let clamped_raw = raw_chunk.max(MIN_CHUNK as u64).min(MAX_CHUNK as u64);
     let chunk = round_down_power_of_two(clamped_raw).max(MIN_CHUNK as u64) as usize;

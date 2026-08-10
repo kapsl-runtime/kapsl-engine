@@ -210,9 +210,9 @@ pub(crate) fn perform_device_code_login_flow(
     eprintln!(
         "  {}  {}  {}  {}",
         a.dim("Enter code"),
-        a.bold(&user_code),
+        a.bold(user_code),
         a.dim("at"),
-        a.teal(&verification_uri)
+        a.teal(verification_uri)
     );
     eprintln!("  {}", a.dim("Waiting for authorization approval..."));
 
@@ -495,14 +495,14 @@ pub(crate) fn percent_encode_query_component(input: &str) -> String {
 pub(crate) fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        return Command::new("open").arg(url).status().is_ok();
+        Command::new("open").arg(url).status().is_ok()
     }
     #[cfg(target_os = "windows")]
     {
-        return Command::new("cmd")
+        Command::new("cmd")
             .args(["/C", "start", "", url])
             .status()
-            .is_ok();
+            .is_ok()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

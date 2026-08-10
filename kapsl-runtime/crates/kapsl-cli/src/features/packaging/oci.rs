@@ -435,16 +435,17 @@ pub(crate) fn push_kapsl_to_oci_remote(
 
     let manifest = read_manifest_from_kapsl_archive(absolute_path).ok();
 
-    let mut annotations = Vec::new();
-    annotations.push(("io.kapsl.aimod.target".to_string(), target.as_string()));
-    annotations.push(("io.kapsl.aimod.repo".to_string(), target.repo.clone()));
-    annotations.push(("io.kapsl.aimod.model".to_string(), target.model.clone()));
-    annotations.push(("io.kapsl.aimod.label".to_string(), target.label.clone()));
-    annotations.push(("io.kapsl.aimod.filename".to_string(), filename.to_string()));
-    annotations.push((
-        "io.kapsl.aimod.size".to_string(),
-        bytes_uploaded.to_string(),
-    ));
+    let mut annotations = vec![
+        ("io.kapsl.aimod.target".to_string(), target.as_string()),
+        ("io.kapsl.aimod.repo".to_string(), target.repo.clone()),
+        ("io.kapsl.aimod.model".to_string(), target.model.clone()),
+        ("io.kapsl.aimod.label".to_string(), target.label.clone()),
+        ("io.kapsl.aimod.filename".to_string(), filename.to_string()),
+        (
+            "io.kapsl.aimod.size".to_string(),
+            bytes_uploaded.to_string(),
+        ),
+    ];
     if let Some(sha256) = sha256.as_ref() {
         annotations.push(("io.kapsl.aimod.sha256".to_string(), sha256.clone()));
     }

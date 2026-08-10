@@ -41,6 +41,9 @@ pub(crate) fn context_metadata_missing(context_path: &Path) -> bool {
     context_path.is_dir() && !context_path.join("metadata.json").exists()
 }
 
+// These arguments mirror independent CLI override flags and remain explicit at
+// the command boundary so precedence is visible to callers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_context_build(
     context_path: &Path,
     model_override: Option<&Path>,

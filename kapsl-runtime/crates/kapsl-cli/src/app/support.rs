@@ -156,7 +156,7 @@ pub(crate) fn print_startup_ready(
             "  {}  {:label_w$}  {}",
             a.teal("→"),
             a.dim(label),
-            a.teal(&url),
+            a.teal(url),
             label_w = label_w,
         );
     }
