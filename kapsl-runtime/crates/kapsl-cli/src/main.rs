@@ -20,10 +20,7 @@ use kapsl_engine_api::{
 #[cfg(feature = "gpu-device-pool")]
 use kapsl_engine_api::{EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport};
 use kapsl_hal::device::DeviceInfo;
-use kapsl_ipc::{
-    IpcServer, RequestHeader, ResponseHeader, TcpServer, OP_INFER, OP_INFER_STREAM, STATUS_ERR,
-    STATUS_OK, STATUS_STREAM_CHUNK, STATUS_STREAM_END,
-};
+use kapsl_ipc::{IpcServer, TcpServer};
 use kapsl_llm::block_manager::{new_shared_allocator, SharedBlockAllocator};
 use kapsl_llm::global_scheduler::{EngineHandle as KvEngineHandle, GlobalKvScheduler};
 use kapsl_llm::llm_backend::LLMBackend;
