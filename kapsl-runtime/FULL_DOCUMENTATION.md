@@ -693,14 +693,39 @@ CPU memory governance:
 
 - `KAPSL_CPU_MEMORY_LIMIT_MB`: optional process-wide system-memory ceiling in
   MiB. Kapsl uses the tightest of this value, detected host RAM, and the Linux
-  cgroup memory limit, then retains 20% as safety headroom. CPU LLM KV-cache
-  limits are derived from the resulting safe budget. Before each in-process CPU
-  model or replica loads, Kapsl also reserves an estimate for expanded weights
-  and execution workspace within the other half of the safe budget; admission
-  fails before allocation if aggregate reservations would exceed that partition.
-  Reservations are released on
-  unload. This is accounting only: Kapsl does not reserve a second physical CPU
-  arena.
+  cgroup memory limit, then retains 20% as safety headroom. CPU LLM KV-cache,
+  model/session, and active request-transient accounting are separate classes
+  under that one safe budget. KV keeps one half-budget; model/session and active
+  request-transient reservations share the complementary half, preventing a
+  full logical KV cache from overcommitting host memory. Reservations are
+  released with the model, replica, or request lease. Model loads are serialized
+  for a before/after process-RSS sample; reconciliation can raise (but never
+  lower) the conservative model reservation. This is accounting only: Kapsl
+  does not reserve a second physical CPU arena.
+
+Memory admission is coordinated by a backend-neutral authority. A `MemoryPlan`
+contains typed host, pinned-host, mapped-host, CUDA-device, or provider-domain
+claims, each attributed to a model ID, replica ID, allocation class, allocation
+source, and stable allocation ID. Model loading admits the complete plan
+transactionally, reconciles backend reports and observed CUDA/RSS deltas after
+load, and commits a single RAII `MemoryLease`; failure or unload releases all
+domains. Request input, staging, output, and workspace reports receive
+short-lived leases around synchronous, batched, and streaming inference. CUDA
+claims use the physical pool/budget manager, host claims use the CPU budget
+manager, and non-CUDA providers use accounting adapters. Physical allocations
+shared by replicas are charged once while each replica keeps its own ownership
+reference.
+
+When a CUDA pool is materialized, the native and `gguf-native` paths allocate
+weights, scratch/workspace, block tables, request buffers, and KV blocks from
+typed views over that pool. ONNX CUDA/TensorRT sessions use the pool through the
+ORT environment allocator. Compatible rank-4 autoregressive ONNX graphs also
+retain authoritative `present.*` KV OrtValues on CUDA and bind them directly as
+the next step's `past_key_values.*`; an unsupported graph, disabled/fallback
+allocator, isolated worker, or binding failure uses the host KV implementation.
+The llama.cpp-backed GGUF path remains explicit backend-managed CUDA memory for
+weights and compute scratch because GGML does not yet expose a Kapsl pool buffer
+adapter; its shared paged KV is still runtime-managed in the pool.
 
 ## 13. Runtime Pressure Management
 

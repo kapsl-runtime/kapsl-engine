@@ -2,6 +2,7 @@ use super::*;
 
 struct KvEngineRecord {
     model_id: u32,
+    replica_id: u32,
     device_id: usize,
     live_cap: Arc<AtomicUsize>,
 }
@@ -82,11 +83,12 @@ fn ceiling_is_squeezed(device_id: usize, declared: usize, live_bytes: usize) -> 
 }
 
 impl KvCoordinatorInner {
+    #[cfg(test)]
     pub(crate) fn new(device_info: &DeviceInfo) -> KvCoordinator {
         Self::new_with_host_budget(device_info, None)
     }
 
-    fn new_with_host_budget(
+    pub(crate) fn new_with_host_budget(
         device_info: &DeviceInfo,
         host_budget_override: Option<super::host_memory::HostMemoryBudget>,
     ) -> KvCoordinator {
@@ -159,6 +161,7 @@ impl KvCoordinatorInner {
         &self,
         device_id: usize,
         model_id: u32,
+        replica_id: u32,
         weight: u32,
     ) -> (
         SharedBlockAllocator,
@@ -192,6 +195,7 @@ impl KvCoordinatorInner {
                 engine_id,
                 KvEngineRecord {
                     model_id,
+                    replica_id,
                     device_id,
                     live_cap: live_cap.clone(),
                 },
@@ -371,6 +375,13 @@ impl KvCoordinatorInner {
             let new_cap =
                 (total_blocks * budget.max_tokens / device_tokens).max(MIN_BLOCKS_PER_ENGINE);
             record.live_cap.store(new_cap, Ordering::Relaxed);
+            log::trace!(
+                "[memory-authority] KV cap for model {} replica {} on device {}: {} blocks",
+                record.model_id,
+                record.replica_id,
+                device_id,
+                new_cap
+            );
         }
     }
 }
@@ -452,7 +463,7 @@ mod vram_clamp_tests {
         );
 
         assert_eq!(state.device_bytes.get(&cpu_id).copied(), Some(16 * GIB));
-        let (_, cap, _, _, _) = state.attach_engine(cpu_id, 10, 1);
+        let (_, cap, _, _, _) = state.attach_engine(cpu_id, 10, 0, 1);
         assert_eq!(cap, 4_096);
     }
 
@@ -476,8 +487,8 @@ mod vram_clamp_tests {
         ]);
         let state = KvCoordinatorInner::new(&info);
 
-        let (_, _, _, _, first_cap) = state.attach_engine(first_device, 10, 1);
-        let (_, _, _, _, second_cap) = state.attach_engine(second_device, 20, 1);
+        let (_, _, _, _, first_cap) = state.attach_engine(first_device, 10, 0, 1);
+        let (_, _, _, _, second_cap) = state.attach_engine(second_device, 20, 3, 1);
 
         // Each device has one engine, so each receives its own full logical KV
         // budget: half of VRAM divided into 2 MiB blocks.

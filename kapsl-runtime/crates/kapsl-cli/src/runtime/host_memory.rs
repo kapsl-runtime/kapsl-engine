@@ -1,7 +1,10 @@
 use crate::app::constants::KAPSL_CPU_MEMORY_LIMIT_MB_ENV;
+use crate::runtime::memory::{MemoryAllocationClass, MemoryClaim, MemoryDomain, MemoryOwner};
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
+use sysinfo::{Pid, System};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 const MIB: usize = 1024 * 1024;
 const DEFAULT_HEADROOM_PERCENT: usize = 20;
@@ -16,83 +19,269 @@ pub(crate) struct HostMemoryBudget {
 
 pub(crate) struct HostMemoryManager {
     budget: HostMemoryBudget,
-    cpu_device_ids: HashSet<usize>,
-    reserved_bytes: Mutex<usize>,
+    reservations: Mutex<HostReservations>,
+    load_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HostReservationOwner {
+    owner: MemoryOwner,
+    class: MemoryAllocationClass,
+}
+
+#[derive(Default)]
+struct HostReservations {
+    by_owner: HashMap<HostReservationOwner, usize>,
+}
+
+impl HostReservations {
+    fn total_bytes(&self) -> usize {
+        self.by_owner
+            .values()
+            .copied()
+            .fold(0usize, usize::saturating_add)
+    }
+
+    fn class_group_bytes(&self, class: MemoryAllocationClass) -> usize {
+        self.by_owner
+            .iter()
+            .filter(|(key, _)| budget_group(key.class) == budget_group(class))
+            .map(|(_, bytes)| *bytes)
+            .fold(0usize, usize::saturating_add)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostBudgetGroup {
+    Model,
+    Kv,
+}
+
+fn budget_group(class: MemoryAllocationClass) -> HostBudgetGroup {
+    match class {
+        MemoryAllocationClass::KvCache => HostBudgetGroup::Kv,
+        MemoryAllocationClass::PersistentWeights
+        | MemoryAllocationClass::ModelSession
+        | MemoryAllocationClass::TransientWorkspace
+        | MemoryAllocationClass::BlockTable
+        | MemoryAllocationClass::RequestTransient
+        | MemoryAllocationClass::ExternallyOwned => HostBudgetGroup::Model,
+    }
 }
 
 impl HostMemoryManager {
     pub(crate) fn new(device_info: &kapsl_hal::device::DeviceInfo) -> Arc<Self> {
         Arc::new(Self {
             budget: HostMemoryBudget::detect(device_info.total_memory),
-            cpu_device_ids: device_info
-                .devices
-                .iter()
-                .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cpu"))
-                .map(|device| device.id)
-                .collect(),
-            reserved_bytes: Mutex::new(0),
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
         })
+    }
+
+    pub(crate) fn budget(&self) -> HostMemoryBudget {
+        self.budget
     }
 
     pub(crate) fn admit(
         self: &Arc<Self>,
-        device_ids: &[usize],
-        model_id: u32,
-        requested_bytes: usize,
+        claim: &MemoryClaim,
     ) -> Result<Option<HostMemoryLease>, String> {
-        if requested_bytes == 0
-            || !device_ids
-                .iter()
-                .any(|device_id| self.cpu_device_ids.contains(device_id))
-        {
-            return Ok(None);
-        }
-        // The KV coordinator may consume half of the same safe host budget.
-        // Keep model/session reservations inside the complementary half so the
-        // two independently allocated classes cannot jointly exceed it.
-        let admission_budget = self.budget.safe_bytes / 2;
-        let mut reserved = self.reserved_bytes.lock();
-        let projected = reserved.saturating_add(requested_bytes);
-        if projected > admission_budget {
+        if !matches!(
+            claim.domain,
+            MemoryDomain::Host | MemoryDomain::HostPinned { .. } | MemoryDomain::HostMapped { .. }
+        ) {
             return Err(format!(
-                "CPU memory admission rejected for model {model_id}: requested={requested_bytes} reserved={} projected={projected} model_budget={admission_budget} host_safe_budget={} bytes",
-                *reserved, self.budget.safe_bytes,
+                "host memory manager cannot admit a {} claim",
+                claim.domain
             ));
         }
-        *reserved = projected;
+        if claim.bytes == 0 {
+            return Ok(None);
+        }
+        // KV retains its historical half-budget. Model/session and active
+        // request-transient memory share the complementary half, so a full KV
+        // cache can never push aggregate admitted memory above the safe budget.
+        let class_budget = self.budget.class_limit(claim.class);
+        let mut reservations = self.reservations.lock();
+        let class_reserved = reservations.class_group_bytes(claim.class);
+        let class_projected = class_reserved.saturating_add(claim.bytes);
+        let global_projected = reservations.total_bytes().saturating_add(claim.bytes);
+        if class_projected > class_budget || global_projected > self.budget.safe_bytes {
+            return Err(format!(
+                "host memory admission rejected for {} class={}: requested={} class_reserved={} class_projected={} class_budget={} global_projected={} host_safe_budget={} bytes",
+                claim.owner,
+                claim.class,
+                claim.bytes,
+                class_reserved,
+                class_projected,
+                class_budget,
+                global_projected,
+                self.budget.safe_bytes,
+            ));
+        }
+        let key = HostReservationOwner {
+            owner: claim.owner,
+            class: claim.class,
+        };
+        let owned = reservations.by_owner.entry(key).or_default();
+        *owned = owned.saturating_add(claim.bytes);
         log::info!(
-            "[host-memory] admitted model {}: reserved={} global_reserved={} model_budget={} host_safe_budget={} bytes",
-            model_id,
-            requested_bytes,
-            projected,
-            admission_budget,
+            "[host-memory] admitted {} class={}: reserved={} class_reserved={} global_reserved={} class_budget={} host_safe_budget={} bytes",
+            claim.owner,
+            claim.class,
+            claim.bytes,
+            class_projected,
+            global_projected,
+            class_budget,
             self.budget.safe_bytes
         );
         Ok(Some(HostMemoryLease {
             manager: Arc::clone(self),
-            bytes: requested_bytes,
+            key,
+            bytes: claim.bytes,
         }))
     }
 
     #[cfg(test)]
-    fn reserved_bytes(&self) -> usize {
-        *self.reserved_bytes.lock()
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservations.lock().total_bytes()
+    }
+
+    /// Serialize host model loads so a before/after process-RSS delta can be
+    /// attributed to one load transaction. Existing inference may still move
+    /// RSS while the sample is open, so reconciliation only raises the planned
+    /// reservation; it never weakens a conservative estimate.
+    pub(crate) async fn begin_load_reconciliation(self: &Arc<Self>) -> HostMemoryLoadAdmission {
+        let guard = Arc::clone(&self.load_lock).lock_owned().await;
+        HostMemoryLoadAdmission {
+            manager: Arc::clone(self),
+            rss_before: process_rss_bytes(),
+            _guard: Some(guard),
+        }
+    }
+
+    fn resize_lease(&self, lease: &mut HostMemoryLease, target_bytes: usize) -> Result<(), String> {
+        if lease.bytes == target_bytes {
+            return Ok(());
+        }
+        let mut reservations = self.reservations.lock();
+        let class_reserved = reservations.class_group_bytes(lease.key.class);
+        let global_reserved = reservations.total_bytes();
+        let class_projected = class_reserved
+            .saturating_sub(lease.bytes)
+            .saturating_add(target_bytes);
+        let global_projected = global_reserved
+            .saturating_sub(lease.bytes)
+            .saturating_add(target_bytes);
+        let class_budget = self.budget.class_limit(lease.key.class);
+        if class_projected > class_budget || global_projected > self.budget.safe_bytes {
+            return Err(format!(
+                "host memory reconciliation rejected for {} class={}: planned={} observed_target={} class_projected={} class_budget={} global_projected={} host_safe_budget={} bytes",
+                lease.key.owner,
+                lease.key.class,
+                lease.bytes,
+                target_bytes,
+                class_projected,
+                class_budget,
+                global_projected,
+                self.budget.safe_bytes,
+            ));
+        }
+        let owned = reservations.by_owner.entry(lease.key).or_default();
+        *owned = owned
+            .saturating_sub(lease.bytes)
+            .saturating_add(target_bytes);
+        if *owned == 0 {
+            reservations.by_owner.remove(&lease.key);
+        }
+        lease.bytes = target_bytes;
+        Ok(())
     }
 }
 
 pub(crate) struct HostMemoryLease {
     manager: Arc<HostMemoryManager>,
+    key: HostReservationOwner,
     bytes: usize,
+}
+
+/// Before/after RSS attribution guard for one host model load.
+pub(crate) struct HostMemoryLoadAdmission {
+    manager: Arc<HostMemoryManager>,
+    rss_before: Option<usize>,
+    _guard: Option<OwnedMutexGuard<()>>,
+}
+
+impl HostMemoryLoadAdmission {
+    pub(crate) fn reconcile(&mut self, leases: &mut [HostMemoryLease]) -> Result<(), String> {
+        let planned_total = leases
+            .iter()
+            .filter(|lease| budget_group(lease.key.class) == HostBudgetGroup::Model)
+            .map(|lease| lease.bytes)
+            .fold(0usize, usize::saturating_add);
+        let observed_delta = self
+            .rss_before
+            .zip(process_rss_bytes())
+            .map(|(before, after)| after.saturating_sub(before));
+        let target_total = observed_delta.map_or(planned_total, |bytes| bytes.max(planned_total));
+
+        if target_total > planned_total {
+            let Some(index) = leases
+                .iter()
+                .position(|lease| budget_group(lease.key.class) == HostBudgetGroup::Model)
+            else {
+                self._guard.take();
+                return Err(format!(
+                    "observed {} bytes of host RSS growth without a model/session reservation",
+                    target_total - planned_total
+                ));
+            };
+            let target = leases[index]
+                .bytes
+                .saturating_add(target_total - planned_total);
+            self.manager.resize_lease(&mut leases[index], target)?;
+        }
+        log::info!(
+            "[host-memory] reconciled model load: planned={} observed_rss_delta={:?} retained={} bytes",
+            planned_total,
+            observed_delta,
+            target_total
+        );
+        self._guard.take();
+        Ok(())
+    }
+}
+
+fn process_rss_bytes() -> Option<usize> {
+    let mut system = System::new();
+    let pid = Pid::from_u32(std::process::id());
+    system.refresh_process(pid);
+    system.process(pid).map(|process| process.memory() as usize)
 }
 
 impl Drop for HostMemoryLease {
     fn drop(&mut self) {
-        let mut reserved = self.manager.reserved_bytes.lock();
-        *reserved = reserved.saturating_sub(self.bytes);
+        let mut reservations = self.manager.reservations.lock();
+        let remove = reservations
+            .by_owner
+            .get_mut(&self.key)
+            .is_some_and(|bytes| {
+                *bytes = bytes.saturating_sub(self.bytes);
+                *bytes == 0
+            });
+        if remove {
+            reservations.by_owner.remove(&self.key);
+        }
     }
 }
 
 impl HostMemoryBudget {
+    pub(crate) fn class_limit(self, _class: MemoryAllocationClass) -> usize {
+        // Each group may use up to half of safe memory, but all groups remain
+        // subject to the single global safe-memory cap.
+        self.safe_bytes / 2
+    }
+
     pub(crate) fn detect(system_total_kib: u64) -> Self {
         let physical = usize::try_from(system_total_kib)
             .unwrap_or(usize::MAX / 1024)
@@ -145,10 +334,11 @@ fn cgroup_memory_limit_bytes() -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostMemoryBudget, HostMemoryManager};
+    use super::{HostMemoryBudget, HostMemoryManager, HostReservations};
+    use crate::runtime::memory::{MemoryAllocationClass, MemoryClaim, MemoryDomain, MemoryOwner};
     use parking_lot::Mutex;
-    use std::collections::HashSet;
     use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
 
     const GIB: usize = 1024 * 1024 * 1024;
 
@@ -179,27 +369,131 @@ mod tests {
                 limit_bytes: 10 * GIB,
                 safe_bytes: 8 * GIB,
             },
-            cpu_device_ids: HashSet::from([0]),
-            reserved_bytes: Mutex::new(0),
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
         });
-        let lease = manager.admit(&[0], 7, 3 * GIB).unwrap().unwrap();
+        let first = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(7, 2),
+            MemoryAllocationClass::ModelSession,
+            3 * GIB,
+        );
+        let lease = manager.admit(&first).unwrap().unwrap();
         assert_eq!(manager.reserved_bytes(), 3 * GIB);
-        assert!(manager.admit(&[0], 8, 6 * GIB).is_err());
+        let too_large = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(8, 0),
+            MemoryAllocationClass::PersistentWeights,
+            2 * GIB,
+        );
+        assert!(manager.admit(&too_large).is_err());
         drop(lease);
         assert_eq!(manager.reserved_bytes(), 0);
     }
 
     #[test]
-    fn non_cpu_devices_do_not_consume_host_admission_budget() {
+    fn rss_reconciliation_can_raise_but_not_overcommit_a_lease() {
         let manager = Arc::new(HostMemoryManager {
             budget: HostMemoryBudget {
                 limit_bytes: 10 * GIB,
                 safe_bytes: 8 * GIB,
             },
-            cpu_device_ids: HashSet::from([0]),
-            reserved_bytes: Mutex::new(0),
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
         });
-        assert!(manager.admit(&[1], 7, GIB).unwrap().is_none());
+        let claim = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(7, 2),
+            MemoryAllocationClass::ModelSession,
+            2 * GIB,
+        );
+        let mut lease = manager.admit(&claim).unwrap().unwrap();
+        manager.resize_lease(&mut lease, 3 * GIB).unwrap();
+        assert_eq!(manager.reserved_bytes(), 3 * GIB);
+        assert!(manager.resize_lease(&mut lease, 5 * GIB).is_err());
+        assert_eq!(manager.reserved_bytes(), 3 * GIB);
+        drop(lease);
         assert_eq!(manager.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn kv_and_model_classes_have_independent_half_budgets() {
+        let manager = Arc::new(HostMemoryManager {
+            budget: HostMemoryBudget {
+                limit_bytes: 10 * GIB,
+                safe_bytes: 8 * GIB,
+            },
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
+        });
+        let model = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(7, 0),
+            MemoryAllocationClass::ModelSession,
+            4 * GIB,
+        );
+        let kv = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(7, 0),
+            MemoryAllocationClass::KvCache,
+            4 * GIB,
+        );
+        let model_lease = manager.admit(&model).unwrap().unwrap();
+        let kv_lease = manager.admit(&kv).unwrap().unwrap();
+        assert_eq!(manager.reserved_bytes(), 8 * GIB);
+        drop((model_lease, kv_lease));
+        assert_eq!(manager.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn request_transient_shares_the_non_kv_half_budget() {
+        let manager = Arc::new(HostMemoryManager {
+            budget: HostMemoryBudget {
+                limit_bytes: 10 * GIB,
+                safe_bytes: 8 * GIB,
+            },
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
+        });
+        let model = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(7, 0),
+            MemoryAllocationClass::ModelSession,
+            3 * GIB,
+        );
+        let request = MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(7, 0),
+            MemoryAllocationClass::RequestTransient,
+            GIB,
+        );
+        let model_lease = manager.admit(&model).unwrap().unwrap();
+        let request_lease = manager.admit(&request).unwrap().unwrap();
+        assert!(manager.admit(&request).is_err());
+        drop((model_lease, request_lease));
+        assert_eq!(manager.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn non_host_domains_are_rejected() {
+        let manager = Arc::new(HostMemoryManager {
+            budget: HostMemoryBudget {
+                limit_bytes: 10 * GIB,
+                safe_bytes: 8 * GIB,
+            },
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
+        });
+        let claim = MemoryClaim::runtime(
+            MemoryDomain::Cuda { device_id: 1 },
+            MemoryOwner::new(7, 0),
+            MemoryAllocationClass::ModelSession,
+            GIB,
+        );
+        let error = match manager.admit(&claim) {
+            Ok(_) => panic!("CUDA claim must not be admitted by the host manager"),
+            Err(error) => error,
+        };
+        assert!(error.contains("cannot admit"));
     }
 }

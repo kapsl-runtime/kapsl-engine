@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: beta-runtime-installers
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -286,6 +290,7 @@ jobs:
           name: runtime-installers-${{ matrix.os }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 1
 
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
@@ -341,6 +346,7 @@ jobs:
           path: dist/*
           if-no-files-found: error
           compression-level: 0
+          retention-days: 1
 
   publish-beta-release:
     needs: [build-runtime-installers, build-cuda-runtime]
@@ -440,10 +446,11 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          # Also overwrite the "latest-beta" pointer so clients can always find the newest beta
-          aws s3 cp release-assets/ \
+          # Keep the mutable latest directory as an exact mirror. Artifact names
+          # contain their version, so --delete prevents old betas accumulating here.
+          aws s3 sync release-assets/ \
             s3://kapsl-installer/runtime/beta/latest/ \
-            --recursive \
+            --delete \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
@@ -479,3 +486,37 @@ jobs:
             --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+      - name: Delete superseded beta installers from R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          CURRENT_BETA_VERSION: v${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          listing="$(aws s3 ls s3://kapsl-installer/runtime/beta/ \
+            --endpoint-url "$R2_ENDPOINT")"
+          mapfile -t versions < <(
+            printf '%s\n' "$listing" \
+              | awk '$NF ~ /^v.*\/$/ { sub(/\/$/, "", $NF); print $NF }'
+          )
+
+          deleted=0
+          for version in "${versions[@]}"; do
+            if [ "$version" = "$CURRENT_BETA_VERSION" ]; then
+              continue
+            fi
+
+            echo "Deleting superseded beta s3://kapsl-installer/runtime/beta/$version/"
+            aws s3 rm "s3://kapsl-installer/runtime/beta/$version/" \
+              --recursive \
+              --no-progress \
+              --endpoint-url "$R2_ENDPOINT"
+            deleted=$((deleted + 1))
+          done
+
+          echo "Deleted $deleted superseded beta version(s); retained $CURRENT_BETA_VERSION."

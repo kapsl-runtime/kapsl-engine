@@ -131,6 +131,10 @@ pub(super) async fn load_replica(
             .filter_map(|rank| mesh.get_device(rank))
             .map(|device| device.id)
             .collect();
+        let memory_domains: Vec<_> = (0..mesh.world_size)
+            .filter_map(|rank| mesh.get_device(rank))
+            .map(|device| MemoryDomain::for_provider(&device.backend.to_string(), device.id))
+            .collect();
         let backend = create_pipeline_backend(
             &plan,
             logical_provider
@@ -142,9 +146,10 @@ pub(super) async fn load_replica(
         let backend = load_runtime_backend(
             backend,
             &plan.model_file_path,
-            &device_ids,
+            &memory_domains,
             &resources,
             plan.base_model_id,
+            plan.replica_id,
             EngineKind::resolve(&plan.loader.manifest),
             &role.load_context(&plan, None),
         )
@@ -175,13 +180,18 @@ pub(super) async fn load_replica(
                 onnx_tuning,
                 &resources,
                 plan.base_model_id,
+                plan.replica_id,
             )?;
             let backend = load_runtime_backend(
                 backend,
                 &plan.model_file_path,
-                &[device.id],
+                &[MemoryDomain::for_provider(
+                    &device.backend.to_string(),
+                    device.id,
+                )],
                 &resources,
                 plan.base_model_id,
+                plan.replica_id,
                 EngineKind::resolve(&plan.loader.manifest),
                 &role.load_context(&plan, Some(device.id)),
             )
@@ -195,6 +205,15 @@ pub(super) async fn load_replica(
         }
         engines
     } else {
+        let selection =
+            select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info);
+        let selection = selection.map_err(|error| {
+            format!(
+                "Failed to select a device for {}: {}",
+                role.selection_context(&plan),
+                error
+            )
+        })?;
         let device_id = plan
             .loader
             .manifest
@@ -207,13 +226,18 @@ pub(super) async fn load_replica(
             onnx_tuning,
             &resources,
             plan.base_model_id,
+            plan.replica_id,
         )?;
         let backend = load_runtime_backend(
             backend,
             &plan.model_file_path,
-            &[device_id],
+            &[MemoryDomain::for_provider(
+                &selection.logical_provider,
+                device_id,
+            )],
             &resources,
             plan.base_model_id,
+            plan.replica_id,
             EngineKind::resolve(&plan.loader.manifest),
             &role.load_context(&plan, Some(device_id)),
         )
@@ -269,7 +293,8 @@ fn create_pipeline_backend(
         LLMBackend::with_devices(logical_provider.to_owned(), backend_device_ids.clone())
     } else {
         LLMBackend::with_device_ids(backend_device_ids.clone())
-    };
+    }
+    .with_memory_owner(plan.base_model_id, plan.replica_id);
     #[cfg(feature = "gpu-device-pool")]
     {
         backend = backend.with_env_allocators(
@@ -280,9 +305,13 @@ fn create_pipeline_backend(
     }
 
     let primary_device = device_ids.first().copied().unwrap_or(0);
-    let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) = resources
-        .kv()
-        .attach_engine(primary_device, plan.base_model_id, plan.priority_weight);
+    let (kv_pool, kv_blocks_cap, global_sched, sched_engine_id, live_cap) =
+        resources.kv().attach_engine(
+            primary_device,
+            plan.base_model_id,
+            plan.replica_id,
+            plan.priority_weight,
+        );
     backend = backend
         .with_shared_pool(kv_pool)
         .with_kv_blocks_cap(kv_blocks_cap)
