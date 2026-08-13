@@ -83,21 +83,40 @@ fn ceiling_is_squeezed(device_id: usize, declared: usize, live_bytes: usize) -> 
 
 impl KvCoordinatorInner {
     pub(crate) fn new(device_info: &DeviceInfo) -> KvCoordinator {
+        Self::new_with_host_budget(device_info, None)
+    }
+
+    fn new_with_host_budget(
+        device_info: &DeviceInfo,
+        host_budget_override: Option<super::host_memory::HostMemoryBudget>,
+    ) -> KvCoordinator {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const KV_BLOCK_SIZE: usize = 16;
         let mut device_bytes = HashMap::new();
         let mut estimated_kv_tokens: usize = 0;
+        let host_budget = host_budget_override.unwrap_or_else(|| {
+            super::host_memory::HostMemoryBudget::detect(device_info.total_memory)
+        });
         for device in &device_info.devices {
-            if device.backend.to_string().eq_ignore_ascii_case("cpu") {
+            let is_cpu = device.backend.to_string().eq_ignore_ascii_case("cpu");
+            let total = if is_cpu {
+                host_budget.safe_bytes
+            } else {
+                (device.memory_mb as usize).saturating_mul(1024 * 1024)
+            };
+            if total == 0 {
                 continue;
             }
-            let total = (device.memory_mb as usize).saturating_mul(1024 * 1024);
             // Cooperative software-vGPU clamp: when a per-device VRAM cap is
             // configured (HAMi env or the kapsl alias), size the KV budget to
             // the slice rather than the whole card. A no-op when no cap is set
             // or the cap exceeds the card, so default behavior is unchanged and
             // a MIG slice (which already reports its true size) is never inflated.
-            let total = device_vram_cap_bytes(device.id).map_or(total, |cap| total.min(cap));
+            let total = if is_cpu {
+                total
+            } else {
+                device_vram_cap_bytes(device.id).map_or(total, |cap| total.min(cap))
+            };
             device_bytes.insert(device.id, total);
             let kv_blocks = (total / 2) / KV_BYTES_PER_BLOCK;
             estimated_kv_tokens = estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
@@ -360,6 +379,7 @@ impl KvCoordinatorInner {
 mod vram_clamp_tests {
     use super::KvCoordinatorInner;
     use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+    use crate::runtime::host_memory::HostMemoryBudget;
     use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
 
     const GIB: usize = 1024 * 1024 * 1024;
@@ -383,6 +403,25 @@ mod vram_clamp_tests {
         }
     }
 
+    fn cpu_device(id: usize) -> Device {
+        Device {
+            id,
+            name: "test-cpu".to_string(),
+            backend: DeviceBackend::Cpu,
+            memory_mb: 0,
+            compute_units: 1,
+            pci_bus_id: None,
+            partition_id: None,
+            driver_version: None,
+            cuda_version: None,
+            compute_capability: None,
+            utilization_gpu_pct: None,
+            temperature_c: None,
+            supports_fp16: false,
+            supports_int8: true,
+        }
+    }
+
     fn device_info(devices: Vec<Device>) -> DeviceInfo {
         DeviceInfo {
             cpu_cores: 1,
@@ -395,6 +434,26 @@ mod vram_clamp_tests {
             has_directml: false,
             devices,
         }
+    }
+
+    #[test]
+    fn cpu_kv_budget_is_derived_from_safe_host_memory() {
+        let cpu_id = 4260;
+        let mut info = device_info(vec![cpu_device(cpu_id)]);
+        // DeviceInfo reports host memory in KiB. The host budget retains 20%,
+        // then the KV coordinator dedicates half of that safe budget to KV.
+        info.total_memory = 20 * 1024 * 1024;
+        let state = KvCoordinatorInner::new_with_host_budget(
+            &info,
+            Some(HostMemoryBudget {
+                limit_bytes: 20 * GIB,
+                safe_bytes: 16 * GIB,
+            }),
+        );
+
+        assert_eq!(state.device_bytes.get(&cpu_id).copied(), Some(16 * GIB));
+        let (_, cap, _, _, _) = state.attach_engine(cpu_id, 10, 1);
+        assert_eq!(cap, 4_096);
     }
 
     #[test]

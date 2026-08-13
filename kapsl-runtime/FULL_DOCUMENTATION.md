@@ -689,6 +689,14 @@ Model cache / disk-check env vars (read by `kapsl-core` loader):
 - `KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` / `KAPSL_MODEL_CACHE_RESERVED_FREE_MIB`: minimum free disk space that must remain after a model cache copy; the loader will evict LRU entries until the constraint is satisfied (or fail with `InsufficientDiskSpace`).
 - `KAPSL_PACKAGE_TMP_DIR`: override the temporary directory used when unpacking an `.aimod` archive.
 
+CPU memory governance:
+
+- `KAPSL_CPU_MEMORY_LIMIT_MB`: optional process-wide system-memory ceiling in
+  MiB. Kapsl uses the tightest of this value, detected host RAM, and the Linux
+  cgroup memory limit, then retains 20% as safety headroom. CPU LLM KV-cache
+  limits are derived from the resulting safe budget. This is admission and
+  capacity accounting; Kapsl does not reserve a second physical CPU arena.
+
 ## 13. Runtime Pressure Management
 
 The runtime monitors system resource utilization and adjusts inference behavior when under pressure. There are three pressure states:

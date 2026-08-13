@@ -11,6 +11,7 @@ pub(crate) mod config;
 mod device_budget;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) mod device_memory;
+mod host_memory;
 pub(crate) mod inference_service;
 pub(crate) mod model;
 pub(crate) mod model_manager;

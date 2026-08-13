@@ -73,6 +73,10 @@ pub(crate) const CUDA_DEVICE_MEMORY_LIMIT_ENV: &str = "CUDA_DEVICE_MEMORY_LIMIT"
 /// kapsl alias for the per-device VRAM cap, in plain MiB, for non-HAMi
 /// deployments that still want cooperative self-limiting.
 pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_MB";
+/// Cooperative process-wide system-memory ceiling, in MiB. The host-memory
+/// budget also observes container limits and keeps a safety reserve; this
+/// override is useful on bare-metal hosts where no cgroup boundary exists.
+pub(crate) const KAPSL_CPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_CPU_MEMORY_LIMIT_MB";
 /// Internal worker override used to keep process-local CUDA arenas from each
 /// claiming the parent process's full configured pool.
 pub(crate) const GPU_DEVICE_POOL_DISABLED_ENV: &str = "KAPSL_GPU_DEVICE_POOL_DISABLED";
