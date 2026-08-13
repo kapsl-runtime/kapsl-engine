@@ -1,6 +1,6 @@
 [package]
 name = "kapsl"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [features]
@@ -30,18 +30,18 @@ gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", 
 cc = "1"
 
 [dependencies]
-kapsl-core = "0.1.1"
-kapsl-hal = "0.1.1"
-kapsl-engine-api = "0.1.1"
-kapsl-backends = "0.1.1"
-kapsl-scheduler = "0.1.1"
-kapsl-ipc = "0.1.1"
-kapsl-monitor = "0.1.1"
-kapsl-transport = "0.1.1"
-kapsl-shm = "0.1.1"
-kapsl-llm = "0.1.1"
-kapsl-rag = "0.1.1"
-kapsl-rag-sdk = "0.1.1"
+kapsl-core = "0.1.2"
+kapsl-hal = "0.1.2"
+kapsl-engine-api = "0.1.2"
+kapsl-backends = "0.1.2"
+kapsl-scheduler = "0.1.2"
+kapsl-ipc = "0.1.2"
+kapsl-monitor = "0.1.2"
+kapsl-transport = "0.1.2"
+kapsl-shm = "0.1.2"
+kapsl-llm = "0.1.2"
+kapsl-rag = "0.1.2"
+kapsl-rag-sdk = "0.1.2"
 warp = "0.3"
 prometheus = "0.14"
 parking_lot = "0.12"
