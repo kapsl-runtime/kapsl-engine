@@ -2100,8 +2100,7 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd252922cc188ea048d16c911eb0088d158ac41f79bdc642717a3ed9e6dfd4f"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2131,8 +2130,7 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a60839b1991bdb43743f38d0c485297b3c0269fd63b5e11ea5ae234c59893fa"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "flate2",
  "fs2",
@@ -2152,8 +2150,7 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08733653a817b887d3730fca63b485e79e5b14323b6a8def1ab114801352a329"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2165,8 +2162,7 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcd167e22b300dffa066287b232f743b8373afc3b30cc1967ccc695e7f10a4f4"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "cudarc",
  "half",
@@ -2180,8 +2176,7 @@ dependencies = [
 [[package]]
 name = "kapsl-ipc"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f75ae76089778278df4b1b7ce57c86cf82f108039b86f9d120774643976b4aa9"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2199,8 +2194,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21365b4b2a537f68770beb80b276a63e040ddd227c02d12d58321cbc89b30bc7"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "cudarc",
  "half",
@@ -2241,8 +2235,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "526eb4e05528f6c90fbd108aed7ecd551e3ef7cbd82867df15dcd3807d450789"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2272,8 +2265,7 @@ dependencies = [
 [[package]]
 name = "kapsl-loader"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2cb361ad0afeb195ca43c173c9c6a5f5502fd682ba3f2610a01d178b09d7ad1"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "half",
  "kapsl-hal",
@@ -2288,8 +2280,7 @@ dependencies = [
 [[package]]
 name = "kapsl-monitor"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f494785bdb51f685f1abdb07e13d64de98c99dcc6c42a40676c47ddfca17503"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2303,8 +2294,7 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd758ee6e01d51370388089cf5d4395067e1ad5909ed3b48863838831a92c611"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "anyhow",
  "half",
@@ -2319,8 +2309,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef12070b6d071d20f711617aab5b2449a759c00081da89a3828c22363b50356b"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2340,8 +2329,7 @@ dependencies = [
 [[package]]
 name = "kapsl-rag-sdk"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bda5c5504f07d305983b2b4ec35b64217f6d68f73933e670e553df1e25253f1"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "futures",
@@ -2353,8 +2341,7 @@ dependencies = [
 [[package]]
 name = "kapsl-scheduler"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "664e33edd94f090c244d78652b186a713c0ae87b96ebc9882dad9c8ddd932cc6"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2373,8 +2360,7 @@ dependencies = [
 [[package]]
 name = "kapsl-shm"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e10439d3cefc893c73aabebbe55c649d57aaa78a3998d3a10d7e4851f5e092a9"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2395,8 +2381,7 @@ dependencies = [
 [[package]]
 name = "kapsl-transport"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e2b2abd48f8d8aa226af24199e5d97ef02602fadb2a91eb678f410486634cc0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=e02f03f445df66715a9130607ef7fd7b3448bf70#e02f03f445df66715a9130607ef7fd7b3448bf70"
 dependencies = [
  "async-trait",
  "bincode",
