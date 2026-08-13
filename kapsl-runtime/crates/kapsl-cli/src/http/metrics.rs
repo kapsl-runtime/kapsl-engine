@@ -3,12 +3,14 @@ use super::*;
 pub(crate) fn build_metrics_route(
     registry_arc: Arc<Registry>,
     api_auth_state_for_api: Arc<RwLock<ApiAuthState>>,
+    resources: Arc<RuntimeResources>,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     // Metrics endpoint (admin scope when auth is enabled; loopback only when disabled)
     let metrics_route =
         warp::path("metrics")
             .and(warp::get())
             .map(move || -> warp::reply::Response {
+                resources.refresh_device_pool_metrics();
                 let encoder = TextEncoder::new();
                 let metric_families = registry_arc.gather();
                 let mut buffer = vec![];

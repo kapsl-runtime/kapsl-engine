@@ -142,12 +142,55 @@ kapsl run \
 Loopback TCP does not require a token. Non-loopback TCP does, and the protocol
 is still plaintext; use it only on a trusted network or through a TLS tunnel.
 
-Physical CUDA device pooling is process-owned. Isolated model workers disable
-their local CUDA arena by default, even when `KAPSL_GPU_DEVICE_POOL_BYTES` is
-set in the parent. Enable it only when every worker has an exclusive GPU/MIG
-slice or an explicit `CUDA_DEVICE_MEMORY_LIMIT[_N]`/
-`KAPSL_GPU_MEMORY_LIMIT_MB` quota; `KAPSL_ISOLATED_WORKER_GPU_POOL=true` is an
-operator attestation of an exclusive boundary.
+The stable CUDA application profile uses `gguf-cuda-shared-kv`. The explicit
+`gguf-cuda` feature remains available as the llama.cpp native-KV rollback profile.
+In that stable profile, the process-owned physical CUDA pool now defaults to
+model-aware automatic sizing. Kapsl plans all startup packages before opening
+backend sessions, subtracts known GGUF/native weights, retains unpooled room
+for scratch, native-KV fallback, and later model additions, then creates one
+immutable aligned backing allocation per CUDA device that needs it. The sizing
+ceiling is also clamped to the configured device limit and live free VRAM.
+Pooled ONNX weight copies, including configured session concurrency, form a
+hard minimum checked before ORT session construction.
+
+Pool controls accept an optional `_<device_id>` suffix, which takes precedence:
+
+- `KAPSL_GPU_DEVICE_POOL_MODE=auto|fixed|off` selects the policy.
+- `KAPSL_GPU_DEVICE_POOL_BYTES=8g` is an exact fixed-size override and implies
+  `fixed` when mode is omitted. It is never silently reduced.
+- `KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES=2g` replaces the automatic
+  scratch/fallback/add-model reserve; zero is valid and an explicit reserve is
+  never silently reduced.
+- `CUDA_DEVICE_MEMORY_LIMIT[_N]` or `KAPSL_GPU_MEMORY_LIMIT_MB` bounds the
+  process-visible VRAM used by automatic sizing and admission.
+
+An unset runtime with no startup models does not reserve every detected GPU;
+implicit automatic sizing is deferred until the first pooled model targets a
+device. Mode and byte settings are validated together: for example, a global
+fixed byte override conflicts with a per-device `auto` or `off` mode rather
+than being silently ignored.
+
+The default automatic reserve is 20% of the safe device budget with a 1 GiB
+floor and one-third cap. A separate driver safety band of at least 512 MiB (or
+10% of declared VRAM) remains outside that budget. Automatic pools have a
+256 MiB minimum and 2 MiB alignment. If implicit automatic sizing cannot make
+a viable allocation, Kapsl logs the decision and continues without a
+runtime-owned pool; explicit `auto` and `fixed` configurations fail fast.
+
+Physical CUDA pooling is process-owned. Isolated model workers disable their
+local pool by default, even when pool settings are inherited from the parent.
+Enable it only when every worker has an exclusive GPU/MIG slice or an explicit
+`CUDA_DEVICE_MEMORY_LIMIT[_N]`/`KAPSL_GPU_MEMORY_LIMIT_MB` quota;
+`KAPSL_ISOLATED_WORKER_GPU_POOL=true` is an operator attestation of an
+exclusive boundary. Pool mode, size, or reserve alone is not an isolation
+boundary. A planned isolated model suppresses implicit parent-pool creation on
+its target device; only an explicit operator pool policy overrides that choice.
+
+Prometheus scrapes expose current pool allocation, free-range, and
+fragmentation state under `kapsl_gpu_device_pool_*`, plus per-owner usage,
+quota, admission, and allocatable-byte gauges. The existing
+`kapsl_device_memory_pooled_bytes` gauge is the immutable backing capacity;
+it is not live usage.
 
 Example tuned for low latency:
 

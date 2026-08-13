@@ -85,86 +85,10 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                         .with_label_values(&[&model_id_str])
                         .set(healthy as i64);
 
-                    shared_metrics_for_scaler
-                        .kv_cache_bytes_used
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_bytes_used as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_bytes_capacity
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_bytes_capacity as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_blocks_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_blocks_total as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_blocks_free
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_blocks_free as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_sequences
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_sequences as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_evicted_blocks
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_evicted_blocks as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_evicted_sequences
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_evicted_sequences as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_packed_layers
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_packed_layers as i64);
-                    shared_metrics_for_scaler
-                        .kv_cache_cpu_offloaded_blocks
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_cache_cpu_offloaded_blocks as i64);
-                    shared_metrics_for_scaler
-                        .prompt_tokens_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.prompt_tokens_total as i64);
-                    shared_metrics_for_scaler
-                        .generated_tokens_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.generated_tokens_total as i64);
-                    shared_metrics_for_scaler
-                        .decode_steps_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.decode_steps_total as i64);
-                    shared_metrics_for_scaler
-                        .decode_tokens_evaluated_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.decode_tokens_evaluated_total as i64);
-                    shared_metrics_for_scaler
-                        .kv_partial_reuse_hits_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_partial_reuse_hits_total as i64);
-                    shared_metrics_for_scaler
-                        .kv_partial_reuse_tokens_saved_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.kv_partial_reuse_tokens_saved_total as i64);
-                    shared_metrics_for_scaler
-                        .engine_health
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.engine_health as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_total as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_idle
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_idle as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_waits_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_waits_total as i64);
-                    shared_metrics_for_scaler
-                        .onnx_session_pool_wait_seconds_total
-                        .with_label_values(&[&model_id_str])
-                        .set(metrics.onnx_session_pool_wait_seconds_total);
+                    // kapsl-monitor owns the EngineMetrics -> Prometheus mapping.
+                    // Keeping that translation in one place makes newly added
+                    // engine fields visible to every runtime caller together.
+                    shared_metrics_for_scaler.set_kv_cache_metrics(&model_id_str, &metrics);
 
                     (high + low, healthy as u32, true, metrics.memory_usage)
                 } else {

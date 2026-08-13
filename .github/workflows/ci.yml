@@ -47,14 +47,25 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace
 
-      # Type-check the optional CUDA memory authority without requiring nvcc
-      # or a GPU on the hosted runner. The fixed cudarc API feature takes
-      # precedence over cuda-version-from-build-system for this compile only.
-      - name: Check GPU device pool feature
+      # Exercise the optional CUDA memory authority without requiring nvcc or a
+      # GPU on the hosted runner. The fixed cudarc API feature takes precedence
+      # over cuda-version-from-build-system for this test build only.
+      - name: Test GPU device pool feature
         if: runner.os == 'Linux'
         run: >-
-          cargo check --manifest-path kapsl-runtime/Cargo.toml -p kapsl
-          --features gpu-device-pool,cudarc/cuda-12040
+          cargo test --manifest-path kapsl-runtime/Cargo.toml -p kapsl
+          --features gpu-device-pool,cudarc/cuda-12040 -- --test-threads=1
+
+      - name: Verify stable CUDA profile uses shared KV
+        if: runner.os == 'Linux'
+        run: |
+          cargo metadata --manifest-path kapsl-runtime/Cargo.toml \
+            --locked --no-deps --format-version 1 \
+            | jq -e '[.packages[] | select(.name == "kapsl") | .features.cuda] == [["gguf-cuda-shared-kv"]]'
+
+      - name: Test GPU integration harness contract
+        if: runner.os == 'Linux'
+        run: .github/scripts/test-gpu-device-pool-integration.sh --self-test
 
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'

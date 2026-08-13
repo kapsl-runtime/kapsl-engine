@@ -1,11 +1,13 @@
 use super::*;
 
 mod backend;
-mod load_plan;
+mod lifecycle;
+pub(crate) mod load_plan;
 mod replica;
 mod scaling;
 
 use backend::*;
+pub(crate) use lifecycle::*;
 use load_plan::*;
 use replica::*;
 pub(crate) use scaling::*;
@@ -23,24 +25,36 @@ pub(crate) async fn run_worker(
     let model_path = &args.model[0];
     let onnx_tuning = onnx_tuning_profile.resolve(model_id);
 
-    let registry = Arc::new(Registry::new());
-    let model_registry = Arc::new(ModelRegistry::new());
-    let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
-
-    let resources = RuntimeResources::new(device_info)?;
-    let (pool, _) = load_model(
+    let plan = prepare_model_load(
         model_id,
+        model_id,
+        0,
         model_path,
         device_info,
-        resources,
         args.batch_size,
         args.scheduler_queue_size,
         args.scheduler_max_micro_batch,
         args.scheduler_queue_delay_ms,
-        &model_registry,
-        &shared_metrics,
         &args.topology,
         args.tp_degree,
+        &onnx_tuning,
+    )?;
+    #[cfg(feature = "gpu-device-pool")]
+    let bootstrap = device_memory_bootstrap_plan(std::iter::once(&plan), device_info)?;
+
+    let registry = Arc::new(Registry::new());
+    let model_registry = Arc::new(ModelRegistry::new());
+    let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
+    #[cfg(feature = "gpu-device-pool")]
+    let resources = RuntimeResources::new_with_device_memory_plan(device_info, &bootstrap)?;
+    #[cfg(not(feature = "gpu-device-pool"))]
+    let resources = RuntimeResources::new(device_info)?;
+    let (pool, _) = load_prepared_model(
+        plan,
+        device_info,
+        resources,
+        &model_registry,
+        &shared_metrics,
         onnx_tuning,
     )
     .await?;
@@ -109,14 +123,7 @@ pub(crate) async fn load_model(
     tp_degree: usize,
     onnx_tuning: OnnxRuntimeTuning,
 ) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), DynError> {
-    #[cfg(feature = "gpu-device-pool")]
-    resources.attach_device_memory_metrics(shared_metrics.clone());
-    log::info!(
-        "Current directory: {:?}",
-        std::env::current_dir().unwrap_or_default()
-    );
-
-    let plan = build_model_load_plan(
+    let plan = prepare_model_load(
         model_id,
         model_id,
         0,
@@ -128,7 +135,70 @@ pub(crate) async fn load_model(
         scheduler_queue_delay_ms,
         topology,
         tp_degree,
+        &onnx_tuning,
     )?;
+    load_prepared_model(
+        plan,
+        device_info,
+        resources,
+        model_registry,
+        shared_metrics,
+        onnx_tuning,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_model_load(
+    base_model_id: u32,
+    runtime_model_id: u32,
+    replica_id: u32,
+    model_path: &Path,
+    device_info: &DeviceInfo,
+    batch_size: usize,
+    scheduler_queue_size: usize,
+    scheduler_max_micro_batch: usize,
+    scheduler_queue_delay_ms: u64,
+    topology: &str,
+    tp_degree: usize,
+    onnx_tuning: &OnnxRuntimeTuning,
+) -> Result<ModelLoadPlan, DynError> {
+    build_model_load_plan(
+        base_model_id,
+        runtime_model_id,
+        replica_id,
+        model_path,
+        device_info,
+        batch_size,
+        scheduler_queue_size,
+        scheduler_max_micro_batch,
+        scheduler_queue_delay_ms,
+        topology,
+        tp_degree,
+        onnx_tuning,
+    )
+}
+
+pub(crate) async fn load_prepared_model(
+    plan: ModelLoadPlan,
+    device_info: &DeviceInfo,
+    resources: Arc<RuntimeResources>,
+    model_registry: &ModelRegistry,
+    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
+    onnx_tuning: OnnxRuntimeTuning,
+) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), DynError> {
+    let model_id = plan.base_model_id();
+    #[cfg(feature = "gpu-device-pool")]
+    {
+        let bootstrap = device_memory_bootstrap_plan(std::iter::once(&plan), device_info)?;
+        resources.ensure_device_pools(&bootstrap)?;
+        resources.attach_device_memory_metrics(shared_metrics.clone());
+    }
+    log::info!(
+        "Current directory: {:?}",
+        std::env::current_dir().unwrap_or_default()
+    );
+
     let LoadedReplica {
         scheduler,
         swap_handles,

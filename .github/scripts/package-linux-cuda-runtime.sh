@@ -40,6 +40,14 @@ case "$needed_libs" in
     ;;
 esac
 
+# The stable CUDA profile must include Kapsl's shared-KV GGUF path. This marker
+# is referenced only by that feature, so reject a legacy native-KV build before
+# it can be published under the CUDA installer name.
+if ! grep -aFq 'KAPSL_GGUF_DISABLE_SHARED_KV' "$binary"; then
+  echo "CUDA runtime binary does not include the shared-KV GGUF path; check the stable cuda feature alias." >&2
+  exit 1
+fi
+
 bundle_name="kapsl-${KAPSL_VERSION}-linux-x86_64-cuda12"
 bundle_root="${RUNNER_TEMP}/${bundle_name}"
 mkdir -p dist "$bundle_root"

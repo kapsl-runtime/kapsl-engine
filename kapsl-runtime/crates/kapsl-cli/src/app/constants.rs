@@ -76,6 +76,12 @@ pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_M
 /// Internal worker override used to keep process-local CUDA arenas from each
 /// claiming the parent process's full configured pool.
 pub(crate) const GPU_DEVICE_POOL_DISABLED_ENV: &str = "KAPSL_GPU_DEVICE_POOL_DISABLED";
+/// Selects physical CUDA pool policy: `auto`, `fixed`, or `off`. A per-device
+/// `_<device_id>` suffix takes precedence. When omitted, an explicit
+/// `KAPSL_GPU_DEVICE_POOL_BYTES` means `fixed`; the shared-KV CUDA application
+/// profile otherwise defaults to `auto`.
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_DEVICE_POOL_MODE_ENV: &str = "KAPSL_GPU_DEVICE_POOL_MODE";
 /// Explicit operator attestation that each isolated worker receives an
 /// exclusive GPU/MIG slice. A configured per-process VRAM cap is also accepted
 /// as an isolation boundary.
@@ -87,6 +93,12 @@ pub(crate) const ISOLATED_WORKER_GPU_POOL_ENV: &str = "KAPSL_ISOLATED_WORKER_GPU
 /// `_<device_id>` suffix takes precedence.
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) const GPU_DEVICE_POOL_BYTES_ENV: &str = "KAPSL_GPU_DEVICE_POOL_BYTES";
+/// Bytes kept outside an automatically-sized backing pool for backend scratch,
+/// native-KV fallback, and later model additions. The default is a bounded
+/// fraction of the safe device budget.
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES_ENV: &str =
+    "KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES";
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) const GPU_ONNX_GUARANTEED_BYTES_ENV: &str = "KAPSL_GPU_ONNX_GUARANTEED_BYTES";
 #[cfg(feature = "gpu-device-pool")]

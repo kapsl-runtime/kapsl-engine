@@ -650,6 +650,27 @@ Server pressure env vars:
 - `KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS`: max new tokens allowed per request in conserve state.
 - `KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS`: max new tokens allowed per request in emergency state.
 
+Physical CUDA pool env vars (stable shared-KV CUDA profile):
+
+- `KAPSL_GPU_DEVICE_POOL_MODE[_<id>]`: `auto`, `fixed`, or `off`. The stable `gguf-cuda-shared-kv` profile defaults to automatic sizing; other profiles remain off unless explicitly enabled.
+- `KAPSL_GPU_DEVICE_POOL_BYTES[_<id>]`: exact positive backing size and implicit fixed-mode override; accepts byte, `k`, `m`, and `g` suffixes.
+- `KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES[_<id>]`: automatic-mode room retained for scratch, native-KV fallback, and later models; zero is valid.
+- `CUDA_DEVICE_MEMORY_LIMIT[_<id>]` / `KAPSL_GPU_MEMORY_LIMIT_MB`: strict automatic-sizing and admission ceiling.
+- `KAPSL_GGUF_DISABLE_SHARED_KV`: force GGUF back to llama.cpp native KV.
+- `KAPSL_ISOLATED_WORKER_GPU_POOL`: operator attestation that each isolated worker owns an exclusive GPU/MIG boundary. Pool settings alone do not establish isolation.
+
+Automatic sizing happens after startup package planning and before backend/ORT
+session construction. It subtracts known external weights, an unpooled reserve,
+and a separate driver safety band from the lower of the declared ceiling and
+live free VRAM. Planned pooled ONNX weight copies form a hard lower bound. The
+resulting process-lifetime backing allocation is aligned to 2 MiB and is never
+resized. See `docs/configuration.md` for the full formula and failure policy.
+At scrape time, `/metrics` refreshes `kapsl_gpu_device_pool_*` gauges for live
+allocation bytes/count, free bytes/ranges, largest free range, fragmentation,
+and per-owner usage/quota/admission/allocatable bytes. Stale unloaded-owner
+rows are removed; `kapsl_device_memory_pooled_bytes` continues to mean fixed
+backing capacity.
+
 GPU co-tenancy env vars:
 
 - `KAPSL_COTENANCY_GUARD` (`1`/`true`/`on`, default off): probe each monitor tick (via `nvidia-smi --query-compute-apps`) for other processes using the GPU — e.g. a training job sharing the card. When enabled:
@@ -682,12 +703,17 @@ Thresholds are configured via env vars (see Section 12). The runtime evaluates p
 
 ## 14. LLM Shared KV Cache
 
-For multi-model deployments with LLM backends, the runtime coordinates a shared KV cache block pool across all LLM engine instances on the same device.
+There are two related layers. `SharedKvState` coordinates logical token/block
+budgets across LLM engines. In the stable CUDA profile, `GpuDevicePool` also
+provides one physical byte backing allocation per used device for ORT and
+compatible paged-KV consumers. The physical pool is geometry-neutral and is
+sized once before backend sessions are constructed.
 
 Key details:
 
-- Each KV block is 2 MB.
-- Block size is 16 tokens.
+- The logical coordinator uses nominal 2 MiB / 16-token accounting blocks.
+- Physical paged-KV block bytes are derived from the model geometry; they are
+  not necessarily the logical coordinator's nominal size.
 - The `SharedKvState` coordinates device-level block allocator pools and a `GlobalKvScheduler`.
 - Each LLM engine attaches to the shared pool on startup and detaches on shutdown.
 - Cross-model token-budget coordination prevents any single engine from monopolising device memory.

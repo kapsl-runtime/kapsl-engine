@@ -301,34 +301,7 @@ pub(crate) fn build_model_lifecycle_routes(
                     );
                 }
 
-                // Update status to Stopping
-                if let Err(e) = models
-                    .registry()
-                    .set_status(model_id, ModelStatus::Stopping)
-                {
-                    log::warn!(
-                        "Failed to set status to Stopping during stop request for {}: {}",
-                        model_id,
-                        e
-                    );
-                    // Proceed anyway? Yes, we want to stop.
-                }
-
-                // Remove pool (this will drop it and clean up resources)
-                models.stop_runtime(model_id);
-                resources.kv().detach_engine_for_model(model_id);
-
-                // Update status to Inactive
-                if let Err(e) = models
-                    .registry()
-                    .set_status(model_id, ModelStatus::Inactive)
-                {
-                    log::warn!(
-                        "Failed to set status to Inactive after stop for {}: {}",
-                        model_id,
-                        e
-                    );
-                }
+                stop_model_and_replicas(model_id, &models, &resources);
 
                 warp::reply::with_status(
                     warp::reply::json(&SuccessResponse {
@@ -375,9 +348,7 @@ pub(crate) fn build_model_lifecycle_routes(
 
                 let base_model_id = model_info.base_model_id;
                 let _lifecycle_guard = models.lock_lifecycle(base_model_id).await;
-                let replicas = models.registry().list_replicas(base_model_id);
-
-                force_stop_model_before_remove(base_model_id, &replicas, &models, &resources);
+                let replicas = stop_model_and_replicas(base_model_id, &models, &resources);
                 models.remove(base_model_id);
 
                 for replica in replicas {

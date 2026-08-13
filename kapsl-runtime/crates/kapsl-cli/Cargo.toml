@@ -5,9 +5,10 @@ edition = "2021"
 
 [features]
 # Release profiles. Portable installers use `default`; the Linux CUDA bundle
-# uses the stable `cuda` alias below.
+# uses the stable shared-KV `cuda` alias below. The explicit `gguf-cuda`
+# feature remains available as the llama.cpp native-KV rollback profile.
 default = []
-cuda = ["gguf-cuda"]
+cuda = ["gguf-cuda-shared-kv"]
 
 # Shared implementation switch for runtime-owned CUDA memory. It remains a
 # separate feature so CI can type-check the memory authority without compiling

@@ -104,16 +104,35 @@ EOF
 
 chmod +x "$fake_bin/readelf" "$fake_bin/ldd" "$fake_bin/find" "$fake_bin/patchelf"
 
-(
-  cd "$work_dir"
-  PATH="$fake_bin:$PATH" \
-  RUNNER_OS=Linux \
-  RUNNER_ARCH=X64 \
-  RUNNER_TEMP="$runner_temp" \
-  KAPSL_VERSION=9.9.9 \
-  KAPSL_NVIDIA_LICENSE_FILE="$nvidia_license" \
-    bash .github/scripts/package-linux-cuda-runtime.sh
-)
+run_packager() {
+  (
+    cd "$work_dir"
+    PATH="$fake_bin:$PATH" \
+    RUNNER_OS=Linux \
+    RUNNER_ARCH=X64 \
+    RUNNER_TEMP="$runner_temp" \
+    KAPSL_VERSION=9.9.9 \
+    KAPSL_NVIDIA_LICENSE_FILE="$nvidia_license" \
+      bash .github/scripts/package-linux-cuda-runtime.sh
+  )
+}
+
+missing_shared_kv_log="${test_root}/missing-shared-kv.log"
+if run_packager >"$missing_shared_kv_log" 2>&1; then
+  echo "CUDA packager accepted a binary without the shared-KV feature marker." >&2
+  exit 1
+fi
+grep -q 'does not include the shared-KV GGUF path' "$missing_shared_kv_log"
+
+cat > "$work_dir/kapsl-runtime/target/release/kapsl" <<'EOF'
+#!/bin/sh
+# Shared-KV feature marker used by the packager's profile assertion:
+# KAPSL_GGUF_DISABLE_SHARED_KV
+echo kapsl
+EOF
+chmod +x "$work_dir/kapsl-runtime/target/release/kapsl"
+
+run_packager
 
 archive="$work_dir/dist/kapsl-9.9.9-linux-x86_64-cuda12.tar.gz"
 test -f "$archive"

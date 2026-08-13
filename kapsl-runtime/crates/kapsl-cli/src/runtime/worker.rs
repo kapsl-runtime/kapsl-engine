@@ -585,6 +585,17 @@ mod remote_engine_tests {
             ISOLATED_WORKER_GPU_POOL_ENV,
             "false"
         ));
+        #[cfg(feature = "gpu-device-pool")]
+        {
+            assert!(!is_explicit_worker_gpu_boundary(
+                GPU_DEVICE_POOL_MODE_ENV,
+                "auto"
+            ));
+            assert!(!is_explicit_worker_gpu_boundary(
+                GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES_ENV,
+                "2g"
+            ));
+        }
     }
 
     #[cfg(unix)]

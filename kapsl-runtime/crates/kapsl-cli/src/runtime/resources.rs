@@ -40,11 +40,29 @@ pub(crate) struct RuntimeResources {
 }
 
 impl RuntimeResources {
+    #[cfg_attr(feature = "gpu-device-pool", allow(dead_code))]
     pub(crate) fn new(device_info: &DeviceInfo) -> Result<Arc<Self>, String> {
+        #[cfg(feature = "gpu-device-pool")]
+        {
+            Self::new_with_device_memory_plan(device_info, &DeviceMemoryBootstrapPlan::default())
+        }
+        #[cfg(not(feature = "gpu-device-pool"))]
+        {
+            Ok(Arc::new(Self {
+                kv: KvCoordinatorInner::new(device_info),
+                pressure: ResourcePressure::from_env(),
+            }))
+        }
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn new_with_device_memory_plan(
+        device_info: &DeviceInfo,
+        bootstrap: &DeviceMemoryBootstrapPlan,
+    ) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
             kv: KvCoordinatorInner::new(device_info),
-            #[cfg(feature = "gpu-device-pool")]
-            device_memory: DeviceMemoryManager::from_env(device_info)?,
+            device_memory: DeviceMemoryManager::from_env_with_plan(device_info, bootstrap)?,
             pressure: ResourcePressure::from_env(),
         }))
     }
@@ -76,6 +94,17 @@ impl RuntimeResources {
         self.device_memory
             .as_ref()
             .is_some_and(|manager| manager.has_pool(device_id))
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn ensure_device_pools(
+        &self,
+        bootstrap: &DeviceMemoryBootstrapPlan,
+    ) -> Result<(), String> {
+        if let Some(manager) = self.device_memory.as_ref() {
+            manager.ensure_pools_for_plan(bootstrap)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "gpu-device-pool")]
@@ -116,6 +145,13 @@ impl RuntimeResources {
     ) {
         if let Some(manager) = self.device_memory.as_ref() {
             manager.attach_metrics(metrics);
+        }
+    }
+
+    pub(crate) fn refresh_device_pool_metrics(&self) {
+        #[cfg(feature = "gpu-device-pool")]
+        if let Some(manager) = self.device_memory.as_ref() {
+            manager.refresh_pool_metrics();
         }
     }
 }

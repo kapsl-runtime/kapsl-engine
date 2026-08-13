@@ -26,6 +26,8 @@ pub(crate) use config::*;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use device_memory::*;
 pub(crate) use inference_service::*;
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) use model::load_plan::device_memory_bootstrap_plan;
 pub(crate) use model::*;
 pub(crate) use model_manager::*;
 pub(crate) use monitor::*;

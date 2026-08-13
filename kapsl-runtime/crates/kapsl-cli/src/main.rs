@@ -264,13 +264,47 @@ async fn main() -> Result<(), DynError> {
         _ => {}
     }
 
-    // One process-owned facade for logical KV, physical device memory, and
-    // pressure state. Its components remain independently testable.
-    let resources = RuntimeResources::new(&device_info)?;
-
     let registry = Arc::new(Registry::new());
     let model_registry = Arc::new(ModelRegistry::new());
     let models = ModelManager::new(model_registry.clone());
+
+    // Resolve and retain every startup package before choosing the immutable
+    // physical GPU pool. This gives automatic sizing a host-only view of
+    // external weights without constructing a backend or CUDA/ORT session.
+    log::info!("=== Package Planning ===");
+    let mut startup_plans = Vec::with_capacity(args.model.len());
+    for model_path in &args.model {
+        let model_id = models.allocate_model_id();
+        let onnx_tuning = onnx_tuning_profile.resolve(model_id);
+        let plan = prepare_model_load(
+            model_id,
+            model_id,
+            0,
+            model_path,
+            &device_info,
+            args.batch_size,
+            args.scheduler_queue_size,
+            args.scheduler_max_micro_batch,
+            args.scheduler_queue_delay_ms,
+            &args.topology,
+            args.tp_degree,
+            &onnx_tuning,
+        )?;
+        startup_plans.push((model_path.clone(), plan));
+    }
+
+    // One process-owned facade for logical KV, physical device memory, and
+    // pressure state. Pool registration completes before any backend/session
+    // construction begins.
+    #[cfg(feature = "gpu-device-pool")]
+    let resources = {
+        let bootstrap =
+            device_memory_bootstrap_plan(startup_plans.iter().map(|(_, plan)| plan), &device_info)?;
+        RuntimeResources::new_with_device_memory_plan(&device_info, &bootstrap)?
+    };
+    #[cfg(not(feature = "gpu-device-pool"))]
+    let resources = RuntimeResources::new(&device_info)?;
+
     let auto_scaler = Arc::new(RwLock::new(AutoScaler::new()));
     let runtime_samples = Arc::new(RwLock::new(RuntimeSamples::default()));
     let throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>> =
@@ -291,6 +325,8 @@ async fn main() -> Result<(), DynError> {
 
     // Create shared metrics instance ONCE for all models
     let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
+    #[cfg(feature = "gpu-device-pool")]
+    resources.attach_device_memory_metrics(shared_metrics.clone());
 
     let runtime_samples_for_sampler = runtime_samples.clone();
     let has_cuda_for_sampler = device_info.has_cuda;
@@ -403,52 +439,39 @@ async fn main() -> Result<(), DynError> {
         }
     });
 
-    // 2. Load Packagesƒ
-    log::info!("=== Package Loading ===");
-    let load_parallelism = resolve_model_load_parallelism(args.model.len());
-    if args.model.len() > 1 {
+    // 2. Construct and load the preplanned model backends.
+    log::info!("=== Model Loading ===");
+    let load_parallelism = resolve_model_load_parallelism(startup_plans.len());
+    if startup_plans.len() > 1 {
         log::info!(
-            "Loading {} model packages with parallelism {} ({}=N to override)",
-            args.model.len(),
+            "Loading {} model backends with parallelism {} ({}=N to override)",
+            startup_plans.len(),
             load_parallelism,
             MODEL_LOAD_PARALLELISM_ENV
         );
     }
-    let load_specs = args
-        .model
-        .iter()
-        .map(|model_path| (models.allocate_model_id(), model_path.clone()))
-        .collect::<Vec<_>>();
 
-    let load_results = run_with_loading_async("Loading model packages", {
+    let load_results = run_with_loading_async("Loading model backends", {
         let device_info = device_info.clone();
         let resources = resources.clone();
         let model_registry = model_registry.clone();
         let shared_metrics = shared_metrics.clone();
-        let topology = args.topology.clone();
         let onnx_tuning_profile = onnx_tuning_profile.clone();
         async move {
-            let results = stream::iter(load_specs.into_iter().map(|(model_id, model_path)| {
+            let results = stream::iter(startup_plans.into_iter().map(|(model_path, plan)| {
                 let device_info = device_info.clone();
                 let resources = resources.clone();
                 let model_registry = model_registry.clone();
                 let shared_metrics = shared_metrics.clone();
-                let topology = topology.clone();
+                let model_id = plan.base_model_id();
                 let onnx_tuning = onnx_tuning_profile.resolve(model_id);
                 async move {
-                    let result = load_model(
-                        model_id,
-                        &model_path,
+                    let result = load_prepared_model(
+                        plan,
                         &device_info,
                         resources,
-                        args.batch_size,
-                        args.scheduler_queue_size,
-                        args.scheduler_max_micro_batch,
-                        args.scheduler_queue_delay_ms,
                         &model_registry,
                         &shared_metrics,
-                        &topology,
-                        args.tp_degree,
                         onnx_tuning,
                     )
                     .await;
@@ -660,8 +683,11 @@ async fn main() -> Result<(), DynError> {
     let resources_for_autoscaler = resources.clone();
 
     tokio::spawn(async move {
-        let metrics_route =
-            build_metrics_route(registry_arc.clone(), api_auth_state_for_api.clone());
+        let metrics_route = build_metrics_route(
+            registry_arc.clone(),
+            api_auth_state_for_api.clone(),
+            resources_for_api.clone(),
+        );
 
         // API routes
         let model_routes = build_model_routes(ModelRoutesConfig {

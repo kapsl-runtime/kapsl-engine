@@ -1,5 +1,91 @@
 use std::collections::HashMap;
 
+pub(crate) const AUTO_POOL_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const AUTO_POOL_MIN_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const AUTO_POOL_GROWTH_FLOOR_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AutoPoolSizingInput {
+    pub(crate) safe_budget_bytes: usize,
+    pub(crate) planned_external_bytes: usize,
+    pub(crate) minimum_pool_bytes: usize,
+    pub(crate) unpooled_reserve_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoPoolSizingDecision {
+    pub(crate) capacity_bytes: Option<usize>,
+    pub(crate) planned_external_bytes: usize,
+    pub(crate) unpooled_reserve_bytes: usize,
+    pub(crate) reason: Option<String>,
+}
+
+/// Choose one immutable backing allocation after retaining room for known
+/// external weights and for unpooled scratch/native-KV/future model loads.
+/// The caller has already removed the driver safety band from `safe_budget`.
+pub(crate) fn choose_auto_pool_capacity(input: AutoPoolSizingInput) -> AutoPoolSizingDecision {
+    let available_after_external = input
+        .safe_budget_bytes
+        .saturating_sub(input.planned_external_bytes);
+    if input.planned_external_bytes >= input.safe_budget_bytes {
+        return AutoPoolSizingDecision {
+            capacity_bytes: None,
+            planned_external_bytes: input.planned_external_bytes,
+            unpooled_reserve_bytes: 0,
+            reason: Some(format!(
+                "planned external memory ({}) leaves no safe pool capacity in the {}-byte budget",
+                input.planned_external_bytes, input.safe_budget_bytes
+            )),
+        };
+    }
+
+    let required_pool_bytes = AUTO_POOL_MIN_BYTES.max(input.minimum_pool_bytes);
+    let default_reserve = (input.safe_budget_bytes / 5)
+        .max(1024 * 1024 * 1024)
+        .min(input.safe_budget_bytes / 3);
+    let requested_reserve = input.unpooled_reserve_bytes.unwrap_or(default_reserve);
+    let max_reserve = available_after_external.saturating_sub(required_pool_bytes);
+    if input.unpooled_reserve_bytes.is_some() && requested_reserve > max_reserve {
+        return AutoPoolSizingDecision {
+            capacity_bytes: None,
+            planned_external_bytes: input.planned_external_bytes,
+            unpooled_reserve_bytes: requested_reserve,
+            reason: Some(format!(
+                "the explicit {requested_reserve}-byte unpooled reserve leaves less than the {}-byte automatic-pool minimum",
+                required_pool_bytes
+            )),
+        };
+    }
+    let retained_reserve = requested_reserve.min(max_reserve);
+    let allocatable_capacity = available_after_external.saturating_sub(retained_reserve);
+    // Automatic mode is demand-sized. Retain bounded growth room instead of
+    // eagerly converting every otherwise-free byte into an immutable backing.
+    let growth_headroom = (required_pool_bytes / 4).max(AUTO_POOL_GROWTH_FLOOR_BYTES);
+    let raw_capacity = required_pool_bytes
+        .saturating_add(growth_headroom)
+        .min(allocatable_capacity);
+    let capacity = raw_capacity / AUTO_POOL_ALIGNMENT_BYTES * AUTO_POOL_ALIGNMENT_BYTES;
+
+    if capacity < required_pool_bytes {
+        return AutoPoolSizingDecision {
+            capacity_bytes: None,
+            planned_external_bytes: input.planned_external_bytes,
+            unpooled_reserve_bytes: retained_reserve,
+            reason: Some(format!(
+                "only {capacity} aligned bytes remain, below the {}-byte automatic-pool minimum",
+                required_pool_bytes
+            )),
+        };
+    }
+
+    AutoPoolSizingDecision {
+        capacity_bytes: Some(capacity),
+        planned_external_bytes: input.planned_external_bytes,
+        unpooled_reserve_bytes: retained_reserve,
+        reason: None,
+    }
+}
+
 /// Accounting-only view of a CUDA device's runtime budget.
 ///
 /// The elastic pool is one physical allocation, so its full backing capacity is
@@ -106,6 +192,32 @@ impl DeviceBudgetLedger {
         Ok((snapshot(device), true))
     }
 
+    /// Update the one process-lifetime backing allocation after deferred/auto
+    /// sizing. This is intentionally not a general resize API: callers set it
+    /// once before publishing the pool to any backend.
+    pub(crate) fn set_pooled_bytes(
+        &mut self,
+        device_id: usize,
+        pooled_bytes: usize,
+    ) -> Result<DeviceBudgetSnapshot, String> {
+        let device = self
+            .devices
+            .get_mut(&device_id)
+            .ok_or_else(|| format!("CUDA device {device_id} has no runtime memory authority"))?;
+        let external = snapshot(device)
+            .planned_external_bytes
+            .saturating_add(snapshot(device).external_bytes);
+        let projected = pooled_bytes.saturating_add(external);
+        if projected > device.budget_bytes {
+            return Err(format!(
+                "CUDA device {device_id} pool reserves {pooled_bytes} bytes with {external} external bytes already charged, exceeding its {}-byte safe budget",
+                device.budget_bytes
+            ));
+        }
+        device.pooled_bytes = pooled_bytes;
+        Ok(snapshot(device))
+    }
+
     /// Replace one load's planned reservation with its observed external use.
     ///
     /// The observed value is retained even when it crosses the budget. The
@@ -196,6 +308,112 @@ mod tests {
     }
 
     #[test]
+    fn auto_pool_subtracts_weights_and_retains_unpooled_headroom() {
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 20 * GIB,
+            planned_external_bytes: 6 * GIB,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: Some(2 * GIB),
+        });
+        assert_eq!(decision.capacity_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(decision.unpooled_reserve_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn auto_pool_default_reserve_is_bounded_and_aligned() {
+        let safe_budget = 24 * GIB;
+        let planned_external = 5 * GIB;
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: safe_budget,
+            planned_external_bytes: planned_external,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: None,
+        });
+        let capacity = decision.capacity_bytes.expect("automatic pool");
+        let expected_reserve = (safe_budget / 5).max(GIB).min(safe_budget / 3);
+        let expected_capacity = 512 * 1024 * 1024;
+        assert_eq!(capacity % AUTO_POOL_ALIGNMENT_BYTES, 0);
+        assert_eq!(decision.unpooled_reserve_bytes, expected_reserve);
+        assert_eq!(capacity, expected_capacity);
+    }
+
+    #[test]
+    fn auto_pool_disables_when_external_memory_consumes_budget() {
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 8 * GIB,
+            planned_external_bytes: 8 * GIB,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: None,
+        });
+        assert_eq!(decision.capacity_bytes, None);
+        assert!(decision.reason.unwrap().contains("leaves no safe pool"));
+    }
+
+    #[test]
+    fn automatic_pool_minimum_boundary_is_inclusive() {
+        let exact = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: AUTO_POOL_MIN_BYTES,
+            planned_external_bytes: 0,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: Some(0),
+        });
+        assert_eq!(exact.capacity_bytes, Some(AUTO_POOL_MIN_BYTES));
+
+        let below = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: AUTO_POOL_MIN_BYTES - 1,
+            planned_external_bytes: 0,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: Some(0),
+        });
+        assert_eq!(below.capacity_bytes, None);
+    }
+
+    #[test]
+    fn explicit_zero_unpooled_reserve_is_honored() {
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 4 * GIB,
+            planned_external_bytes: GIB,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: Some(0),
+        });
+        assert_eq!(decision.capacity_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(decision.unpooled_reserve_bytes, 0);
+    }
+
+    #[test]
+    fn explicit_unpooled_reserve_is_not_silently_reduced() {
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 4 * GIB,
+            planned_external_bytes: 3 * GIB,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: Some(GIB),
+        });
+        assert_eq!(decision.capacity_bytes, None);
+        assert_eq!(decision.unpooled_reserve_bytes, GIB);
+        assert!(decision.reason.unwrap().contains("explicit"));
+    }
+
+    #[test]
+    fn pooled_model_footprint_is_a_hard_minimum() {
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 8 * GIB,
+            planned_external_bytes: 2 * GIB,
+            minimum_pool_bytes: 5 * GIB,
+            unpooled_reserve_bytes: Some(2 * GIB),
+        });
+        assert_eq!(decision.capacity_bytes, None);
+        assert!(decision.reason.unwrap().contains("5"));
+
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 8 * GIB,
+            planned_external_bytes: 2 * GIB,
+            minimum_pool_bytes: 5 * GIB,
+            unpooled_reserve_bytes: None,
+        });
+        assert!(decision.capacity_bytes.unwrap() >= 5 * GIB);
+    }
+
+    #[test]
     fn pool_and_external_reservations_share_one_budget() {
         let mut ledger = ledger();
         let (snapshot, owns_charge) = ledger
@@ -205,6 +423,23 @@ mod tests {
         assert_eq!(snapshot.used_bytes(), 20 * GIB);
         assert_eq!(snapshot.available_bytes(), 0);
         assert!(ledger.reserve_external(DEVICE, "weights-b", 1).is_err());
+    }
+
+    #[test]
+    fn deferred_pool_charge_accounts_for_existing_external_bytes() {
+        let mut ledger = DeviceBudgetLedger::default();
+        ledger.insert_device(DEVICE, 20 * GIB, 0).unwrap();
+        ledger.reserve_external(DEVICE, "weights", 6 * GIB).unwrap();
+
+        let snapshot = ledger.set_pooled_bytes(DEVICE, 12 * GIB).unwrap();
+        assert_eq!(snapshot.pooled_bytes, 12 * GIB);
+        assert_eq!(snapshot.available_bytes(), 2 * GIB);
+
+        let error = ledger
+            .set_pooled_bytes(DEVICE, 15 * GIB)
+            .expect_err("pool plus weights must remain within budget");
+        assert!(error.contains("exceeding"), "{error}");
+        assert_eq!(ledger.snapshot(DEVICE).unwrap().pooled_bytes, 12 * GIB);
     }
 
     #[test]

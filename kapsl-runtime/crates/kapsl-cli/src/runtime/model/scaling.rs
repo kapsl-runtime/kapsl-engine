@@ -39,7 +39,13 @@ pub(crate) async fn scale_up_model(
         scheduler_queue_delay_ms,
         topology,
         tp_degree,
+        &onnx_tuning,
     )?;
+    #[cfg(feature = "gpu-device-pool")]
+    {
+        let bootstrap = device_memory_bootstrap_plan(std::iter::once(&plan), device_info)?;
+        resources.ensure_device_pools(&bootstrap)?;
+    }
     let LoadedReplica {
         scheduler,
         mut swap_handles,
@@ -128,56 +134,6 @@ pub(crate) async fn scale_down_model(
     );
 
     Ok(())
-}
-
-pub(crate) fn force_stop_model_before_remove(
-    base_model_id: u32,
-    replicas: &[ModelInfo],
-    models: &ModelManager,
-    resources: &RuntimeResources,
-) {
-    for replica in replicas {
-        if let Err(error) = models
-            .registry()
-            .set_status(replica.id, ModelStatus::Stopping)
-        {
-            log::warn!(
-                "Failed to set model {} replica {} to Stopping before remove: {}",
-                base_model_id,
-                replica.replica_id,
-                error
-            );
-        }
-    }
-
-    if let Some(pool) = models.pool(base_model_id) {
-        for replica in replicas {
-            if !pool.remove_replica(replica.replica_id) {
-                log::debug!(
-                    "Replica {} for model {} was not present in the pool during remove",
-                    replica.replica_id,
-                    base_model_id
-                );
-            }
-        }
-    }
-
-    models.stop_runtime(base_model_id);
-    resources.kv().detach_engine_for_model(base_model_id);
-
-    for replica in replicas {
-        if let Err(error) = models
-            .registry()
-            .set_status(replica.id, ModelStatus::Inactive)
-        {
-            log::warn!(
-                "Failed to set model {} replica {} to Inactive before remove: {}",
-                base_model_id,
-                replica.replica_id,
-                error
-            );
-        }
-    }
 }
 
 pub(crate) const MEMORY_HEADROOM_FRACTION: f64 = 0.80;

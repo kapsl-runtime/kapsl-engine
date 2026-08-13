@@ -35,6 +35,21 @@ That single archive contains the CUDA-compiled GGUF runtime and the ONNX CUDA
 execution provider, plus their user-space CUDA dependencies. It requires only a
 compatible host NVIDIA driver, like a Triton GPU image.
 
+The stable CUDA runtime uses Kapsl's paged shared-KV path for supported GGUF
+architectures. Models rejected by its compatibility policy use llama.cpp's
+native KV path instead. Set `KAPSL_GGUF_DISABLE_SHARED_KV=1` to force that path
+for diagnosis or rollback. Source builds can instead select the explicit
+`gguf-cuda` feature to exclude shared-KV entirely.
+
+The same stable profile automatically sizes one process-owned CUDA backing
+pool on each device used by a pooled model. Startup packages are planned first,
+so external GGUF/native weights and conservative unpooled scratch/fallback
+headroom are removed before the immutable pool size is selected. Use
+`KAPSL_GPU_DEVICE_POOL_MODE=off` to opt out, `auto` to make failure strict, or
+`fixed` together with `KAPSL_GPU_DEVICE_POOL_BYTES[_N]` for an exact operator
+allocation. See the GPU memory section in `docs/configuration.md` for sizing
+and isolated-worker behavior.
+
 Install CUDA 12 and TensorRT 10 packs:
 
 ```bash
