@@ -34,6 +34,7 @@ impl ResourcePressure {
 /// code one stable owner and a consistent per-process authority boundary.
 pub(crate) struct RuntimeResources {
     kv: KvCoordinator,
+    host_memory: Arc<super::host_memory::HostMemoryManager>,
     #[cfg(feature = "gpu-device-pool")]
     device_memory: Option<Arc<DeviceMemoryManager>>,
     pressure: Arc<ResourcePressure>,
@@ -50,6 +51,7 @@ impl RuntimeResources {
         {
             Ok(Arc::new(Self {
                 kv: KvCoordinatorInner::new(device_info),
+                host_memory: super::host_memory::HostMemoryManager::new(device_info),
                 pressure: ResourcePressure::from_env(),
             }))
         }
@@ -62,6 +64,7 @@ impl RuntimeResources {
     ) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
             kv: KvCoordinatorInner::new(device_info),
+            host_memory: super::host_memory::HostMemoryManager::new(device_info),
             device_memory: DeviceMemoryManager::from_env_with_plan(device_info, bootstrap)?,
             pressure: ResourcePressure::from_env(),
         }))
@@ -73,6 +76,16 @@ impl RuntimeResources {
 
     pub(crate) fn pressure(&self) -> &Arc<ResourcePressure> {
         &self.pressure
+    }
+
+    pub(crate) fn begin_host_memory_admission(
+        &self,
+        device_ids: &[usize],
+        model_id: u32,
+        requested_bytes: usize,
+    ) -> Result<Option<super::host_memory::HostMemoryLease>, String> {
+        self.host_memory
+            .admit(device_ids, model_id, requested_bytes)
     }
 
     #[cfg(any(

@@ -694,8 +694,13 @@ CPU memory governance:
 - `KAPSL_CPU_MEMORY_LIMIT_MB`: optional process-wide system-memory ceiling in
   MiB. Kapsl uses the tightest of this value, detected host RAM, and the Linux
   cgroup memory limit, then retains 20% as safety headroom. CPU LLM KV-cache
-  limits are derived from the resulting safe budget. This is admission and
-  capacity accounting; Kapsl does not reserve a second physical CPU arena.
+  limits are derived from the resulting safe budget. Before each in-process CPU
+  model or replica loads, Kapsl also reserves an estimate for expanded weights
+  and execution workspace within the other half of the safe budget; admission
+  fails before allocation if aggregate reservations would exceed that partition.
+  Reservations are released on
+  unload. This is accounting only: Kapsl does not reserve a second physical CPU
+  arena.
 
 ## 13. Runtime Pressure Management
 

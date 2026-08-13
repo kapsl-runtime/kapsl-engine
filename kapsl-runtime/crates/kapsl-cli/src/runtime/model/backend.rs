@@ -1,4 +1,93 @@
 use super::*;
+use kapsl_engine_api::{EngineStream, ExternalDeviceMemoryReport};
+
+struct HostMemoryTrackedEngine {
+    inner: Box<dyn kapsl_engine_api::Engine>,
+    lease: Option<super::super::host_memory::HostMemoryLease>,
+}
+
+impl Drop for HostMemoryTrackedEngine {
+    fn drop(&mut self) {
+        self.inner.unload();
+        self.lease.take();
+    }
+}
+
+#[async_trait::async_trait]
+impl kapsl_engine_api::Engine for HostMemoryTrackedEngine {
+    fn planned_external_device_memory(
+        &self,
+        path: &Path,
+    ) -> Result<ExternalDeviceMemoryReport, EngineError> {
+        self.inner.planned_external_device_memory(path)
+    }
+    async fn load(&mut self, path: &Path) -> Result<(), EngineError> {
+        self.inner.load(path).await
+    }
+    fn actual_external_device_memory(&self) -> ExternalDeviceMemoryReport {
+        self.inner.actual_external_device_memory()
+    }
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.inner.infer(request)
+    }
+    fn infer_batch(
+        &self,
+        requests: &[InferenceRequest],
+    ) -> Result<Vec<BinaryTensorPacket>, EngineError> {
+        self.inner.infer_batch(requests)
+    }
+    fn max_batch(&self) -> usize {
+        self.inner.max_batch()
+    }
+    fn self_batches(&self) -> bool {
+        self.inner.self_batches()
+    }
+    fn batching_policy(&self) -> BatchingPolicy {
+        self.inner.batching_policy()
+    }
+    fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+        self.inner.infer_stream(request)
+    }
+    async fn warmup(&self) -> Result<(), EngineError> {
+        self.inner.warmup().await
+    }
+    fn unload(&mut self) {
+        self.inner.unload();
+        self.lease.take();
+    }
+    fn metrics(&self) -> EngineMetrics {
+        self.inner.metrics()
+    }
+    fn model_info(&self) -> Option<EngineModelInfo> {
+        self.inner.model_info()
+    }
+    fn health_check(&self) -> Result<(), EngineError> {
+        self.inner.health_check()
+    }
+    fn supports_swap(&self) -> bool {
+        self.inner.supports_swap()
+    }
+    fn is_staged(&self) -> bool {
+        self.inner.is_staged()
+    }
+    async fn stage(&self, path: &Path) -> Result<(), EngineError> {
+        self.inner.stage(path).await
+    }
+    async fn swap(&self) -> Result<(), EngineError> {
+        self.inner.swap().await
+    }
+}
+
+fn estimated_host_model_bytes(model_path: &Path) -> Result<usize, String> {
+    let serialized = std::fs::metadata(model_path)
+        .map_err(|error| format!("stat model {}: {error}", model_path.display()))?
+        .len() as usize;
+    // Account for decoded/aligned weights and a bounded execution workspace.
+    Ok(serialized
+        .saturating_mul(5)
+        .saturating_div(4)
+        .saturating_add((serialized / 4).max(256 * 1024 * 1024)))
+}
 
 #[cfg(feature = "gpu-device-pool")]
 struct DeviceMemoryTrackedEngine {
@@ -308,6 +397,11 @@ pub(super) async fn load_runtime_backend(
     engine_kind: EngineKind,
     load_context: &str,
 ) -> Result<Box<dyn kapsl_engine_api::Engine>, DynError> {
+    let host_memory_lease = resources.begin_host_memory_admission(
+        admission_device_ids,
+        model_id,
+        estimated_host_model_bytes(model_file_path)?,
+    )?;
     #[cfg(not(feature = "gpu-device-pool"))]
     let _ = (admission_device_ids, resources, model_id, engine_kind);
 
@@ -350,16 +444,26 @@ pub(super) async fn load_runtime_backend(
             .into_iter()
             .map(DeviceMemoryAdmission::commit)
             .collect();
-        Ok(track_device_memory(
-            backend,
-            leases,
-            resources.clone(),
-            model_id,
-        ))
+        let backend = track_device_memory(backend, leases, resources.clone(), model_id);
+        Ok(if host_memory_lease.is_some() {
+            Box::new(HostMemoryTrackedEngine {
+                inner: backend,
+                lease: host_memory_lease,
+            })
+        } else {
+            backend
+        })
     }
 
     #[cfg(not(feature = "gpu-device-pool"))]
-    Ok(backend)
+    Ok(if host_memory_lease.is_some() {
+        Box::new(HostMemoryTrackedEngine {
+            inner: backend,
+            lease: host_memory_lease,
+        })
+    } else {
+        backend
+    })
 }
 
 pub(super) fn monitor_runtime_backend(
