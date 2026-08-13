@@ -29,13 +29,12 @@ impl ResourcePressure {
 
 /// Coordinating facade for runtime-owned resources.
 ///
-/// Logical KV allocation, physical CUDA pooling/admission, and pressure
-/// monitoring remain independent components; this type only gives lifecycle
-/// code one stable owner and a consistent per-process authority boundary.
+/// Logical KV allocation and pressure monitoring remain independent policy
+/// components. All physical/accounting memory domains live below one
+/// `MemoryAuthority` owned here.
 pub(crate) struct RuntimeResources {
     kv: KvCoordinator,
-    #[cfg(feature = "gpu-device-pool")]
-    device_memory: Option<Arc<DeviceMemoryManager>>,
+    memory: Arc<MemoryAuthority>,
     pressure: Arc<ResourcePressure>,
 }
 
@@ -48,8 +47,13 @@ impl RuntimeResources {
         }
         #[cfg(not(feature = "gpu-device-pool"))]
         {
+            let memory = MemoryAuthority::new(device_info)?;
             Ok(Arc::new(Self {
-                kv: KvCoordinatorInner::new(device_info),
+                kv: KvCoordinatorInner::new_with_host_budget(
+                    device_info,
+                    Some(memory.host_budget()),
+                ),
+                memory,
                 pressure: ResourcePressure::from_env(),
             }))
         }
@@ -60,9 +64,10 @@ impl RuntimeResources {
         device_info: &DeviceInfo,
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<Arc<Self>, String> {
+        let memory = MemoryAuthority::new_with_cuda_plan(device_info, bootstrap)?;
         Ok(Arc::new(Self {
-            kv: KvCoordinatorInner::new(device_info),
-            device_memory: DeviceMemoryManager::from_env_with_plan(device_info, bootstrap)?,
+            kv: KvCoordinatorInner::new_with_host_budget(device_info, Some(memory.host_budget())),
+            memory,
             pressure: ResourcePressure::from_env(),
         }))
     }
@@ -75,6 +80,10 @@ impl RuntimeResources {
         &self.pressure
     }
 
+    pub(crate) fn memory(&self) -> &Arc<MemoryAuthority> {
+        &self.memory
+    }
+
     #[cfg(any(
         feature = "native",
         feature = "gguf-native",
@@ -84,16 +93,12 @@ impl RuntimeResources {
         &self,
         device_id: usize,
     ) -> Option<Arc<kapsl_hal::gpu_arena::GpuDevicePool>> {
-        self.device_memory
-            .as_ref()
-            .and_then(|manager| manager.pool(device_id))
+        self.memory.cuda_pool(device_id)
     }
 
     #[cfg(feature = "gpu-device-pool")]
     pub(crate) fn uses_env_allocators(&self, device_id: usize) -> bool {
-        self.device_memory
-            .as_ref()
-            .is_some_and(|manager| manager.has_pool(device_id))
+        self.memory.uses_cuda_environment_allocator(device_id)
     }
 
     #[cfg(feature = "gpu-device-pool")]
@@ -101,41 +106,7 @@ impl RuntimeResources {
         &self,
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<(), String> {
-        if let Some(manager) = self.device_memory.as_ref() {
-            manager.ensure_pools_for_plan(bootstrap)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "gpu-device-pool")]
-    pub(crate) async fn begin_device_memory_admission(
-        &self,
-        device_id: usize,
-        model_id: u32,
-        kind: EngineKind,
-        planned_report: &ExternalDeviceMemoryReport,
-    ) -> Result<Option<DeviceMemoryAdmission>, String> {
-        let Some(manager) = self.device_memory.as_ref() else {
-            return Ok(None);
-        };
-        manager
-            .begin_admission(device_id, model_id, kind, planned_report)
-            .await
-    }
-
-    #[cfg(feature = "gpu-device-pool")]
-    pub(crate) async fn begin_device_memory_swap_admission(
-        &self,
-        device_id: usize,
-        model_id: u32,
-        planned_report: &ExternalDeviceMemoryReport,
-    ) -> Result<Option<DeviceMemorySwapAdmission>, String> {
-        let Some(manager) = self.device_memory.as_ref() else {
-            return Ok(None);
-        };
-        manager
-            .begin_swap_admission(device_id, model_id, planned_report)
-            .await
+        self.memory.ensure_cuda_pools(bootstrap)
     }
 
     #[cfg(feature = "gpu-device-pool")]
@@ -143,15 +114,10 @@ impl RuntimeResources {
         &self,
         metrics: kapsl_monitor::metrics::KapslMetrics,
     ) {
-        if let Some(manager) = self.device_memory.as_ref() {
-            manager.attach_metrics(metrics);
-        }
+        self.memory.attach_cuda_metrics(metrics);
     }
 
     pub(crate) fn refresh_device_pool_metrics(&self) {
-        #[cfg(feature = "gpu-device-pool")]
-        if let Some(manager) = self.device_memory.as_ref() {
-            manager.refresh_pool_metrics();
-        }
+        self.memory.refresh_cuda_pool_metrics();
     }
 }

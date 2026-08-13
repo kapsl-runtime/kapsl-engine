@@ -18,7 +18,7 @@ use kapsl_engine_api::{
     EngineModelInfo, InferenceRequest, TensorDtype,
 };
 #[cfg(feature = "gpu-device-pool")]
-use kapsl_engine_api::{EngineStream, ExternalDeviceMemory, ExternalDeviceMemoryReport};
+use kapsl_engine_api::{ExternalDeviceMemory, ExternalDeviceMemoryReport};
 use kapsl_hal::device::DeviceInfo;
 use kapsl_ipc::{IpcServer, TcpServer};
 use kapsl_llm::block_manager::{new_shared_allocator, SharedBlockAllocator};

@@ -3,7 +3,7 @@ use super::device_budget::{
 };
 use super::*;
 use cudarc::driver::{result as cuda_result, CudaDevice};
-use kapsl_hal::gpu_arena::{GpuDevicePool, PoolOwner};
+use kapsl_hal::gpu_arena::{GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -115,6 +115,7 @@ impl DeviceMemoryBootstrapPlan {
 #[derive(Debug)]
 struct ExternalReservation {
     allocation_id: String,
+    memory_owner: MemoryOwner,
     owns_charge: bool,
 }
 
@@ -122,7 +123,7 @@ struct ExternalReservation {
 ///
 /// Backends receive cloned elastic-pool handles where available, while this
 /// manager retains the global device budget and accounts allocations that
-/// cannot yet live in that pool (notably GGUF/native weights).
+/// cannot yet live in that pool (notably llama.cpp weights and compute scratch).
 pub(crate) struct DeviceMemoryManager {
     devices: HashMap<usize, DeviceAuthority>,
     pools: Mutex<HashMap<usize, Arc<GpuDevicePool>>>,
@@ -565,6 +566,71 @@ impl DeviceMemoryManager {
         self.pools.lock().unwrap().contains_key(&device_id)
     }
 
+    /// Admit one request-lifetime CUDA claim without taking the model-load
+    /// sampling lock. Pool-managed rows are already bounded by the admitted
+    /// workload quota. Backend-managed rows receive a unique ledger ID so
+    /// concurrent requests are charged additively rather than mistaken for a
+    /// shared persistent allocation.
+    pub(crate) fn admit_transient(
+        self: &Arc<Self>,
+        claim: &MemoryClaim,
+    ) -> Result<Option<DeviceMemoryTransientLease>, String> {
+        let MemoryDomain::Cuda { device_id } = claim.domain else {
+            return Err(format!(
+                "device memory manager cannot admit a {} claim",
+                claim.domain
+            ));
+        };
+        if claim.bytes == 0 {
+            return Ok(None);
+        }
+        if matches!(claim.source, MemoryClaimSource::Runtime { .. }) {
+            if !self.has_pool(device_id) {
+                return Err(format!(
+                    "runtime-managed CUDA claim for {} targets device {} without a physical pool",
+                    claim.owner, device_id
+                ));
+            }
+            return Ok(None);
+        }
+
+        let reported_id = match &claim.source {
+            MemoryClaimSource::External { allocation_id } => allocation_id.as_str(),
+            MemoryClaimSource::Runtime { .. } => unreachable!("handled above"),
+        };
+        let allocation_id = format!(
+            "request:{}:{}:{}:{}:{}",
+            claim.owner.model_id,
+            claim.owner.replica_id,
+            device_id,
+            self.next_fallback_allocation
+                .fetch_add(1, Ordering::Relaxed),
+            reported_id
+        );
+        let snapshot = {
+            let mut budget = self.budget.lock().unwrap();
+            let (snapshot, owns_charge) = budget.reserve_external(
+                device_id,
+                &allocation_id,
+                claim.bytes,
+                claim.owner,
+                claim.class,
+            )?;
+            debug_assert!(owns_charge, "request allocation IDs are unique");
+            snapshot
+        };
+        self.publish_metrics(device_id, snapshot);
+        Ok(Some(DeviceMemoryTransientLease {
+            manager: Arc::clone(self),
+            device_id,
+            reservation: ExternalReservation {
+                allocation_id,
+                memory_owner: claim.owner,
+                owns_charge: true,
+            },
+        }))
+    }
+
     /// Reserve this workload's planned external weight bytes and protect its
     /// configured elastic-pool guarantee during model load. Loads are
     /// serialized per device so the before/after CUDA samples can be attributed
@@ -573,7 +639,7 @@ impl DeviceMemoryManager {
     pub(crate) async fn begin_admission(
         self: &Arc<Self>,
         device_id: usize,
-        model_id: u32,
+        memory_owner: MemoryOwner,
         kind: EngineKind,
         planned_report: &ExternalDeviceMemoryReport,
     ) -> Result<Option<DeviceMemoryAdmission>, String> {
@@ -581,7 +647,7 @@ impl DeviceMemoryManager {
             return Ok(None);
         };
         let load_guard = Arc::clone(&authority.load_lock).lock_owned().await;
-        let owner = owner_for(kind, model_id);
+        let pool_owner = pool_owner_for(kind, memory_owner);
         let mut planned_allocations: Vec<_> = planned_report
             .allocations
             .iter()
@@ -610,17 +676,24 @@ impl DeviceMemoryManager {
                     device_id,
                     &allocation.allocation_id,
                     allocation.bytes,
+                    memory_owner,
+                    classify_external_allocation(&allocation.allocation_id),
                 ) {
                     Ok((snapshot, owns_charge)) => {
                         current = snapshot;
                         reservations.push(ExternalReservation {
                             allocation_id: allocation.allocation_id.clone(),
+                            memory_owner,
                             owns_charge,
                         });
                     }
                     Err(error) => {
                         for reservation in &reservations {
-                            budget.release_external(device_id, &reservation.allocation_id);
+                            budget.release_external(
+                                device_id,
+                                &reservation.allocation_id,
+                                reservation.memory_owner,
+                            );
                         }
                         return Err(error);
                     }
@@ -629,7 +702,7 @@ impl DeviceMemoryManager {
             current
         };
         self.publish_metrics(device_id, snapshot);
-        if let Err(error) = self.admit_pool(device_id, owner) {
+        if let Err(error) = self.admit_pool(device_id, pool_owner) {
             self.release_external_reservations(device_id, &reservations);
             return Err(error);
         }
@@ -637,7 +710,7 @@ impl DeviceMemoryManager {
             Ok(bytes) => bytes,
             Err(error) => {
                 self.release_external_reservations(device_id, &reservations);
-                self.release_pool_one(device_id, owner);
+                self.release_pool_one(device_id, pool_owner);
                 return Err(error);
             }
         };
@@ -646,8 +719,9 @@ impl DeviceMemoryManager {
             .map(|allocation| allocation.bytes)
             .sum::<usize>();
         log::info!(
-            "[device-memory] admitted {:?} on CUDA device {}: planned_external_weights={} global_used={} global_available={} bytes",
-            owner,
+            "[device-memory] admitted {} ({:?}) on CUDA device {}: planned_external={} global_used={} global_available={} bytes",
+            memory_owner,
+            pool_owner,
             device_id,
             planned_external_bytes,
             snapshot.used_bytes(),
@@ -656,7 +730,8 @@ impl DeviceMemoryManager {
         Ok(Some(DeviceMemoryAdmission {
             manager: Arc::clone(self),
             device_id,
-            owner,
+            memory_owner,
+            pool_owner,
             reservations,
             free_before_load,
             _load_guard: Some(load_guard),
@@ -673,7 +748,7 @@ impl DeviceMemoryManager {
     pub(crate) async fn begin_swap_admission(
         self: &Arc<Self>,
         device_id: usize,
-        model_id: u32,
+        memory_owner: MemoryOwner,
         planned_report: &ExternalDeviceMemoryReport,
     ) -> Result<Option<DeviceMemorySwapAdmission>, String> {
         let Some(authority) = self.devices.get(&device_id) else {
@@ -699,23 +774,36 @@ impl DeviceMemoryManager {
                 format!("CUDA device {device_id} has no runtime memory authority")
             })?;
             for (index, allocation) in planned_allocations.iter().enumerate() {
-                let allocation_id =
-                    format!("runtime-swap-peak:{model_id}:{device_id}:{swap_id}:{index}");
-                match budget.reserve_external(device_id, &allocation_id, allocation.bytes) {
+                let allocation_id = format!(
+                    "runtime-swap-peak:{}:{}:{device_id}:{swap_id}:{index}",
+                    memory_owner.model_id, memory_owner.replica_id
+                );
+                match budget.reserve_external(
+                    device_id,
+                    &allocation_id,
+                    allocation.bytes,
+                    memory_owner,
+                    classify_external_allocation(&allocation.allocation_id),
+                ) {
                     Ok((snapshot, owns_charge)) => {
                         debug_assert!(owns_charge);
                         current = snapshot;
                         reservations.push(ExternalReservation {
                             allocation_id,
+                            memory_owner,
                             owns_charge,
                         });
                     }
                     Err(error) => {
                         for reservation in &reservations {
-                            budget.release_external(device_id, &reservation.allocation_id);
+                            budget.release_external(
+                                device_id,
+                                &reservation.allocation_id,
+                                reservation.memory_owner,
+                            );
                         }
                         return Err(format!(
-                            "hot-swap memory admission for model {model_id} failed: {error}"
+                            "hot-swap memory admission for {memory_owner} failed: {error}"
                         ));
                     }
                 }
@@ -724,8 +812,8 @@ impl DeviceMemoryManager {
         };
         self.publish_metrics(device_id, snapshot);
         log::info!(
-            "[device-memory] admitted hot-swap peak for model {} on CUDA device {}: target_external={} global_used={} global_available={} bytes",
-            model_id,
+            "[device-memory] admitted hot-swap peak for {} on CUDA device {}: target_external={} global_used={} global_available={} bytes",
+            memory_owner,
             device_id,
             planned_allocations
                 .iter()
@@ -819,7 +907,11 @@ impl DeviceMemoryManager {
         let snapshot = {
             let mut budget = self.budget.lock().unwrap();
             for reservation in reservations {
-                budget.release_external(device_id, &reservation.allocation_id);
+                budget.release_external(
+                    device_id,
+                    &reservation.allocation_id,
+                    reservation.memory_owner,
+                );
             }
             budget.snapshot(device_id)
         };
@@ -895,7 +987,7 @@ impl DeviceMemoryManager {
             .lock()
             .unwrap()
             .get(&device_id)
-            .map(|pool| pool.owner_usage_bytes(owner))
+            .map(|pool| pool.workload_usage_bytes(owner))
             .unwrap_or(0);
         log::info!(
             "[device-memory] deferring {:?} admission release on CUDA device {} until {} live bytes are freed",
@@ -916,7 +1008,7 @@ impl DeviceMemoryManager {
                 .lock()
                 .unwrap()
                 .get(&device_id)
-                .map(|pool| pool.owner_usage_bytes(owner))
+                .map(|pool| pool.workload_usage_bytes(owner))
                 .unwrap_or(0);
             log::warn!(
                 "[device-memory] timed out releasing {:?} admission on CUDA device {}; {} bytes remain live",
@@ -941,7 +1033,7 @@ impl DeviceMemoryManager {
             refs.remove(&key);
             return true;
         };
-        if pool.owner_usage_bytes(owner) != 0 {
+        if pool.workload_usage_bytes(owner) != 0 {
             return false;
         }
         match pool.set_owner_admitted(owner, false) {
@@ -1020,7 +1112,8 @@ impl DeviceMemoryManager {
 pub(crate) struct DeviceMemoryAdmission {
     manager: Arc<DeviceMemoryManager>,
     device_id: usize,
-    owner: PoolOwner,
+    memory_owner: MemoryOwner,
+    pool_owner: PoolOwner,
     reservations: Vec<ExternalReservation>,
     free_before_load: usize,
     _load_guard: Option<OwnedMutexGuard<()>>,
@@ -1070,9 +1163,12 @@ impl DeviceMemoryAdmission {
                 self.device_id,
                 &allocation_id,
                 0,
+                self.memory_owner,
+                classify_external_allocation(&allocation_id),
             )?;
             self.reservations.push(ExternalReservation {
                 allocation_id: allocation_id.clone(),
+                memory_owner: self.memory_owner,
                 owns_charge,
             });
             if owns_charge {
@@ -1096,10 +1192,13 @@ impl DeviceMemoryAdmission {
                 self.device_id,
                 &allocation_id,
                 0,
+                self.memory_owner,
+                MemoryAllocationClass::ExternallyOwned,
             )?;
             debug_assert!(owns_charge);
             self.reservations.push(ExternalReservation {
                 allocation_id: allocation_id.clone(),
+                memory_owner: self.memory_owner,
                 owns_charge,
             });
             self.manager
@@ -1119,7 +1218,8 @@ impl DeviceMemoryAdmission {
         DeviceMemoryLease {
             manager: Arc::clone(&self.manager),
             device_id: self.device_id,
-            owner: self.owner,
+            memory_owner: self.memory_owner,
+            pool_owner: self.pool_owner,
             reservations: std::mem::take(&mut self.reservations),
         }
     }
@@ -1129,7 +1229,7 @@ impl Drop for DeviceMemoryAdmission {
     fn drop(&mut self) {
         if !self.committed {
             self.manager
-                .release_one(self.device_id, self.owner, &self.reservations);
+                .release_one(self.device_id, self.pool_owner, &self.reservations);
         }
     }
 }
@@ -1155,11 +1255,30 @@ impl Drop for DeviceMemorySwapAdmission {
 pub(crate) struct DeviceMemoryLease {
     manager: Arc<DeviceMemoryManager>,
     device_id: usize,
-    owner: PoolOwner,
+    memory_owner: MemoryOwner,
+    pool_owner: PoolOwner,
     reservations: Vec<ExternalReservation>,
 }
 
+/// Request-lifetime reservation for CUDA memory allocated outside the pool.
+pub(crate) struct DeviceMemoryTransientLease {
+    manager: Arc<DeviceMemoryManager>,
+    device_id: usize,
+    reservation: ExternalReservation,
+}
+
+impl Drop for DeviceMemoryTransientLease {
+    fn drop(&mut self) {
+        self.manager
+            .release_external_reservations(self.device_id, std::slice::from_ref(&self.reservation));
+    }
+}
+
 impl DeviceMemoryLease {
+    pub(crate) fn owner(&self) -> MemoryOwner {
+        self.memory_owner
+    }
+
     pub(crate) fn reconcile_report(
         &mut self,
         report: &ExternalDeviceMemoryReport,
@@ -1189,25 +1308,51 @@ impl DeviceMemoryLease {
 impl Drop for DeviceMemoryLease {
     fn drop(&mut self) {
         self.manager
-            .release_one(self.device_id, self.owner, &self.reservations);
+            .release_one(self.device_id, self.pool_owner, &self.reservations);
     }
 }
 
-fn owner_for(kind: EngineKind, model_id: u32) -> PoolOwner {
+fn pool_owner_for(kind: EngineKind, owner: MemoryOwner) -> PoolOwner {
     if kind.is_gguf() {
-        PoolOwner::GgufKv { model_id }
+        PoolOwner::gguf(
+            owner.model_id,
+            owner.replica_id,
+            PoolAllocationClass::PersistentWeights,
+        )
     } else if kind == EngineKind::Native {
-        PoolOwner::NativeKv { model_id }
+        PoolOwner::native(
+            owner.model_id,
+            owner.replica_id,
+            PoolAllocationClass::PersistentWeights,
+        )
     } else {
-        PoolOwner::Onnx
+        PoolOwner::onnx(
+            owner.model_id,
+            owner.replica_id,
+            PoolAllocationClass::PersistentWeights,
+        )
     }
 }
 
 fn pool_owner_metric_label(owner: PoolOwner) -> String {
-    match owner {
-        PoolOwner::Onnx => "onnx".to_string(),
-        PoolOwner::GgufKv { model_id } => format!("gguf_kv:{model_id}"),
-        PoolOwner::NativeKv { model_id } => format!("native_kv:{model_id}"),
+    let backend = match owner.backend() {
+        PoolBackend::Onnx => "onnx",
+        PoolBackend::Gguf => "gguf",
+        PoolBackend::Native => "native",
+    };
+    let class = match owner.class() {
+        PoolAllocationClass::PersistentWeights => "persistent-weights",
+        PoolAllocationClass::KvCache => "kv-cache",
+        PoolAllocationClass::TransientWorkspace => "transient-workspace",
+        PoolAllocationClass::BlockTable => "block-table",
+        PoolAllocationClass::RequestTransient => "request-transient",
+        PoolAllocationClass::ExternallyOwned => "externally-owned",
+    };
+    match (owner.model_id(), owner.replica_id()) {
+        (Some(model_id), Some(replica_id)) => {
+            format!("{backend}:{model_id}:{replica_id}:{class}")
+        }
+        _ => format!("{backend}:unattributed:{class}"),
     }
 }
 
@@ -1246,10 +1391,10 @@ fn configured_quota(
     owner: PoolOwner,
     device_id: usize,
 ) -> Result<(usize, usize), String> {
-    let (guaranteed_name, max_name) = match owner {
-        PoolOwner::Onnx => (GPU_ONNX_GUARANTEED_BYTES_ENV, GPU_ONNX_MAX_BYTES_ENV),
-        PoolOwner::GgufKv { .. } => (GPU_GGUF_GUARANTEED_BYTES_ENV, GPU_GGUF_MAX_BYTES_ENV),
-        PoolOwner::NativeKv { .. } => (GPU_NATIVE_GUARANTEED_BYTES_ENV, GPU_NATIVE_MAX_BYTES_ENV),
+    let (guaranteed_name, max_name) = match owner.backend() {
+        PoolBackend::Onnx => (GPU_ONNX_GUARANTEED_BYTES_ENV, GPU_ONNX_MAX_BYTES_ENV),
+        PoolBackend::Gguf => (GPU_GGUF_GUARANTEED_BYTES_ENV, GPU_GGUF_MAX_BYTES_ENV),
+        PoolBackend::Native => (GPU_NATIVE_GUARANTEED_BYTES_ENV, GPU_NATIVE_MAX_BYTES_ENV),
     };
     let max = configured_bytes(max_name, device_id)?.unwrap_or(pool.capacity_bytes());
     // Protect a useful share for each admitted backend by default. Four-way
@@ -1581,14 +1726,24 @@ mod tests {
 
     #[test]
     fn pool_owner_metric_labels_are_stable_and_include_model_identity() {
-        assert_eq!(pool_owner_metric_label(PoolOwner::Onnx), "onnx");
         assert_eq!(
-            pool_owner_metric_label(PoolOwner::GgufKv { model_id: 42 }),
-            "gguf_kv:42"
+            pool_owner_metric_label(PoolOwner::onnx(
+                11,
+                2,
+                PoolAllocationClass::TransientWorkspace
+            )),
+            "onnx:11:2:transient-workspace"
         );
         assert_eq!(
-            pool_owner_metric_label(PoolOwner::NativeKv { model_id: 7 }),
-            "native_kv:7"
+            pool_owner_metric_label(PoolOwner::gguf(42, 3, PoolAllocationClass::KvCache)),
+            "gguf:42:3:kv-cache"
+        );
+        assert_eq!(
+            pool_owner_metric_label(PoolOwner::unattributed(
+                PoolBackend::Native,
+                PoolAllocationClass::ExternallyOwned
+            )),
+            "native:unattributed:externally-owned"
         );
     }
 
@@ -1603,7 +1758,7 @@ mod tests {
             largest_free_range_bytes: 500,
             fragmentation_ratio: 1.0 / 6.0,
             owners: vec![kapsl_hal::gpu_arena::PoolOwnerSnapshot {
-                owner: PoolOwner::GgufKv { model_id: 9 },
+                owner: PoolOwner::gguf(9, 4, PoolAllocationClass::KvCache),
                 usage_bytes: 400,
                 guaranteed_bytes: 300,
                 max_bytes: 800,
@@ -1619,7 +1774,7 @@ mod tests {
         assert_eq!(metrics.largest_free_range_bytes, 500);
         assert_eq!(metrics.fragmentation_ratio, 1.0 / 6.0);
         assert_eq!(metrics.owners.len(), 1);
-        assert_eq!(metrics.owners[0].owner, "gguf_kv:9");
+        assert_eq!(metrics.owners[0].owner, "gguf:9:4:kv-cache");
         assert_eq!(metrics.owners[0].usage_bytes, 400);
         assert_eq!(metrics.owners[0].guaranteed_bytes, 300);
         assert_eq!(metrics.owners[0].max_bytes, 800);

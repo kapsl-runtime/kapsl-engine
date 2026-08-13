@@ -1,3 +1,4 @@
+use super::memory::{MemoryAllocationClass, MemoryOwner};
 use std::collections::HashMap;
 
 pub(crate) const AUTO_POOL_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
@@ -122,7 +123,8 @@ struct DeviceBudget {
 #[derive(Debug)]
 struct ExternalAllocation {
     bytes: usize,
-    refs: usize,
+    class: MemoryAllocationClass,
+    owners: HashMap<MemoryOwner, usize>,
     planned: bool,
 }
 
@@ -159,13 +161,22 @@ impl DeviceBudgetLedger {
         device_id: usize,
         allocation_id: &str,
         bytes: usize,
+        owner: MemoryOwner,
+        class: MemoryAllocationClass,
     ) -> Result<(DeviceBudgetSnapshot, bool), String> {
         let device = self
             .devices
             .get_mut(&device_id)
             .ok_or_else(|| format!("CUDA device {device_id} has no runtime memory authority"))?;
         if let Some(allocation) = device.allocations.get_mut(allocation_id) {
-            allocation.refs = allocation.refs.saturating_add(1);
+            if allocation.class != class {
+                return Err(format!(
+                    "CUDA device {device_id} external allocation `{allocation_id}` is already classified as {}, not {} for {}",
+                    allocation.class, class, owner
+                ));
+            }
+            let refs = allocation.owners.entry(owner).or_default();
+            *refs = refs.saturating_add(1);
             return Ok((snapshot(device), false));
         }
         let current = snapshot(device);
@@ -181,11 +192,14 @@ impl DeviceBudgetLedger {
                 device.budget_bytes
             ));
         }
+        let mut owners = HashMap::new();
+        owners.insert(owner, 1);
         device.allocations.insert(
             allocation_id.to_string(),
             ExternalAllocation {
                 bytes,
-                refs: 1,
+                class,
+                owners,
                 planned: true,
             },
         );
@@ -253,11 +267,22 @@ impl DeviceBudgetLedger {
         Ok(current)
     }
 
-    pub(crate) fn release_external(&mut self, device_id: usize, allocation_id: &str) {
+    pub(crate) fn release_external(
+        &mut self,
+        device_id: usize,
+        allocation_id: &str,
+        owner: MemoryOwner,
+    ) {
         if let Some(device) = self.devices.get_mut(&device_id) {
             let remove = if let Some(allocation) = device.allocations.get_mut(allocation_id) {
-                allocation.refs = allocation.refs.saturating_sub(1);
-                allocation.refs == 0
+                let remove_owner = allocation.owners.get_mut(&owner).is_some_and(|refs| {
+                    *refs = refs.saturating_sub(1);
+                    *refs == 0
+                });
+                if remove_owner {
+                    allocation.owners.remove(&owner);
+                }
+                allocation.owners.is_empty()
             } else {
                 false
             };
@@ -298,6 +323,30 @@ mod tests {
 
     const DEVICE: usize = 3;
     const GIB: usize = 1024 * 1024 * 1024;
+    const OWNER: MemoryOwner = MemoryOwner::new(7, 0);
+
+    fn reserve(
+        ledger: &mut DeviceBudgetLedger,
+        allocation_id: &str,
+        bytes: usize,
+    ) -> Result<(DeviceBudgetSnapshot, bool), String> {
+        reserve_for(ledger, allocation_id, bytes, OWNER)
+    }
+
+    fn reserve_for(
+        ledger: &mut DeviceBudgetLedger,
+        allocation_id: &str,
+        bytes: usize,
+        owner: MemoryOwner,
+    ) -> Result<(DeviceBudgetSnapshot, bool), String> {
+        ledger.reserve_external(
+            DEVICE,
+            allocation_id,
+            bytes,
+            owner,
+            MemoryAllocationClass::PersistentWeights,
+        )
+    }
 
     fn ledger() -> DeviceBudgetLedger {
         let mut ledger = DeviceBudgetLedger::default();
@@ -416,20 +465,19 @@ mod tests {
     #[test]
     fn pool_and_external_reservations_share_one_budget() {
         let mut ledger = ledger();
-        let (snapshot, owns_charge) = ledger
-            .reserve_external(DEVICE, "weights-a", 12 * GIB)
-            .expect("exact fit should be admitted");
+        let (snapshot, owns_charge) =
+            reserve(&mut ledger, "weights-a", 12 * GIB).expect("exact fit should be admitted");
         assert!(owns_charge);
         assert_eq!(snapshot.used_bytes(), 20 * GIB);
         assert_eq!(snapshot.available_bytes(), 0);
-        assert!(ledger.reserve_external(DEVICE, "weights-b", 1).is_err());
+        assert!(reserve(&mut ledger, "weights-b", 1).is_err());
     }
 
     #[test]
     fn deferred_pool_charge_accounts_for_existing_external_bytes() {
         let mut ledger = DeviceBudgetLedger::default();
         ledger.insert_device(DEVICE, 20 * GIB, 0).unwrap();
-        ledger.reserve_external(DEVICE, "weights", 6 * GIB).unwrap();
+        reserve(&mut ledger, "weights", 6 * GIB).unwrap();
 
         let snapshot = ledger.set_pooled_bytes(DEVICE, 12 * GIB).unwrap();
         assert_eq!(snapshot.pooled_bytes, 12 * GIB);
@@ -445,9 +493,7 @@ mod tests {
     #[test]
     fn reconciliation_releases_overestimated_headroom() {
         let mut ledger = ledger();
-        ledger
-            .reserve_external(DEVICE, "weights", 8 * GIB)
-            .expect("planned load");
+        reserve(&mut ledger, "weights", 8 * GIB).expect("planned load");
         let snapshot = ledger
             .reconcile_external(DEVICE, "weights", 5 * GIB)
             .expect("actual load");
@@ -459,9 +505,7 @@ mod tests {
     #[test]
     fn over_budget_actual_is_retained_until_failed_load_cleans_up() {
         let mut ledger = ledger();
-        ledger
-            .reserve_external(DEVICE, "weights", 8 * GIB)
-            .expect("planned load");
+        reserve(&mut ledger, "weights", 8 * GIB).expect("planned load");
         assert!(ledger
             .reconcile_external(DEVICE, "weights", 13 * GIB)
             .is_err());
@@ -469,63 +513,68 @@ mod tests {
             ledger.snapshot(DEVICE).expect("device").external_bytes,
             13 * GIB
         );
-        assert!(ledger.reserve_external(DEVICE, "other", 1).is_err());
+        assert!(reserve(&mut ledger, "other", 1).is_err());
 
-        ledger.release_external(DEVICE, "weights");
+        ledger.release_external(DEVICE, "weights", OWNER);
         assert_eq!(ledger.snapshot(DEVICE).expect("device").external_bytes, 0);
     }
 
     #[test]
     fn shared_allocation_is_charged_once_and_reference_counted() {
         let mut ledger = ledger();
-        let (_, first_owns_charge) = ledger
-            .reserve_external(DEVICE, "shared-weights", 7 * GIB)
-            .expect("first replica");
+        let first_owner = MemoryOwner::new(7, 0);
+        let second_owner = MemoryOwner::new(7, 1);
+        let (_, first_owns_charge) =
+            reserve_for(&mut ledger, "shared-weights", 7 * GIB, first_owner)
+                .expect("first replica");
         ledger
             .reconcile_external(DEVICE, "shared-weights", 6 * GIB)
             .expect("actual weights");
-        let (snapshot, second_owns_charge) = ledger
-            .reserve_external(DEVICE, "shared-weights", 7 * GIB)
-            .expect("second replica");
+        let (snapshot, second_owns_charge) =
+            reserve_for(&mut ledger, "shared-weights", 7 * GIB, second_owner)
+                .expect("second replica");
         assert!(first_owns_charge);
         assert!(!second_owns_charge);
         assert_eq!(snapshot.external_bytes, 6 * GIB);
 
-        ledger.release_external(DEVICE, "shared-weights");
+        let allocation = ledger.devices[&DEVICE]
+            .allocations
+            .get("shared-weights")
+            .unwrap();
+        assert_eq!(allocation.class, MemoryAllocationClass::PersistentWeights);
+        assert!(allocation.owners.contains_key(&first_owner));
+        assert!(allocation.owners.contains_key(&second_owner));
+
+        ledger.release_external(DEVICE, "shared-weights", first_owner);
         assert_eq!(
             ledger.snapshot(DEVICE).expect("device").external_bytes,
             6 * GIB
         );
-        ledger.release_external(DEVICE, "shared-weights");
+        ledger.release_external(DEVICE, "shared-weights", second_owner);
         assert_eq!(ledger.snapshot(DEVICE).expect("device").external_bytes, 0);
     }
 
     #[test]
     fn swap_peak_requires_room_for_active_and_target_weights() {
         let mut ledger = ledger();
-        ledger
-            .reserve_external(DEVICE, "active-weights", 7 * GIB)
-            .expect("active model plan");
+        reserve(&mut ledger, "active-weights", 7 * GIB).expect("active model plan");
         ledger
             .reconcile_external(DEVICE, "active-weights", 7 * GIB)
             .expect("active model actual");
 
-        assert!(ledger
-            .reserve_external(DEVICE, "swap-peak-1", 6 * GIB)
-            .is_err());
+        assert!(reserve(&mut ledger, "swap-peak-1", 6 * GIB).is_err());
         let snapshot = ledger.snapshot(DEVICE).expect("device");
         assert_eq!(snapshot.external_bytes, 7 * GIB);
         assert_eq!(snapshot.planned_external_bytes, 0);
 
-        let (snapshot, owns_charge) = ledger
-            .reserve_external(DEVICE, "swap-peak-2", 5 * GIB)
+        let (snapshot, owns_charge) = reserve(&mut ledger, "swap-peak-2", 5 * GIB)
             .expect("active plus target is an exact fit");
         assert!(owns_charge);
         assert_eq!(snapshot.external_bytes, 7 * GIB);
         assert_eq!(snapshot.planned_external_bytes, 5 * GIB);
         assert_eq!(snapshot.available_bytes(), 0);
 
-        ledger.release_external(DEVICE, "swap-peak-2");
+        ledger.release_external(DEVICE, "swap-peak-2", OWNER);
         assert_eq!(
             ledger.snapshot(DEVICE).expect("device").available_bytes(),
             5 * GIB
