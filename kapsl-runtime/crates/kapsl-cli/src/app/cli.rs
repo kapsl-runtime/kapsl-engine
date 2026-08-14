@@ -40,6 +40,10 @@ pub(crate) enum KapslCommand {
     Provider(ProviderCommandArgs),
     /// Hot-load a model into an already-running runtime (no restart required)
     AddModel(AddModelCommandArgs),
+    /// List models loaded in a running Kapsl Engine
+    List(ListCommandArgs),
+    /// Stop, unload, and unregister a model from a running Kapsl Engine
+    RemoveModel(RemoveModelCommandArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -355,6 +359,62 @@ pub(crate) struct AddModelCommandArgs {
     pub(crate) tp_degree: usize,
 
     /// HTTP request timeout (ms) for the load call — large models may take longer to respond
+    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    pub(crate) timeout_ms: u64,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(next_help_heading = "List Options")]
+pub(crate) struct ListCommandArgs {
+    /// HTTP port of the running runtime's API server
+    #[arg(long, default_value_t = 9095, value_name = "PORT")]
+    pub(crate) http_port: u16,
+
+    /// Hostname or IP of the running runtime's API server
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    pub(crate) http_host: String,
+
+    /// Full base URL of the running runtime (overrides --http-host / --http-port)
+    #[arg(long, value_name = "URL")]
+    pub(crate) http_url: Option<String>,
+
+    /// Bearer token if the runtime has API authentication enabled
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) auth_token: Option<String>,
+
+    /// Print the complete API response as JSON instead of a table
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// HTTP request timeout (ms)
+    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    pub(crate) timeout_ms: u64,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(next_help_heading = "Remove-Model Options")]
+pub(crate) struct RemoveModelCommandArgs {
+    /// ID of the model to remove (shown by `kapsl list`)
+    #[arg(value_name = "MODEL_ID")]
+    pub(crate) model_id: u32,
+
+    /// HTTP port of the running runtime's API server
+    #[arg(long, default_value_t = 9095, value_name = "PORT")]
+    pub(crate) http_port: u16,
+
+    /// Hostname or IP of the running runtime's API server
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    pub(crate) http_host: String,
+
+    /// Full base URL of the running runtime (overrides --http-host / --http-port)
+    #[arg(long, value_name = "URL")]
+    pub(crate) http_url: Option<String>,
+
+    /// Admin bearer token if the runtime has API authentication enabled
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) auth_token: Option<String>,
+
+    /// HTTP request timeout (ms)
     #[arg(long, default_value_t = 30000, value_name = "MS")]
     pub(crate) timeout_ms: u64,
 }

@@ -27,6 +27,14 @@ const HELP_EXAMPLES: &[(&str, &[&str])] = &[
         &["kapsl add-model --model models/llama/llama.aimod"],
     ),
     (
+        "# List models loaded in the running runtime",
+        &["kapsl list"],
+    ),
+    (
+        "# Remove a loaded model (the package file is kept)",
+        &["kapsl remove-model 2"],
+    ),
+    (
         "# Package a model directory or single file",
         &[
             "kapsl build ./models/gpt-llm",

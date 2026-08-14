@@ -82,6 +82,9 @@ Defaults:
 `kapsl` supports subcommands and legacy direct run invocation:
 
 - `kapsl run ...`
+- `kapsl add-model ...`
+- `kapsl list ...`
+- `kapsl remove-model ...`
 - `kapsl build ...`
 - `kapsl push ...`
 - `kapsl pull ...`

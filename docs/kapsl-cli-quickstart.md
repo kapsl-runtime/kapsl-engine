@@ -6,6 +6,8 @@ Use it to:
 
 - run `.aimod` model packages
 - add models to a running runtime without restarting
+- list models loaded in a running runtime
+- remove models from a running runtime
 - build `.aimod` packages from model files
 - push/pull packages from a remote backend
 
@@ -88,6 +90,34 @@ Add to a specific port or authenticated runtime:
 ```bash
 kapsl add-model --model ./model.aimod --http-port 9100 --auth-token "$KAPSL_API_TOKEN_ADMIN"
 ```
+
+List loaded models:
+
+```bash
+kapsl list
+```
+
+Target another runtime or print the complete API response:
+
+```bash
+kapsl list --http-url http://192.168.1.10:9095 --auth-token "$KAPSL_API_TOKEN_READER"
+kapsl list --json
+```
+
+Remove a loaded model by the ID shown in `kapsl list`:
+
+```bash
+kapsl remove-model 2
+```
+
+For an authenticated or remote runtime:
+
+```bash
+kapsl remove-model 2 --http-url http://192.168.1.10:9095 --auth-token "$KAPSL_API_TOKEN_ADMIN"
+```
+
+This unloads the model and unregisters its replicas. It does not delete the
+`.aimod` package from disk.
 
 Build package from model file:
 

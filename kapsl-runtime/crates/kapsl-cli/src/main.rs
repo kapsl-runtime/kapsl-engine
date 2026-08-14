@@ -93,6 +93,8 @@ async fn main() -> Result<(), DynError> {
         Some(KapslCommand::Extension(args)) => return execute_extension_command(args),
         Some(KapslCommand::Provider(args)) => return execute_provider_command(args),
         Some(KapslCommand::AddModel(args)) => return execute_add_model_command(args),
+        Some(KapslCommand::List(args)) => return execute_list_command(args),
+        Some(KapslCommand::RemoveModel(args)) => return execute_remove_model_command(args),
         Some(KapslCommand::Run(_)) | None => {}
     }
 
