@@ -35,6 +35,7 @@ impl ResourcePressure {
 pub(crate) struct RuntimeResources {
     kv: KvCoordinator,
     memory: Arc<MemoryAuthority>,
+    priority: Arc<PriorityArbiter>,
     pressure: Arc<ResourcePressure>,
 }
 
@@ -49,11 +50,9 @@ impl RuntimeResources {
         {
             let memory = MemoryAuthority::new(device_info)?;
             Ok(Arc::new(Self {
-                kv: KvCoordinatorInner::new_with_host_budget(
-                    device_info,
-                    Some(memory.host_budget()),
-                ),
+                kv: KvCoordinatorInner::new(memory.clone()),
                 memory,
+                priority: PriorityArbiter::new(),
                 pressure: ResourcePressure::from_env(),
             }))
         }
@@ -66,8 +65,9 @@ impl RuntimeResources {
     ) -> Result<Arc<Self>, String> {
         let memory = MemoryAuthority::new_with_cuda_plan(device_info, bootstrap)?;
         Ok(Arc::new(Self {
-            kv: KvCoordinatorInner::new_with_host_budget(device_info, Some(memory.host_budget())),
+            kv: KvCoordinatorInner::new(memory.clone()),
             memory,
+            priority: PriorityArbiter::new(),
             pressure: ResourcePressure::from_env(),
         }))
     }
@@ -82,6 +82,10 @@ impl RuntimeResources {
 
     pub(crate) fn memory(&self) -> &Arc<MemoryAuthority> {
         &self.memory
+    }
+
+    pub(crate) fn priority(&self) -> &Arc<PriorityArbiter> {
+        &self.priority
     }
 
     #[cfg(any(

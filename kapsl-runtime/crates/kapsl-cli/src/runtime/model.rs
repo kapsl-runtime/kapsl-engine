@@ -49,7 +49,8 @@ pub(crate) async fn run_worker(
     let resources = RuntimeResources::new_with_device_memory_plan(device_info, &bootstrap)?;
     #[cfg(not(feature = "gpu-device-pool"))]
     let resources = RuntimeResources::new(device_info)?;
-    let (pool, _) = load_prepared_model(
+    let memory_for_reconciliation = resources.memory().clone();
+    let (pool, handles) = load_prepared_model(
         plan,
         device_info,
         resources,
@@ -58,6 +59,22 @@ pub(crate) async fn run_worker(
         onnx_tuning,
     )
     .await?;
+
+    // Isolated workers do not run the parent HTTP/system monitor. Keep their
+    // process-local authority current as provider arenas and KV allocations
+    // change, using the same cadence as the parent sampler.
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            for handle in &handles {
+                let _ = handle.actual_memory();
+            }
+            if let Some(rss) = super::host_memory::process_rss_bytes() {
+                memory_for_reconciliation.observe_process_memory(rss);
+            }
+        }
+    });
 
     let mut schedulers = HashMap::new();
     schedulers.insert(model_id, pool as Arc<dyn ReplicaScheduler + Send + Sync>);

@@ -56,44 +56,40 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     as u32;
 
                 // Calculate pool state and update metrics.
-                let (
-                    total_queue_depth,
-                    healthy_replicas,
-                    metrics_available,
-                    total_model_memory_bytes,
-                ) = if let Some(pool) = models_for_scaler.pool(base_model_id) {
-                    let (high, low) = pool.get_queue_depth();
-                    let healthy = pool.get_healthy_replica_count();
-                    let metrics = pool.get_metrics();
+                let (total_queue_depth, healthy_replicas, metrics_available) =
+                    if let Some(pool) = models_for_scaler.pool(base_model_id) {
+                        let (high, low) = pool.get_queue_depth();
+                        let healthy = pool.get_healthy_replica_count();
+                        let metrics = pool.get_metrics();
 
-                    // Update pool metrics
-                    let model_id_str = base_model_id.to_string();
-                    shared_metrics_for_scaler
-                        .pool_active_replicas
-                        .with_label_values(&[&model_id_str])
-                        .set(current_replicas as i64);
-                    shared_metrics_for_scaler
-                        .pool_queue_depth_high
-                        .with_label_values(&[&model_id_str])
-                        .set(high as i64);
-                    shared_metrics_for_scaler
-                        .pool_queue_depth_low
-                        .with_label_values(&[&model_id_str])
-                        .set(low as i64);
-                    shared_metrics_for_scaler
-                        .pool_healthy_replicas
-                        .with_label_values(&[&model_id_str])
-                        .set(healthy as i64);
+                        // Update pool metrics
+                        let model_id_str = base_model_id.to_string();
+                        shared_metrics_for_scaler
+                            .pool_active_replicas
+                            .with_label_values(&[&model_id_str])
+                            .set(current_replicas as i64);
+                        shared_metrics_for_scaler
+                            .pool_queue_depth_high
+                            .with_label_values(&[&model_id_str])
+                            .set(high as i64);
+                        shared_metrics_for_scaler
+                            .pool_queue_depth_low
+                            .with_label_values(&[&model_id_str])
+                            .set(low as i64);
+                        shared_metrics_for_scaler
+                            .pool_healthy_replicas
+                            .with_label_values(&[&model_id_str])
+                            .set(healthy as i64);
 
-                    // kapsl-monitor owns the EngineMetrics -> Prometheus mapping.
-                    // Keeping that translation in one place makes newly added
-                    // engine fields visible to every runtime caller together.
-                    shared_metrics_for_scaler.set_kv_cache_metrics(&model_id_str, &metrics);
+                        // kapsl-monitor owns the EngineMetrics -> Prometheus mapping.
+                        // Keeping that translation in one place makes newly added
+                        // engine fields visible to every runtime caller together.
+                        shared_metrics_for_scaler.set_kv_cache_metrics(&model_id_str, &metrics);
 
-                    (high + low, healthy as u32, true, metrics.memory_usage)
-                } else {
-                    (0, 0, false, 0)
-                };
+                        (high + low, healthy as u32, true)
+                    } else {
+                        (0, 0, false)
+                    };
 
                 // Check for scale-up
                 let should_scale_up = auto_scaler_clone.write().should_scale_up(
@@ -110,7 +106,8 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     // load growth: a new replica would land on the same starved
                     // device and thrash. Skip and re-evaluate next tick — the
                     // ceiling's grow-slow recovery provides the hysteresis.
-                    if resources_for_scaler.kv().foreign_pressure_active() {
+                    let memory_snapshot = resources_for_scaler.memory().snapshot();
+                    if memory_snapshot.foreign_pressure_active {
                         log::warn!(
                             "Auto-scaler: model {} queue depth {} exceeds threshold, but a \
                              co-tenant GPU process is limiting the KV ceiling; suppressing \
@@ -123,11 +120,10 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                         continue;
                     }
                     let onnx_tuning = onnx_tuning_profile_for_scaler.resolve(base_model_id);
-                    let capped_target = cap_scale_up_target_by_memory_headroom(
+                    let capped_target = memory_snapshot.cap_replica_target(
+                        base_model_id,
                         current_replicas,
                         target_replicas,
-                        total_model_memory_bytes,
-                        device_info_for_scaler.total_memory,
                     );
                     if capped_target < target_replicas {
                         log::warn!(

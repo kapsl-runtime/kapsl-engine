@@ -167,7 +167,7 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
 
         // ORT CUDA/TensorRT sessions use the registered environment allocator,
         // so their weights and workspaces are pool demand rather than external
-        // bytes. GGUF/native weights remain outside the shared backing pool.
+        // bytes.
         if kind.uses_onnx_session() && wants_pool {
             let model_bytes = std::fs::metadata(&plan.model_file_path)
                 .map_err(|error| {
@@ -202,6 +202,27 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
             }
             continue;
         }
+
+        // Native CUDA allocates weights and execution scratch from the runtime
+        // pool. A swap uploads the replacement before dropping the active
+        // weights, so automatic sizing must include the two-copy peak rather
+        // than falling back to the generic 512 MiB demand floor.
+        if kind == EngineKind::Native && wants_pool {
+            let weight_bytes = planned_external_weight_bytes(kind, &plan.model_file_path)?;
+            let pooled_bytes = planned_native_pool_bytes(weight_bytes);
+            for &device_id in &cuda_device_ids {
+                bootstrap.add_pooled_allocation(
+                    device_id,
+                    format!(
+                        "bootstrap-native:{}:{}:{}",
+                        plan.base_model_id, plan.replica_id, device_id
+                    ),
+                    pooled_bytes,
+                );
+            }
+            continue;
+        }
+
         let bytes = planned_external_weight_bytes(kind, &plan.model_file_path)?;
         if bytes == 0 {
             continue;
@@ -236,6 +257,12 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
         }
     }
     Ok(bootstrap)
+}
+
+#[cfg(feature = "gpu-device-pool")]
+fn planned_native_pool_bytes(weight_bytes: usize) -> usize {
+    let scratch_bytes = (weight_bytes / 8).max(256 * 1024 * 1024);
+    weight_bytes.saturating_mul(2).saturating_add(scratch_bytes)
 }
 
 #[cfg(feature = "gpu-device-pool")]
@@ -398,5 +425,18 @@ mod device_memory_plan_tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_pool_estimate_includes_hot_swap_two_copy_peak() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let weights = 2 * GIB + 200 * 1024 * 1024;
+        let scratch = (weights / 8).max(256 * 1024 * 1024);
+
+        assert_eq!(
+            planned_native_pool_bytes(weights),
+            weights.saturating_mul(2).saturating_add(scratch)
+        );
+        assert!(planned_native_pool_bytes(weights) > 4 * GIB);
     }
 }

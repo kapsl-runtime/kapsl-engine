@@ -93,6 +93,8 @@ async fn main() -> Result<(), DynError> {
         Some(KapslCommand::Extension(args)) => return execute_extension_command(args),
         Some(KapslCommand::Provider(args)) => return execute_provider_command(args),
         Some(KapslCommand::AddModel(args)) => return execute_add_model_command(args),
+        Some(KapslCommand::List(args)) => return execute_list_command(args),
+        Some(KapslCommand::RemoveModel(args)) => return execute_remove_model_command(args),
         Some(KapslCommand::Run(_)) | None => {}
     }
 
@@ -333,6 +335,8 @@ async fn main() -> Result<(), DynError> {
     let runtime_pressure_config_for_sampler = runtime_pressure_config.clone();
     let runtime_pressure_state_for_sampler = runtime_pressure_state.clone();
     let kv_for_rebalance = resources.kv().clone();
+    let memory_for_sampler = resources.memory().clone();
+    let models_for_memory_reconciliation = models.clone();
     // Opt-in co-tenancy guard: probe for foreign GPU processes each tick,
     // shrink the live KV ceiling by their footprint, and exclude their bytes
     // from the pressure ratio. Default off — single-tenant behavior unchanged.
@@ -341,6 +345,7 @@ async fn main() -> Result<(), DynError> {
     // Ceiling observability exists only when the guard does, so the default
     // configuration exports no new metric series and logs nothing new.
     let mut cotenancy_exporter = cotenancy_guard.then(|| CotenancyCeilingExporter::new(&registry));
+    let memory_exporter = MemorySnapshotExporter::new(&registry);
     tokio::spawn(async move {
         let pid = Pid::from_u32(std::process::id());
         let mut system = System::new();
@@ -355,6 +360,12 @@ async fn main() -> Result<(), DynError> {
             // (e.g. tripped circuit breaker / stalled watchdog), redistributing
             // it to healthy engines.
             kv_for_rebalance.maybe_rebalance_for_health();
+
+            // Backend-owned host/provider/device allocations can change long
+            // after model load (KV growth, provider arenas, compaction, or
+            // migration). Resample every live engine before publishing the
+            // authority snapshot used by pressure and admission policy.
+            models_for_memory_reconciliation.reconcile_memory_reports();
 
             system.refresh_process(pid);
             let process_memory_bytes = system
@@ -393,7 +404,13 @@ async fn main() -> Result<(), DynError> {
                 && nvidia_smi_retry_after.is_none_or(|retry_after| now >= retry_after)
             {
                 let foreign = sample_foreign_vram();
-                let ceilings = kv_for_rebalance.refresh_ceilings(&foreign);
+                let ceilings = memory_for_sampler.reconcile_external_device_memory(&foreign);
+                if ceilings
+                    .iter()
+                    .any(|sample| sample.smoothed_bytes != sample.previous_bytes)
+                {
+                    kv_for_rebalance.rebalance_kv_caps();
+                }
                 if let Some(exporter) = cotenancy_exporter.as_mut() {
                     exporter.observe(&ceilings);
                 }
@@ -418,8 +435,19 @@ async fn main() -> Result<(), DynError> {
             };
             *runtime_samples_for_sampler.write() = snapshot.clone();
 
-            let next_state =
-                evaluate_runtime_pressure_state(&snapshot, &runtime_pressure_config_for_sampler);
+            memory_for_sampler.observe_process_memory(process_memory_bytes);
+            if let Some(gpu_bytes) = gpu_memory_bytes {
+                memory_for_sampler.observe_cuda_memory_total(
+                    gpu_bytes.saturating_sub(foreign_gpu_memory_bytes.unwrap_or(0)),
+                );
+            }
+            let memory_snapshot = memory_for_sampler.snapshot();
+            memory_exporter.observe(&memory_snapshot);
+            let next_state = evaluate_authority_pressure_state(
+                &memory_snapshot,
+                snapshot.gpu_utilization,
+                &runtime_pressure_config_for_sampler,
+            );
             let previous_raw =
                 runtime_pressure_state_for_sampler.swap(next_state as u8, Ordering::Relaxed);
             let previous = RuntimePressureState::from_u8(previous_raw);

@@ -4,6 +4,8 @@ The `kapsl` CLI helps you:
 
 - run model packages
 - add models to a running runtime without restarting
+- list models loaded in a running runtime
+- remove models from a running runtime
 - build `.aimod` packages
 - push packages to a remote backend
 - pull packages from a remote backend
@@ -42,6 +44,8 @@ Commands:
 
 - `run`: run the runtime server
 - `add-model`: add model(s) to an already-running runtime
+- `list`: list models loaded in an already-running runtime
+- `remove-model`: unload and unregister a model from a running runtime
 - `build`: build a `.aimod` package
 - `push`: upload a `.aimod` package
 - `pull`: download a `.aimod` package
@@ -163,6 +167,9 @@ Pool controls accept an optional `_<device_id>` suffix, which takes precedence:
   never silently reduced.
 - `CUDA_DEVICE_MEMORY_LIMIT[_N]` or `KAPSL_GPU_MEMORY_LIMIT_MB` bounds the
   process-visible VRAM used by automatic sizing and admission.
+- `KAPSL_PROVIDER_MEMORY_LIMITS=metal=8g,directml:0=6g` sets hard limits for
+  non-CUDA provider/device domains. Exact-device entries override the
+  provider-wide fallback.
 
 An unset runtime with no startup models does not reserve every detected GPU;
 implicit automatic sizing is deferred until the first pooled model targets a
@@ -191,6 +198,11 @@ fragmentation state under `kapsl_gpu_device_pool_*`, plus per-owner usage,
 quota, admission, and allocatable-byte gauges. The existing
 `kapsl_device_memory_pooled_bytes` gauge is the immutable backing capacity;
 it is not live usage.
+
+The runtime also resamples each live backend's cross-domain memory report every
+two seconds and reconciles growth, shrink, compaction, and migration into its
+authority lease. Rejected over-limit growth remains visible as observed usage,
+so admission and pressure decisions cannot fall back to stale planned bytes.
 
 Example tuned for low latency:
 
@@ -247,7 +259,69 @@ Options:
 
 The command sends `POST /api/models/start` for each model. The runtime loads it asynchronously and returns the assigned `model_id`. All transport, port, and scheduler configuration of the running instance is preserved.
 
-## 4) Build Packages (`kapsl build`)
+## 4) List Models in a Running Runtime (`kapsl list`)
+
+List the models loaded in the local runtime:
+
+```bash
+kapsl list
+```
+
+The default table includes each model's ID, name, version, format, device,
+status, and health. To target another runtime or one with API authentication:
+
+```bash
+kapsl list \
+  --http-url http://192.168.1.10:9095 \
+  --auth-token "$KAPSL_API_TOKEN_READER"
+```
+
+Print the complete `GET /api/models` response for scripts:
+
+```bash
+kapsl list --json
+```
+
+Options:
+
+- `--http-port <PORT>` — HTTP API port of the running runtime (default: `9095`)
+- `--http-host <HOST>` — runtime host (default: `127.0.0.1`)
+- `--http-url <URL>` — full base URL, overrides `--http-host` and `--http-port`
+- `--auth-token <TOKEN>` — bearer token for authenticated runtimes
+- `--json` — print the complete API response as formatted JSON
+- `--timeout-ms <MS>` — request timeout (default: `30000`)
+
+## 5) Remove a Model from a Running Runtime (`kapsl remove-model`)
+
+Use `kapsl list` to find the model ID, then remove it:
+
+```bash
+kapsl list
+kapsl remove-model 2
+```
+
+Target a remote or authenticated runtime with the same connection options:
+
+```bash
+kapsl remove-model 2 \
+  --http-url http://192.168.1.10:9095 \
+  --auth-token "$KAPSL_API_TOKEN_ADMIN"
+```
+
+The command calls `POST /api/models/:id/remove`. The running engine stops the
+model and its replicas, releases their runtime resources, and unregisters them.
+The source `.aimod` package remains on disk and can be loaded again later.
+
+Options:
+
+- `<MODEL_ID>` — numeric ID shown by `kapsl list` (required)
+- `--http-port <PORT>` — HTTP API port of the running runtime (default: `9095`)
+- `--http-host <HOST>` — runtime host (default: `127.0.0.1`)
+- `--http-url <URL>` — full base URL, overrides `--http-host` and `--http-port`
+- `--auth-token <TOKEN>` — admin bearer token for authenticated runtimes
+- `--timeout-ms <MS>` — request timeout (default: `30000`)
+
+## 6) Build Packages (`kapsl build`)
 
 You can build in two modes.
 
@@ -292,7 +366,7 @@ cd ./models/gpt-llm
 kapsl build
 ```
 
-## 5) Push Packages (`kapsl push`)
+## 7) Push Packages (`kapsl push`)
 
 Push target format:
 - Required: `<repo_name>/<model>:<label>`
@@ -349,7 +423,7 @@ In SSH sessions, plain `kapsl login` automatically prefers device-code flow (Git
 
 If no token is configured and the remote returns `401`, `kapsl push`/`kapsl pull` will automatically start browser login and retry once.
 
-## 6) Pull Packages (`kapsl pull`)
+## 8) Pull Packages (`kapsl pull`)
 
 Pull by target:
 
@@ -530,6 +604,12 @@ kapsl run --model <path-to-kapsl>
 
 # add model to running runtime
 kapsl add-model --model <path-to-kapsl> [--http-port <port>] [--auth-token <token>]
+
+# list models in running runtime
+kapsl list [--http-url <url>] [--auth-token <token>] [--json]
+
+# unload and unregister model from running runtime
+kapsl remove-model <model-id> [--http-url <url>] [--auth-token <admin-token>]
 
 # build
 kapsl build <path-to-model-file> --output <output.aimod>

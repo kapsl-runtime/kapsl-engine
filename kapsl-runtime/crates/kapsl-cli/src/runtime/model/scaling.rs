@@ -135,30 +135,3 @@ pub(crate) async fn scale_down_model(
 
     Ok(())
 }
-
-pub(crate) const MEMORY_HEADROOM_FRACTION: f64 = 0.80;
-
-pub(crate) fn cap_scale_up_target_by_memory_headroom(
-    current_replicas: u32,
-    proposed_target: u32,
-    total_model_memory_bytes: usize,
-    system_total_memory_kb: u64,
-) -> u32 {
-    if proposed_target <= current_replicas
-        || current_replicas == 0
-        || total_model_memory_bytes == 0
-        || system_total_memory_kb == 0
-    {
-        return proposed_target;
-    }
-
-    let per_replica_bytes = total_model_memory_bytes as f64 / current_replicas as f64;
-    if per_replica_bytes <= 0.0 {
-        return proposed_target;
-    }
-
-    let budget_bytes = (system_total_memory_kb as f64 * 1024.0 * MEMORY_HEADROOM_FRACTION).max(1.0);
-    let max_by_headroom = (budget_bytes / per_replica_bytes).floor() as u32;
-    let capped_max = max_by_headroom.max(current_replicas).max(1);
-    proposed_target.min(capped_max)
-}
