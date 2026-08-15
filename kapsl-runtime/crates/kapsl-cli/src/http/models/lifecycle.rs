@@ -205,30 +205,62 @@ pub(crate) fn build_model_lifecycle_routes(
                     let resources = resources.clone();
                     async move {
                         let _lifecycle_guard = lifecycle_guard;
-                        let model_registry_clone = model_registry.clone();
-                        let device_info_clone = device_info.clone();
-                        let shared_metrics_clone = shared_metrics.clone();
-                        let model_path_thread = model_path.clone();
-                        let topology_clone = topology.clone();
+                        // A typed authority rejection may reclaim one idle,
+                        // strictly lower-weight victim at a time and retry from
+                        // a clean load transaction. Ordinary backend failures
+                        // never enter arbitration.
+                        let mut reclaim_attempts = 0usize;
+                        let res = loop {
+                            let model_registry_for_attempt = model_registry.clone();
+                            let device_info_for_attempt = device_info.clone();
+                            let shared_metrics_for_attempt = shared_metrics.clone();
+                            let model_path_for_attempt = model_path.clone();
+                            let topology_for_attempt = topology.clone();
+                            let resources_for_attempt = resources.clone();
+                            let onnx_tuning_for_attempt = onnx_tuning.clone();
+                            let attempt = tokio::task::spawn_blocking(move || {
+                                load_model_blocking(
+                                    model_id,
+                                    &model_path_for_attempt,
+                                    &device_info_for_attempt,
+                                    resources_for_attempt,
+                                    batch_size_for_start,
+                                    scheduler_queue_size_for_start,
+                                    scheduler_max_micro_batch_for_start,
+                                    scheduler_queue_delay_ms_for_start,
+                                    &model_registry_for_attempt,
+                                    &shared_metrics_for_attempt,
+                                    &topology_for_attempt,
+                                    tp_degree,
+                                    onnx_tuning_for_attempt,
+                                )
+                            })
+                            .await;
 
-                        let res = tokio::task::spawn_blocking(move || {
-                            load_model_blocking(
-                                model_id,
-                                &model_path_thread,
-                                &device_info_clone,
-                                resources,
-                                batch_size_for_start,
-                                scheduler_queue_size_for_start,
-                                scheduler_max_micro_batch_for_start,
-                                scheduler_queue_delay_ms_for_start,
-                                &model_registry_clone,
-                                &shared_metrics_clone,
-                                &topology_clone,
-                                tp_degree,
-                                onnx_tuning.clone(),
+                            let Ok(Err(error)) = &attempt else {
+                                break attempt;
+                            };
+                            let Some(failure) = error.downcast_ref::<MemoryAdmissionFailure>() else {
+                                break attempt;
+                            };
+                            if reclaim_attempts >= 32 {
+                                log::warn!(
+                                    "Priority arbitration for model {} reached its bounded retry limit",
+                                    model_id
+                                );
+                                break attempt;
+                            }
+                            let Some(_reclaimed) = reclaim_one_lower_priority_model(
+                                failure,
+                                &models,
+                                &resources,
                             )
-                        })
-                        .await;
+                            .await
+                            else {
+                                break attempt;
+                            };
+                            reclaim_attempts += 1;
+                        };
 
                         match res {
                             Ok(Err(e)) => {

@@ -884,7 +884,7 @@ fn test_mesh_selection_preserves_coreml_on_metal_device() {
 }
 
 #[test]
-fn test_evaluate_runtime_pressure_state_transitions() {
+fn test_evaluate_authority_pressure_state_transitions() {
     let config = RuntimePressureConfig {
         memory_conserve_ratio: 0.7,
         memory_emergency_ratio: 0.9,
@@ -896,36 +896,44 @@ fn test_evaluate_runtime_pressure_state_transitions() {
         emergency_max_new_tokens: Some(128),
     };
 
-    let normal = RuntimeSamples {
-        process_memory_bytes: 2 * 1024,
-        total_system_memory_bytes: Some(10 * 1024),
-        gpu_utilization: 0.2,
-        gpu_memory_bytes: Some(100),
-        gpu_memory_total_bytes: Some(1000),
-        foreign_gpu_memory_bytes: None,
-        collected_at_ms: 0,
+    let snapshot = |host_observed, cuda_observed| MemorySnapshot {
+        rows: Vec::new(),
+        domains: vec![
+            MemoryDomainSnapshot {
+                domain: MemoryDomain::Host,
+                budget_bytes: 10 * 1024,
+                planned_bytes: 0,
+                reserved_bytes: 0,
+                committed_bytes: 0,
+                observed_bytes: host_observed,
+                available_bytes: (10 * 1024usize).saturating_sub(host_observed),
+            },
+            MemoryDomainSnapshot {
+                domain: MemoryDomain::Cuda { device_id: 0 },
+                budget_bytes: 1000,
+                planned_bytes: 0,
+                reserved_bytes: 0,
+                committed_bytes: 0,
+                observed_bytes: cuda_observed,
+                available_bytes: 1000usize.saturating_sub(cuda_observed),
+            },
+        ],
+        foreign_pressure_active: false,
     };
+    let normal = snapshot(2 * 1024, 100);
     assert_eq!(
-        evaluate_runtime_pressure_state(&normal, &config),
+        evaluate_authority_pressure_state(&normal, 0.2, &config),
         RuntimePressureState::Normal
     );
 
-    let conserve = RuntimeSamples {
-        process_memory_bytes: 8 * 1024,
-        total_system_memory_bytes: Some(10 * 1024),
-        ..normal.clone()
-    };
+    let conserve = snapshot(8 * 1024, 100);
     assert_eq!(
-        evaluate_runtime_pressure_state(&conserve, &config),
+        evaluate_authority_pressure_state(&conserve, 0.2, &config),
         RuntimePressureState::Conserve
     );
 
-    let emergency = RuntimeSamples {
-        gpu_utilization: 0.97,
-        ..normal
-    };
     assert_eq!(
-        evaluate_runtime_pressure_state(&emergency, &config),
+        evaluate_authority_pressure_state(&normal, 0.97, &config),
         RuntimePressureState::Emergency
     );
 }

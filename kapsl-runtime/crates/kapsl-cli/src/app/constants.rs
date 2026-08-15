@@ -77,6 +77,11 @@ pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_M
 /// budget also observes container limits and keeps a safety reserve; this
 /// override is useful on bare-metal hosts where no cgroup boundary exists.
 pub(crate) const KAPSL_CPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_CPU_MEMORY_LIMIT_MB";
+/// Comma-separated hard limits for non-CPU, non-CUDA provider domains.
+/// Entries use `provider[:device]=size`, for example
+/// `metal=8g,directml:0=6g`. An exact device entry overrides the provider-wide
+/// fallback. CUDA/TensorRT and CPU retain their dedicated limit variables.
+pub(crate) const PROVIDER_MEMORY_LIMITS_ENV: &str = "KAPSL_PROVIDER_MEMORY_LIMITS";
 /// Internal worker override used to keep process-local CUDA arenas from each
 /// claiming the parent process's full configured pool.
 pub(crate) const GPU_DEVICE_POOL_DISABLED_ENV: &str = "KAPSL_GPU_DEVICE_POOL_DISABLED";

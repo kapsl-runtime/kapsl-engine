@@ -151,6 +151,7 @@ pub(super) async fn load_replica(
             plan.base_model_id,
             plan.replica_id,
             EngineKind::resolve(&plan.loader.manifest),
+            plan.priority_weight,
             &role.load_context(&plan, None),
         )
         .await?;
@@ -193,6 +194,7 @@ pub(super) async fn load_replica(
                 plan.base_model_id,
                 plan.replica_id,
                 EngineKind::resolve(&plan.loader.manifest),
+                plan.priority_weight,
                 &role.load_context(&plan, Some(device.id)),
             )
             .await?;
@@ -239,6 +241,7 @@ pub(super) async fn load_replica(
             plan.base_model_id,
             plan.replica_id,
             EngineKind::resolve(&plan.loader.manifest),
+            plan.priority_weight,
             &role.load_context(&plan, Some(device_id)),
         )
         .await?;

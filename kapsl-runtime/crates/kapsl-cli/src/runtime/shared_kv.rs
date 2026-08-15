@@ -14,8 +14,8 @@ struct KvEngineRecord {
 /// allocation.  All `LLMBackend` instances on the same physical GPU share the
 /// same `SharedBlockAllocator`, enforcing a single unified block budget.
 pub(crate) struct KvCoordinatorInner {
-    /// Total VRAM bytes per device ID — used to size pools on first access.
-    device_bytes: HashMap<usize, usize>,
+    /// The sole source of physical-domain capacity and pressure state.
+    memory: Arc<MemoryAuthority>,
     /// Per-device shared KV block allocators (lazily created).
     logical_block_allocators: Mutex<HashMap<usize, SharedBlockAllocator>>,
     /// Cross-model token-budget coordinator (hard admission gate in Phase 2).
@@ -32,99 +32,21 @@ pub(crate) struct KvCoordinatorInner {
     /// engine's health changes, reclaiming a degraded/dead engine's block quota
     /// for healthy engines without waiting for a full detach.
     last_health_epoch: AtomicU64,
-    /// Live per-device *soft* KV ceiling in bytes, foreign-aware. Refreshed by
-    /// `refresh_ceilings` from the monitor loop: the declared budget minus VRAM
-    /// held by co-tenant processes (e.g. a training job on the same card) minus
-    /// a safety reserve. Drives `rebalance_kv_caps` so concurrency backs off
-    /// under a noisy neighbor instead of OOMing it. Empty until the first
-    /// refresh, and never populated when the co-tenancy path is disabled, so the
-    /// soft budget falls back to `device_bytes` and default behavior is
-    /// unchanged. Distinct from the *hard* arena in `get_or_create_pool`, which
-    /// stays sized off `device_bytes` because handed-out blocks can't be
-    /// reclaimed.
-    live_ceiling: Mutex<HashMap<usize, Arc<AtomicUsize>>>,
 }
 
 pub(crate) type KvCoordinator = Arc<KvCoordinatorInner>;
 
-/// One device's ceiling arithmetic from a `refresh_ceilings` tick, surfaced so
-/// the monitor loop can export it (Prometheus gauges + transition logs) —
-/// otherwise the shrink-fast/recover-slow behavior is invisible from outside
-/// the process. `target_bytes` is the instantaneous foreign-aware ceiling;
-/// `smoothed_bytes` is the damped value that actually drives the KV caps, and
-/// during grow-slow recovery it lags `target_bytes` — that gap is the
-/// hysteresis, and it is exactly what a dashboard should show.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CeilingSample {
-    pub(crate) device_id: usize,
-    /// Co-tenant VRAM bytes observed on this device this tick.
-    pub(crate) foreign_bytes: usize,
-    /// Instantaneous ceiling: declared budget minus foreign minus reserve.
-    pub(crate) target_bytes: usize,
-    /// Damped live ceiling after shrink-fast/grow-slow smoothing.
-    pub(crate) smoothed_bytes: usize,
-    /// Live ceiling before this tick (equals `smoothed_bytes` when unchanged).
-    pub(crate) previous_bytes: usize,
-    /// Whether this device currently reads as squeezed by a co-tenant — the
-    /// same per-device predicate `foreign_pressure_active` ORs together, so a
-    /// dashboard can show exactly why the autoscaler is suppressed.
-    pub(crate) squeezed: bool,
-}
-
-/// The per-device squeeze predicate behind `foreign_pressure_active`: the live
-/// soft ceiling sits below 90% of the no-foreign target (the reserve alone
-/// keeps the idle ceiling under the declared bytes, so the baseline is the
-/// idle target, not the raw budget). Shared with `refresh_ceilings` so the
-/// exported `CeilingSample::squeezed` can never drift from the autoscaler's
-/// suppression signal.
-fn ceiling_is_squeezed(device_id: usize, declared: usize, live_bytes: usize) -> bool {
-    let idle_target = effective_ceiling_bytes(device_id, declared, 0);
-    live_bytes < idle_target.saturating_mul(9) / 10
-}
-
 impl KvCoordinatorInner {
-    #[cfg(test)]
-    pub(crate) fn new(device_info: &DeviceInfo) -> KvCoordinator {
-        Self::new_with_host_budget(device_info, None)
-    }
-
-    pub(crate) fn new_with_host_budget(
-        device_info: &DeviceInfo,
-        host_budget_override: Option<super::host_memory::HostMemoryBudget>,
-    ) -> KvCoordinator {
+    pub(crate) fn new(memory: Arc<MemoryAuthority>) -> KvCoordinator {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const KV_BLOCK_SIZE: usize = 16;
-        let mut device_bytes = HashMap::new();
         let mut estimated_kv_tokens: usize = 0;
-        let host_budget = host_budget_override.unwrap_or_else(|| {
-            super::host_memory::HostMemoryBudget::detect(device_info.total_memory)
-        });
-        for device in &device_info.devices {
-            let is_cpu = device.backend.to_string().eq_ignore_ascii_case("cpu");
-            let total = if is_cpu {
-                host_budget.safe_bytes
-            } else {
-                (device.memory_mb as usize).saturating_mul(1024 * 1024)
-            };
-            if total == 0 {
-                continue;
-            }
-            // Cooperative software-vGPU clamp: when a per-device VRAM cap is
-            // configured (HAMi env or the kapsl alias), size the KV budget to
-            // the slice rather than the whole card. A no-op when no cap is set
-            // or the cap exceeds the card, so default behavior is unchanged and
-            // a MIG slice (which already reports its true size) is never inflated.
-            let total = if is_cpu {
-                total
-            } else {
-                device_vram_cap_bytes(device.id).map_or(total, |cap| total.min(cap))
-            };
-            device_bytes.insert(device.id, total);
-            let kv_blocks = (total / 2) / KV_BYTES_PER_BLOCK;
+        for (_, kv_bytes) in memory.kv_device_budgets() {
+            let kv_blocks = kv_bytes / KV_BYTES_PER_BLOCK;
             estimated_kv_tokens = estimated_kv_tokens.saturating_add(kv_blocks * KV_BLOCK_SIZE);
         }
         Arc::new(Self {
-            device_bytes,
+            memory,
             logical_block_allocators: Mutex::new(HashMap::new()),
             scheduler: Arc::new(parking_lot::Mutex::new(GlobalKvScheduler::new(
                 estimated_kv_tokens.max(16_384),
@@ -132,7 +54,6 @@ impl KvCoordinatorInner {
             next_engine_id: AtomicU32::new(1),
             engine_records: Mutex::new(HashMap::new()),
             last_health_epoch: AtomicU64::new(0),
-            live_ceiling: Mutex::new(HashMap::new()),
         })
     }
 
@@ -144,8 +65,8 @@ impl KvCoordinatorInner {
         }
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
         const KV_BLOCK_SIZE: usize = 16;
-        let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
-        let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(256);
+        let total_bytes = self.memory.kv_budget_bytes(device_id);
+        let total_blocks = (total_bytes / KV_BYTES_PER_BLOCK).max(1);
         let allocator = new_shared_allocator(total_blocks, KV_BLOCK_SIZE, device_id);
         allocators.insert(device_id, allocator.clone());
         allocator
@@ -179,9 +100,9 @@ impl KvCoordinatorInner {
             max_tokens: None,
         });
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
-        const MIN_BLOCKS_PER_ENGINE: usize = 256;
-        let total_bytes = self.device_bytes.get(&device_id).copied().unwrap_or(0);
-        let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
+        const MIN_BLOCKS_PER_ENGINE: usize = 1;
+        let total_bytes = self.memory.kv_budget_bytes(device_id);
+        let total_blocks = (total_bytes / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
         let (initial_cap, live_cap) = {
             let mut records = self.engine_records.lock();
             let engine_count = records
@@ -246,6 +167,91 @@ impl KvCoordinatorInner {
         self.rebalance_kv_caps();
     }
 
+    /// Conservative request-time KV reservation expressed in authority bytes.
+    /// Backends with model-specific geometry publish their own KV row; this is
+    /// the compatibility floor for older built-ins that only expose logical
+    /// block admission.
+    pub(crate) fn request_memory_plan(
+        &self,
+        owner: MemoryOwner,
+        request: &InferenceRequest,
+        fallback_claims: &[MemoryClaim],
+        reserve_host_fallback: bool,
+    ) -> MemoryPlan {
+        const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
+        const KV_BLOCK_SIZE: usize = 16;
+        let max_new_tokens = request
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.max_new_tokens)
+            .map(|tokens| tokens as usize)
+            .unwrap_or(512);
+        // Integer-token packets contain one token per element; UTF-8/byte
+        // prompts can tokenize to at most one token per input byte. Auxiliary
+        // tensors (attention masks, media, etc.) do not create KV positions.
+        let element_bytes = request.input.dtype.size_bytes().max(1);
+        let input_tokens = request
+            .input
+            .data
+            .len()
+            .saturating_add(element_bytes - 1)
+            .saturating_div(element_bytes);
+        let tokens = input_tokens.saturating_add(max_new_tokens).max(1);
+        let requested_blocks = tokens
+            .saturating_add(KV_BLOCK_SIZE - 1)
+            .saturating_div(KV_BLOCK_SIZE);
+
+        let record = self.engine_records.lock().values().find_map(|record| {
+            (record.model_id == owner.model_id && record.replica_id == owner.replica_id)
+                .then_some((record.device_id, record.live_cap.load(Ordering::Relaxed)))
+        });
+        let blocks = record
+            .map(|(_, live_cap)| requested_blocks.min(live_cap))
+            .unwrap_or(requested_blocks);
+        let mut claims = fallback_claims.to_vec();
+        if claims.is_empty() {
+            let domain = record
+                .map(|(device_id, _)| self.memory.domain_for_device(device_id))
+                .unwrap_or(MemoryDomain::Host);
+            claims.push(MemoryClaim::runtime(
+                domain,
+                owner,
+                MemoryAllocationClass::KvCache,
+                0,
+            ));
+        }
+        if reserve_host_fallback
+            && claims
+                .iter()
+                .any(|claim| matches!(claim.domain, MemoryDomain::Cuda { .. }))
+            && !claims.iter().any(|claim| {
+                matches!(
+                    claim.domain,
+                    MemoryDomain::Host
+                        | MemoryDomain::HostPinned { .. }
+                        | MemoryDomain::HostMapped { .. }
+                )
+            })
+        {
+            // Older SDK backends expose only the CUDA KV template. Reserve the
+            // host destination in the same transaction so provider fallback
+            // can never create an unleased second copy.
+            claims.push(MemoryClaim::runtime(
+                MemoryDomain::Host,
+                owner,
+                MemoryAllocationClass::KvCache,
+                0,
+            ));
+        }
+
+        let mut plan = MemoryPlan::new();
+        for mut claim in claims {
+            claim.bytes = blocks.saturating_mul(KV_BYTES_PER_BLOCK);
+            plan.push(claim);
+        }
+        plan
+    }
+
     /// Recompute per-engine KV block caps from the global scheduler's budget
     /// allocation and push the new values into each engine's `Arc<AtomicUsize>`.
     ///
@@ -276,34 +282,13 @@ impl KvCoordinatorInner {
     ///
     /// Returns one `CeilingSample` per device so the caller can export the
     /// arithmetic (metrics + logs) without re-deriving it.
+    #[cfg(test)]
     pub(crate) fn refresh_ceilings(&self, foreign: &HashMap<usize, usize>) -> Vec<CeilingSample> {
-        let mut changed = false;
-        let mut samples = Vec::with_capacity(self.device_bytes.len());
+        let samples = self.memory.reconcile_external_device_memory(foreign);
+        if samples
+            .iter()
+            .any(|sample| sample.smoothed_bytes != sample.previous_bytes)
         {
-            let mut live = self.live_ceiling.lock();
-            for (&device_id, &declared) in &self.device_bytes {
-                let foreign_bytes = foreign.get(&device_id).copied().unwrap_or(0);
-                let target = effective_ceiling_bytes(device_id, declared, foreign_bytes);
-                let atom = live
-                    .entry(device_id)
-                    .or_insert_with(|| Arc::new(AtomicUsize::new(declared)));
-                let previous = atom.load(Ordering::Relaxed);
-                let smoothed = smooth_ceiling_bytes(previous, target);
-                if smoothed != previous {
-                    atom.store(smoothed, Ordering::Relaxed);
-                    changed = true;
-                }
-                samples.push(CeilingSample {
-                    device_id,
-                    foreign_bytes,
-                    target_bytes: target,
-                    smoothed_bytes: smoothed,
-                    previous_bytes: previous,
-                    squeezed: ceiling_is_squeezed(device_id, declared, smoothed),
-                });
-            }
-        }
-        if changed {
             self.rebalance_kv_caps();
         }
         samples
@@ -317,32 +302,24 @@ impl KvCoordinatorInner {
     /// neighbor from real load growth — adding a replica on a starved GPU only
     /// thrashes. The grow-slow smoothing keeps this true for a few ticks after
     /// the neighbor exits, which doubles as scale-up hysteresis. Always false
-    /// when the co-tenancy guard is off (`live_ceiling` never populated).
+    /// when the co-tenancy guard has not observed a squeeze.
+    #[cfg(test)]
     pub(crate) fn foreign_pressure_active(&self) -> bool {
-        let live = self.live_ceiling.lock();
-        live.iter().any(|(device_id, atom)| {
-            let declared = self.device_bytes.get(device_id).copied().unwrap_or(0);
-            ceiling_is_squeezed(*device_id, declared, atom.load(Ordering::Relaxed))
-        })
+        self.memory.snapshot().foreign_pressure_active
     }
 
     /// The soft KV budget in bytes for a device: the live foreign-aware ceiling
-    /// when one has been refreshed, otherwise the static declared `device_bytes`.
+    /// when one has been refreshed, otherwise the authority's static budget.
     /// A floored (zero) live ceiling is honored rather than falling back, so a
     /// GPU fully claimed by a trainer shrinks engines to their block minimum
     /// instead of resetting to the full budget.
     fn device_soft_ceiling_bytes(&self, device_id: usize) -> usize {
-        self.live_ceiling
-            .lock()
-            .get(&device_id)
-            .map(|atom| atom.load(Ordering::Relaxed))
-            .or_else(|| self.device_bytes.get(&device_id).copied())
-            .unwrap_or(0)
+        self.memory.kv_budget_bytes(device_id)
     }
 
     pub(crate) fn rebalance_kv_caps(&self) {
         const KV_BYTES_PER_BLOCK: usize = 2 * 1024 * 1024;
-        const MIN_BLOCKS_PER_ENGINE: usize = 256;
+        const MIN_BLOCKS_PER_ENGINE: usize = 1;
 
         let budgets = self.scheduler.lock().allocate_budgets();
         if budgets.is_empty() {
@@ -367,11 +344,11 @@ impl KvCoordinatorInner {
                 .copied()
                 .unwrap_or(1)
                 .max(1);
-            // Soft budget: the live foreign-aware ceiling when refreshed, else the
-            // static declared bytes. The hard arena in get_or_create_pool keeps
-            // reading device_bytes so already-handed-out blocks are never revoked.
+            // Soft budget: the live foreign-aware ceiling when refreshed, else
+            // the authority's static budget. Already-handed-out logical blocks
+            // are never revoked here.
             let total_bytes = self.device_soft_ceiling_bytes(device_id);
-            let total_blocks = ((total_bytes / 2) / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
+            let total_blocks = (total_bytes / KV_BYTES_PER_BLOCK).max(MIN_BLOCKS_PER_ENGINE);
             let new_cap =
                 (total_blocks * budget.max_tokens / device_tokens).max(MIN_BLOCKS_PER_ENGINE);
             record.live_cap.store(new_cap, Ordering::Relaxed);
@@ -390,7 +367,11 @@ impl KvCoordinatorInner {
 mod vram_clamp_tests {
     use super::KvCoordinatorInner;
     use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
-    use crate::runtime::host_memory::HostMemoryBudget;
+    use crate::runtime::memory::{
+        MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryDomain,
+    };
+    use crate::runtime::tuning::effective_ceiling_bytes;
+    use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
     use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
 
     const GIB: usize = 1024 * 1024 * 1024;
@@ -447,6 +428,14 @@ mod vram_clamp_tests {
         }
     }
 
+    fn coordinator(info: &DeviceInfo) -> super::KvCoordinator {
+        #[cfg(feature = "gpu-device-pool")]
+        let authority = MemoryAuthority::new_accounting_only_for_test(info).unwrap();
+        #[cfg(not(feature = "gpu-device-pool"))]
+        let authority = MemoryAuthority::new(info).unwrap();
+        KvCoordinatorInner::new(authority)
+    }
+
     #[test]
     fn cpu_kv_budget_is_derived_from_safe_host_memory() {
         let cpu_id = 4260;
@@ -454,15 +443,9 @@ mod vram_clamp_tests {
         // DeviceInfo reports host memory in KiB. The host budget retains 20%,
         // then the KV coordinator dedicates half of that safe budget to KV.
         info.total_memory = 20 * 1024 * 1024;
-        let state = KvCoordinatorInner::new_with_host_budget(
-            &info,
-            Some(HostMemoryBudget {
-                limit_bytes: 20 * GIB,
-                safe_bytes: 16 * GIB,
-            }),
-        );
+        let state = coordinator(&info);
 
-        assert_eq!(state.device_bytes.get(&cpu_id).copied(), Some(16 * GIB));
+        assert_eq!(state.memory.kv_budget_bytes(cpu_id), 8 * GIB);
         let (_, cap, _, _, _) = state.attach_engine(cpu_id, 10, 0, 1);
         assert_eq!(cap, 4_096);
     }
@@ -473,8 +456,59 @@ mod vram_clamp_tests {
         // CUDA_DEVICE_MEMORY_LIMIT / KAPSL_GPU_MEMORY_LIMIT_MB globals are never
         // set by any test, so the cooperative clamp is a no-op here.
         let info = device_info(vec![cuda_device(4242, 24576)]);
-        let state = KvCoordinatorInner::new(&info);
-        assert_eq!(state.device_bytes.get(&4242).copied(), Some(24 * GIB));
+        let state = coordinator(&info);
+        assert_eq!(
+            state.memory.kv_budget_bytes(4242),
+            effective_ceiling_bytes(4242, 24 * GIB, 0) / 2
+        );
+    }
+
+    #[test]
+    fn legacy_cuda_request_plan_reserves_the_host_fallback_too() {
+        let device_id = 4252;
+        let owner = crate::runtime::memory::MemoryOwner::new(77, 1);
+        let state = coordinator(&device_info(vec![cuda_device(device_id, 8 * 1024)]));
+        let request = InferenceRequest {
+            input: BinaryTensorPacket {
+                shape: vec![1],
+                dtype: TensorDtype::Uint8,
+                data: vec![1, 2, 3, 4],
+            },
+            additional_inputs: Vec::new(),
+            session_id: None,
+            metadata: None,
+            cancellation: None,
+        };
+        let template = MemoryClaim::runtime_allocation(
+            MemoryDomain::Cuda { device_id },
+            owner,
+            MemoryAllocationClass::KvCache,
+            "legacy:cuda-kv",
+            0,
+        );
+        let templates = vec![template];
+        let plan = state.request_memory_plan(owner, &request, &templates, true);
+
+        assert_eq!(plan.claims().len(), 2);
+        assert!(plan
+            .claims()
+            .iter()
+            .any(|claim| claim.domain == MemoryDomain::Cuda { device_id }));
+        assert!(plan
+            .claims()
+            .iter()
+            .any(|claim| claim.domain == MemoryDomain::Host));
+        assert!(plan.claims().iter().all(|claim| claim.bytes > 0));
+
+        let native_plan = state.request_memory_plan(owner, &request, &templates, false);
+        assert!(native_plan
+            .claims()
+            .iter()
+            .any(|claim| claim.domain == MemoryDomain::Cuda { device_id }));
+        assert!(!native_plan
+            .claims()
+            .iter()
+            .any(|claim| claim.domain == MemoryDomain::Host));
     }
 
     #[test]
@@ -485,15 +519,21 @@ mod vram_clamp_tests {
             cuda_device(first_device, 8 * 1024),
             cuda_device(second_device, 16 * 1024),
         ]);
-        let state = KvCoordinatorInner::new(&info);
+        let state = coordinator(&info);
 
         let (_, _, _, _, first_cap) = state.attach_engine(first_device, 10, 0, 1);
         let (_, _, _, _, second_cap) = state.attach_engine(second_device, 20, 3, 1);
 
         // Each device has one engine, so each receives its own full logical KV
         // budget: half of VRAM divided into 2 MiB blocks.
-        assert_eq!(first_cap.load(std::sync::atomic::Ordering::Relaxed), 2_048);
-        assert_eq!(second_cap.load(std::sync::atomic::Ordering::Relaxed), 4_096);
+        assert_eq!(
+            first_cap.load(std::sync::atomic::Ordering::Relaxed),
+            state.memory.kv_budget_bytes(first_device) / (2 * 1024 * 1024)
+        );
+        assert_eq!(
+            second_cap.load(std::sync::atomic::Ordering::Relaxed),
+            state.memory.kv_budget_bytes(second_device) / (2 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -502,24 +542,25 @@ mod vram_clamp_tests {
         // 40 GiB card, no cap env → declared == physical.
         let device_id = 4245;
         let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
-        let state = KvCoordinatorInner::new(&info);
+        let state = coordinator(&info);
 
-        // Before any refresh the soft ceiling is the full declared budget.
-        assert_eq!(state.device_soft_ceiling_bytes(device_id), 40 * GIB);
+        // The authority retains its device reserve, then exposes half of the
+        // safe domain budget to logical KV policy.
+        assert_eq!(state.device_soft_ceiling_bytes(device_id), 18 * GIB);
 
         // A 6 GiB trainer appears: 40 - 6 - 4 (10% reserve) = 30 GiB, and a
         // shrink is applied immediately (no damping on the safety side).
         let mut foreign = HashMap::new();
         foreign.insert(device_id, 6 * GIB);
         state.refresh_ceilings(&foreign);
-        assert_eq!(state.device_soft_ceiling_bytes(device_id), 30 * GIB);
+        assert_eq!(state.device_soft_ceiling_bytes(device_id), 15 * GIB);
 
         // Trainer exits: target recovers to 40 - 4 = 36 GiB but growth is damped
         // to a quarter of the gap → 30 + (36 - 30)/4 = 31.5 GiB.
         state.refresh_ceilings(&HashMap::new());
         assert_eq!(
             state.device_soft_ceiling_bytes(device_id),
-            30 * GIB + (6 * GIB) / 4
+            (30 * GIB + (6 * GIB) / 4) / 2
         );
     }
 
@@ -530,7 +571,7 @@ mod vram_clamp_tests {
         // mirror the stored arithmetic so metrics can't drift from behavior.
         let device_id = 4247;
         let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
-        let state = KvCoordinatorInner::new(&info);
+        let state = coordinator(&info);
 
         // A 12 GiB trainer: target = 40 - 12 - 4 (reserve) = 24 GiB, shrink is
         // immediate so smoothed == target, and the device reads as squeezed —
@@ -544,7 +585,7 @@ mod vram_clamp_tests {
         assert_eq!(sample.foreign_bytes, 12 * GIB);
         assert_eq!(sample.target_bytes, 24 * GIB);
         assert_eq!(sample.smoothed_bytes, 24 * GIB);
-        assert_eq!(sample.previous_bytes, 40 * GIB);
+        assert_eq!(sample.previous_bytes, 36 * GIB);
         assert!(sample.squeezed);
         assert_eq!(sample.squeezed, state.foreign_pressure_active());
 
@@ -574,7 +615,7 @@ mod vram_clamp_tests {
         use std::collections::HashMap;
         let device_id = 4246;
         let info = device_info(vec![cuda_device(device_id, 40 * 1024)]);
-        let state = KvCoordinatorInner::new(&info);
+        let state = coordinator(&info);
 
         // Guard off / never refreshed → never "under pressure".
         assert!(!state.foreign_pressure_active());
@@ -608,11 +649,14 @@ mod vram_clamp_tests {
         let var = format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_{device_id}");
         std::env::set_var(&var, "8g");
         let info = device_info(vec![cuda_device(device_id, 24576)]);
-        let state = KvCoordinatorInner::new(&info);
+        let state = coordinator(&info);
         std::env::remove_var(&var);
         // The KV budget sizes to the 8 GiB slice, not the 24 GiB physical card,
         // so the whole downstream KV chain (pools, per-engine caps, rebalancing)
         // self-limits.
-        assert_eq!(state.device_bytes.get(&device_id).copied(), Some(8 * GIB));
+        assert_eq!(
+            state.memory.kv_budget_bytes(device_id),
+            effective_ceiling_bytes(device_id, 8 * GIB, 0) / 2
+        );
     }
 }

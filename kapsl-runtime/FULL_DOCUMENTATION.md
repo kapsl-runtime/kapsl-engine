@@ -706,6 +706,19 @@ CPU memory governance:
   lower) the conservative model reservation. This is accounting only: Kapsl
   does not reserve a second physical CPU arena.
 
+Provider memory governance:
+
+- `KAPSL_PROVIDER_MEMORY_LIMITS`: comma-separated hard ceilings for
+  accounting-only accelerator providers, using `provider[:device]=size` (for
+  example `metal=8g,directml:0=6g`). `coreml` aliases `metal`, `dml` aliases
+  `directml`, and an exact device entry overrides its provider-wide fallback.
+  CPU and CUDA/TensorRT continue to use their dedicated limit variables.
+- Live backend memory reports are reconciled into the owning elastic lease on
+  the two-second monitor cadence, including isolated worker processes. Provider
+  growth, shrink, compaction, and migration therefore update the unified
+  snapshot without a reload. A physical overage that cannot be newly reserved
+  remains visible as `observed` bytes and blocks subsequent admission.
+
 Memory admission is coordinated by a backend-neutral authority. A `MemoryPlan`
 contains typed host, pinned-host, mapped-host, CUDA-device, or provider-domain
 claims, each attributed to a model ID, replica ID, allocation class, allocation

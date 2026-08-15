@@ -110,43 +110,30 @@ impl RuntimePressureConfig {
     }
 }
 
-pub(crate) fn evaluate_runtime_pressure_state(
-    samples: &RuntimeSamples,
+/// Memory pressure is derived solely from the authority snapshot. Raw sampler
+/// fields remain available for the system API, while only non-memory GPU
+/// utilization is consumed directly here.
+pub(crate) fn evaluate_authority_pressure_state(
+    memory: &MemorySnapshot,
+    gpu_utilization: f64,
     config: &RuntimePressureConfig,
 ) -> RuntimePressureState {
-    let process_memory_ratio = samples
-        .total_system_memory_bytes
-        .filter(|total| *total > 0)
-        .map(|total| (samples.process_memory_bytes as f64 / total as f64).clamp(0.0, 1.0));
+    let host_ratio = memory.max_host_ratio();
+    let device_ratio = memory.max_device_ratio();
+    let gpu_util_ratio = gpu_utilization.clamp(0.0, 1.0);
 
-    let gpu_util_ratio = samples.gpu_utilization.clamp(0.0, 1.0);
-    // Pressure reasons about *our own* footprint: a co-tenant's bytes are
-    // subtracted so a trainer sharing the GPU is answered by the KV concurrency
-    // ceiling (smaller batches), not by truncating every request's output. With
-    // no probe data this is the historical device-wide ratio.
-    let gpu_mem_ratio = match (samples.gpu_memory_bytes, samples.gpu_memory_total_bytes) {
-        (Some(used), Some(total)) if total > 0 => {
-            let own = used.saturating_sub(samples.foreign_gpu_memory_bytes.unwrap_or(0));
-            Some((own as f64 / total as f64).clamp(0.0, 1.0))
-        }
-        _ => None,
-    };
-
-    let emergency = process_memory_ratio
-        .is_some_and(|ratio| ratio >= config.memory_emergency_ratio)
+    if host_ratio.is_some_and(|ratio| ratio >= config.memory_emergency_ratio)
+        || device_ratio.is_some_and(|ratio| ratio >= config.gpu_mem_emergency_ratio)
         || gpu_util_ratio >= config.gpu_util_emergency_ratio
-        || gpu_mem_ratio.is_some_and(|ratio| ratio >= config.gpu_mem_emergency_ratio);
-    if emergency {
+    {
         return RuntimePressureState::Emergency;
     }
-
-    let conserve = process_memory_ratio.is_some_and(|ratio| ratio >= config.memory_conserve_ratio)
+    if host_ratio.is_some_and(|ratio| ratio >= config.memory_conserve_ratio)
+        || device_ratio.is_some_and(|ratio| ratio >= config.gpu_mem_conserve_ratio)
         || gpu_util_ratio >= config.gpu_util_conserve_ratio
-        || gpu_mem_ratio.is_some_and(|ratio| ratio >= config.gpu_mem_conserve_ratio);
-    if conserve {
+    {
         return RuntimePressureState::Conserve;
     }
-
     RuntimePressureState::Normal
 }
 
@@ -568,6 +555,67 @@ impl CotenancyCeilingExporter {
     }
 }
 
+/// One normalized metric family for the authority snapshot. Every series uses
+/// the same domain/model/replica/class/state labels, so host, CUDA, and provider
+/// memory can be compared without backend-specific joins.
+pub(crate) struct MemorySnapshotExporter {
+    bytes: prometheus::IntGaugeVec,
+}
+
+impl MemorySnapshotExporter {
+    pub(crate) fn new(registry: &prometheus::Registry) -> Self {
+        let bytes = prometheus::IntGaugeVec::new(
+            prometheus::Opts::new(
+                "kapsl_memory_authority_bytes",
+                "Unified memory authority bytes by domain, model, replica, allocation class, and accounting state.",
+            ),
+            &["domain", "model", "replica", "class", "state"],
+        )
+        .expect("valid memory authority metric labels");
+        registry
+            .register(Box::new(bytes.clone()))
+            .expect("Failed to register kapsl_memory_authority_bytes");
+        Self { bytes }
+    }
+
+    pub(crate) fn observe(&self, snapshot: &MemorySnapshot) {
+        self.bytes.reset();
+        let set =
+            |domain: &str, model: &str, replica: &str, class: &str, state: &str, bytes: usize| {
+                self.bytes
+                    .with_label_values(&[domain, model, replica, class, state])
+                    .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+            };
+        for row in &snapshot.rows {
+            let domain = row.domain.to_string();
+            let model = row.owner.model_id.to_string();
+            let replica = row.owner.replica_id.to_string();
+            let class = row.class.to_string();
+            for (state, bytes) in [
+                ("planned", row.planned_bytes),
+                ("reserved", row.reserved_bytes),
+                ("committed", row.committed_bytes),
+                ("observed", row.observed_bytes),
+            ] {
+                set(&domain, &model, &replica, &class, state, bytes);
+            }
+        }
+        for domain in &snapshot.domains {
+            let label = domain.domain.to_string();
+            for (state, bytes) in [
+                ("planned", domain.planned_bytes),
+                ("reserved", domain.reserved_bytes),
+                ("committed", domain.committed_bytes),
+                ("observed", domain.observed_bytes),
+                ("budget", domain.budget_bytes),
+                ("available", domain.available_bytes),
+            ] {
+                set(&label, "all", "all", "all", state, bytes);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod latency_window_tests {
     use super::LatencyWindow;
@@ -620,10 +668,7 @@ mod latency_window_tests {
 
 #[cfg(test)]
 mod vram_clamp_tests {
-    use super::{
-        aggregate_gpu_samples, evaluate_runtime_pressure_state, RuntimePressureConfig,
-        RuntimePressureState, RuntimeSamples,
-    };
+    use super::aggregate_gpu_samples;
 
     const MIB: f64 = 1024.0 * 1024.0;
     const GIB: usize = 1024 * 1024 * 1024;
@@ -661,86 +706,6 @@ mod vram_clamp_tests {
         let (_, _, total) = aggregate_gpu_samples(csv, |id| (id == 1).then_some(8 * GIB)).unwrap();
         // device 0 physical (24 GiB) + device 1 capped (8 GiB).
         assert_eq!(total, (24576.0 * MIB) as usize + 8 * GIB);
-    }
-
-    #[test]
-    fn pressure_ratio_is_computed_against_the_cap() {
-        // 7 GiB used on a 24 GiB card is calm (29%) physically, but against an
-        // 8 GiB slice it is 88% — the clamped total drives back-pressure into
-        // emergency, which is the whole point of the cooperative clamp.
-        let csv = "10, 7168, 24576";
-        let config = RuntimePressureConfig {
-            memory_conserve_ratio: 0.7,
-            memory_emergency_ratio: 0.9,
-            gpu_util_conserve_ratio: 0.8,
-            gpu_util_emergency_ratio: 0.95,
-            gpu_mem_conserve_ratio: 0.8,
-            gpu_mem_emergency_ratio: 0.85,
-            conserve_max_new_tokens: Some(256),
-            emergency_max_new_tokens: Some(128),
-        };
-
-        let (_, used, physical_total) = aggregate_gpu_samples(csv, |_| None).unwrap();
-        let physical = RuntimeSamples {
-            process_memory_bytes: 0,
-            total_system_memory_bytes: Some(64 * GIB),
-            gpu_utilization: 0.1,
-            gpu_memory_bytes: Some(used),
-            gpu_memory_total_bytes: Some(physical_total),
-            foreign_gpu_memory_bytes: None,
-            collected_at_ms: 0,
-        };
-        assert_eq!(
-            evaluate_runtime_pressure_state(&physical, &config),
-            RuntimePressureState::Normal
-        );
-
-        let (_, used, capped_total) = aggregate_gpu_samples(csv, |_| Some(8 * GIB)).unwrap();
-        let capped = RuntimeSamples {
-            gpu_memory_bytes: Some(used),
-            gpu_memory_total_bytes: Some(capped_total),
-            ..physical
-        };
-        assert_eq!(
-            evaluate_runtime_pressure_state(&capped, &config),
-            RuntimePressureState::Emergency
-        );
-    }
-
-    #[test]
-    fn foreign_bytes_are_excluded_from_the_pressure_ratio() {
-        let config = RuntimePressureConfig {
-            memory_conserve_ratio: 0.7,
-            memory_emergency_ratio: 0.9,
-            gpu_util_conserve_ratio: 0.8,
-            gpu_util_emergency_ratio: 0.95,
-            gpu_mem_conserve_ratio: 0.8,
-            gpu_mem_emergency_ratio: 0.85,
-            conserve_max_new_tokens: Some(256),
-            emergency_max_new_tokens: Some(128),
-        };
-        // 22 of 24 GiB used device-wide (92% → Emergency), but 16 GiB of that
-        // belongs to a trainer. Our own 6 GiB is 25% — calm. The trainer must be
-        // answered by the KV concurrency ceiling, not output truncation.
-        let shared = RuntimeSamples {
-            gpu_memory_bytes: Some(22 * GIB),
-            gpu_memory_total_bytes: Some(24 * GIB),
-            foreign_gpu_memory_bytes: Some(16 * GIB),
-            ..RuntimeSamples::default()
-        };
-        assert_eq!(
-            evaluate_runtime_pressure_state(&shared, &config),
-            RuntimePressureState::Normal
-        );
-        // Without the probe (None) the historical device-wide behavior holds.
-        let unprobed = RuntimeSamples {
-            foreign_gpu_memory_bytes: None,
-            ..shared
-        };
-        assert_eq!(
-            evaluate_runtime_pressure_state(&unprobed, &config),
-            RuntimePressureState::Emergency
-        );
     }
 }
 
@@ -812,7 +777,7 @@ mod foreign_vram_tests {
 #[cfg(test)]
 mod cotenancy_exporter_tests {
     use super::CotenancyCeilingExporter;
-    use crate::runtime::shared_kv::CeilingSample;
+    use crate::runtime::memory::CeilingSample;
 
     const GIB: usize = 1024 * 1024 * 1024;
 

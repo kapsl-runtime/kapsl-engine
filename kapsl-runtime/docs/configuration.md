@@ -105,6 +105,7 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES[_N]` | Automatic-mode reserve for scratch/fallback/later models. Uses the same suffixes, permits zero, and is never silently reduced. |
 | `CUDA_DEVICE_MEMORY_LIMIT[_N]` | Strict process/device VRAM ceiling used by automatic sizing; malformed selected values fail startup. |
 | `KAPSL_GPU_MEMORY_LIMIT_MB` | Process VRAM ceiling in MiB when no CUDA-specific ceiling is set. |
+| `KAPSL_PROVIDER_MEMORY_LIMITS` | Hard limits for non-CPU/non-CUDA provider domains as `provider[:device]=size` entries, e.g. `metal=8g,directml:0=6g`. Exact-device entries override provider-wide values. |
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
@@ -120,6 +121,13 @@ pool modes retain their stated behavior.
 Mode and byte settings are one configuration contract: a global byte override
 still conflicts with a per-device `auto` or `off` mode instead of being
 silently ignored.
+
+Every live backend is resampled on the two-second runtime monitor cadence.
+Changes to backend-owned host, CUDA, Metal/CoreML, DirectML, ROCm, or custom
+provider allocations atomically resize the owning memory lease. If physical
+usage has already crossed a hard limit, Kapsl retains the over-limit observed
+value in the authority snapshot, closes further admission, and enters the
+normal pressure policy rather than reverting to a stale reservation.
 
 `/metrics` samples the live allocator at scrape time. Pool-wide series are
 `kapsl_gpu_device_pool_allocated_bytes`, `_live_allocations`, `_free_bytes`,

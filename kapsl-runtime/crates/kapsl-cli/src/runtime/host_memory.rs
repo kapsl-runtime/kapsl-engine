@@ -23,8 +23,9 @@ pub(crate) struct HostMemoryManager {
     load_lock: Arc<AsyncMutex<()>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HostReservationOwner {
+    domain: MemoryDomain,
     owner: MemoryOwner,
     class: MemoryAllocationClass,
 }
@@ -120,10 +121,11 @@ impl HostMemoryManager {
             ));
         }
         let key = HostReservationOwner {
+            domain: claim.domain.clone(),
             owner: claim.owner,
             class: claim.class,
         };
-        let owned = reservations.by_owner.entry(key).or_default();
+        let owned = reservations.by_owner.entry(key.clone()).or_default();
         *owned = owned.saturating_add(claim.bytes);
         log::info!(
             "[host-memory] admitted {} class={}: reserved={} class_reserved={} global_reserved={} class_budget={} host_safe_budget={} bytes",
@@ -160,7 +162,11 @@ impl HostMemoryManager {
         }
     }
 
-    fn resize_lease(&self, lease: &mut HostMemoryLease, target_bytes: usize) -> Result<(), String> {
+    pub(crate) fn resize_lease(
+        &self,
+        lease: &mut HostMemoryLease,
+        target_bytes: usize,
+    ) -> Result<(), String> {
         if lease.bytes == target_bytes {
             return Ok(());
         }
@@ -187,7 +193,7 @@ impl HostMemoryManager {
                 self.budget.safe_bytes,
             ));
         }
-        let owned = reservations.by_owner.entry(lease.key).or_default();
+        let owned = reservations.by_owner.entry(lease.key.clone()).or_default();
         *owned = owned
             .saturating_sub(lease.bytes)
             .saturating_add(target_bytes);
@@ -203,6 +209,32 @@ pub(crate) struct HostMemoryLease {
     manager: Arc<HostMemoryManager>,
     key: HostReservationOwner,
     bytes: usize,
+}
+
+impl HostMemoryLease {
+    pub(crate) fn matches(&self, claim: &MemoryClaim) -> bool {
+        self.key.domain == claim.domain
+            && self.key.owner == claim.owner
+            && self.key.class == claim.class
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn claim(&self) -> MemoryClaim {
+        MemoryClaim::runtime(
+            self.key.domain.clone(),
+            self.key.owner,
+            self.key.class,
+            self.bytes,
+        )
+    }
+
+    pub(crate) fn resize(&mut self, target_bytes: usize) -> Result<(), String> {
+        let manager = Arc::clone(&self.manager);
+        manager.resize_lease(self, target_bytes)
+    }
 }
 
 /// Before/after RSS attribution guard for one host model load.
@@ -252,7 +284,7 @@ impl HostMemoryLoadAdmission {
     }
 }
 
-fn process_rss_bytes() -> Option<usize> {
+pub(crate) fn process_rss_bytes() -> Option<usize> {
     let mut system = System::new();
     let pid = Pid::from_u32(std::process::id());
     system.refresh_process(pid);

@@ -54,6 +54,13 @@ impl DeviceBootstrapDemand {
     }
 }
 
+fn auto_pool_requires_rematerialization(
+    current_capacity_bytes: usize,
+    required_capacity_bytes: usize,
+) -> bool {
+    required_capacity_bytes > current_capacity_bytes
+}
+
 /// Host-only demand summary built before a physical CUDA backing allocation is
 /// chosen. Allocation IDs let duplicate immutable GGUF weights be counted once.
 #[derive(Debug, Clone, Default)]
@@ -316,7 +323,7 @@ impl DeviceMemoryManager {
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<(), String> {
         for (&device_id, demand) in &bootstrap.devices {
-            if !demand.wants_pool || demand.has_isolated_worker || self.has_pool(device_id) {
+            if !demand.wants_pool || demand.has_isolated_worker {
                 continue;
             }
             let Some(authority) = self.devices.get(&device_id) else {
@@ -325,10 +332,20 @@ impl DeviceMemoryManager {
             match authority.pool_mode {
                 DevicePoolMode::Fixed(capacity) => {
                     self.validate_fixed_pool(device_id, capacity, demand)?;
-                    self.materialize_pool(device_id, capacity, false)?;
+                    if !self.has_pool(device_id) {
+                        self.materialize_pool(device_id, capacity, false)?;
+                    }
                 }
                 DevicePoolMode::Auto { explicit } => {
-                    self.materialize_auto_pool(device_id, demand, explicit)?;
+                    let current_capacity = self.pool_capacity_bytes(device_id);
+                    if current_capacity == 0 {
+                        self.materialize_auto_pool(device_id, demand, explicit)?;
+                    } else if auto_pool_requires_rematerialization(
+                        current_capacity,
+                        demand.minimum_pool_bytes(),
+                    ) {
+                        self.grow_idle_auto_pool(device_id, demand, explicit)?;
+                    }
                 }
                 DevicePoolMode::Off => {}
             }
@@ -350,6 +367,21 @@ impl DeviceMemoryManager {
         // Concurrent first model starts must not size competing immutable
         // pools from different demand snapshots.
         let _init_guard = authority.pool_init_lock.lock().unwrap();
+        self.materialize_auto_pool_locked(device_id, demand, explicit)
+    }
+
+    /// Materialize an automatic pool while the caller holds this device's
+    /// `pool_init_lock`.
+    fn materialize_auto_pool_locked(
+        &self,
+        device_id: usize,
+        demand: &DeviceBootstrapDemand,
+        explicit: bool,
+    ) -> Result<(), String> {
+        let authority = self
+            .devices
+            .get(&device_id)
+            .ok_or_else(|| format!("CUDA device {device_id} has no runtime memory authority"))?;
         if self.has_pool(device_id) {
             return Ok(());
         }
@@ -393,6 +425,68 @@ impl DeviceMemoryManager {
             capacity,
         );
         self.materialize_pool_locked(device_id, capacity, !explicit)
+    }
+
+    /// Replace an idle automatic pool when a later dynamic model load has a
+    /// larger pooled-memory floor than the process-start demand. CUDA backing
+    /// is immutable, so growth is safe only before any workload admission and
+    /// while every byte in the existing pool is free.
+    fn grow_idle_auto_pool(
+        &self,
+        device_id: usize,
+        demand: &DeviceBootstrapDemand,
+        explicit: bool,
+    ) -> Result<(), String> {
+        let authority = self
+            .devices
+            .get(&device_id)
+            .ok_or_else(|| format!("CUDA device {device_id} has no runtime memory authority"))?;
+        let _init_guard = authority.pool_init_lock.lock().unwrap();
+        let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
+            return self.materialize_auto_pool_locked(device_id, demand, explicit);
+        };
+        let current_capacity = pool.capacity_bytes();
+        let required_capacity = demand.minimum_pool_bytes();
+        if !auto_pool_requires_rematerialization(current_capacity, required_capacity) {
+            return Ok(());
+        }
+        if self
+            .admission_refs
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|(candidate, _)| *candidate == device_id)
+        {
+            return Err(format!(
+                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool has admitted workloads and cannot be rematerialized"
+            ));
+        }
+        if pool.free_bytes() != current_capacity {
+            return Err(format!(
+                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool still has live allocations and cannot be rematerialized"
+            ));
+        }
+        kapsl_backends::ort_pool_allocator::unregister_pool_allocator(device_id as i32, &pool)
+            .map_err(|error| {
+                format!("cannot rematerialize automatic CUDA pool on device {device_id}: {error}")
+            })?;
+        self.pools.lock().unwrap().remove(&device_id);
+        if let Some(metrics) = self.metrics.lock().unwrap().clone() {
+            metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
+        }
+        drop(pool);
+        authority
+            .implicit_auto_attempted
+            .store(false, Ordering::Release);
+        let snapshot = self.budget.lock().unwrap().set_pooled_bytes(device_id, 0)?;
+        self.publish_metrics(device_id, snapshot);
+        log::info!(
+            "[device-memory] rematerializing idle automatic CUDA pool on device {}: previous={} required_at_least={} bytes",
+            device_id,
+            current_capacity,
+            required_capacity,
+        );
+        self.materialize_auto_pool_locked(device_id, demand, explicit)
     }
 
     fn auto_pool_sizing_decision(
@@ -566,11 +660,99 @@ impl DeviceMemoryManager {
         self.pools.lock().unwrap().contains_key(&device_id)
     }
 
+    /// Physical CUDA backing reserved up front by the central pool. Raw
+    /// process VRAM includes this whole allocation even while its suballocator
+    /// is empty, so the authority subtracts it before adding exact pool usage.
+    pub(crate) fn pool_capacity_bytes(&self, device_id: usize) -> usize {
+        self.pools
+            .lock()
+            .unwrap()
+            .get(&device_id)
+            .map(|pool| pool.capacity_bytes())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn domain_budgets(&self) -> Vec<(usize, usize)> {
+        let budget = self.budget.lock().unwrap();
+        self.devices
+            .keys()
+            .filter_map(|&device_id| {
+                budget
+                    .snapshot(device_id)
+                    .map(|snapshot| (device_id, snapshot.budget_bytes))
+            })
+            .collect()
+    }
+
+    pub(crate) fn observed_pool_claims(&self) -> Vec<MemoryClaim> {
+        let pools: Vec<_> = self
+            .pools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(&device_id, pool)| (device_id, Arc::clone(pool)))
+            .collect();
+        let mut claims = Vec::new();
+        for (device_id, pool) in pools {
+            for owner in pool.snapshot().owners {
+                let (Some(model_id), Some(replica_id)) =
+                    (owner.owner.model_id(), owner.owner.replica_id())
+                else {
+                    continue;
+                };
+                if owner.usage_bytes == 0 {
+                    continue;
+                }
+                claims.push(MemoryClaim::runtime(
+                    MemoryDomain::Cuda { device_id },
+                    MemoryOwner::new(model_id, replica_id),
+                    memory_class(owner.owner.class()),
+                    owner.usage_bytes,
+                ));
+            }
+        }
+        claims
+    }
+
+    /// Remaining physical/quota capacity for an already-admitted pool
+    /// workload. `None` is expected while model-load admission is establishing
+    /// the workload for the first time.
+    pub(crate) fn runtime_allocatable(&self, claim: &MemoryClaim) -> Result<Option<usize>, String> {
+        let MemoryDomain::Cuda { device_id } = claim.domain else {
+            return Err(format!(
+                "device memory manager cannot inspect a {} claim",
+                claim.domain
+            ));
+        };
+        let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
+            return Err(format!(
+                "runtime-managed CUDA claim for {} targets device {} without a physical pool",
+                claim.owner, device_id
+            ));
+        };
+        let snapshot = pool.snapshot();
+        let representative = snapshot
+            .owners
+            .iter()
+            .find(|owner| {
+                owner.owner.model_id() == Some(claim.owner.model_id)
+                    && owner.owner.replica_id() == Some(claim.owner.replica_id)
+                    && owner.admitted
+            })
+            .map(|owner| owner.owner);
+        let Some(representative) = representative else {
+            return Ok(None);
+        };
+        Ok(Some(pool.max_allocatable(
+            representative.with_class(pool_class(claim.class)),
+            1,
+            1,
+        )))
+    }
+
     /// Admit one request-lifetime CUDA claim without taking the model-load
-    /// sampling lock. Pool-managed rows are already bounded by the admitted
-    /// workload quota. Backend-managed rows receive a unique ledger ID so
-    /// concurrent requests are charged additively rather than mistaken for a
-    /// shared persistent allocation.
+    /// sampling lock. Backend-managed rows receive a unique ledger ID;
+    /// runtime-managed rows are bounded by their pool workload quota.
     pub(crate) fn admit_transient(
         self: &Arc<Self>,
         claim: &MemoryClaim,
@@ -585,10 +767,16 @@ impl DeviceMemoryManager {
             return Ok(None);
         }
         if matches!(claim.source, MemoryClaimSource::Runtime { .. }) {
-            if !self.has_pool(device_id) {
-                return Err(format!(
-                    "runtime-managed CUDA claim for {} targets device {} without a physical pool",
+            let allocatable = self.runtime_allocatable(claim)?.ok_or_else(|| {
+                format!(
+                    "runtime-managed CUDA claim for {} targets device {} without an admitted pool workload",
                     claim.owner, device_id
+                )
+            })?;
+            if claim.bytes > allocatable {
+                return Err(format!(
+                    "CUDA memory admission rejected for {} class={}: requested={} allocatable={} device={} bytes",
+                    claim.owner, claim.class, claim.bytes, allocatable, device_id
                 ));
             }
             return Ok(None);
@@ -628,6 +816,8 @@ impl DeviceMemoryManager {
                 memory_owner: claim.owner,
                 owns_charge: true,
             },
+            class: claim.class,
+            bytes: claim.bytes,
         }))
     }
 
@@ -1094,6 +1284,9 @@ impl DeviceMemoryManager {
             return;
         }
         self.pools.lock().unwrap().remove(&device_id);
+        if let Some(metrics) = self.metrics.lock().unwrap().clone() {
+            metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
+        }
         authority
             .implicit_auto_attempted
             .store(false, Ordering::Release);
@@ -1265,6 +1458,35 @@ pub(crate) struct DeviceMemoryTransientLease {
     manager: Arc<DeviceMemoryManager>,
     device_id: usize,
     reservation: ExternalReservation,
+    class: MemoryAllocationClass,
+    bytes: usize,
+}
+
+impl DeviceMemoryTransientLease {
+    pub(crate) fn matches(&self, claim: &MemoryClaim) -> bool {
+        self.device_id
+            == match claim.domain {
+                MemoryDomain::Cuda { device_id } => device_id,
+                _ => return false,
+            }
+            && self.reservation.memory_owner == claim.owner
+            && self.class == claim.class
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn resize(&mut self, target_bytes: usize) -> Result<(), String> {
+        let manager = Arc::clone(&self.manager);
+        manager.reconcile_external(
+            self.device_id,
+            &self.reservation.allocation_id,
+            target_bytes,
+        )?;
+        self.bytes = target_bytes;
+        Ok(())
+    }
 }
 
 impl Drop for DeviceMemoryTransientLease {
@@ -1331,6 +1553,30 @@ fn pool_owner_for(kind: EngineKind, owner: MemoryOwner) -> PoolOwner {
             owner.replica_id,
             PoolAllocationClass::PersistentWeights,
         )
+    }
+}
+
+fn pool_class(class: MemoryAllocationClass) -> PoolAllocationClass {
+    match class {
+        MemoryAllocationClass::PersistentWeights | MemoryAllocationClass::ModelSession => {
+            PoolAllocationClass::PersistentWeights
+        }
+        MemoryAllocationClass::KvCache => PoolAllocationClass::KvCache,
+        MemoryAllocationClass::TransientWorkspace => PoolAllocationClass::TransientWorkspace,
+        MemoryAllocationClass::BlockTable => PoolAllocationClass::BlockTable,
+        MemoryAllocationClass::RequestTransient => PoolAllocationClass::RequestTransient,
+        MemoryAllocationClass::ExternallyOwned => PoolAllocationClass::ExternallyOwned,
+    }
+}
+
+fn memory_class(class: PoolAllocationClass) -> MemoryAllocationClass {
+    match class {
+        PoolAllocationClass::PersistentWeights => MemoryAllocationClass::PersistentWeights,
+        PoolAllocationClass::KvCache => MemoryAllocationClass::KvCache,
+        PoolAllocationClass::TransientWorkspace => MemoryAllocationClass::TransientWorkspace,
+        PoolAllocationClass::BlockTable => MemoryAllocationClass::BlockTable,
+        PoolAllocationClass::RequestTransient => MemoryAllocationClass::RequestTransient,
+        PoolAllocationClass::ExternallyOwned => MemoryAllocationClass::ExternallyOwned,
     }
 }
 
@@ -1710,6 +1956,23 @@ mod tests {
         assert!(demand.wants_pool);
         assert_eq!(demand.planned_external_bytes(), 150);
         assert_eq!(demand.minimum_pool_bytes(), 400);
+    }
+
+    #[test]
+    fn dynamic_auto_pool_growth_is_demand_driven_and_never_shrinks() {
+        const MIB: usize = 1024 * 1024;
+        assert!(auto_pool_requires_rematerialization(
+            512 * MIB,
+            5 * 1024 * MIB
+        ));
+        assert!(!auto_pool_requires_rematerialization(
+            5 * 1024 * MIB,
+            512 * MIB
+        ));
+        assert!(!auto_pool_requires_rematerialization(
+            5 * 1024 * MIB,
+            5 * 1024 * MIB
+        ));
     }
 
     #[test]

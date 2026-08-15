@@ -167,6 +167,9 @@ Pool controls accept an optional `_<device_id>` suffix, which takes precedence:
   never silently reduced.
 - `CUDA_DEVICE_MEMORY_LIMIT[_N]` or `KAPSL_GPU_MEMORY_LIMIT_MB` bounds the
   process-visible VRAM used by automatic sizing and admission.
+- `KAPSL_PROVIDER_MEMORY_LIMITS=metal=8g,directml:0=6g` sets hard limits for
+  non-CUDA provider/device domains. Exact-device entries override the
+  provider-wide fallback.
 
 An unset runtime with no startup models does not reserve every detected GPU;
 implicit automatic sizing is deferred until the first pooled model targets a
@@ -195,6 +198,11 @@ fragmentation state under `kapsl_gpu_device_pool_*`, plus per-owner usage,
 quota, admission, and allocatable-byte gauges. The existing
 `kapsl_device_memory_pooled_bytes` gauge is the immutable backing capacity;
 it is not live usage.
+
+The runtime also resamples each live backend's cross-domain memory report every
+two seconds and reconciles growth, shrink, compaction, and migration into its
+authority lease. Rejected over-limit growth remains visible as observed usage,
+so admission and pressure decisions cannot fall back to stale planned bytes.
 
 Example tuned for low latency:
 

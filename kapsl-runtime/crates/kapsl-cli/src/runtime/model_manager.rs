@@ -158,6 +158,22 @@ impl ModelManager {
             .map(|entry| entry.swap_handles.clone())
     }
 
+    /// Resample every live backend's retained cross-domain footprint. The
+    /// runtime memory wrapper reconciles the returned report into its elastic
+    /// lease before this call returns.
+    pub(crate) fn reconcile_memory_reports(&self) -> usize {
+        let handles = self
+            .entries
+            .read()
+            .values()
+            .flat_map(|entry| entry.swap_handles.iter().cloned())
+            .collect::<Vec<_>>();
+        for handle in &handles {
+            let _ = handle.actual_memory();
+        }
+        handles.len()
+    }
+
     /// Stop runtime execution while retaining the package path and lifecycle
     /// entry so the same logical model can be started again.
     pub(crate) fn stop_runtime(&self, model_id: u32) {
