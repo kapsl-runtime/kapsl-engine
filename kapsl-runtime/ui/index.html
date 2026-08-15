@@ -4,6 +4,7 @@
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Kapsl Runtime Console</title>
+        <link rel="icon" href="/ui/favicon.ico" sizes="any" />
         <link rel="stylesheet" href="/ui/styles.css" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -476,7 +477,9 @@
                                 ></canvas>
                             </div>
                             <div class="metric-card">
-                                <div class="metric-label">Model Memory Sum</div>
+                                <div class="metric-label">
+                                    Authority Model Memory
+                                </div>
                                 <div class="metric-value" id="sys-model-mem">
                                     -
                                 </div>
@@ -549,49 +552,94 @@
                             </div>
                         </div>
 
-                        <section class="panel">
-                            <div class="panel-header">
-                                <h3>Process</h3>
-                                <p>Host stats from /api/system/stats.</p>
-                            </div>
-                            <div class="kv-list">
-                                <div class="kv-row">
-                                    <span>PID</span>
-                                    <strong id="sys-pid">-</strong>
+                        <div class="grid-2 system-detail-grid">
+                            <section class="panel memory-share-panel">
+                                <div class="panel-header">
+                                    <h3>Model Memory Share</h3>
+                                    <p>
+                                        Live authority usage across host and
+                                        provider domains. Replicas are rolled
+                                        up to their model.
+                                    </p>
                                 </div>
-                                <div class="kv-row">
-                                    <span>Pressure State</span>
-                                    <strong id="sys-pressure">
-                                        <span
-                                            class="status-dot"
-                                            id="sys-pressure-dot"
-                                        ></span>
-                                        <span id="sys-pressure-text">-</span>
-                                    </strong>
+                                <div class="memory-share-layout">
+                                    <div
+                                        id="memory-model-pie"
+                                        class="memory-pie"
+                                        role="img"
+                                        aria-label="No attributed model memory"
+                                    >
+                                        <div class="memory-pie-center">
+                                            <strong id="memory-model-total">0 B</strong>
+                                            <span>tracked</span>
+                                        </div>
+                                    </div>
+                                    <div
+                                        id="memory-model-legend"
+                                        class="memory-legend"
+                                    >
+                                        <div class="memory-legend-empty">
+                                            Waiting for memory authority data.
+                                        </div>
+                                    </div>
                                 </div>
-                                <div class="kv-row">
-                                    <span>Process Memory</span>
-                                    <strong id="sys-mem-detail">-</strong>
+                            </section>
+
+                            <section class="panel">
+                                <div class="panel-header">
+                                    <h3>Process</h3>
+                                    <p>Host stats from /api/system/stats.</p>
                                 </div>
-                                <div class="kv-row">
-                                    <span>System Memory</span>
-                                    <strong id="sys-total-mem">-</strong>
+                                <div class="kv-list">
+                                    <div class="kv-row">
+                                        <span>PID</span>
+                                        <strong id="sys-pid">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Pressure State</span>
+                                        <strong id="sys-pressure">
+                                            <span
+                                                class="status-dot"
+                                                id="sys-pressure-dot"
+                                            ></span>
+                                            <span id="sys-pressure-text">-</span>
+                                        </strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Process Memory</span>
+                                        <strong id="sys-mem-detail">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>System Memory</span>
+                                        <strong id="sys-total-mem">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Authority Domain Use</span>
+                                        <strong id="sys-authority-domain">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Authority Headroom</span>
+                                        <strong id="sys-authority-headroom">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>GPU Memory</span>
+                                        <strong id="sys-gpu-mem">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Co-tenant GPU Memory</span>
+                                        <strong id="sys-foreign-gpu-mem">-</strong>
+                                    </div>
+                                    <div class="kv-row">
+                                        <span>Collected</span>
+                                        <strong id="sys-collected">-</strong>
+                                    </div>
                                 </div>
-                                <div class="kv-row">
-                                    <span>GPU Memory</span>
-                                    <strong id="sys-gpu-mem">-</strong>
-                                </div>
-                                <div class="kv-row">
-                                    <span>Co-tenant GPU Memory</span>
-                                    <strong id="sys-foreign-gpu-mem">-</strong>
-                                </div>
-                                <div class="kv-row">
-                                    <span>Collected</span>
-                                    <strong id="sys-collected">-</strong>
-                                </div>
-                            </div>
-                            <div id="system-feedback" class="status-line"></div>
-                        </section>
+                                <div
+                                    id="system-feedback"
+                                    class="status-line"
+                                ></div>
+                            </section>
+                        </div>
                     </section>
 
                     <section

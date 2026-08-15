@@ -63,7 +63,7 @@ pub(super) async fn load_replica(
     log_package_plan(&plan);
 
     let needs_mesh = role.is_primary() || plan.use_pipeline_backend;
-    let (mut device_mesh, logical_provider) = if needs_mesh {
+    let (mut device_mesh, mut logical_provider) = if needs_mesh {
         use kapsl_hal::device_mesh::DeviceMesh;
 
         let selected =
@@ -216,6 +216,7 @@ pub(super) async fn load_replica(
                 error
             )
         })?;
+        logical_provider = Some(selection.logical_provider.clone());
         let device_id = plan
             .loader
             .manifest
@@ -278,10 +279,12 @@ pub(super) async fn load_replica(
         .with_queue_overflow_policy(plan.queue_overflow_policy),
     );
 
+    let selected_provider =
+        logical_provider.expect("successful model loads always select an execution provider");
     Ok(LoadedReplica {
         scheduler,
         swap_handles,
-        model_info: model_info_for_plan(&plan, role, device_info),
+        model_info: model_info_for_plan(&plan, role, &selected_provider),
     })
 }
 
@@ -330,7 +333,7 @@ fn create_pipeline_backend(
 fn model_info_for_plan(
     plan: &ModelLoadPlan,
     role: ReplicaLoadRole,
-    device_info: &DeviceInfo,
+    selected_provider: &str,
 ) -> ModelInfo {
     let manifest = &plan.loader.manifest;
     let optimization_level = manifest
@@ -339,7 +342,7 @@ fn model_info_for_plan(
         .clone()
         .unwrap_or_else(|| "basic".to_string());
     let path = plan.absolute_path.to_string_lossy().to_string();
-    let device = device_info.get_best_provider().to_string();
+    let device = selected_provider.to_string();
 
     match role {
         ReplicaLoadRole::Primary => ModelInfo::new(
@@ -381,4 +384,43 @@ fn log_package_plan(plan: &ModelLoadPlan) {
         plan.queue_overflow_policy.as_str()
     );
     log::info!("  Priority weight: {}", plan.priority_weight);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_plan() -> ModelLoadPlan {
+        let model_path = std::env::temp_dir().join("selected-provider-model.onnx");
+        ModelLoadPlan {
+            base_model_id: 7,
+            runtime_model_id: 7,
+            replica_id: 0,
+            absolute_path: model_path.clone(),
+            loader: PackageLoader::from_raw_file(&model_path).expect("test package loader"),
+            model_file_path: model_path,
+            batch_size: 1,
+            scheduler_queue_size: 1,
+            scheduler_max_micro_batch: 1,
+            scheduler_queue_delay_ms: 0,
+            queue_overflow_policy: kapsl_scheduler::QueueOverflowPolicy::Block,
+            priority_weight: 1,
+            pipeline_stages: None,
+            mesh_topology: kapsl_hal::device_mesh::MeshTopology::DataParallel,
+            worker_topology: "data-parallel",
+            worker_tp_degree: 1,
+            use_pipeline_backend: false,
+            #[cfg(feature = "gpu-device-pool")]
+            onnx_peak_concurrency: 1,
+            isolate_process: false,
+            isolate_strict: false,
+        }
+    }
+
+    #[test]
+    fn model_info_reports_selected_provider() {
+        let info = model_info_for_plan(&test_plan(), ReplicaLoadRole::Primary, "cpu");
+
+        assert_eq!(info.device, "cpu");
+    }
 }

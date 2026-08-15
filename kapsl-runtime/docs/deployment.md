@@ -143,10 +143,12 @@ implicitly. Stable releases update `latest`, `latest-cpu`, `latest-cuda`, and
 git clone https://github.com/kapsl-runtime/kapsl-engine
 cd kapsl-engine/kapsl-runtime
 
-cargo build --release
+./scripts/build-with-embedded-ui.sh --release
 ```
 
-The compiled binary is at `target/release/kapsl`.
+The compiled binary is at `target/release/kapsl`. The wrapper invalidates the
+embedded dashboard before building, which also makes source deployments safe
+after timestamp-preserving transfers such as `rsync -a`.
 
 ## Quick start
 

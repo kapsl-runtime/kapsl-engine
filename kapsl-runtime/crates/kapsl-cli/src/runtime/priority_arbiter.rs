@@ -121,10 +121,7 @@ impl PriorityArbiter {
             if !registered_for_domain {
                 continue;
             }
-            let bytes = row
-                .reserved_bytes
-                .max(row.committed_bytes)
-                .max(row.observed_bytes);
+            let bytes = row.used_bytes();
             let total = reclaimable.entry(row.owner.model_id).or_default();
             *total = total.saturating_add(bytes);
         }

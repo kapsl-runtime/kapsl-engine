@@ -78,6 +78,12 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(test)]
 mod tests;
 
+fn system_memory_bytes_from_sysinfo(bytes: u64) -> Option<usize> {
+    // sysinfo 0.30 reports memory in bytes. Older releases used KiB, which is
+    // why multiplying by 1024 here used to be necessary.
+    usize::try_from(bytes).ok()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     let raw_argv: Vec<String> = std::env::args().collect();
@@ -352,7 +358,7 @@ async fn main() -> Result<(), DynError> {
         let mut interval = tokio::time::interval(Duration::from_secs(2));
         let mut nvidia_smi_retry_after: Option<Instant> = None;
         system.refresh_memory();
-        let total_system_memory_bytes = Some(system.total_memory() as usize * 1024);
+        let total_system_memory_bytes = system_memory_bytes_from_sysinfo(system.total_memory());
         loop {
             interval.tick().await;
 
@@ -751,6 +757,7 @@ async fn main() -> Result<(), DynError> {
             device_info_for_api.clone(),
             runtime_samples_clone.clone(),
             runtime_pressure_state.clone(),
+            resources_for_api.clone(),
         );
 
         let engine_routes = build_engine_routes();

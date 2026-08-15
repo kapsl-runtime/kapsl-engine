@@ -180,7 +180,10 @@ pub(crate) fn build_model_lifecycle_routes(
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let device_str = device_info.get_best_provider().to_string();
+                // Provider selection happens inside the asynchronous load. Do
+                // not claim that the detected fastest device is the selected
+                // provider while the model is still starting.
+                let device_str = "pending".to_string();
                 let optimization_level = "basic".to_string();
                 let mut model_info = ModelInfo::new(
                     model_id,

@@ -952,10 +952,18 @@ class KapslApp {
 
     const primaryModels = modelsData.filter((m) => (m.replica_id || 0) === 0);
 
-    const modelMemBytes = primaryModels.reduce(
+    const reportedModelMemBytes = primaryModels.reduce(
       (sum, m) => sum + Number(m.memory_usage || 0),
       0,
     );
+    const memoryAuthority =
+      stats?.memory_authority && typeof stats.memory_authority === "object"
+        ? stats.memory_authority
+        : null;
+    const authorityModelMemBytes = Number(memoryAuthority?.model_bytes);
+    const modelMemBytes = Number.isFinite(authorityModelMemBytes)
+      ? authorityModelMemBytes
+      : reportedModelMemBytes;
     const totalThroughput = primaryModels.reduce(
       (sum, m) => sum + Number(m.throughput || 0),
       0,
@@ -1023,6 +1031,21 @@ class KapslApp {
     document.getElementById("sys-total-mem").textContent =
       totalMemBytes > 0 ? this.formatBytes(totalMemBytes) : "n/a";
 
+    const authorityDomainUsed = Number(memoryAuthority?.domain_used_bytes);
+    const authorityDomainBudget = Number(memoryAuthority?.domain_budget_bytes);
+    const authorityHeadroom = Number(memoryAuthority?.domain_available_bytes);
+    document.getElementById("sys-authority-domain").textContent =
+      memoryAuthority && Number.isFinite(authorityDomainUsed)
+        ? authorityDomainBudget > 0
+          ? `${this.formatBytes(authorityDomainUsed)} / ${this.formatBytes(authorityDomainBudget)}`
+          : this.formatBytes(authorityDomainUsed)
+        : "n/a";
+    document.getElementById("sys-authority-headroom").textContent =
+      memoryAuthority && Number.isFinite(authorityHeadroom)
+        ? this.formatBytes(authorityHeadroom)
+        : "n/a";
+    this.updateMemoryAuthorityView(memoryAuthority);
+
     const gpuMemBytes = stats?.gpu_memory_bytes ?? null;
     const gpuMemTotalBytes = Number(stats?.gpu_memory_total_bytes) || 0;
     let gpuMemPct = 0;
@@ -1086,6 +1109,86 @@ class KapslApp {
     } else {
       this.setAccessFeedback(feedbackId, "", false);
     }
+  }
+
+  updateMemoryAuthorityView(authority) {
+    const pie = document.getElementById("memory-model-pie");
+    const totalElement = document.getElementById("memory-model-total");
+    const legend = document.getElementById("memory-model-legend");
+    if (!pie || !totalElement || !legend) {
+      return;
+    }
+
+    const models = Array.isArray(authority?.models)
+      ? authority.models.filter((model) => Number(model?.used_bytes) > 0)
+      : [];
+    const reportedTotal = Number(authority?.model_bytes);
+    const summedTotal = models.reduce(
+      (sum, model) => sum + Number(model.used_bytes || 0),
+      0,
+    );
+    const total =
+      Number.isFinite(reportedTotal) && reportedTotal >= 0
+        ? reportedTotal
+        : summedTotal;
+
+    totalElement.textContent = this.formatBytes(total);
+    if (!models.length || !(total > 0)) {
+      pie.style.background = "conic-gradient(var(--border-2) 0 100%)";
+      pie.setAttribute("aria-label", "No attributed model memory");
+      legend.innerHTML = `<div class="memory-legend-empty">${
+        authority
+          ? "No model memory is currently attributed."
+          : "Memory authority data is unavailable."
+      }</div>`;
+      return;
+    }
+
+    const palette = [
+      "hsl(170 80% 45%)",
+      "hsl(207 86% 58%)",
+      "hsl(24 88% 57%)",
+      "hsl(266 70% 64%)",
+      "hsl(45 90% 55%)",
+      "hsl(335 75% 59%)",
+      "hsl(142 60% 48%)",
+      "hsl(190 72% 52%)",
+      "hsl(8 78% 58%)",
+      "hsl(292 58% 58%)",
+    ];
+    let cursor = 0;
+    const slices = [];
+    const labels = [];
+    const rows = models.map((model, index) => {
+      const bytes = Number(model.used_bytes || 0);
+      const percentage = (bytes / total) * 100;
+      const start = cursor;
+      cursor += percentage;
+      const end = index === models.length - 1 ? 100 : Math.min(cursor, 100);
+      const color = palette[index % palette.length];
+      slices.push(`${color} ${start.toFixed(4)}% ${end.toFixed(4)}%`);
+
+      const name = String(model.name || `Model ${model.model_id ?? "-"}`);
+      labels.push(`${name}: ${percentage.toFixed(1)}%`);
+      const replicaCount = Math.max(1, Number(model.replica_count) || 1);
+      const replicaLabel = `${replicaCount} replica${replicaCount === 1 ? "" : "s"}`;
+      return `
+        <div class="memory-legend-row" title="${this.escapeHtml(name)}">
+          <span class="memory-legend-swatch" style="background:${color}"></span>
+          <div class="memory-legend-copy">
+            <div class="memory-legend-name">${this.escapeHtml(name)}</div>
+            <div class="memory-legend-meta">model ${this.escapeHtml(model.model_id)} · ${replicaLabel}</div>
+          </div>
+          <div class="memory-legend-value">
+            <strong>${percentage.toFixed(1)}%</strong>
+            ${this.formatBytes(bytes)}
+          </div>
+        </div>`;
+    });
+
+    pie.style.background = `conic-gradient(${slices.join(", ")})`;
+    pie.setAttribute("aria-label", `Model memory share. ${labels.join(", ")}`);
+    legend.innerHTML = rows.join("");
   }
 
   updateModelHistory(modelsData) {

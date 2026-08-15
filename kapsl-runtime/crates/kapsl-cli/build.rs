@@ -1,5 +1,10 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=KAPSL_VERSION");
+    // rust-embed consumes files outside this crate directory. Register the
+    // dashboard explicitly for ordinary incremental builds. Timestamp-
+    // preserving deployment syncs should use scripts/build-with-embedded-ui.sh,
+    // which invalidates the Rust embedding module before invoking Cargo.
+    println!("cargo:rerun-if-changed=../../ui");
 
     // On Linux, provide glibc 2.38+ compat symbols so ort-sys prebuilts link
     // on older cluster glibc (< 2.38 lacks __isoc23_strtoll et al.).
