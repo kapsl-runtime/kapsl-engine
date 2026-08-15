@@ -1,8 +1,7 @@
 use super::*;
 
 pub(crate) struct ModelReaderRoutesConfig {
-    pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) replica_pools: ReplicaPools,
+    pub(crate) models: Arc<ModelManager>,
     pub(crate) shared_metrics: kapsl_monitor::metrics::KapslMetrics,
     pub(crate) throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
     pub(crate) generated_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
@@ -14,8 +13,7 @@ pub(crate) fn build_model_reader_routes(
     config: ModelReaderRoutesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let ModelReaderRoutesConfig {
-        model_registry: model_registry_clone,
-        replica_pools: replica_pools_clone,
+        models,
         shared_metrics: shared_metrics_clone,
         throughput_samples: throughput_samples_clone,
         generated_token_samples: generated_token_samples_clone,
@@ -23,8 +21,7 @@ pub(crate) fn build_model_reader_routes(
         latency_samples: latency_samples_clone,
     } = config;
 
-    let model_registry_for_list = model_registry_clone.clone();
-    let replica_pools_for_list = replica_pools_clone.clone();
+    let models_for_list = models.clone();
     let metrics_for_list = shared_metrics_clone.clone();
     let throughput_samples_for_list = throughput_samples_clone.clone();
     let generated_token_samples_for_list = generated_token_samples_clone.clone();
@@ -60,7 +57,7 @@ pub(crate) fn build_model_reader_routes(
             healthy: bool,
         }
 
-        let models = model_registry_for_list.list();
+        let model_infos = models_for_list.registry().list();
         let mut statuses = Vec::new();
         let now = Instant::now();
         let mut seen_ids = HashSet::new();
@@ -69,7 +66,7 @@ pub(crate) fn build_model_reader_routes(
         let mut generated_token_samples = generated_token_samples_for_list.write();
         let mut total_token_samples = total_token_samples_for_list.write();
 
-        for model in models {
+        for model in model_infos {
             seen_ids.insert(model.id);
             let model_id_str = model.id.to_string();
             let active = metrics_for_list
@@ -103,7 +100,7 @@ pub(crate) fn build_model_reader_routes(
                 onnx_session_pool_idle,
                 onnx_session_pool_waits_total,
                 onnx_session_pool_wait_seconds_total,
-            ) = if let Some(pool) = replica_pools_for_list.read().get(&model.id) {
+            ) = if let Some(pool) = models_for_list.pool(model.id) {
                 let metrics = pool.get_metrics();
                 (
                     pool.get_queue_depth(),
@@ -194,8 +191,7 @@ pub(crate) fn build_model_reader_routes(
         warp::reply::json(&statuses)
     });
 
-    let model_registry_for_get = model_registry_clone.clone();
-    let replica_pools_for_get = replica_pools_clone.clone();
+    let models_for_get = models.clone();
     let metrics_for_get = shared_metrics_clone.clone();
     let throughput_samples_for_get = throughput_samples_clone.clone();
     let generated_token_samples_for_get = generated_token_samples_clone.clone();
@@ -237,7 +233,7 @@ pub(crate) fn build_model_reader_routes(
                     error: String,
                 }
 
-                match model_registry_for_get.get(model_id) {
+                match models_for_get.registry().get(model_id) {
                     Some(model) => {
                         let model_id_str = model.id.to_string();
                         let active = metrics_for_get
@@ -272,7 +268,7 @@ pub(crate) fn build_model_reader_routes(
                             onnx_session_pool_idle,
                             onnx_session_pool_waits_total,
                             onnx_session_pool_wait_seconds_total,
-                        ) = if let Some(pool) = replica_pools_for_get.read().get(&model.id) {
+                        ) = if let Some(pool) = models_for_get.pool(model.id) {
                             let metrics = pool.get_metrics();
                             (
                                 pool.get_queue_depth(),

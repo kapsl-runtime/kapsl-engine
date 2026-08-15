@@ -1,19 +1,5 @@
 use super::*;
 
-pub(crate) fn placeholder_remote_storage_dir() -> PathBuf {
-    if let Some(path) = optional_env_var(REMOTE_PLACEHOLDER_DIR_ENV) {
-        return PathBuf::from(path);
-    }
-
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(REMOTE_PLACEHOLDER_DIR)
-}
-
-pub(crate) fn is_default_placeholder_remote(remote_url: &str) -> bool {
-    remote_url.trim_end_matches('/') == REMOTE_PLACEHOLDER_URL.trim_end_matches('/')
-}
-
 pub(crate) fn artifact_url_for_remote(remote_url: &str, target: &ModelTargetRef) -> String {
     format!(
         "{}/aimod/{}/{}:{}",
@@ -29,13 +15,6 @@ pub(crate) fn remote_inventory_url_for_remote(remote_url: &str) -> String {
         "{}/kapsl/repositories/current/models",
         remote_url.trim_end_matches('/')
     )
-}
-
-pub(crate) fn placeholder_remote_artifact_path(target: &ModelTargetRef) -> PathBuf {
-    placeholder_remote_storage_dir()
-        .join(&target.repo)
-        .join(&target.model)
-        .join(format!("{}.aimod", target.label))
 }
 
 pub(crate) fn format_remote_http_error(error: ureq::Error) -> String {
@@ -76,12 +55,6 @@ pub(crate) fn fetch_remote_artifact_inventory(
     custom_remote_url: Option<&str>,
 ) -> Result<RuntimeRemoteArtifactInventoryResponse, String> {
     let remote_url = resolved_login_remote_url(custom_remote_url);
-    if is_oci_remote_url(&remote_url) {
-        return Err(
-            "Remote artifact browsing is not available for oci:// remotes yet.".to_string(),
-        );
-    }
-
     let inventory_url = remote_inventory_url_for_remote(&remote_url);
     let authorization_header = resolved_remote_token(&remote_url, None);
     let agent = native_tls_http_agent();

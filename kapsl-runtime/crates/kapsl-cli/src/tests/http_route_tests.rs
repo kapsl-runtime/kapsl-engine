@@ -1,11 +1,12 @@
 use super::*;
 use std::net::SocketAddr;
 use warp::http::StatusCode;
+use warp::Reply;
 
 fn test_device_info() -> Arc<DeviceInfo> {
     Arc::new(DeviceInfo {
         cpu_cores: 1,
-        total_memory: 0,
+        total_memory: 10 * 1024 * 1024,
         os_type: "test".to_string(),
         os_release: "test".to_string(),
         has_cuda: false,
@@ -14,6 +15,30 @@ fn test_device_info() -> Arc<DeviceInfo> {
         has_directml: false,
         devices: Vec::new(),
     })
+}
+
+fn test_pressure_config() -> Arc<RuntimePressureConfig> {
+    Arc::new(RuntimePressureConfig {
+        memory_conserve_ratio: 0.7,
+        memory_emergency_ratio: 0.9,
+        gpu_util_conserve_ratio: 0.8,
+        gpu_util_emergency_ratio: 0.95,
+        gpu_mem_conserve_ratio: 0.8,
+        gpu_mem_emergency_ratio: 0.95,
+        conserve_max_new_tokens: Some(256),
+        emergency_max_new_tokens: Some(128),
+    })
+}
+
+fn test_inference_service(models: Arc<ModelManager>) -> Arc<InferenceService> {
+    InferenceService::new(
+        models,
+        ResourcePressure::new(
+            Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+            test_pressure_config(),
+        ),
+        Arc::new(RwLock::new(HashMap::new())),
+    )
 }
 
 fn unique_temp_path(name: &str) -> PathBuf {
@@ -33,8 +58,60 @@ async fn test_static_routes_serve_embedded_index() {
 
 #[tokio::test]
 async fn test_system_routes_report_health_and_pressure_state() {
-    let model_registry = Arc::new(ModelRegistry::new());
-    let replica_pools: ReplicaPools = Arc::new(RwLock::new(HashMap::new()));
+    let registry = Arc::new(ModelRegistry::new());
+    registry.register(ModelInfo::new(
+        7,
+        "alpha".to_string(),
+        "1".to_string(),
+        "onnx".to_string(),
+        "cpu".to_string(),
+        "all".to_string(),
+        "/tmp/alpha.aimod".to_string(),
+    ));
+    registry.register(ModelInfo::new(
+        9,
+        "beta".to_string(),
+        "1".to_string(),
+        "onnx".to_string(),
+        "cpu".to_string(),
+        "all".to_string(),
+        "/tmp/beta.aimod".to_string(),
+    ));
+    let models = ModelManager::new(registry);
+    let device_info = test_device_info();
+    let resources = RuntimeResources::new(device_info.as_ref()).expect("runtime resources");
+    let mut memory_plan = MemoryPlan::new();
+    memory_plan.push(MemoryClaim::runtime(
+        MemoryDomain::Host,
+        MemoryOwner::new(7, 0),
+        MemoryAllocationClass::PersistentWeights,
+        300,
+    ));
+    memory_plan.push(MemoryClaim::runtime(
+        MemoryDomain::Host,
+        MemoryOwner::new(7, 1),
+        MemoryAllocationClass::KvCache,
+        100,
+    ));
+    memory_plan.push(MemoryClaim::runtime(
+        MemoryDomain::Host,
+        MemoryOwner::new(9, 0),
+        MemoryAllocationClass::ModelSession,
+        100,
+    ));
+    memory_plan.push(MemoryClaim::runtime(
+        MemoryDomain::HostPinned {
+            provider: "onnx".to_string(),
+            device_id: Some(0),
+        },
+        MemoryOwner::new(7, 0),
+        MemoryAllocationClass::TransientWorkspace,
+        500,
+    ));
+    let _memory_lease = resources
+        .memory()
+        .admit(&memory_plan)
+        .expect("memory plan admitted");
     let runtime_samples = Arc::new(RwLock::new(RuntimeSamples {
         process_memory_bytes: 123,
         total_system_memory_bytes: Some(456),
@@ -46,11 +123,11 @@ async fn test_system_routes_report_health_and_pressure_state() {
     }));
     let pressure_state = Arc::new(AtomicU8::new(RuntimePressureState::Conserve as u8));
     let routes = build_system_routes(
-        model_registry,
-        replica_pools,
-        test_device_info(),
+        models,
+        device_info,
         runtime_samples,
         pressure_state,
+        resources,
     );
 
     let health = warp::test::request()
@@ -61,7 +138,7 @@ async fn test_system_routes_report_health_and_pressure_state() {
     let health_json: serde_json::Value =
         serde_json::from_slice(health.body()).expect("health json");
     assert_eq!(health_json["status"], "healthy");
-    assert_eq!(health_json["total_models"], 0);
+    assert_eq!(health_json["total_models"], 2);
 
     let stats = warp::test::request()
         .path("/api/system/stats")
@@ -74,12 +151,39 @@ async fn test_system_routes_report_health_and_pressure_state() {
     assert_eq!(stats_json["gpu_memory_total_bytes"], 20);
     assert_eq!(stats_json["foreign_gpu_memory_bytes"], 4);
     assert_eq!(stats_json["pressure_state"], "conserve");
+    assert_eq!(stats_json["memory_authority"]["model_bytes"], 1000);
+    assert_eq!(stats_json["memory_authority"]["domain_used_bytes"], 1000);
+    assert_eq!(
+        stats_json["memory_authority"]["domains"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        stats_json["memory_authority"]["domain_budget_bytes"],
+        stats_json["memory_authority"]["domains"][0]["budget_bytes"]
+    );
+    assert_eq!(stats_json["memory_authority"]["models"][0]["model_id"], 7);
+    assert_eq!(stats_json["memory_authority"]["models"][0]["name"], "alpha");
+    assert_eq!(
+        stats_json["memory_authority"]["models"][0]["replica_count"],
+        2
+    );
+    assert_eq!(
+        stats_json["memory_authority"]["models"][0]["percentage"],
+        90.0
+    );
+    assert_eq!(stats_json["memory_authority"]["models"][1]["model_id"], 9);
+    assert_eq!(
+        stats_json["memory_authority"]["models"][1]["percentage"],
+        10.0
+    );
 }
 
 #[tokio::test]
 async fn test_auth_login_route_allows_local_loopback_when_auth_disabled() {
     let auth_state = Arc::new(RwLock::new(ApiAuthState {
-        legacy_tokens: ApiRoleTokenConfig::default(),
+        role_tokens: ApiRoleTokenConfig::default(),
         store_path: unique_temp_path("auth-store").join("auth-store.json"),
         store: ApiAuthStoreFile::default(),
         key_hash_index: HashMap::new(),
@@ -100,6 +204,126 @@ async fn test_auth_login_route_allows_local_loopback_when_auth_disabled() {
     assert_eq!(body["authenticated"], true);
     assert_eq!(body["mode"], "local-loopback");
     assert_eq!(body["access"]["admin"], true);
+}
+
+#[tokio::test]
+async fn test_metrics_auth_does_not_intercept_login_or_role_routes() {
+    let now = now_unix_seconds();
+    let credentials = [
+        ("reader-user", "reader-api-key", ApiRole::Reader),
+        ("writer-user", "writer-api-key", ApiRole::Writer),
+        ("admin-user", "admin-api-key", ApiRole::Admin),
+    ];
+    let store = ApiAuthStoreFile {
+        users: credentials
+            .iter()
+            .map(|(user_id, _, role)| ApiAuthUser {
+                id: (*user_id).to_string(),
+                username: (*user_id).to_string(),
+                display_name: None,
+                role: *role,
+                status: ApiUserStatus::Active,
+                created_at: now,
+                updated_at: now,
+            })
+            .collect(),
+        api_keys: credentials
+            .iter()
+            .enumerate()
+            .map(|(index, (user_id, token, _))| ApiAuthKey {
+                id: format!("key-{index}"),
+                user_id: (*user_id).to_string(),
+                name: format!("key-{index}"),
+                key_prefix: token.chars().take(8).collect(),
+                key_hash: sha256_hex(token),
+                scopes: Vec::new(),
+                created_at: now,
+                created_by: None,
+                last_used_at: None,
+                expires_at: None,
+                revoked_at: None,
+            })
+            .collect(),
+    };
+    let auth_state = Arc::new(RwLock::new(ApiAuthState {
+        role_tokens: ApiRoleTokenConfig::default(),
+        store_path: unique_temp_path("role-route-auth-store").join("auth-store.json"),
+        key_hash_index: ApiAuthState::build_key_hash_index(&store),
+        store,
+    }));
+    let resources = RuntimeResources::new(test_device_info().as_ref()).expect("runtime resources");
+    let metrics_route =
+        build_metrics_route(Arc::new(Registry::new()), auth_state.clone(), resources);
+    let login_route = build_auth_routes(auth_state.clone()).login;
+
+    let reader_route = warp::path!("api" / "reader-probe")
+        .and(warp::get())
+        .map(|| warp::reply::json(&serde_json::json!({ "role": "reader" })).into_response());
+    let reader_route = api_auth_filter(ApiRole::Reader, ApiScope::Read, auth_state.clone())
+        .and(reader_route)
+        .map(|response: warp::reply::Response| response);
+    let writer_route = warp::path!("api" / "writer-probe")
+        .and(warp::post())
+        .map(|| warp::reply::json(&serde_json::json!({ "role": "writer" })).into_response());
+    let writer_route = api_auth_filter(ApiRole::Writer, ApiScope::Write, auth_state)
+        .and(writer_route)
+        .map(|response: warp::reply::Response| response);
+    let api_routes = reader_route
+        .or(writer_route)
+        .unify()
+        .or_else(map_api_auth_rejection);
+    let routes = metrics_route.or(login_route).or(api_routes);
+
+    let login = warp::test::request()
+        .method("POST")
+        .path("/api/auth/login")
+        .remote_addr(SocketAddr::from(([127, 0, 0, 1], 45_002)))
+        .header("content-type", "application/json")
+        .body(r#"{"token":"reader-api-key"}"#)
+        .reply(&routes)
+        .await;
+    assert_eq!(login.status(), StatusCode::OK);
+    let login_body: serde_json::Value =
+        serde_json::from_slice(login.body()).expect("login response json");
+    assert_eq!(login_body["role"], "reader");
+    assert_eq!(login_body["mode"], "api-key");
+
+    let reader = warp::test::request()
+        .path("/api/reader-probe")
+        .header("authorization", "Bearer reader-api-key")
+        .reply(&routes)
+        .await;
+    assert_eq!(reader.status(), StatusCode::OK);
+
+    let writer_read = warp::test::request()
+        .path("/api/reader-probe")
+        .header("authorization", "Bearer writer-api-key")
+        .reply(&routes)
+        .await;
+    assert_eq!(writer_read.status(), StatusCode::OK);
+
+    let writer = warp::test::request()
+        .method("POST")
+        .path("/api/writer-probe")
+        .header("authorization", "Bearer writer-api-key")
+        .reply(&routes)
+        .await;
+    assert_eq!(writer.status(), StatusCode::OK);
+
+    let reader_write = warp::test::request()
+        .method("POST")
+        .path("/api/writer-probe")
+        .header("authorization", "Bearer reader-api-key")
+        .reply(&routes)
+        .await;
+    assert_eq!(reader_write.status(), StatusCode::FORBIDDEN);
+
+    let reader_metrics = warp::test::request()
+        .path("/metrics")
+        .header("authorization", "Bearer reader-api-key")
+        .reply(&routes)
+        .await;
+    assert_eq!(reader_metrics.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -168,22 +392,12 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
         doc_store: FsDocStore::new(&docs_root),
     };
 
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     let route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
-        replica_pools: Arc::new(RwLock::new(HashMap::new())),
-        model_registry: Arc::new(ModelRegistry::new()),
+        models: models.clone(),
+        inference: test_inference_service(models),
         log_sensitive_ids: false,
         rag_state,
-        runtime_pressure_state: Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
-        runtime_pressure_config: Arc::new(RuntimePressureConfig {
-            memory_conserve_ratio: 0.7,
-            memory_emergency_ratio: 0.9,
-            gpu_util_conserve_ratio: 0.8,
-            gpu_util_emergency_ratio: 0.95,
-            gpu_mem_conserve_ratio: 0.8,
-            gpu_mem_emergency_ratio: 0.95,
-            conserve_max_new_tokens: Some(256),
-            emergency_max_new_tokens: Some(128),
-        }),
     });
 
     let response = warp::test::request()
@@ -201,21 +415,10 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
 }
 
 fn test_openai_routes() -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     build_openai_routes(OpenAiRoutesConfig {
-        model_registry: Arc::new(ModelRegistry::new()),
-        replica_pools: Arc::new(RwLock::new(HashMap::new())),
-        latency_samples: Arc::new(RwLock::new(HashMap::new())),
-        runtime_pressure_state: Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
-        runtime_pressure_config: Arc::new(RuntimePressureConfig {
-            memory_conserve_ratio: 0.7,
-            memory_emergency_ratio: 0.9,
-            gpu_util_conserve_ratio: 0.8,
-            gpu_util_emergency_ratio: 0.95,
-            gpu_mem_conserve_ratio: 0.8,
-            gpu_mem_emergency_ratio: 0.95,
-            conserve_max_new_tokens: Some(256),
-            emergency_max_new_tokens: Some(128),
-        }),
+        models: models.clone(),
+        inference: test_inference_service(models),
         log_sensitive_ids: false,
     })
 }

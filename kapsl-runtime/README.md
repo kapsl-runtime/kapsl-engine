@@ -23,8 +23,13 @@ Shared Rust crates such as `kapsl-core`, `kapsl-backends`, `kapsl-llm`,
 ## Building
 
 ```bash
-cargo build --release
+./scripts/build-with-embedded-ui.sh --release
 ```
+
+The wrapper explicitly invalidates the dashboard embedding module before an
+incremental build. Use it for deployment builds, especially after a source sync
+that preserves timestamps (for example `rsync -a`). Plain `cargo build` remains
+appropriate for normal local edits and clean builds.
 
 ## Runtime Release Artifacts
 

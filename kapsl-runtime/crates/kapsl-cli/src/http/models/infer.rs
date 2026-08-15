@@ -1,89 +1,48 @@
 use super::*;
 
 pub(crate) struct ModelInferRouteConfig {
-    pub(crate) replica_pools: ReplicaPools,
-    pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
+    pub(crate) models: Arc<ModelManager>,
+    pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
     pub(crate) rag_state: RagRuntimeState,
-    pub(crate) inter_model_relay_state: Arc<InterModelRelayState>,
-    pub(crate) runtime_pressure_state: Arc<AtomicU8>,
-    pub(crate) runtime_pressure_config: Arc<RuntimePressureConfig>,
 }
 
 pub(crate) fn build_model_infer_route(
     config: ModelInferRouteConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let ModelInferRouteConfig {
-        replica_pools: replica_pools_clone,
-        model_registry: model_registry_clone,
-        latency_samples: latency_samples_clone,
+        models,
+        inference,
         log_sensitive_ids: log_sensitive_ids_for_api,
         rag_state: rag_state_for_api,
-        inter_model_relay_state,
-        runtime_pressure_state,
-        runtime_pressure_config,
     } = config;
 
     // POST /api/models/:id/infer - Synchronous inference
-    let replica_pools_for_infer = replica_pools_clone.clone();
-    let model_registry_for_infer = model_registry_clone.clone();
-    let latency_samples_for_infer = latency_samples_clone.clone();
+    let models_for_infer = models.clone();
+    let inference_for_infer = inference.clone();
     let request_adapters_for_infer = Arc::new(default_request_adapter_registry());
     let log_sensitive_ids_for_infer = log_sensitive_ids_for_api;
     let rag_state_for_infer = rag_state_for_api.clone();
-    let inter_model_relay_for_infer = inter_model_relay_state.clone();
-    let runtime_pressure_state_for_infer = runtime_pressure_state.clone();
-    let runtime_pressure_config_for_infer = runtime_pressure_config.clone();
     let infer_route = warp::path!("api" / "models" / u32 / "infer")
     .and(warp::post())
     .and(warp::body::bytes())
     .and_then(move |model_id: u32, body: warp::hyper::body::Bytes| {
-        let pools = replica_pools_for_infer.clone();
-        let model_registry = model_registry_for_infer.clone();
-        let latency_samples = latency_samples_for_infer.clone();
+        let models = models_for_infer.clone();
+        let inference = inference_for_infer.clone();
         let request_adapters = request_adapters_for_infer.clone();
         let log_sensitive_ids = log_sensitive_ids_for_infer;
         let rag_state = rag_state_for_infer.clone();
-        let inter_model_relay = inter_model_relay_for_infer.clone();
-        let runtime_pressure_state = runtime_pressure_state_for_infer.clone();
-        let runtime_pressure_config = runtime_pressure_config_for_infer.clone();
         async move {
             use warp::http::StatusCode;
-            let scheduler = {
-                let p = pools.read();
-                p.get(&model_id).cloned()
-            };
+            let scheduler = models.pool(model_id);
 
             match scheduler {
                 Some(pool) => {
-                    if !pool.is_healthy() {
-                        let overload =
-                            EngineError::overloaded("Model pool is overloaded".to_string());
-                        let status = status_code_for_engine_error(&overload);
-                        log::warn!(
-                            "Infer request rejected: model_id={} status={} reason={}",
-                            model_id,
-                            status.as_u16(),
-                            overload
-                        );
-                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(
-                                &serde_json::json!({ "error": overload.to_string() }),
-                            ),
-                            status,
-                        ));
-                    }
-
-                    let source_model_info = model_registry.get(model_id);
+                    let source_model_info = models.registry().get(model_id);
                     let model_framework = source_model_info
                         .as_ref()
                         .map(|model| model.framework.clone())
                         .unwrap_or_else(|| "unknown".to_string());
-                    let source_model_name = source_model_info
-                        .as_ref()
-                        .map(|model| model.name.clone())
-                        .unwrap_or_else(|| format!("model-{model_id}"));
                     // Fast-path tensor JSON inference: avoid an intermediate `serde_json::Value`
                     // for huge tensors (ex: `[1,3,224,224]` float32 represented as a JSON byte
                     // array). Falling back keeps support for other adapters.
@@ -269,115 +228,25 @@ pub(crate) fn build_model_infer_route(
                         .and_then(|metadata| metadata.request_id.as_deref())
                         .unwrap_or("-");
                     let session_id = request.session_id.as_deref().unwrap_or("-");
-                    let request_is_relay = session_id.starts_with(INTER_MODEL_RELAY_SESSION_PREFIX);
                     let request_id_for_log =
                         redact_identifier_for_logs(request_id, log_sensitive_ids);
                     let session_id_for_log =
                         redact_identifier_for_logs(session_id, log_sensitive_ids);
-                    let scheduler_priority = scheduler_priority_for_request(&request);
+                    let scheduler_priority = inference.priority_for_request(&request);
                     let force_cpu = request
                         .metadata
                         .as_ref()
                         .and_then(|metadata| metadata.force_cpu)
                         .unwrap_or(false);
-                    let pressure_state = RuntimePressureState::from_u8(
-                        runtime_pressure_state.load(Ordering::Relaxed),
-                    );
-                    if pressure_state == RuntimePressureState::Emergency
-                        && matches!(scheduler_priority, kapsl_scheduler::Priority::Throughput)
-                    {
-                        let error = EngineError::resource_exhausted(format!(
-                            "runtime pressure {}: throughput requests are temporarily rejected",
-                            pressure_state.as_str()
-                        ));
-                        let status = status_code_for_engine_error(&error);
-                        log::warn!(
-                            "Infer execution rejected: model_id={} framework={} request_id={} session_id={} status={} error={}",
-                            model_id,
-                            model_framework,
-                            request_id_for_log,
-                            session_id_for_log,
-                            status.as_u16(),
-                            error
-                        );
-                        return Ok::<_, warp::Rejection>(warp::reply::with_status(
-                            warp::reply::json(&serde_json::json!({ "error": error.to_string() })),
-                            status,
-                        ));
-                    }
-                    if let Some(cap) = runtime_pressure_config.max_new_tokens_cap(pressure_state) {
-                        let metadata = request
-                            .metadata
-                            .get_or_insert_with(kapsl_engine_api::RequestMetadata::default);
-                        metadata.max_new_tokens =
-                            Some(metadata.max_new_tokens.map(|existing| existing.min(cap)).unwrap_or(cap));
-                    }
-                    // Attach a cancellation token so that if the HTTP request is dropped
-                    // (client disconnects), we can stop any queued/in-flight work.
-                    struct CancelOnDrop(kapsl_engine_api::CancellationToken);
-                    impl Drop for CancelOnDrop {
-                        fn drop(&mut self) {
-                            self.0.cancel();
-                        }
-                    }
-
-                    let cancellation_token = request
-                        .cancellation
-                        .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
-                        .clone();
-                    let _cancel_on_drop = CancelOnDrop(cancellation_token.clone());
-
-                    let timeout_ms = request
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.timeout_ms)
-                        .filter(|ms| *ms > 0);
-
-                    // End-to-end inference latency: scheduler queue wait + compute.
-                    // This is the signal the enterprise autoscaler scales SLOs on.
-                    let inference_started = std::time::Instant::now();
-                    let infer_fut = pool.infer(&request, scheduler_priority, force_cpu);
-                    let infer_result = if let Some(timeout_ms) = timeout_ms {
-                        match tokio::time::timeout(
-                            Duration::from_millis(timeout_ms),
-                            infer_fut,
-                        )
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => {
-                                cancellation_token.cancel();
-                                Err(EngineError::timeout(format!(
-                                    "Inference timed out after {timeout_ms}ms"
-                                )))
-                            }
-                        }
-                    } else {
-                        infer_fut.await
-                    };
+                    let infer_result = inference
+                        .infer(model_id, request, scheduler_priority, force_cpu)
+                        .await;
 
                     match infer_result {
-                        Ok(output) => {
-                            let latency_ms = inference_started.elapsed().as_secs_f64() * 1000.0;
-                            latency_samples
-                                .write()
-                                .entry(model_id)
-                                .or_default()
-                                .record(latency_ms);
-                            maybe_publish_inter_model_relays(
-                                &inter_model_relay,
-                                model_id,
-                                &source_model_name,
-                                request_is_relay,
-                                &output,
-                                &pools,
-                                &model_registry,
-                            );
-                            Ok::<_, warp::Rejection>(warp::reply::with_status(
-                                warp::reply::json(&output),
-                                StatusCode::OK,
-                            ))
-                        }
+                        Ok(output) => Ok::<_, warp::Rejection>(warp::reply::with_status(
+                            warp::reply::json(&output),
+                            StatusCode::OK,
+                        )),
                         Err(e) => {
                             let status = status_code_for_engine_error(&e);
                             if status == StatusCode::INTERNAL_SERVER_ERROR {

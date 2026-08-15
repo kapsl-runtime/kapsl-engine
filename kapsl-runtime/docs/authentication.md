@@ -26,22 +26,13 @@ export KAPSL_API_TOKEN_READER="your-reader-secret"
 kapsl --model model.aimod
 ```
 
-### Option 2 — Shared fallback token
-
-A single token that grants admin access:
-
-```bash
-export KAPSL_API_TOKEN="your-shared-secret"
-kapsl --model model.aimod
-```
-
-### Option 3 — CLI flag at startup
+### Option 2 — CLI flag at startup
 
 ```bash
 kapsl --model model.aimod --admin-token "your-admin-secret"
 ```
 
-### Option 4 — Auth store (persistent, managed via API)
+### Option 3 — Auth store (persistent, managed via API)
 
 The runtime stores users and API keys in `~/.kapsl/auth-store.json` (override with `KAPSL_AUTH_STORE_PATH`). Manage them via the web dashboard or the API (see below).
 
@@ -109,7 +100,7 @@ curl http://127.0.0.1:9095/api/auth/access/status \
   -H "Authorization: Bearer <admin-token>"
 ```
 
-Returns a summary: auth enabled/disabled, number of users, legacy token config.
+Returns a summary: auth enabled/disabled, number of users, and role-token configuration.
 
 ## Local (unauthenticated) mode
 
@@ -121,5 +112,5 @@ The web dashboard detects this and authenticates automatically when accessed fro
 
 - Do not expose the HTTP port to the internet without TLS and authentication
 - Use `KAPSL_ALLOW_INSECURE_HTTP=1` only when behind a TLS-terminating reverse proxy
-- Prefer per-user API keys over the shared `KAPSL_API_TOKEN` in production
+- Prefer per-user API keys over role tokens in production
 - Rotate keys by creating a replacement, updating your services, then revoking the old key

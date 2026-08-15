@@ -1,14 +1,14 @@
 #!/usr/bin/env sh
 # Kapsl CLI installer
 # Usage: curl -fsSL https://downloads.kapsl.net/install.sh | sh
-# CUDA: curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator cuda
+# CUDA: curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
 set -e
 
 BASE_URL="${KAPSL_BASE_URL:-https://downloads.kapsl.net}"
 BIN_NAME="kapsl"
 INSTALL_DIR="${KAPSL_INSTALL_DIR:-$HOME/.local/bin}"
 ACCELERATOR="${KAPSL_ACCELERATOR:-cpu}"
-CHANNEL="stable"
+CHANNEL="${KAPSL_CHANNEL:-stable}"
 VERSION="${KAPSL_VERSION:-}"
 
 usage() {
@@ -21,7 +21,7 @@ Usage:
 
 Examples:
   curl -fsSL https://downloads.kapsl.net/install.sh | sh
-  curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator cuda
+  curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
   curl -fsSL https://downloads.kapsl.net/install.sh | sh -s -- --accelerator tensorrt
 EOF
 }
@@ -130,6 +130,37 @@ download() {
     fi
 }
 
+# Install a bundle tarball into "$INSTALL_DIR". Returns non-zero (after
+# reporting why) if it could not be downloaded, unpacked, or did not carry the
+# binary, so the caller can try a different bundle.
+install_bundle() {
+    bundle_file="$1"
+    bundle_url="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${bundle_file}"
+    bundle_tmp="${TMP_DIR}/${bundle_file}"
+    extract_dir="${TMP_DIR}/extract-${bundle_file}"
+
+    if ! download "$bundle_url" "$bundle_tmp"; then
+        echo "Bundle ${bundle_file} is unavailable." >&2
+        return 1
+    fi
+
+    mkdir -p "$extract_dir"
+    if ! tar -xzf "$bundle_tmp" -C "$extract_dir"; then
+        echo "Failed to extract ${bundle_file}." >&2
+        return 1
+    fi
+
+    bundle_bin="$(find "$extract_dir" -type f -name "$BIN_NAME" | head -n 1)"
+    if [ -z "$bundle_bin" ]; then
+        echo "Bundle ${bundle_file} does not contain ${BIN_NAME}." >&2
+        return 1
+    fi
+
+    cp -R "$(dirname "$bundle_bin")/." "$INSTALL_DIR/"
+    chmod +x "${INSTALL_DIR}/${BIN_NAME}"
+    INSTALLED_BUNDLE_DIR="$(dirname "$bundle_bin")"
+}
+
 install_provider_pack() {
     provider="$1"
     provider_version="$2"
@@ -161,14 +192,33 @@ case "$ACCELERATOR" in
         ;;
 esac
 
+case "$ACCELERATOR" in
+    cuda | cuda12 | tensorrt | tensorrt10)
+        if [ "$PLATFORM" != "linux-x86_64" ]; then
+            echo "The ${ACCELERATOR} runtime is currently available only for Linux x86_64." >&2
+            exit 1
+        fi
+        ;;
+esac
+
 if [ -z "$VERSION" ]; then
     printf "Fetching latest version... "
     VERSION="$(latest_version)"
     echo "$VERSION"
 fi
 
-BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
-BUNDLE_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BUNDLE_FILE}"
+case "$ACCELERATOR" in
+    cpu)
+        BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}.tar.gz"
+        ;;
+    cuda | cuda12 | tensorrt | tensorrt10)
+        # One archive contains the CUDA-compiled GGUF runtime, the ONNX CUDA
+        # provider, and their user-space CUDA dependencies. Only the matching
+        # NVIDIA driver remains a host prerequisite.
+        BUNDLE_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}-cuda12.tar.gz"
+        ;;
+esac
+
 BIN_FILE="${BIN_NAME}-${VERSION}-${PLATFORM}"
 DOWNLOAD_URL="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${BIN_FILE}"
 
@@ -179,41 +229,29 @@ mkdir -p "$INSTALL_DIR"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-BUNDLE_TMP="${TMP_DIR}/${BUNDLE_FILE}"
-EXTRACT_DIR="${TMP_DIR}/bundle"
-
-if download "$BUNDLE_URL" "$BUNDLE_TMP"; then
-    mkdir -p "$EXTRACT_DIR"
-    if tar -xzf "$BUNDLE_TMP" -C "$EXTRACT_DIR"; then
-        BUNDLE_BIN="$(find "$EXTRACT_DIR" -type f -name "$BIN_NAME" | head -n 1)"
-        if [ -n "$BUNDLE_BIN" ]; then
-            cp -R "$(dirname "$BUNDLE_BIN")/." "$INSTALL_DIR/"
-            chmod +x "${INSTALL_DIR}/${BIN_NAME}"
-        else
-            echo "Downloaded bundle does not contain ${BIN_NAME}; falling back to single executable." >&2
-            TMP="${TMP_DIR}/${BIN_FILE}"
-            download "$DOWNLOAD_URL" "$TMP"
-            chmod +x "$TMP"
-            mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
-        fi
-    else
-        echo "Failed to extract bundle; falling back to single executable." >&2
-        TMP="${TMP_DIR}/${BIN_FILE}"
-        download "$DOWNLOAD_URL" "$TMP"
-        chmod +x "$TMP"
-        mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+if ! install_bundle "$BUNDLE_FILE"; then
+    if [ "$ACCELERATOR" != "cpu" ]; then
+        echo "The requested ${ACCELERATOR} runtime is unavailable; no CPU runtime was substituted." >&2
+        exit 1
     fi
-else
-    echo "Bundle unavailable; falling back to single executable." >&2
-    TMP="${TMP_DIR}/${BIN_FILE}"
-    download "$DOWNLOAD_URL" "$TMP"
-    chmod +x "$TMP"
-    mv "$TMP" "${INSTALL_DIR}/${BIN_NAME}"
+
+    # Old CPU releases may only have the bare executable. Accelerator installs
+    # deliberately do not use this fallback because it cannot run GGUF on CUDA.
+    echo "Falling back to single executable." >&2
+    tmp="${TMP_DIR}/${BIN_FILE}"
+    download "$DOWNLOAD_URL" "$tmp"
+    chmod +x "$tmp"
+    mv "$tmp" "${INSTALL_DIR}/${BIN_NAME}"
 fi
 
 case "$ACCELERATOR" in
     cuda | cuda12 | tensorrt | tensorrt10)
-        install_provider_pack "cuda" "12"
+        # Compatibility for pre-merged releases: new CUDA archives already
+        # contain this marker and need no second download.
+        if [ ! -f "${INSTALLED_BUNDLE_DIR}/kapsl-provider-cuda12.json" ]; then
+            echo "Installing legacy split ONNX CUDA provider pack..."
+            install_provider_pack "cuda" "12"
+        fi
         ;;
 esac
 case "$ACCELERATOR" in
@@ -237,6 +275,8 @@ esac
 echo ""
 if [ "$ACCELERATOR" != "cpu" ]; then
     echo "Installed accelerator profile: ${ACCELERATOR}"
-    echo "Linux accelerator packs require compatible NVIDIA system runtime libraries."
+    echo "GGUF models: CUDA compiled into this runtime build."
+    echo "ONNX models: CUDA execution provider installed."
+    echo "A compatible NVIDIA driver is required."
 fi
 echo "Run 'kapsl --help' to get started."

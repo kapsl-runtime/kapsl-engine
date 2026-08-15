@@ -64,7 +64,7 @@ This checklist tracks production readiness for image/video inference via `POST /
 
 ## Operational Controls
 
-- [x] Inline media preprocessing can be disabled via `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS` (legacy `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS` also supported).
+- [x] Inline media preprocessing can be disabled via `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS`.
 - [x] Throughput profile no longer disables media preprocessing by default.
 - [ ] Add explicit CLI flag for disabling inline preprocessing (instead of env-only control).
 

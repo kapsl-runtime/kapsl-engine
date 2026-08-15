@@ -8,14 +8,16 @@
 - GPU drivers and SDKs only if using a non-CPU backend:
   - A compatible NVIDIA display driver on Windows; the provider packs include
     the required CUDA 12, cuDNN 9, and TensorRT 10 user-space runtime libraries
-  - Compatible system CUDA/TensorRT runtime libraries on Linux
+  - A compatible NVIDIA driver on Linux; the CUDA installer includes the CUDA
+    12, cuDNN 9, and NCCL user-space libraries. Bare-metal TensorRT installs
+    additionally require compatible TensorRT 10 system libraries
   - Xcode command line tools for Metal (macOS)
 
 ## Runtime and accelerator packages
 
 The default installer contains the portable Kapsl runtime and ONNX Runtime core
-libraries. NVIDIA libraries are published separately so CPU, DirectML, and Apple
-Silicon installations stay small.
+libraries. The Linux CUDA installer is a separate self-contained archive so CPU,
+DirectML, and Apple Silicon installations stay small.
 
 Install the default runtime:
 
@@ -23,12 +25,30 @@ Install the default runtime:
 curl -fsSL https://downloads.kapsl.net/install.sh | sh
 ```
 
-Install it with the CUDA 12 pack:
+Install the Linux x86_64 CUDA 12 runtime:
 
 ```bash
-curl -fsSL https://downloads.kapsl.net/install.sh |
-  sh -s -- --accelerator cuda
+curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
 ```
+
+That single archive contains the CUDA-compiled GGUF runtime and the ONNX CUDA
+execution provider, plus their user-space CUDA dependencies. It requires only a
+compatible host NVIDIA driver, like a Triton GPU image.
+
+The stable CUDA runtime uses Kapsl's paged shared-KV path for supported GGUF
+architectures. Models rejected by its compatibility policy use llama.cpp's
+native KV path instead. Set `KAPSL_GGUF_DISABLE_SHARED_KV=1` to force that path
+for diagnosis or rollback. Source builds can instead select the explicit
+`gguf-cuda` feature to exclude shared-KV entirely.
+
+The same stable profile automatically sizes one process-owned CUDA backing
+pool on each device used by a pooled model. Startup packages are planned first,
+so external GGUF/native weights and conservative unpooled scratch/fallback
+headroom are removed before the immutable pool size is selected. Use
+`KAPSL_GPU_DEVICE_POOL_MODE=off` to opt out, `auto` to make failure strict, or
+`fixed` together with `KAPSL_GPU_DEVICE_POOL_BYTES[_N]` for an exact operator
+allocation. See the GPU memory section in `docs/configuration.md` for sizing
+and isolated-worker behavior.
 
 Install CUDA 12 and TensorRT 10 packs:
 
@@ -66,7 +86,11 @@ PowerShell. A saved copy of the general installer also accepts explicit paramete
 .\install.ps1 -Accelerator tensorrt
 ```
 
-The latest beta has equivalent Windows entry points:
+The latest beta has equivalent entry points:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install-beta-cuda.sh | sh
+```
 
 ```powershell
 irm https://downloads.kapsl.net/install-beta.ps1 | iex
@@ -75,9 +99,10 @@ irm https://downloads.kapsl.net/install-beta-tensorrt.ps1 | iex
 ```
 
 Windows provider packs contain the calculated NVIDIA DLL dependency closure.
-Linux packs contain the ONNX Runtime provider sidecars and require compatible
-NVIDIA driver and system runtime libraries. macOS uses system Metal/CoreML
-frameworks and does not require an accelerator pack.
+The standalone Linux provider packs remain available for existing portable
+installations and require compatible NVIDIA system runtime libraries. The merged
+Linux CUDA installer does not require that extra provider step. macOS uses system
+Metal/CoreML frameworks and does not require an accelerator pack.
 
 ## Docker images
 
@@ -87,10 +112,10 @@ Docker images follow the same modular split:
 # Small, multi-architecture CPU image; also published as :latest
 docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-cpu
 
-# Linux amd64 with CUDA 12, cuDNN, and the Kapsl CUDA provider pack
+# Linux amd64 with the merged GGUF + ONNX CUDA 12 runtime
 docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-cuda
 
-# Linux amd64 with CUDA 12, cuDNN, TensorRT 10, and both provider packs
+# Linux amd64 with the merged CUDA runtime and TensorRT 10 add-on
 docker pull ghcr.io/kapsl-runtime/kapsl-engine:latest-tensorrt
 ```
 
@@ -118,10 +143,12 @@ implicitly. Stable releases update `latest`, `latest-cpu`, `latest-cuda`, and
 git clone https://github.com/kapsl-runtime/kapsl-engine
 cd kapsl-engine/kapsl-runtime
 
-cargo build --release
+./scripts/build-with-embedded-ui.sh --release
 ```
 
-The compiled binary is at `target/release/kapsl`.
+The compiled binary is at `target/release/kapsl`. The wrapper invalidates the
+embedded dashboard before building, which also makes source deployments safe
+after timestamp-preserving transfers such as `rsync -a`.
 
 ## Quick start
 

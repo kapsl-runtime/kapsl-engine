@@ -16,6 +16,8 @@ Real-time monitoring:
 - Inference throughput (requests/sec, tokens/sec)
 - Request queue depth
 - Hardware utilisation (CPU, GPU memory)
+- Unified memory-authority usage and headroom across host/device domains
+- Per-model memory share pie chart, with replicas rolled up to the base model
 - Per-model latency histograms
 
 ### Models
@@ -67,7 +69,7 @@ Admin-only section for managing authentication:
 |------|--------------|
 | `local-loopback` | Auth disabled; loopback access automatically granted with admin privileges |
 | `api-key` | Authenticated with a user API key |
-| `legacy-token` | Authenticated with an older role-token (`KAPSL_API_TOKEN_*`) |
+| `role-token` | Authenticated with a configured role token (`KAPSL_API_TOKEN_*`) |
 
 The current session mode and role are shown in the top status bar.
 
@@ -84,3 +86,4 @@ Key metrics:
 | `kapsl_queue_depth` | Current queue depth per model |
 | `kapsl_active_replicas` | Running replicas per model |
 | `kapsl_tokens_generated_total` | Tokens generated (LLM models) |
+| `kapsl_memory_authority_bytes` | Planned, reserved, committed, and observed bytes by domain, model, replica, class, and state |

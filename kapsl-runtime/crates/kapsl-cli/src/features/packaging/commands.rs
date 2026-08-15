@@ -41,6 +41,9 @@ pub(crate) fn context_metadata_missing(context_path: &Path) -> bool {
     context_path.is_dir() && !context_path.join("metadata.json").exists()
 }
 
+// These arguments mirror independent CLI override flags and remain explicit at
+// the command boundary so precedence is visible to callers.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_context_build(
     context_path: &Path,
     model_override: Option<&Path>,
@@ -111,19 +114,8 @@ pub(crate) fn format_elapsed(duration: Duration) -> String {
     }
 }
 
-pub(crate) fn transfer_backend_label(remote_url: &str) -> &'static str {
-    if is_oci_remote_url(remote_url) {
-        "oci"
-    } else if is_default_placeholder_remote(remote_url) {
-        "placeholder"
-    } else {
-        "http"
-    }
-}
-
 pub(crate) fn print_transfer_summary(
     action: &str,
-    remote_url: &str,
     bytes: u64,
     elapsed: Duration,
     path_or_target: &str,
@@ -136,7 +128,7 @@ pub(crate) fn print_transfer_summary(
         a.green("✓"),
         action,
         format_human_bytes(bytes),
-        a.dim(&format!("via {}", transfer_backend_label(remote_url))),
+        a.dim("via http"),
         a.dim(&format!(
             "in {} ({}/s)",
             format_elapsed(elapsed),
@@ -318,11 +310,10 @@ pub(crate) fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError
 
     let started_at = Instant::now();
     let response = run_with_loading("Uploading package", || {
-        push_kapsl_to_placeholder_remote(&request).map_err(dyn_error_from_message)
+        push_kapsl_to_remote(&request).map_err(dyn_error_from_message)
     })?;
     print_transfer_summary(
         "Uploaded",
-        &response.remote_url,
         response.bytes_uploaded,
         started_at.elapsed(),
         &response.artifact_url,
@@ -343,7 +334,6 @@ pub(crate) fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError
 
     let request = PullKapslRequest {
         target: target.as_string(),
-        reference: args.reference,
         destination_dir: args
             .destination_dir
             .map(|p| p.to_string_lossy().to_string()),
@@ -354,11 +344,10 @@ pub(crate) fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError
 
     let started_at = Instant::now();
     let response = run_with_loading("Downloading package", || {
-        pull_kapsl_from_placeholder_remote(&request).map_err(dyn_error_from_message)
+        pull_kapsl_from_remote(&request).map_err(dyn_error_from_message)
     })?;
     print_transfer_summary(
         "Downloaded",
-        &response.remote_url,
         response.bytes_downloaded,
         started_at.elapsed(),
         &response.kapsl_path,

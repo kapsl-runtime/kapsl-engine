@@ -82,6 +82,9 @@ Defaults:
 `kapsl` supports subcommands and legacy direct run invocation:
 
 - `kapsl run ...`
+- `kapsl add-model ...`
+- `kapsl list ...`
+- `kapsl remove-model ...`
 - `kapsl build ...`
 - `kapsl push ...`
 - `kapsl pull ...`
@@ -190,12 +193,6 @@ Pull:
 kapsl pull acme/model:prod --destination-dir ./models
 ```
 
-OCI pull with digest ref:
-
-```bash
-kapsl pull acme/model:prod --ref sha256:abc123... --destination-dir ./models
-```
-
 Target format:
 
 - Required for push and pull: `<repo_name>/<model>:<label>`
@@ -204,9 +201,8 @@ Target format:
 Default remote behavior:
 
 - Uses `https://api.kapsl.net/v1` by default.
-- If remote URL resolves to the legacy placeholder URL, mirrors artifacts to a local directory (configurable env var).
-- If `remote_url` is overridden, uses HTTP PUT/GET remote backend.
-- If `remote_url` starts with `oci://`, uses ORAS to push/pull the `.aimod` as an OCI artifact (MIME type `application/vnd.kapsl.aimod.v1`). Requires the `oras` binary (path configurable via `KAPSL_ORAS_BIN`). Credentials use `KAPSL_OCI_USERNAME` and `KAPSL_OCI_PASSWORD`.
+- Uses HTTP upload/download endpoints for all remote transfers.
+- Override the endpoint with `remote_url` or `KAPSL_REMOTE_URL`.
 
 ### 4.4 Login Command
 
@@ -375,7 +371,7 @@ Auth store:
 
 By default runtime refuses non-loopback HTTP bind unless:
 
-- `KAPSL_ALLOW_INSECURE_HTTP=1` (or legacy alias).
+- `KAPSL_ALLOW_INSECURE_HTTP=1`.
 
 This is a guard against exposing plaintext API directly.
 
@@ -405,7 +401,7 @@ Writer endpoints:
 
 Unauthenticated endpoints:
 
-- `POST /api/auth/login`: probe auth status or validate a token. Request body: `{"token": "<optional>"}`. Response: `{"authenticated": bool, "auth_enabled": bool, "legacy_auth_enabled": bool, "role": "...", "scopes": [...], "mode": "...", "access": {"read": bool, "write": bool, "admin": bool}}`.
+- `POST /api/auth/login`: probe auth status or validate a token. Request body: `{"token": "<optional>"}`. Response: `{"authenticated": bool, "auth_enabled": bool, "role_token_auth_enabled": bool, "role": "...", "scopes": [...], "mode": "...", "access": {"read": bool, "write": bool, "admin": bool}}`.
 
 Admin endpoints:
 
@@ -626,7 +622,6 @@ See `kapsl-sdk/docs` for installation, API reference, and Python examples.
 
 Primary runtime env vars:
 
-- `KAPSL_API_TOKEN`
 - `KAPSL_API_TOKEN_READER`
 - `KAPSL_API_TOKEN_WRITER`
 - `KAPSL_API_TOKEN_ADMIN`
@@ -641,24 +636,11 @@ Primary runtime env vars:
 - `KAPSL_EXT_CONFIG_ROOT`
 - `KAPSL_EXTENSION_MARKETPLACE_URL`
 - `KAPSL_REMOTE_URL`
-- `KAPSL_REMOTE_PLACEHOLDER_URL`
-- `KAPSL_REMOTE_PLACEHOLDER_DIR`
+- `KAPSL_REMOTE_TOKEN`
 - `KAPSL_REMOTE_TOKEN_STORE_PATH`: path to the OAuth token store file (default `~/.kapsl/tokens.json`).
 - `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS`
-- `KAPSL_INFER_ADAPTERS` (optional adapters; e.g. `echo_tensor` when built with feature)
 - `KAPSL_SHM_SIZE_MB`: size of the shared memory segment in MiB (default `256`).
-- `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY` (legacy alias `KAPSL_LITE_INGRESS_BACKPRESSURE`): sets the queue overflow policy (`block|drop_newest|drop_oldest`).
-
-OCI / ORAS env vars:
-
-- `KAPSL_ORAS_BIN`: path to the `oras` binary used for OCI push/pull (defaults to `oras` on `PATH`).
-- `KAPSL_OCI_USERNAME`: username for OCI registry authentication.
-- `KAPSL_OCI_PASSWORD`: password for OCI registry authentication.
-
-Inter-model relay env vars:
-
-- `KAPSL_INTER_MODEL_ROUTES` (legacy alias `KAPSL_LITE_INTER_MODEL_ROUTES`): JSON-encoded map of source model ID to list of destination model IDs for automatic inter-model relay.
-- `KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS` (legacy alias `KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS`): minimum interval in ms between relay publishes (default `2000`).
+- `KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY`: sets the queue overflow policy (`block|drop_newest|drop_oldest`).
 
 Server pressure env vars:
 
@@ -670,6 +652,27 @@ Server pressure env vars:
 - `KAPSL_SERVER_PRESSURE_GPU_MEM_EMERGENCY_PCT`: GPU memory usage % threshold for emergency state.
 - `KAPSL_SERVER_PRESSURE_CONSERVE_MAX_NEW_TOKENS`: max new tokens allowed per request in conserve state.
 - `KAPSL_SERVER_PRESSURE_EMERGENCY_MAX_NEW_TOKENS`: max new tokens allowed per request in emergency state.
+
+Physical CUDA pool env vars (stable shared-KV CUDA profile):
+
+- `KAPSL_GPU_DEVICE_POOL_MODE[_<id>]`: `auto`, `fixed`, or `off`. The stable `gguf-cuda-shared-kv` profile defaults to automatic sizing; other profiles remain off unless explicitly enabled.
+- `KAPSL_GPU_DEVICE_POOL_BYTES[_<id>]`: exact positive backing size and implicit fixed-mode override; accepts byte, `k`, `m`, and `g` suffixes.
+- `KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES[_<id>]`: automatic-mode room retained for scratch, native-KV fallback, and later models; zero is valid.
+- `CUDA_DEVICE_MEMORY_LIMIT[_<id>]` / `KAPSL_GPU_MEMORY_LIMIT_MB`: strict automatic-sizing and admission ceiling.
+- `KAPSL_GGUF_DISABLE_SHARED_KV`: force GGUF back to llama.cpp native KV.
+- `KAPSL_ISOLATED_WORKER_GPU_POOL`: operator attestation that each isolated worker owns an exclusive GPU/MIG boundary. Pool settings alone do not establish isolation.
+
+Automatic sizing happens after startup package planning and before backend/ORT
+session construction. It subtracts known external weights, an unpooled reserve,
+and a separate driver safety band from the lower of the declared ceiling and
+live free VRAM. Planned pooled ONNX weight copies form a hard lower bound. The
+resulting process-lifetime backing allocation is aligned to 2 MiB and is never
+resized. See `docs/configuration.md` for the full formula and failure policy.
+At scrape time, `/metrics` refreshes `kapsl_gpu_device_pool_*` gauges for live
+allocation bytes/count, free bytes/ranges, largest free range, fragmentation,
+and per-owner usage/quota/admission/allocatable bytes. Stale unloaded-owner
+rows are removed; `kapsl_device_memory_pooled_bytes` continues to mean fixed
+backing capacity.
 
 GPU co-tenancy env vars:
 
@@ -684,28 +687,63 @@ GPU co-tenancy env vars:
 
 Model cache / disk-check env vars (read by `kapsl-core` loader):
 
-- `KAPSL_MODEL_CACHE_DIR` (or `KAPSL_LITE_MODEL_CACHE_DIR`): override the model cache root directory (default: `.kapsl-model-cache/` next to the `.aimod` file).
+- `KAPSL_MODEL_CACHE_DIR`: override the model cache root directory (default: `.kapsl-model-cache/` next to the `.aimod` file).
 - `KAPSL_MODEL_CACHE_MAX_BYTES` / `KAPSL_MODEL_CACHE_MAX_MIB`: cap the total size of the model cache; the loader will evict least-recently-used entries to stay within limit.
 - `KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` / `KAPSL_MODEL_CACHE_RESERVED_FREE_MIB`: minimum free disk space that must remain after a model cache copy; the loader will evict LRU entries until the constraint is satisfied (or fail with `InsufficientDiskSpace`).
-- `KAPSL_PACKAGE_TMP_DIR` (or `KAPSL_LITE_PACKAGE_TMP_DIR`): override the temporary directory used when unpacking an `.aimod` archive.
+- `KAPSL_PACKAGE_TMP_DIR`: override the temporary directory used when unpacking an `.aimod` archive.
 
-All above support legacy `KAPSL_*` aliases in runtime code.
+CPU memory governance:
 
-## 13. Inter-Model Relay
+- `KAPSL_CPU_MEMORY_LIMIT_MB`: optional process-wide system-memory ceiling in
+  MiB. Kapsl uses the tightest of this value, detected host RAM, and the Linux
+  cgroup memory limit, then retains 20% as safety headroom. CPU LLM KV-cache,
+  model/session, and active request-transient accounting are separate classes
+  under that one safe budget. KV keeps one half-budget; model/session and active
+  request-transient reservations share the complementary half, preventing a
+  full logical KV cache from overcommitting host memory. Reservations are
+  released with the model, replica, or request lease. Model loads are serialized
+  for a before/after process-RSS sample; reconciliation can raise (but never
+  lower) the conservative model reservation. This is accounting only: Kapsl
+  does not reserve a second physical CPU arena.
 
-The runtime supports routing inference outputs from one model as inputs to one or more downstream models within the same process.
+Provider memory governance:
 
-Configuration is via `KAPSL_INTER_MODEL_ROUTES` (or legacy `KAPSL_LITE_INTER_MODEL_ROUTES`): a JSON map from source model ID to a list of destination model IDs.
+- `KAPSL_PROVIDER_MEMORY_LIMITS`: comma-separated hard ceilings for
+  accounting-only accelerator providers, using `provider[:device]=size` (for
+  example `metal=8g,directml:0=6g`). `coreml` aliases `metal`, `dml` aliases
+  `directml`, and an exact device entry overrides its provider-wide fallback.
+  CPU and CUDA/TensorRT continue to use their dedicated limit variables.
+- Live backend memory reports are reconciled into the owning elastic lease on
+  the two-second monitor cadence, including isolated worker processes. Provider
+  growth, shrink, compaction, and migration therefore update the unified
+  snapshot without a reload. A physical overage that cannot be newly reserved
+  remains visible as `observed` bytes and blocks subsequent admission.
 
-Example:
+Memory admission is coordinated by a backend-neutral authority. A `MemoryPlan`
+contains typed host, pinned-host, mapped-host, CUDA-device, or provider-domain
+claims, each attributed to a model ID, replica ID, allocation class, allocation
+source, and stable allocation ID. Model loading admits the complete plan
+transactionally, reconciles backend reports and observed CUDA/RSS deltas after
+load, and commits a single RAII `MemoryLease`; failure or unload releases all
+domains. Request input, staging, output, and workspace reports receive
+short-lived leases around synchronous, batched, and streaming inference. CUDA
+claims use the physical pool/budget manager, host claims use the CPU budget
+manager, and non-CUDA providers use accounting adapters. Physical allocations
+shared by replicas are charged once while each replica keeps its own ownership
+reference.
 
-```json
-{"encoder": ["decoder-a", "decoder-b"]}
-```
+When a CUDA pool is materialized, the native and `gguf-native` paths allocate
+weights, scratch/workspace, block tables, request buffers, and KV blocks from
+typed views over that pool. ONNX CUDA/TensorRT sessions use the pool through the
+ORT environment allocator. Compatible rank-4 autoregressive ONNX graphs also
+retain authoritative `present.*` KV OrtValues on CUDA and bind them directly as
+the next step's `past_key_values.*`; an unsupported graph, disabled/fallback
+allocator, isolated worker, or binding failure uses the host KV implementation.
+The llama.cpp-backed GGUF path remains explicit backend-managed CUDA memory for
+weights and compute scratch because GGML does not yet expose a Kapsl pool buffer
+adapter; its shared paged KV is still runtime-managed in the pool.
 
-Relay sessions are prefixed with `relay/` internally. The relay publishes at most once every `KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS` (default `2000 ms`).
-
-## 13a. Runtime Pressure Management
+## 13. Runtime Pressure Management
 
 The runtime monitors system resource utilization and adjusts inference behavior when under pressure. There are three pressure states:
 
@@ -717,19 +755,24 @@ The runtime monitors system resource utilization and adjusts inference behavior 
 
 Thresholds are configured via env vars (see Section 12). The runtime evaluates pressure state continuously using `evaluate_runtime_pressure_state()`.
 
-## 13b. LLM Shared KV Cache
+## 14. LLM Shared KV Cache
 
-For multi-model deployments with LLM backends, the runtime coordinates a shared KV cache block pool across all LLM engine instances on the same device.
+There are two related layers. `SharedKvState` coordinates logical token/block
+budgets across LLM engines. In the stable CUDA profile, `GpuDevicePool` also
+provides one physical byte backing allocation per used device for ORT and
+compatible paged-KV consumers. The physical pool is geometry-neutral and is
+sized once before backend sessions are constructed.
 
 Key details:
 
-- Each KV block is 2 MB.
-- Block size is 16 tokens.
+- The logical coordinator uses nominal 2 MiB / 16-token accounting blocks.
+- Physical paged-KV block bytes are derived from the model geometry; they are
+  not necessarily the logical coordinator's nominal size.
 - The `SharedKvState` coordinates device-level block allocator pools and a `GlobalKvScheduler`.
 - Each LLM engine attaches to the shared pool on startup and detaches on shutdown.
 - Cross-model token-budget coordination prevents any single engine from monopolising device memory.
 
-## 14. Example API Calls
+## 15. Example API Calls
 
 Health:
 
@@ -768,7 +811,7 @@ curl -X POST http://127.0.0.1:9095/api/engine/package \
   }'
 ```
 
-## 15. Testing and Benchmarks
+## 16. Testing and Benchmarks
 
 Run runtime checks from `kapsl-runtime/`:
 
@@ -791,7 +834,7 @@ engine/kapsl-benchmarks/run_kapsl_vs_vllm_qwen.sh
 The script starts a tuned kapsl instance, waits for vLLM to be ready on its own port, runs throughput/latency sweeps against both, and prints a concise summary table.
 See `engine/kapsl-benchmarks/README.md` for reproducible usage and common options.
 
-## 16. Troubleshooting
+## 17. Troubleshooting
 
 Common issues:
 
@@ -802,10 +845,9 @@ Common issues:
 - Push/pull placeholder error: ensure pushed artifact exists in placeholder mirror dir.
 - Unauthorized/forbidden API: verify role token/api key and required route scope.
 - `InsufficientDiskSpace` on load: the loader could not free enough cache space. Either set `KAPSL_MODEL_CACHE_MAX_BYTES`/`KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES` to a larger threshold, point `KAPSL_MODEL_CACHE_DIR` at a volume with more space, or remove stale entries from the cache directory manually.
-- OCI push/pull fails: ensure `oras` is on `PATH` (or set `KAPSL_ORAS_BIN`), and that `KAPSL_OCI_USERNAME`/`KAPSL_OCI_PASSWORD` are set correctly.
 - `kapsl control` not shifting weights: check that each `--runtime` URL is reachable and that `--auth-token` / `--runtime-token` are set if auth is enabled. Use `--dry-run` to validate decisions without applying them.
 
-## 17. Known Constraints
+## 18. Known Constraints
 
 - HTTP infer is synchronous; token streaming is available on IPC protocol/Python stream client path.
 - RAG embeddings are currently lightweight hash-based embeddings (not external embedding model-backed).

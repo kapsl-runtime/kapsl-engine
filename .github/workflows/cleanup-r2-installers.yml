@@ -2,14 +2,18 @@ name: Cleanup R2 Installers
 
 on:
   schedule:
-    # Run on the 1st of every month at 02:00 UTC
-    - cron: "0 2 1 * *"
+    # Run daily so abandoned beta uploads are removed promptly.
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       keep_latest:
         description: "Number of most recent versions to keep"
         required: false
         default: "3"
+      beta_retention_days:
+        description: "Delete superseded beta versions older than this many days"
+        required: false
+        default: "1"
 
 jobs:
   cleanup:
@@ -60,3 +64,76 @@ jobs:
           done
 
           echo "Done. Retained: $(echo "$versions" | tail -n "$KEEP_LATEST" | tr '\n' ' ')"
+
+      - name: Delete expired beta installer versions
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+          R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          BETA_RETENTION_DAYS: ${{ github.event.inputs.beta_retention_days || '1' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$BETA_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+            echo "beta_retention_days must be a non-negative integer." >&2
+            exit 1
+          fi
+
+          latest_version="$(aws s3 cp \
+            s3://kapsl-installer/runtime/beta/latest.txt - \
+            --no-progress \
+            --endpoint-url "$R2_ENDPOINT" \
+            | tr -d '[:space:]')"
+          if ! [[ "$latest_version" =~ ^[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "Refusing to prune beta versions: latest.txt contains an invalid version." >&2
+            exit 1
+          fi
+          current_version="v${latest_version}"
+          cutoff_epoch="$(date -u -d "$BETA_RETENTION_DAYS days ago" +%s)"
+
+          objects="$(aws s3api list-objects-v2 \
+            --bucket kapsl-installer \
+            --prefix runtime/beta/v \
+            --query 'Contents[].[Key,LastModified]' \
+            --output text \
+            --endpoint-url "$R2_ENDPOINT")"
+
+          declare -A newest_object_by_version=()
+          while IFS=$'\t' read -r key last_modified; do
+            if [ -z "${key:-}" ] || [ "$key" = "None" ]; then
+              continue
+            fi
+
+            relative_key="${key#runtime/beta/}"
+            version="${relative_key%%/*}"
+            if [[ "$version" != v* ]] || [ "$relative_key" = "$version" ]; then
+              continue
+            fi
+
+            modified_epoch="$(date -u -d "$last_modified" +%s)"
+            previous_epoch="${newest_object_by_version[$version]:-0}"
+            if (( modified_epoch > previous_epoch )); then
+              newest_object_by_version[$version]="$modified_epoch"
+            fi
+          done <<< "$objects"
+
+          deleted=0
+          for version in "${!newest_object_by_version[@]}"; do
+            if [ "$version" = "$current_version" ]; then
+              continue
+            fi
+            if (( newest_object_by_version[$version] >= cutoff_epoch )); then
+              continue
+            fi
+
+            echo "Deleting expired beta s3://kapsl-installer/runtime/beta/$version/"
+            aws s3 rm "s3://kapsl-installer/runtime/beta/$version/" \
+              --recursive \
+              --no-progress \
+              --endpoint-url "$R2_ENDPOINT"
+            deleted=$((deleted + 1))
+          done
+
+          echo "Deleted $deleted beta version(s) older than $BETA_RETENTION_DAYS day(s); retained $current_version."

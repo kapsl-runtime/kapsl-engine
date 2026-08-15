@@ -37,6 +37,8 @@ cat > "${cuda_payload_dir}/kapsl" <<'EOF'
 echo "kapsl cuda release-script test"
 EOF
 chmod +x "${cuda_payload_dir}/kapsl"
+echo '{}' > "${cuda_payload_dir}/kapsl-provider-cuda12.json"
+echo 'cuda provider' > "${cuda_payload_dir}/libonnxruntime_providers_cuda.so"
 echo '{}' > "${cuda_provider_payload_dir}/kapsl-provider-cuda12.json"
 echo '{}' > "${tensorrt_provider_payload_dir}/kapsl-provider-tensorrt10.json"
 
@@ -146,6 +148,13 @@ sha256sum \
     "${release_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz" \
     >"${release_dir}/kapsl-${version}-linux-x86_64-cuda12.tar.gz.sha256"
 
+# The normal CUDA/Docker path is one archive. Remove the legacy standalone
+# provider pack after the readiness test to prove neither CUDA nor TensorRT
+# installation downloads it.
+rm \
+    "${release_dir}/kapsl-provider-cuda12-${version}-linux-x86_64.tar.gz" \
+    "${release_dir}/kapsl-provider-cuda12-${version}-linux-x86_64.tar.gz.sha256"
+
 install_dir="${test_root}/install"
 KAPSL_VERSION="${version}" \
 KAPSL_RELEASE_BASE_URL="${base_url}" \
@@ -168,6 +177,7 @@ case "$(uname -m)" in
             exit 1
         fi
         test -f "${cuda_install_dir}/kapsl-provider-cuda12.json"
+        test -f "${cuda_install_dir}/libonnxruntime_providers_cuda.so"
 
         tensorrt_install_dir="${test_root}/install-tensorrt"
         KAPSL_VERSION="${version}" \
@@ -179,6 +189,7 @@ case "$(uname -m)" in
             exit 1
         fi
         test -f "${tensorrt_install_dir}/kapsl-provider-cuda12.json"
+        test -f "${tensorrt_install_dir}/libonnxruntime_providers_cuda.so"
         test -f "${tensorrt_install_dir}/kapsl-provider-tensorrt10.json"
         ;;
 esac

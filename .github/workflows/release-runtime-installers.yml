@@ -360,7 +360,10 @@ jobs:
     name: Build CUDA runtime (linux-x86_64)
     runs-on: ubuntu-22.04
     container:
-      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+      # The CUDA archive carries the complete GGUF + ONNX GPU runtime, like a
+      # Triton GPU image. Use the cuDNN build image so the packager can collect
+      # every user-space library; only the NVIDIA driver stays host-provided.
+      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
     env:
       CARGO_BUILD_JOBS: "2"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
@@ -371,7 +374,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev pkg-config
+            binutils build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev patchelf pkg-config
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
@@ -397,9 +400,9 @@ jobs:
           echo "KAPSL_VERSION=$runtime_version" >> "$GITHUB_ENV"
 
       - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --features cuda
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
 
-      - name: Collect ONNX Runtime core sidecars
+      - name: Collect ONNX Runtime sidecars
         shell: bash
         run: .github/scripts/collect-ort-sidecars.sh
 
@@ -526,17 +529,19 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-      - name: Upload install.sh to R2 (stable URL)
+      - name: Upload Linux installer scripts to R2 (stable URLs)
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          aws s3 cp install.sh \
-            s3://kapsl-installer/install.sh \
-            --content-type "text/plain" \
-            --no-progress \
-            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          for script in install.sh install-cuda.sh; do
+            aws s3 cp "$script" \
+              "s3://kapsl-installer/$script" \
+              --content-type "text/plain" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done
 
       - name: Upload Windows installer scripts to R2 (stable URLs)
         env:

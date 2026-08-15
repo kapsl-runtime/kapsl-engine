@@ -1,5 +1,15 @@
 use super::*;
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn test_sysinfo_total_memory_is_already_reported_in_bytes() {
+    let sixteen_gib = 16_u64 * 1024 * 1024 * 1024;
+    assert_eq!(
+        system_memory_bytes_from_sysinfo(sixteen_gib),
+        Some(sixteen_gib as usize)
+    );
+}
+
 #[test]
 fn test_authorization_matches_token_plain_and_bearer() {
     assert!(authorization_matches_token(Some("token123"), "token123"));
@@ -47,20 +57,18 @@ fn test_auth_base_url_from_remote_url() {
         auth_base_url_from_remote_url("https://idx.example.com/api/v1").expect("valid"),
         "https://idx.example.com"
     );
-    assert!(auth_base_url_from_remote_url("oci://ghcr.io").is_err());
+    assert!(auth_base_url_from_remote_url("ftp://registry.example.com").is_err());
 }
 
 #[test]
 fn test_resolved_login_remote_url_uses_store_fallback() {
     let old_home = std::env::var_os("HOME");
     let old_remote_url = std::env::var_os(REMOTE_URL_ENV);
-    let old_placeholder_url = std::env::var_os(REMOTE_PLACEHOLDER_URL_ENV);
     let unique = format!("test-home-{}", std::process::id());
     let temp_home = std::env::temp_dir().join(unique);
     fs::create_dir_all(&temp_home).expect("create temp home");
     std::env::set_var("HOME", &temp_home);
     std::env::remove_var(REMOTE_URL_ENV);
-    std::env::remove_var(REMOTE_PLACEHOLDER_URL_ENV);
 
     let expected = "https://idx.example.com/v1";
     store_remote_token_for_remote(expected, "Bearer abc").expect("store token");
@@ -76,11 +84,6 @@ fn test_resolved_login_remote_url_uses_store_fallback() {
         std::env::set_var(REMOTE_URL_ENV, value);
     } else {
         std::env::remove_var(REMOTE_URL_ENV);
-    }
-    if let Some(value) = old_placeholder_url {
-        std::env::set_var(REMOTE_PLACEHOLDER_URL_ENV, value);
-    } else {
-        std::env::remove_var(REMOTE_PLACEHOLDER_URL_ENV);
     }
 }
 
@@ -191,6 +194,17 @@ fn test_loopback_remote_detection() {
 }
 
 #[test]
+fn test_native_tcp_non_loopback_requires_authentication() {
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    let wildcard: IpAddr = "0.0.0.0".parse().unwrap();
+
+    assert!(validate_native_tcp_exposure(loopback, None).is_ok());
+    assert!(validate_native_tcp_exposure(wildcard, Some("native-secret")).is_ok());
+    let error = validate_native_tcp_exposure(wildcard, None).unwrap_err();
+    assert!(error.contains(TCP_AUTH_TOKEN_ENV));
+}
+
+#[test]
 fn test_api_role_update_requires_admin_token_when_enabled() {
     let mut config = ApiRoleTokenConfig::default();
 
@@ -233,7 +247,7 @@ fn make_test_auth_state() -> ApiAuthState {
         .collect::<String>();
     let store_path = std::env::temp_dir().join(format!("kapsl-auth-state-{}.json", unique_suffix));
     ApiAuthState {
-        legacy_tokens: ApiRoleTokenConfig::default(),
+        role_tokens: ApiRoleTokenConfig::default(),
         store_path,
         store: ApiAuthStoreFile {
             users: vec![
@@ -831,8 +845,10 @@ fn test_device(id: usize, backend: kapsl_hal::device::DeviceBackend) -> kapsl_ha
 
 #[test]
 fn test_mesh_selection_preserves_tensorrt_on_cuda_device() {
-    let mut requirements = kapsl_core::HardwareRequirements::default();
-    requirements.preferred_provider = Some("tensorrt".to_string());
+    let requirements = kapsl_core::HardwareRequirements {
+        preferred_provider: Some("tensorrt".to_string()),
+        ..kapsl_core::HardwareRequirements::default()
+    };
     let device_info = DeviceInfo {
         cpu_cores: 8,
         total_memory: 32 * 1024 * 1024 * 1024,
@@ -854,8 +870,10 @@ fn test_mesh_selection_preserves_tensorrt_on_cuda_device() {
 
 #[test]
 fn test_mesh_selection_preserves_coreml_on_metal_device() {
-    let mut requirements = kapsl_core::HardwareRequirements::default();
-    requirements.preferred_provider = Some("coreml".to_string());
+    let requirements = kapsl_core::HardwareRequirements {
+        preferred_provider: Some("coreml".to_string()),
+        ..kapsl_core::HardwareRequirements::default()
+    };
     let device_info = DeviceInfo {
         cpu_cores: 8,
         total_memory: 32 * 1024 * 1024 * 1024,
@@ -876,7 +894,7 @@ fn test_mesh_selection_preserves_coreml_on_metal_device() {
 }
 
 #[test]
-fn test_evaluate_runtime_pressure_state_transitions() {
+fn test_evaluate_authority_pressure_state_transitions() {
     let config = RuntimePressureConfig {
         memory_conserve_ratio: 0.7,
         memory_emergency_ratio: 0.9,
@@ -888,36 +906,44 @@ fn test_evaluate_runtime_pressure_state_transitions() {
         emergency_max_new_tokens: Some(128),
     };
 
-    let normal = RuntimeSamples {
-        process_memory_bytes: 2 * 1024,
-        total_system_memory_bytes: Some(10 * 1024),
-        gpu_utilization: 0.2,
-        gpu_memory_bytes: Some(100),
-        gpu_memory_total_bytes: Some(1000),
-        foreign_gpu_memory_bytes: None,
-        collected_at_ms: 0,
+    let snapshot = |host_observed, cuda_observed| MemorySnapshot {
+        rows: Vec::new(),
+        domains: vec![
+            MemoryDomainSnapshot {
+                domain: MemoryDomain::Host,
+                budget_bytes: 10 * 1024,
+                planned_bytes: 0,
+                reserved_bytes: 0,
+                committed_bytes: 0,
+                observed_bytes: host_observed,
+                available_bytes: (10 * 1024usize).saturating_sub(host_observed),
+            },
+            MemoryDomainSnapshot {
+                domain: MemoryDomain::Cuda { device_id: 0 },
+                budget_bytes: 1000,
+                planned_bytes: 0,
+                reserved_bytes: 0,
+                committed_bytes: 0,
+                observed_bytes: cuda_observed,
+                available_bytes: 1000usize.saturating_sub(cuda_observed),
+            },
+        ],
+        foreign_pressure_active: false,
     };
+    let normal = snapshot(2 * 1024, 100);
     assert_eq!(
-        evaluate_runtime_pressure_state(&normal, &config),
+        evaluate_authority_pressure_state(&normal, 0.2, &config),
         RuntimePressureState::Normal
     );
 
-    let conserve = RuntimeSamples {
-        process_memory_bytes: 8 * 1024,
-        total_system_memory_bytes: Some(10 * 1024),
-        ..normal.clone()
-    };
+    let conserve = snapshot(8 * 1024, 100);
     assert_eq!(
-        evaluate_runtime_pressure_state(&conserve, &config),
+        evaluate_authority_pressure_state(&conserve, 0.2, &config),
         RuntimePressureState::Conserve
     );
 
-    let emergency = RuntimeSamples {
-        gpu_utilization: 0.97,
-        ..normal
-    };
     assert_eq!(
-        evaluate_runtime_pressure_state(&emergency, &config),
+        evaluate_authority_pressure_state(&normal, 0.97, &config),
         RuntimePressureState::Emergency
     );
 }

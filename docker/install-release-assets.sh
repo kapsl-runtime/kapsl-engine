@@ -77,18 +77,12 @@ case "$accelerator" in
         runtime_asset="kapsl-${KAPSL_VERSION}-${platform}.tar.gz"
         ;;
     cuda | tensorrt)
-        # GGUF CUDA is statically compiled into this runtime. ONNX accelerator
-        # providers remain separate packs installed below.
+        # One self-contained archive supplies both the CUDA-compiled GGUF
+        # runtime and the ONNX CUDA provider, matching the GPU image model.
         runtime_asset="kapsl-${KAPSL_VERSION}-${platform}-cuda12.tar.gz"
         ;;
 esac
 extract_asset "$runtime_asset"
-
-case "$accelerator" in
-    cuda | tensorrt)
-        extract_asset "kapsl-provider-cuda12-${KAPSL_VERSION}-${platform}.tar.gz"
-        ;;
-esac
 
 if [ "$accelerator" = "tensorrt" ]; then
     extract_asset "kapsl-provider-tensorrt10-${KAPSL_VERSION}-${platform}.tar.gz"

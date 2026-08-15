@@ -14,11 +14,8 @@ mod types;
 use types::openai_error;
 
 pub(crate) struct OpenAiRoutesConfig {
-    pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) replica_pools: ReplicaPools,
-    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
-    pub(crate) runtime_pressure_state: Arc<AtomicU8>,
-    pub(crate) runtime_pressure_config: Arc<RuntimePressureConfig>,
+    pub(crate) models: Arc<ModelManager>,
+    pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
 }
 
@@ -38,22 +35,21 @@ pub(crate) struct ResolvedModel {
 /// and a bare numeric id (which is what `/api/models/:id/infer` takes, and is
 /// convenient when scripting against both surfaces).
 pub(crate) fn resolve_model(
-    registry: &ModelRegistry,
-    pools: &ReplicaPools,
+    models: &ModelManager,
     requested: &str,
 ) -> Result<ResolvedModel, String> {
-    let served = served_models(registry, pools);
+    let served = served_models(models);
     resolve_model_from(&served, requested)
 }
 
 /// The models that are both registered and backed by a live pool. Anything
 /// else cannot serve a request, so it is not addressable and not advertised.
-fn served_models(registry: &ModelRegistry, pools: &ReplicaPools) -> Vec<ModelInfo> {
-    let pools = pools.read();
-    registry
+fn served_models(models: &ModelManager) -> Vec<ModelInfo> {
+    models
+        .registry()
         .list()
         .into_iter()
-        .filter(|model| pools.contains_key(&model.id))
+        .filter(|model| models.contains_pool(model.id))
         .collect()
 }
 
@@ -138,19 +134,15 @@ pub(crate) fn build_openai_routes(
     config: OpenAiRoutesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let OpenAiRoutesConfig {
-        model_registry,
-        replica_pools,
-        latency_samples,
-        runtime_pressure_state,
-        runtime_pressure_config,
+        models,
+        inference,
         log_sensitive_ids,
     } = config;
 
     // GET /v1/models
-    let registry_for_list = model_registry.clone();
-    let pools_for_list = replica_pools.clone();
+    let models_for_list = models.clone();
     let list_models = warp::path!("v1" / "models").and(warp::get()).map(move || {
-        let mut served = served_models(&registry_for_list, &pools_for_list);
+        let mut served = served_models(&models_for_list);
         // Only advertise primaries: replicas duplicate the name and are an
         // internal scaling detail.
         served.retain(|model| model.id == model.base_model_id);
@@ -163,14 +155,13 @@ pub(crate) fn build_openai_routes(
     });
 
     // GET /v1/models/:model
-    let registry_for_get = model_registry.clone();
-    let pools_for_get = replica_pools.clone();
+    let models_for_get = models.clone();
     let get_model =
         warp::path!("v1" / "models" / String)
             .and(warp::get())
-            .map(move |requested: String| {
-                match resolve_model(&registry_for_get, &pools_for_get, &requested) {
-                    Ok(resolved) => match registry_for_get.get(resolved.id) {
+            .map(
+                move |requested: String| match resolve_model(&models_for_get, &requested) {
+                    Ok(resolved) => match models_for_get.registry().get(resolved.id) {
                         Some(model) => {
                             reply_into_response(warp::reply::json(&model_object(&model)))
                         }
@@ -185,15 +176,12 @@ pub(crate) fn build_openai_routes(
                         message,
                         "invalid_request_error",
                     ),
-                }
-            });
+                },
+            );
 
     let chat_completions = chat::build_chat_completions_route(chat::ChatCompletionsConfig {
-        model_registry,
-        replica_pools,
-        latency_samples,
-        runtime_pressure_state,
-        runtime_pressure_config,
+        models,
+        inference,
         log_sensitive_ids,
     });
 

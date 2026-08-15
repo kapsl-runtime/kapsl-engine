@@ -1,45 +1,28 @@
 use super::*;
 
-pub(crate) fn resolved_remote_url(custom_url: Option<&str>) -> String {
+/// The remote URL sources both resolvers share, in precedence order: an
+/// explicit non-blank argument, then `REMOTE_URL_ENV`.
+fn remote_url_from_arg_or_env(custom_url: Option<&str>) -> Option<String> {
     if let Some(url) = custom_url {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
-            return trimmed.to_string();
+            return Some(trimmed.to_string());
         }
     }
 
-    if let Some(url) = optional_env_var(REMOTE_URL_ENV) {
-        return url;
-    }
-
-    if let Some(url) = optional_env_var(REMOTE_PLACEHOLDER_URL_ENV) {
-        return url;
-    }
-
-    DEFAULT_REMOTE_URL.to_string()
+    optional_env_var(REMOTE_URL_ENV)
 }
 
+pub(crate) fn resolved_remote_url(custom_url: Option<&str>) -> String {
+    remote_url_from_arg_or_env(custom_url).unwrap_or_else(|| DEFAULT_REMOTE_URL.to_string())
+}
+
+/// As [`resolved_remote_url`], but falls back to the last remote recorded by a
+/// previous login before giving up on the default.
 pub(crate) fn resolved_login_remote_url(custom_url: Option<&str>) -> String {
-    if let Some(url) = custom_url {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    if let Some(url) = optional_env_var(REMOTE_URL_ENV) {
-        return url;
-    }
-
-    if let Some(url) = optional_env_var(REMOTE_PLACEHOLDER_URL_ENV) {
-        return url;
-    }
-
-    if let Some(url) = read_last_remote_url_from_store() {
-        return url;
-    }
-
-    DEFAULT_REMOTE_URL.to_string()
+    remote_url_from_arg_or_env(custom_url)
+        .or_else(read_last_remote_url_from_store)
+        .unwrap_or_else(|| DEFAULT_REMOTE_URL.to_string())
 }
 
 pub(crate) fn auth_base_url_from_remote_url(remote_url: &str) -> Result<String, String> {
@@ -74,12 +57,6 @@ pub(crate) fn perform_browser_login_flow(
     timeout_seconds: u64,
     no_browser: bool,
 ) -> Result<LoginResponse, String> {
-    if is_oci_remote_url(remote_url) {
-        return Err(
-            "Login is only supported for HTTP(S) remote backends, not oci:// remotes.".to_string(),
-        );
-    }
-
     let auth_base_url = auth_base_url_from_remote_url(remote_url)?;
     let callback_addr = format!("{}:{}", callback_host.trim(), callback_port);
     let listener = TcpListener::bind(&callback_addr).map_err(|e| {
@@ -139,11 +116,6 @@ pub(crate) fn perform_device_code_login_flow(
     timeout_seconds: u64,
     no_browser: bool,
 ) -> Result<LoginResponse, String> {
-    if is_oci_remote_url(remote_url) {
-        return Err(
-            "Login is only supported for HTTP(S) remote backends, not oci:// remotes.".to_string(),
-        );
-    }
     if provider != OAuthProvider::GitHub {
         return Err("Device code flow currently supports only --provider github.".to_string());
     }
@@ -226,9 +198,9 @@ pub(crate) fn perform_device_code_login_flow(
     eprintln!(
         "  {}  {}  {}  {}",
         a.dim("Enter code"),
-        a.bold(&user_code),
+        a.bold(user_code),
         a.dim("at"),
-        a.teal(&verification_uri)
+        a.teal(verification_uri)
     );
     eprintln!("  {}", a.dim("Waiting for authorization approval..."));
 
@@ -511,14 +483,14 @@ pub(crate) fn percent_encode_query_component(input: &str) -> String {
 pub(crate) fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        return Command::new("open").arg(url).status().is_ok();
+        Command::new("open").arg(url).status().is_ok()
     }
     #[cfg(target_os = "windows")]
     {
-        return Command::new("cmd")
+        Command::new("cmd")
             .args(["/C", "start", "", url])
             .status()
-            .is_ok();
+            .is_ok()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

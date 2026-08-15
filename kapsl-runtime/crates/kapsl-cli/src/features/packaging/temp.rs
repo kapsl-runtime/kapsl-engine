@@ -1,9 +1,11 @@
 use super::*;
 
+#[cfg(test)]
 pub(crate) struct TempDirGuard {
     pub(crate) path: PathBuf,
 }
 
+#[cfg(test)]
 impl TempDirGuard {
     pub(crate) fn new(prefix: &str) -> Result<Self, String> {
         Self::new_in(&std::env::temp_dir(), prefix)
@@ -31,6 +33,7 @@ impl TempDirGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for TempDirGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
@@ -63,59 +66,6 @@ pub(crate) fn replace_output_file(staged_path: &Path, output_path: &Path) -> std
         fs::remove_file(output_path)?;
     }
     fs::rename(staged_path, output_path)
-}
-
-pub(crate) fn stage_link_or_copy_file(
-    source_path: &Path,
-    output_path: &Path,
-    prefix: &str,
-) -> Result<u64, String> {
-    if source_path == output_path {
-        return fs::metadata(source_path)
-            .map(|meta| meta.len())
-            .map_err(|e| format!("Failed to stat {}: {}", source_path.display(), e));
-    }
-
-    let staged_path = staged_output_path(output_path, prefix);
-    let stage_result = match fs::hard_link(source_path, &staged_path) {
-        Ok(()) => fs::metadata(source_path)
-            .map(|meta| meta.len())
-            .map_err(|e| {
-                format!(
-                    "Failed to stat staged linked artifact {}: {}",
-                    source_path.display(),
-                    e
-                )
-            }),
-        Err(_) => fs::copy(source_path, &staged_path).map_err(|e| {
-            format!(
-                "Failed to copy artifact {} to staging path {}: {}",
-                source_path.display(),
-                staged_path.display(),
-                e
-            )
-        }),
-    };
-
-    let bytes = match stage_result {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = fs::remove_file(&staged_path);
-            return Err(error);
-        }
-    };
-
-    replace_output_file(&staged_path, output_path).map_err(|e| {
-        let _ = fs::remove_file(&staged_path);
-        format!(
-            "Failed to finalize staged artifact {} -> {}: {}",
-            staged_path.display(),
-            output_path.display(),
-            e
-        )
-    })?;
-
-    Ok(bytes)
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {

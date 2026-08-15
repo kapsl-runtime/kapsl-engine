@@ -4,6 +4,8 @@ The `kapsl` CLI helps you:
 
 - run model packages
 - add models to a running runtime without restarting
+- list models loaded in a running runtime
+- remove models from a running runtime
 - build `.aimod` packages
 - push packages to a remote backend
 - pull packages from a remote backend
@@ -42,6 +44,8 @@ Commands:
 
 - `run`: run the runtime server
 - `add-model`: add model(s) to an already-running runtime
+- `list`: list models loaded in an already-running runtime
+- `remove-model`: unload and unregister a model from a running runtime
 - `build`: build a `.aimod` package
 - `push`: upload a `.aimod` package
 - `pull`: download a `.aimod` package
@@ -124,15 +128,81 @@ Useful run options:
 - `--state-dir <dir>` (namespaces rag-data, extensions, extensions-config, auth-store.json)
 - `--performance-profile <standard|balanced|throughput|latency>`
 
+`hybrid` means Unix socket plus shared-memory tensor transfer; it does not open
+a TCP listener. SHM and `auto` use the live model registry, so models added at
+runtime are immediately addressable through SHM.
+
 Example with TCP transport:
 
 ```bash
+export KAPSL_TCP_AUTH_TOKEN="replace-with-a-dedicated-token"
 kapsl run \
   --model models/mnist/mnist.aimod \
   --transport tcp \
   --bind 0.0.0.0 \
   --port 9096
 ```
+
+Loopback TCP does not require a token. Non-loopback TCP does, and the protocol
+is still plaintext; use it only on a trusted network or through a TLS tunnel.
+
+The stable CUDA application profile uses `gguf-cuda-shared-kv`. The explicit
+`gguf-cuda` feature remains available as the llama.cpp native-KV rollback profile.
+In that stable profile, the process-owned physical CUDA pool now defaults to
+model-aware automatic sizing. Kapsl plans all startup packages before opening
+backend sessions, subtracts known GGUF/native weights, retains unpooled room
+for scratch, native-KV fallback, and later model additions, then creates one
+immutable aligned backing allocation per CUDA device that needs it. The sizing
+ceiling is also clamped to the configured device limit and live free VRAM.
+Pooled ONNX weight copies, including configured session concurrency, form a
+hard minimum checked before ORT session construction.
+
+Pool controls accept an optional `_<device_id>` suffix, which takes precedence:
+
+- `KAPSL_GPU_DEVICE_POOL_MODE=auto|fixed|off` selects the policy.
+- `KAPSL_GPU_DEVICE_POOL_BYTES=8g` is an exact fixed-size override and implies
+  `fixed` when mode is omitted. It is never silently reduced.
+- `KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES=2g` replaces the automatic
+  scratch/fallback/add-model reserve; zero is valid and an explicit reserve is
+  never silently reduced.
+- `CUDA_DEVICE_MEMORY_LIMIT[_N]` or `KAPSL_GPU_MEMORY_LIMIT_MB` bounds the
+  process-visible VRAM used by automatic sizing and admission.
+- `KAPSL_PROVIDER_MEMORY_LIMITS=metal=8g,directml:0=6g` sets hard limits for
+  non-CUDA provider/device domains. Exact-device entries override the
+  provider-wide fallback.
+
+An unset runtime with no startup models does not reserve every detected GPU;
+implicit automatic sizing is deferred until the first pooled model targets a
+device. Mode and byte settings are validated together: for example, a global
+fixed byte override conflicts with a per-device `auto` or `off` mode rather
+than being silently ignored.
+
+The default automatic reserve is 20% of the safe device budget with a 1 GiB
+floor and one-third cap. A separate driver safety band of at least 512 MiB (or
+10% of declared VRAM) remains outside that budget. Automatic pools have a
+256 MiB minimum and 2 MiB alignment. If implicit automatic sizing cannot make
+a viable allocation, Kapsl logs the decision and continues without a
+runtime-owned pool; explicit `auto` and `fixed` configurations fail fast.
+
+Physical CUDA pooling is process-owned. Isolated model workers disable their
+local pool by default, even when pool settings are inherited from the parent.
+Enable it only when every worker has an exclusive GPU/MIG slice or an explicit
+`CUDA_DEVICE_MEMORY_LIMIT[_N]`/`KAPSL_GPU_MEMORY_LIMIT_MB` quota;
+`KAPSL_ISOLATED_WORKER_GPU_POOL=true` is an operator attestation of an
+exclusive boundary. Pool mode, size, or reserve alone is not an isolation
+boundary. A planned isolated model suppresses implicit parent-pool creation on
+its target device; only an explicit operator pool policy overrides that choice.
+
+Prometheus scrapes expose current pool allocation, free-range, and
+fragmentation state under `kapsl_gpu_device_pool_*`, plus per-owner usage,
+quota, admission, and allocatable-byte gauges. The existing
+`kapsl_device_memory_pooled_bytes` gauge is the immutable backing capacity;
+it is not live usage.
+
+The runtime also resamples each live backend's cross-domain memory report every
+two seconds and reconciles growth, shrink, compaction, and migration into its
+authority lease. Rejected over-limit growth remains visible as observed usage,
+so admission and pressure decisions cannot fall back to stale planned bytes.
 
 Example tuned for low latency:
 
@@ -167,7 +237,7 @@ kapsl add-model --model ./model.aimod --http-port 9100
 Authenticated runtime:
 
 ```bash
-kapsl add-model --model ./model.aimod --auth-token "$KAPSL_API_TOKEN"
+kapsl add-model --model ./model.aimod --auth-token "$KAPSL_API_TOKEN_ADMIN"
 ```
 
 Full URL override (e.g. remote host):
@@ -189,7 +259,69 @@ Options:
 
 The command sends `POST /api/models/start` for each model. The runtime loads it asynchronously and returns the assigned `model_id`. All transport, port, and scheduler configuration of the running instance is preserved.
 
-## 4) Build Packages (`kapsl build`)
+## 4) List Models in a Running Runtime (`kapsl list`)
+
+List the models loaded in the local runtime:
+
+```bash
+kapsl list
+```
+
+The default table includes each model's ID, name, version, format, device,
+status, and health. To target another runtime or one with API authentication:
+
+```bash
+kapsl list \
+  --http-url http://192.168.1.10:9095 \
+  --auth-token "$KAPSL_API_TOKEN_READER"
+```
+
+Print the complete `GET /api/models` response for scripts:
+
+```bash
+kapsl list --json
+```
+
+Options:
+
+- `--http-port <PORT>` — HTTP API port of the running runtime (default: `9095`)
+- `--http-host <HOST>` — runtime host (default: `127.0.0.1`)
+- `--http-url <URL>` — full base URL, overrides `--http-host` and `--http-port`
+- `--auth-token <TOKEN>` — bearer token for authenticated runtimes
+- `--json` — print the complete API response as formatted JSON
+- `--timeout-ms <MS>` — request timeout (default: `30000`)
+
+## 5) Remove a Model from a Running Runtime (`kapsl remove-model`)
+
+Use `kapsl list` to find the model ID, then remove it:
+
+```bash
+kapsl list
+kapsl remove-model 2
+```
+
+Target a remote or authenticated runtime with the same connection options:
+
+```bash
+kapsl remove-model 2 \
+  --http-url http://192.168.1.10:9095 \
+  --auth-token "$KAPSL_API_TOKEN_ADMIN"
+```
+
+The command calls `POST /api/models/:id/remove`. The running engine stops the
+model and its replicas, releases their runtime resources, and unregisters them.
+The source `.aimod` package remains on disk and can be loaded again later.
+
+Options:
+
+- `<MODEL_ID>` — numeric ID shown by `kapsl list` (required)
+- `--http-port <PORT>` — HTTP API port of the running runtime (default: `9095`)
+- `--http-host <HOST>` — runtime host (default: `127.0.0.1`)
+- `--http-url <URL>` — full base URL, overrides `--http-host` and `--http-port`
+- `--auth-token <TOKEN>` — admin bearer token for authenticated runtimes
+- `--timeout-ms <MS>` — request timeout (default: `30000`)
+
+## 6) Build Packages (`kapsl build`)
 
 You can build in two modes.
 
@@ -234,7 +366,7 @@ cd ./models/gpt-llm
 kapsl build
 ```
 
-## 5) Push Packages (`kapsl push`)
+## 7) Push Packages (`kapsl push`)
 
 Push target format:
 - Required: `<repo_name>/<model>:<label>`
@@ -291,24 +423,7 @@ In SSH sessions, plain `kapsl login` automatically prefers device-code flow (Git
 
 If no token is configured and the remote returns `401`, `kapsl push`/`kapsl pull` will automatically start browser login and retry once.
 
-### OCI Remote (ORAS)
-
-If `--remote-url` starts with `oci://`, `kapsl` uses ORAS to push/pull the `.aimod` as an OCI artifact.
-
-Prerequisites:
-- Install `oras` and make it available on `PATH` (or set `KAPSL_ORAS_BIN`).
-
-Push to an OCI registry:
-
-```bash
-kapsl push alice/mnist:prod ./mnist.aimod --remote-url oci://ghcr.io
-```
-
-Optional CI auth (otherwise use `oras login` / docker credential store):
-- `KAPSL_OCI_USERNAME`
-- `KAPSL_OCI_PASSWORD`
-
-## 6) Pull Packages (`kapsl pull`)
+## 8) Pull Packages (`kapsl pull`)
 
 Pull by target:
 
@@ -344,22 +459,6 @@ kapsl pull \
 
 If you already ran `kapsl login`, you can omit `--remote-token`.
 
-Pull from an OCI registry:
-
-```bash
-kapsl pull alice/mnist:prod --destination-dir ./models --remote-url oci://ghcr.io
-```
-
-Pull by OCI manifest digest (reproducible):
-
-```bash
-kapsl pull \
-  alice/mnist:prod \
-  --destination-dir ./models \
-  --remote-url oci://ghcr.io \
-  --ref sha256:<manifestDigest>
-```
-
 ## Common Workflows
 
 ### Workflow A: Build and run locally
@@ -391,7 +490,7 @@ If you do not pass `--remote-url`, `push`/`pull` use `https://api.kapsl.net/v1` 
 
 - This is useful when you want to use the shared hosted backend without passing `--remote-url` explicitly.
 - For production sharing across users/machines, use a dedicated remote URL via `--remote-url` (or set `KAPSL_REMOTE_URL`).
-- For authenticated remotes, use `--remote-token` or set `KAPSL_REMOTE_TOKEN` (`KAPSL_REMOTE_TOKEN` legacy).
+- For authenticated remotes, use `--remote-token` or set `KAPSL_REMOTE_TOKEN`.
 - If you install the CLI with Cargo, prefer `cargo install --path crates/kapsl-cli --locked` so the binary matches the checked-in lockfile and dependency feature set.
 
 ## Authentication (API)
@@ -400,7 +499,6 @@ When API auth is enabled, requests to `/api/*` and `/metrics` require a bearer t
 
 Common environment variables:
 
-- `KAPSL_API_TOKEN` (shared fallback token)
 - `KAPSL_API_TOKEN_READER`
 - `KAPSL_API_TOKEN_WRITER`
 - `KAPSL_API_TOKEN_ADMIN`
@@ -408,10 +506,10 @@ Common environment variables:
 Example:
 
 ```bash
-export KAPSL_API_TOKEN="your-token"
+export KAPSL_API_TOKEN_ADMIN="your-token"
 
 curl http://127.0.0.1:9095/api/models \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN"
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN"
 ```
 
 If auth is disabled, API access is loopback-only by default.
@@ -427,7 +525,7 @@ kapsl extension install connector.echo
 If runtime API authentication is enabled:
 
 ```bash
-kapsl extension install connector.echo --auth-token "$KAPSL_API_TOKEN"
+kapsl extension install connector.echo --auth-token "$KAPSL_API_TOKEN_ADMIN"
 ```
 
 Use runtime API endpoints for the rest of the extension lifecycle tasks.
@@ -436,7 +534,7 @@ List installed extensions:
 
 ```bash
 curl http://127.0.0.1:9095/api/extensions \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN"
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN"
 ```
 
 Install from a local extension directory:
@@ -444,7 +542,7 @@ Install from a local extension directory:
 ```bash
 curl -X POST http://127.0.0.1:9095/api/extensions/install \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"path":"./extensions/my-extension"}'
 ```
 
@@ -453,7 +551,7 @@ Set extension config for a workspace:
 ```bash
 curl -X POST http://127.0.0.1:9095/api/extensions/connector.echo/config \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"workspace_id":"default","config":{"api_key":"...","project":"..."}}'
 ```
 
@@ -462,12 +560,12 @@ Launch and sync:
 ```bash
 curl -X POST http://127.0.0.1:9095/api/extensions/connector.echo/launch \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"workspace_id":"default"}'
 
 curl -X POST http://127.0.0.1:9095/api/extensions/connector.echo/sync \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $KAPSL_API_TOKEN" \
+  -H "Authorization: Bearer $KAPSL_API_TOKEN_ADMIN" \
   -d '{"workspace_id":"default"}'
 ```
 
@@ -506,6 +604,12 @@ kapsl run --model <path-to-kapsl>
 
 # add model to running runtime
 kapsl add-model --model <path-to-kapsl> [--http-port <port>] [--auth-token <token>]
+
+# list models in running runtime
+kapsl list [--http-url <url>] [--auth-token <token>] [--json]
+
+# unload and unregister model from running runtime
+kapsl remove-model <model-id> [--http-url <url>] [--auth-token <admin-token>]
 
 # build
 kapsl build <path-to-model-file> --output <output.aimod>

@@ -269,7 +269,10 @@ fn download_checksum(url: &str) -> Result<String, DynError> {
 fn sha256_file(path: &Path) -> Result<String, DynError> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    // Windows executables reserve a 1 MiB main-thread stack by default. Keeping
+    // this 1 MiB transfer buffer on that stack makes provider installation
+    // overflow while checksumming the downloaded archive.
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -403,6 +406,18 @@ mod tests {
         assert_eq!(
             provider_archive_name(ProviderPack::TensorRt10, "0.1.18"),
             "kapsl-provider-tensorrt10-0.1.18-windows-x86_64.zip"
+        );
+    }
+
+    #[test]
+    fn provider_archive_checksum_is_sha256() {
+        let temporary = TemporaryDirectory::create().expect("create temporary directory");
+        let archive_path = temporary.path().join("provider.zip");
+        fs::write(&archive_path, b"kapsl provider pack").expect("write provider fixture");
+
+        assert_eq!(
+            sha256_file(&archive_path).expect("hash provider fixture"),
+            "0fb9ed3f95dbf0485da5119520df57775d39e11b36871dff4092c8118d2ea45f"
         );
     }
 

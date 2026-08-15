@@ -156,7 +156,7 @@ pub(crate) fn print_startup_ready(
             "  {}  {:label_w$}  {}",
             a.teal("→"),
             a.dim(label),
-            a.teal(&url),
+            a.teal(url),
             label_w = label_w,
         );
     }
@@ -167,45 +167,72 @@ pub(crate) fn print_startup_ready(
 
 pub(crate) const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Terminal spinner that runs on its own thread until dropped-into-`finish`.
+///
+/// Extracted so the sync and async `run_with_loading` wrappers share one
+/// implementation -- they previously differed by a single line.
+struct Spinner {
+    ansi: Ansi,
+    label: String,
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn start(label: &str) -> Self {
+        let ansi = Ansi::new();
+        let running = Arc::new(AtomicBool::new(true));
+        let spinner_running = Arc::clone(&running);
+        let spinner_label = label.to_string();
+        let colors_on = ansi.enabled;
+
+        let handle = std::thread::spawn(move || {
+            let mut idx = 0usize;
+            while spinner_running.load(Ordering::Relaxed) {
+                let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
+                if colors_on {
+                    eprint!(
+                        "\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ",
+                        frame, spinner_label
+                    );
+                } else {
+                    eprint!("\r  {}  {}   ", frame, spinner_label);
+                }
+                let _ = std::io::stderr().flush();
+                std::thread::sleep(Duration::from_millis(80));
+                idx = idx.wrapping_add(1);
+            }
+        });
+
+        Self {
+            ansi,
+            label: label.to_string(),
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self, ok: bool) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        let mark = if ok {
+            self.ansi.green("✓")
+        } else {
+            self.ansi.red("✗")
+        };
+        eprintln!("\r  {}  {}   ", mark, self.label);
+    }
+}
+
 pub(crate) fn run_with_loading<T, E, F>(label: &str, action: F) -> Result<T, E>
 where
     F: FnOnce() -> Result<T, E>,
 {
-    let a = Ansi::new();
-    let running = Arc::new(AtomicBool::new(true));
-    let spinner_running = Arc::clone(&running);
-    let spinner_label = label.to_string();
-    let colors_on = a.enabled;
-
-    let spinner_handle = std::thread::spawn(move || {
-        let mut idx = 0usize;
-        while spinner_running.load(Ordering::Relaxed) {
-            let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
-            if colors_on {
-                eprint!(
-                    "\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ",
-                    frame, spinner_label
-                );
-            } else {
-                eprint!("\r  {}  {}   ", frame, spinner_label);
-            }
-            let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(80));
-            idx = idx.wrapping_add(1);
-        }
-    });
-
+    let spinner = Spinner::start(label);
     let result = action();
-
-    running.store(false, Ordering::Relaxed);
-    let _ = spinner_handle.join();
-
-    if result.is_ok() {
-        eprintln!("\r  {}  {}   ", a.green("✓"), label);
-    } else {
-        eprintln!("\r  {}  {}   ", a.red("✗"), label);
-    }
-
+    spinner.finish(result.is_ok());
     result
 }
 
@@ -213,41 +240,9 @@ pub(crate) async fn run_with_loading_async<T, E, Fut>(label: &str, future: Fut) 
 where
     Fut: Future<Output = Result<T, E>>,
 {
-    let a = Ansi::new();
-    let running = Arc::new(AtomicBool::new(true));
-    let spinner_running = Arc::clone(&running);
-    let spinner_label = label.to_string();
-    let colors_on = a.enabled;
-
-    let spinner_handle = std::thread::spawn(move || {
-        let mut idx = 0usize;
-        while spinner_running.load(Ordering::Relaxed) {
-            let frame = SPINNER_FRAMES[idx % SPINNER_FRAMES.len()];
-            if colors_on {
-                eprint!(
-                    "\r  \x1b[38;5;43m{}\x1b[0m  \x1b[2m{}\x1b[0m   ",
-                    frame, spinner_label
-                );
-            } else {
-                eprint!("\r  {}  {}   ", frame, spinner_label);
-            }
-            let _ = std::io::stderr().flush();
-            std::thread::sleep(Duration::from_millis(80));
-            idx = idx.wrapping_add(1);
-        }
-    });
-
+    let spinner = Spinner::start(label);
     let result = future.await;
-
-    running.store(false, Ordering::Relaxed);
-    let _ = spinner_handle.join();
-
-    if result.is_ok() {
-        eprintln!("\r  {}  {}   ", a.green("✓"), label);
-    } else {
-        eprintln!("\r  {}  {}   ", a.red("✗"), label);
-    }
-
+    spinner.finish(result.is_ok());
     result
 }
 

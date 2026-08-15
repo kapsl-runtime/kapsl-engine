@@ -11,7 +11,7 @@ pub(crate) fn build_auth_routes(api_auth_state_for_api: Arc<RwLock<ApiAuthState>
         .and(warp::get())
         .map(move || {
             use warp::http::StatusCode;
-            let config = api_auth_state_for_get_roles.read().legacy_token_config();
+            let config = api_auth_state_for_get_roles.read().role_token_config();
             warp::reply::with_status(warp::reply::json(&config), StatusCode::OK)
         });
 
@@ -23,7 +23,7 @@ pub(crate) fn build_auth_routes(api_auth_state_for_api: Arc<RwLock<ApiAuthState>
             use warp::http::StatusCode;
 
             let mut auth_state = api_auth_state_for_set_roles.write();
-            match auth_state.update_legacy_token_config(payload) {
+            match auth_state.update_role_token_config(payload) {
                 Ok(config) => warp::reply::with_status(warp::reply::json(&config), StatusCode::OK),
                 Err(error) => warp::reply::with_status(
                     warp::reply::json(&serde_json::json!({ "error": error })),
@@ -52,7 +52,7 @@ pub(crate) fn build_auth_routes(api_auth_state_for_api: Arc<RwLock<ApiAuthState>
                     let response = ApiAuthLoginResponse {
                         authenticated: true,
                         auth_enabled: status.auth_enabled,
-                        legacy_auth_enabled: status.legacy_auth_enabled,
+                        role_token_auth_enabled: status.role_token_auth_enabled,
                         role: ApiRole::Admin,
                         scopes: Vec::new(),
                         mode: "local-loopback".to_string(),
@@ -134,13 +134,13 @@ pub(crate) fn build_auth_routes(api_auth_state_for_api: Arc<RwLock<ApiAuthState>
             let response = ApiAuthLoginResponse {
                 authenticated: true,
                 auth_enabled: status.auth_enabled,
-                legacy_auth_enabled: status.legacy_auth_enabled,
+                role_token_auth_enabled: status.role_token_auth_enabled,
                 role,
                 scopes,
                 mode: if matched_key_index.is_some() {
                     "api-key".to_string()
                 } else {
-                    "legacy-token".to_string()
+                    "role-token".to_string()
                 },
                 access: ApiAuthLoginAccess {
                     read: read_allowed,

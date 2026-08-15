@@ -5,33 +5,17 @@ use super::*;
 use futures::StreamExt;
 
 pub(crate) struct ChatCompletionsConfig {
-    pub(crate) model_registry: Arc<ModelRegistry>,
-    pub(crate) replica_pools: ReplicaPools,
-    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
-    pub(crate) runtime_pressure_state: Arc<AtomicU8>,
-    pub(crate) runtime_pressure_config: Arc<RuntimePressureConfig>,
+    pub(crate) models: Arc<ModelManager>,
+    pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
-}
-
-/// Cancel any queued or in-flight work when the response is dropped, which is
-/// what a client disconnect looks like from here.
-struct CancelOnDrop(kapsl_engine_api::CancellationToken);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
 }
 
 pub(crate) fn build_chat_completions_route(
     config: ChatCompletionsConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let ChatCompletionsConfig {
-        model_registry,
-        replica_pools,
-        latency_samples,
-        runtime_pressure_state,
-        runtime_pressure_config,
+        models,
+        inference,
         log_sensitive_ids,
     } = config;
 
@@ -41,21 +25,15 @@ pub(crate) fn build_chat_completions_route(
         .and(warp::header::optional::<String>("x-kapsl-session"))
         .and_then(
             move |body: warp::hyper::body::Bytes, session_header: Option<String>| {
-                let model_registry = model_registry.clone();
-                let replica_pools = replica_pools.clone();
-                let latency_samples = latency_samples.clone();
-                let runtime_pressure_state = runtime_pressure_state.clone();
-                let runtime_pressure_config = runtime_pressure_config.clone();
+                let models = models.clone();
+                let inference = inference.clone();
                 async move {
                     Ok::<_, warp::Rejection>(
                         handle_chat_completion(
                             body,
                             session_header,
-                            &model_registry,
-                            &replica_pools,
-                            &latency_samples,
-                            &runtime_pressure_state,
-                            &runtime_pressure_config,
+                            &models,
+                            &inference,
                             log_sensitive_ids,
                         )
                         .await,
@@ -71,11 +49,8 @@ pub(crate) fn build_chat_completions_route(
 async fn handle_chat_completion(
     body: warp::hyper::body::Bytes,
     session_header: Option<String>,
-    model_registry: &Arc<ModelRegistry>,
-    replica_pools: &ReplicaPools,
-    latency_samples: &Arc<RwLock<HashMap<u32, LatencyWindow>>>,
-    runtime_pressure_state: &Arc<AtomicU8>,
-    runtime_pressure_config: &Arc<RuntimePressureConfig>,
+    models: &Arc<ModelManager>,
+    inference: &Arc<InferenceService>,
     log_sensitive_ids: bool,
 ) -> warp::reply::Response {
     use warp::http::StatusCode;
@@ -95,35 +70,19 @@ async fn handle_chat_completion(
         return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
     }
 
-    let resolved = match resolve_model(model_registry, replica_pools, &chat.model) {
+    let resolved = match resolve_model(models, &chat.model) {
         Ok(resolved) => resolved,
         Err(message) => {
             return openai_error(StatusCode::NOT_FOUND, message, "invalid_request_error");
         }
     };
 
-    let pool = {
-        let pools = replica_pools.read();
-        pools.get(&resolved.id).cloned()
-    };
-    let Some(pool) = pool else {
+    if models.pool(resolved.id).is_none() {
         return openai_error(
             StatusCode::NOT_FOUND,
             format!("The model '{}' is not currently loaded", chat.model),
             "invalid_request_error",
         );
-    };
-
-    if !pool.is_healthy() {
-        let overload = EngineError::overloaded("Model pool is overloaded".to_string());
-        let status = status_code_for_engine_error(&overload);
-        log::warn!(
-            "Chat completion rejected: model_id={} status={} reason={}",
-            resolved.id,
-            status.as_u16(),
-            overload
-        );
-        return openai_error(status, overload.to_string(), "server_error");
     }
 
     let prompt = match build_prompt(&chat.messages, &resolved.name) {
@@ -134,7 +93,7 @@ async fn handle_chat_completion(
     };
 
     // A UTF-8 prompt tensor is shaped `[1, byte_len]`, matching the RAG and
-    // inter-model relay paths. `[1]` only validates for a one-byte prompt.
+    // native inference path. `[1]` only validates for a one-byte prompt.
     let data = prompt.as_bytes().to_vec();
     let input = match BinaryTensorPacket::new(
         vec![1, data.len() as i64],
@@ -170,44 +129,11 @@ async fn handle_chat_completion(
         request.session_id = Some(session);
     }
 
-    let scheduler_priority = scheduler_priority_for_request(&request);
+    let scheduler_priority = inference.priority_for_request(&request);
     let session_id_for_log = redact_identifier_for_logs(
         request.session_id.as_deref().unwrap_or("-"),
         log_sensitive_ids,
     );
-
-    // Same runtime-pressure policy as `/api/models/:id/infer`: shed throughput
-    // work under emergency pressure, and clamp generation length.
-    let pressure_state =
-        RuntimePressureState::from_u8(runtime_pressure_state.load(Ordering::Relaxed));
-    if pressure_state == RuntimePressureState::Emergency
-        && matches!(scheduler_priority, kapsl_scheduler::Priority::Throughput)
-    {
-        let error = EngineError::resource_exhausted(format!(
-            "runtime pressure {}: throughput requests are temporarily rejected",
-            pressure_state.as_str()
-        ));
-        let status = status_code_for_engine_error(&error);
-        log::warn!(
-            "Chat completion rejected: model_id={} session_id={} status={} error={}",
-            resolved.id,
-            session_id_for_log,
-            status.as_u16(),
-            error
-        );
-        return openai_error(status, error.to_string(), "server_error");
-    }
-    if let Some(cap) = runtime_pressure_config.max_new_tokens_cap(pressure_state) {
-        let metadata = request
-            .metadata
-            .get_or_insert_with(kapsl_engine_api::RequestMetadata::default);
-        metadata.max_new_tokens = Some(
-            metadata
-                .max_new_tokens
-                .map(|existing| existing.min(cap))
-                .unwrap_or(cap),
-        );
-    }
 
     let cancellation = request
         .cancellation
@@ -224,7 +150,7 @@ async fn handle_chat_completion(
             .as_ref()
             .is_some_and(|options| options.include_usage);
         return stream_chat_completion(StreamChatArgs {
-            pool,
+            inference: inference.clone(),
             request,
             scheduler_priority,
             cancellation,
@@ -240,21 +166,12 @@ async fn handle_chat_completion(
         .await;
     }
 
-    // Cancels on drop, which for this scope means the client disconnected
-    // before `infer` returned. Cancelling an already-finished request is a
-    // no-op, so letting it drop normally on the success path is fine.
-    let _cancel_on_drop = CancelOnDrop(cancellation);
-    let started = std::time::Instant::now();
-    let result = pool.infer(&request, scheduler_priority, false).await;
+    let result = inference
+        .infer(resolved.id, request, scheduler_priority, false)
+        .await;
 
     match result {
         Ok(output) => {
-            latency_samples
-                .write()
-                .entry(resolved.id)
-                .or_default()
-                .record(started.elapsed().as_secs_f64() * 1000.0);
-
             let raw = String::from_utf8_lossy(&output.data).to_string();
             let (content, finish_reason) = match find_stop_sequence(&raw, &stops) {
                 Some(hit) => (raw[..hit.cut].to_string(), "stop"),
@@ -298,7 +215,7 @@ async fn handle_chat_completion(
 }
 
 struct StreamChatArgs {
-    pool: Arc<ReplicaPool<Scheduler>>,
+    inference: Arc<InferenceService>,
     request: InferenceRequest,
     scheduler_priority: kapsl_scheduler::Priority,
     cancellation: kapsl_engine_api::CancellationToken,
@@ -320,7 +237,7 @@ struct StreamChatArgs {
 /// closed, and the underlying generation is cancelled rather than left running.
 async fn stream_chat_completion(args: StreamChatArgs) -> warp::reply::Response {
     let StreamChatArgs {
-        pool,
+        inference,
         request,
         scheduler_priority,
         cancellation,
@@ -334,7 +251,10 @@ async fn stream_chat_completion(args: StreamChatArgs) -> warp::reply::Response {
         session_id_for_log,
     } = args;
 
-    let stream = match pool.infer_stream(request, scheduler_priority, false).await {
+    let stream = match inference
+        .infer_stream(model_id, request, scheduler_priority, false)
+        .await
+    {
         Ok(stream) => stream,
         Err(error) => {
             let status = status_code_for_engine_error(&error);
@@ -349,16 +269,12 @@ async fn stream_chat_completion(args: StreamChatArgs) -> warp::reply::Response {
         }
     };
 
-    let guard = CancelOnDrop(cancellation.clone());
     // The longest stop sequence bounds how much tail text has to be withheld:
     // a stop marker can straddle token boundaries, so text that could still
     // turn out to be a prefix of one is not emitted until it is ruled out.
     let max_stop_len = stops.iter().map(|stop| stop.len()).max().unwrap_or(0);
 
     struct StreamState {
-        /// Held only for its `Drop`: never read, but keeps generation alive
-        /// for exactly as long as the response stream.
-        _guard: CancelOnDrop,
         cancellation: kapsl_engine_api::CancellationToken,
         /// Text generated so far that has not yet been emitted as a delta.
         pending: String,
@@ -368,7 +284,6 @@ async fn stream_chat_completion(args: StreamChatArgs) -> warp::reply::Response {
     }
 
     let state = StreamState {
-        _guard: guard,
         cancellation,
         pending: String::new(),
         emitted_tokens: 0,

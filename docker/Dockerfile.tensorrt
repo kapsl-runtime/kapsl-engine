@@ -1,5 +1,5 @@
 # Kapsl Runtime — TensorRT image
-# CUDA 12 + cuDNN + TensorRT 10 with matching Kapsl provider packs.
+# CUDA 12 + cuDNN + TensorRT 10 with a merged Kapsl CUDA runtime and TensorRT add-on.
 
 FROM python:3.12-slim AS tensorrt-libs
 
@@ -38,6 +38,10 @@ RUN set -eux; \
         sh /tmp/install-release-assets.sh tensorrt; \
     rm /tmp/install-release-assets.sh; \
     readelf -d /usr/local/bin/kapsl | grep -q 'libcuda.so.1'; \
+    if ldd /usr/local/bin/kapsl | grep -v 'libcuda\.so\.1' | grep -q 'not found'; then \
+        ldd /usr/local/bin/kapsl; \
+        exit 1; \
+    fi; \
     test -f /usr/local/bin/kapsl-provider-cuda12.json; \
     test -f /usr/local/bin/kapsl-provider-tensorrt10.json; \
     test -f /usr/local/bin/libonnxruntime_providers_cuda.so; \

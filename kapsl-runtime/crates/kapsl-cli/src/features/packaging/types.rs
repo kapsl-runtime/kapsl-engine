@@ -42,16 +42,12 @@ pub(crate) struct PushKapslResponse {
     pub(crate) status: String,
     pub(crate) remote_url: String,
     pub(crate) artifact_url: String,
-    pub(crate) mirrored_path: String,
     pub(crate) bytes_uploaded: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) manifest_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PullKapslRequest {
     pub(crate) target: String,
-    pub(crate) reference: Option<String>,
     pub(crate) destination_dir: Option<String>,
     pub(crate) remote_url: Option<String>,
     pub(crate) remote_token: Option<String>,

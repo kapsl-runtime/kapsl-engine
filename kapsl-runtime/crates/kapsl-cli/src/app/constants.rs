@@ -1,31 +1,28 @@
+// Hosted service defaults.
 pub(crate) const DEFAULT_REMOTE_URL: &str = "https://api.kapsl.net/v1";
-pub(crate) const REMOTE_PLACEHOLDER_URL: &str = "https://placeholder-kapsl-registry.example.com/v1";
-pub(crate) const REMOTE_PLACEHOLDER_DIR: &str = ".kapsl-remote-placeholder";
 pub(crate) const EXTENSION_MARKETPLACE_URL: &str =
     "https://api.kapsl.net/api/v1/extensions/marketplace";
-pub(crate) const API_TOKEN_ENV: &str = "KAPSL_API_TOKEN";
+
+// HTTP and native transport authentication.
 pub(crate) const API_READER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_READER";
 pub(crate) const API_WRITER_TOKEN_ENV: &str = "KAPSL_API_TOKEN_WRITER";
 pub(crate) const API_ADMIN_TOKEN_ENV: &str = "KAPSL_API_TOKEN_ADMIN";
 pub(crate) const AUTH_STORE_PATH_ENV: &str = "KAPSL_AUTH_STORE_PATH";
 pub(crate) const DEFAULT_AUTH_STORE_FILENAME: &str = "auth-store.json";
 pub(crate) const LOG_SENSITIVE_IDS_ENV: &str = "KAPSL_LOG_SENSITIVE_IDS";
+pub(crate) const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
+pub(crate) const TCP_AUTH_TOKEN_ENV: &str = "KAPSL_TCP_AUTH_TOKEN";
+
+// Runtime storage and external services.
 pub(crate) const RAG_STORAGE_ROOT_ENV: &str = "KAPSL_RAG_STORAGE_ROOT";
 pub(crate) const REMOTE_URL_ENV: &str = "KAPSL_REMOTE_URL";
 pub(crate) const REMOTE_TOKEN_ENV: &str = "KAPSL_REMOTE_TOKEN";
 pub(crate) const REMOTE_TOKEN_STORE_PATH_ENV: &str = "KAPSL_REMOTE_TOKEN_STORE_PATH";
-pub(crate) const REMOTE_PLACEHOLDER_URL_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_URL";
-pub(crate) const REMOTE_PLACEHOLDER_DIR_ENV: &str = "KAPSL_REMOTE_PLACEHOLDER_DIR";
 pub(crate) const EXTENSION_MARKETPLACE_URL_ENV: &str = "KAPSL_EXTENSION_MARKETPLACE_URL";
-pub(crate) const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
-pub(crate) const OCI_REMOTE_PREFIX: &str = "oci://";
-pub(crate) const KAPSL_OCI_ARTIFACT_TYPE: &str = "application/vnd.kapsl.aimod.v1";
-pub(crate) const KAPSL_OCI_LAYER_TYPE: &str = "application/vnd.kapsl.aimod.v1";
-pub(crate) const KAPSL_OCI_CONFIG_TYPE: &str = "application/vnd.kapsl.aimod.config.v1+json";
-pub(crate) const OCI_PRECOMPUTE_SHA256_ENV: &str = "KAPSL_OCI_PRECOMPUTE_SHA256";
-pub(crate) const ORAS_BIN_ENV: &str = "KAPSL_ORAS_BIN";
-pub(crate) const OCI_USERNAME_ENV: &str = "KAPSL_OCI_USERNAME";
-pub(crate) const OCI_PASSWORD_ENV: &str = "KAPSL_OCI_PASSWORD";
+pub(crate) const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
+pub(crate) const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
+
+// Inference backend tuning.
 pub(crate) const LLM_ISOLATE_PROCESS_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS";
 pub(crate) const LLM_ISOLATE_PROCESS_STRICT_ENV: &str = "KAPSL_LLM_ISOLATE_PROCESS_STRICT";
 pub(crate) const LLM_ALLOW_SCHEDULER_MICROBATCH_ENV: &str = "KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH";
@@ -41,20 +38,10 @@ pub(crate) const MODEL_PEAK_CONCURRENCY_ENV: &str = "KAPSL_MODEL_PEAK_CONCURRENC
 pub(crate) const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
 pub(crate) const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
 pub(crate) const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
-pub(crate) const EXTENSIONS_ROOT_ENV: &str = "KAPSL_EXTENSIONS_ROOT";
-pub(crate) const EXT_CONFIG_ROOT_ENV: &str = "KAPSL_EXT_CONFIG_ROOT";
+
+// Scheduling and runtime pressure policy.
 pub(crate) const SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV: &str =
     "KAPSL_SCHEDULER_QUEUE_OVERFLOW_POLICY";
-pub(crate) const LEGACY_SCHEDULER_QUEUE_OVERFLOW_POLICY_ENV: &str =
-    "KAPSL_LITE_INGRESS_BACKPRESSURE";
-pub(crate) const INTER_MODEL_ROUTES_ENV: &str = "KAPSL_INTER_MODEL_ROUTES";
-pub(crate) const LEGACY_INTER_MODEL_ROUTES_ENV: &str = "KAPSL_LITE_INTER_MODEL_ROUTES";
-pub(crate) const INTER_MODEL_RELAY_MIN_INTERVAL_MS_ENV: &str =
-    "KAPSL_INTER_MODEL_RELAY_MIN_INTERVAL_MS";
-pub(crate) const LEGACY_INTER_MODEL_RELAY_MIN_INTERVAL_MS_ENV: &str =
-    "KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS";
-pub(crate) const INTER_MODEL_RELAY_SESSION_PREFIX: &str = "relay/";
-pub(crate) const DEFAULT_INTER_MODEL_RELAY_MIN_INTERVAL_MS: u64 = 2000;
 pub(crate) const PRESSURE_MEMORY_CONSERVE_PCT_ENV: &str =
     "KAPSL_SERVER_PRESSURE_MEMORY_CONSERVE_PCT";
 pub(crate) const PRESSURE_MEMORY_EMERGENCY_PCT_ENV: &str =
@@ -86,3 +73,50 @@ pub(crate) const CUDA_DEVICE_MEMORY_LIMIT_ENV: &str = "CUDA_DEVICE_MEMORY_LIMIT"
 /// kapsl alias for the per-device VRAM cap, in plain MiB, for non-HAMi
 /// deployments that still want cooperative self-limiting.
 pub(crate) const KAPSL_GPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_GPU_MEMORY_LIMIT_MB";
+/// Cooperative process-wide system-memory ceiling, in MiB. The host-memory
+/// budget also observes container limits and keeps a safety reserve; this
+/// override is useful on bare-metal hosts where no cgroup boundary exists.
+pub(crate) const KAPSL_CPU_MEMORY_LIMIT_MB_ENV: &str = "KAPSL_CPU_MEMORY_LIMIT_MB";
+/// Comma-separated hard limits for non-CPU, non-CUDA provider domains.
+/// Entries use `provider[:device]=size`, for example
+/// `metal=8g,directml:0=6g`. An exact device entry overrides the provider-wide
+/// fallback. CUDA/TensorRT and CPU retain their dedicated limit variables.
+pub(crate) const PROVIDER_MEMORY_LIMITS_ENV: &str = "KAPSL_PROVIDER_MEMORY_LIMITS";
+/// Internal worker override used to keep process-local CUDA arenas from each
+/// claiming the parent process's full configured pool.
+pub(crate) const GPU_DEVICE_POOL_DISABLED_ENV: &str = "KAPSL_GPU_DEVICE_POOL_DISABLED";
+/// Selects physical CUDA pool policy: `auto`, `fixed`, or `off`. A per-device
+/// `_<device_id>` suffix takes precedence. When omitted, an explicit
+/// `KAPSL_GPU_DEVICE_POOL_BYTES` means `fixed`; the shared-KV CUDA application
+/// profile otherwise defaults to `auto`.
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_DEVICE_POOL_MODE_ENV: &str = "KAPSL_GPU_DEVICE_POOL_MODE";
+/// Explicit operator attestation that each isolated worker receives an
+/// exclusive GPU/MIG slice. A configured per-process VRAM cap is also accepted
+/// as an isolation boundary.
+pub(crate) const ISOLATED_WORKER_GPU_POOL_ENV: &str = "KAPSL_ISOLATED_WORKER_GPU_POOL";
+/// Enables the runtime-owned elastic CUDA pool and gives its exact backing
+/// allocation size. The full backing capacity is charged against the same safe
+/// device budget as backend-owned external weights, so this must leave room for
+/// any GGUF/native weights that remain outside the pool. A per-device
+/// `_<device_id>` suffix takes precedence.
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_DEVICE_POOL_BYTES_ENV: &str = "KAPSL_GPU_DEVICE_POOL_BYTES";
+/// Bytes kept outside an automatically-sized backing pool for backend scratch,
+/// native-KV fallback, and later model additions. The default is a bounded
+/// fraction of the safe device budget.
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES_ENV: &str =
+    "KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES";
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_ONNX_GUARANTEED_BYTES_ENV: &str = "KAPSL_GPU_ONNX_GUARANTEED_BYTES";
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_ONNX_MAX_BYTES_ENV: &str = "KAPSL_GPU_ONNX_MAX_BYTES";
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_GGUF_GUARANTEED_BYTES_ENV: &str = "KAPSL_GPU_GGUF_GUARANTEED_BYTES";
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_GGUF_MAX_BYTES_ENV: &str = "KAPSL_GPU_GGUF_MAX_BYTES";
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_NATIVE_GUARANTEED_BYTES_ENV: &str = "KAPSL_GPU_NATIVE_GUARANTEED_BYTES";
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) const GPU_NATIVE_MAX_BYTES_ENV: &str = "KAPSL_GPU_NATIVE_MAX_BYTES";

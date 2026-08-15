@@ -40,7 +40,7 @@ pub(crate) fn build_engine_routes() -> EngineRoutes {
                 error: String,
             }
 
-            match push_kapsl_to_placeholder_remote(&request) {
+            match push_kapsl_to_remote(&request) {
                 Ok(response) => {
                     warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
                 }
@@ -62,7 +62,7 @@ pub(crate) fn build_engine_routes() -> EngineRoutes {
                 error: String,
             }
 
-            match pull_kapsl_from_placeholder_remote(&request) {
+            match pull_kapsl_from_remote(&request) {
                 Ok(response) => {
                     warp::reply::with_status(warp::reply::json(&response), StatusCode::OK)
                 }

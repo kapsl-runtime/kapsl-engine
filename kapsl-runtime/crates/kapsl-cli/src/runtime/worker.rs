@@ -1,4 +1,32 @@
 use super::*;
+#[cfg(unix)]
+use kapsl_transport::protocol::{
+    blocking as wire, CodecError, StreamResponse, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_INFER_STREAM,
+};
+
+fn is_explicit_worker_gpu_boundary(name: &str, value: &str) -> bool {
+    let is_positive_mb = || value.trim().parse::<usize>().is_ok_and(|mb| mb > 0);
+    let is_cuda_cap = || parse_cuda_memory_limit(value).is_some();
+
+    if name == ISOLATED_WORKER_GPU_POOL_ENV {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if name == KAPSL_GPU_MEMORY_LIMIT_MB_ENV {
+        return is_positive_mb();
+    }
+    if name == CUDA_DEVICE_MEMORY_LIMIT_ENV {
+        return is_cuda_cap();
+    }
+    name.strip_prefix(&format!("{CUDA_DEVICE_MEMORY_LIMIT_ENV}_"))
+        .is_some_and(|device_id| !device_id.is_empty() && is_cuda_cap())
+}
+
+fn isolated_worker_gpu_pool_allowed() -> bool {
+    std::env::vars().any(|(name, value)| is_explicit_worker_gpu_boundary(&name, &value))
+}
 
 /// Everything needed to (re)spawn an isolated worker child for a model, so the
 /// supervisor can restart a dead worker without re-deriving arguments.
@@ -176,6 +204,12 @@ pub(crate) fn build_worker_command(
         .arg("--tp-degree")
         .arg(spec.tp_degree.to_string())
         .env(LLM_ISOLATE_PROCESS_ENV, "0");
+    if !isolated_worker_gpu_pool_allowed() {
+        // DeviceMemoryManager still runs in the child for planned-vs-actual
+        // accounting, but no process-local arena may reserve the same global
+        // pool capacity as its siblings.
+        command.env(GPU_DEVICE_POOL_DISABLED_ENV, "1");
+    }
     let onnx_tuning = &spec.onnx_tuning;
     if let Some(value) = onnx_tuning.memory_pattern {
         command.arg("--onnx-memory-pattern").arg(value.to_string());
@@ -204,6 +238,9 @@ pub(crate) fn build_worker_command(
     Ok(command)
 }
 
+// Keep the worker command's launch settings explicit at this process boundary;
+// they are immediately captured in `WorkerSpec` for supervision and restart.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_worker_process(
     model_id: u32,
     model_path: &Path,
@@ -247,30 +284,6 @@ pub(crate) fn spawn_worker_process(
             shutdown: AtomicBool::new(false),
             restarts: AtomicU32::new(0),
         })
-    }
-}
-
-pub(crate) fn wait_for_worker_ready(
-    worker: &WorkerProcess,
-    timeout: Duration,
-) -> Result<(), EngineError> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = worker.try_wait() {
-            return Err(EngineError::backend(format!(
-                "Worker exited before ready: {}",
-                status
-            )));
-        }
-        if socket_ready(&worker.socket_path) {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(EngineError::backend(
-                "Timed out waiting for worker socket".to_string(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -328,21 +341,52 @@ impl RemoteEngine {
         UnixStream::connect(&self.socket_path)
             .map_err(|e| EngineError::backend(format!("IPC connect failed: {}", e)))
     }
+}
 
-    #[cfg(unix)]
-    pub(crate) fn read_response_header(
-        &self,
-        conn: &mut UnixStream,
-    ) -> Result<ResponseHeader, EngineError> {
-        let mut header_buf = [0u8; 8];
-        conn.read_exact(&mut header_buf)
-            .map_err(|e| EngineError::backend(format!("IPC read header failed: {}", e)))?;
-        let status = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-        let payload_size = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
-        Ok(ResponseHeader {
-            status,
-            payload_size,
-        })
+#[cfg(unix)]
+fn remote_codec_error(error: CodecError) -> EngineError {
+    match error {
+        CodecError::Remote(message) => EngineError::backend(format!("Remote error: {message}")),
+        other => EngineError::backend(format!("IPC protocol failed: {other}")),
+    }
+}
+
+#[cfg(unix)]
+fn infer_remote_connection<S>(
+    conn: &mut S,
+    model_id: u32,
+    request: &InferenceRequest,
+) -> Result<BinaryTensorPacket, EngineError>
+where
+    S: Read + Write + ?Sized,
+{
+    wire::infer_request_over_stream(conn, model_id, request).map_err(remote_codec_error)
+}
+
+#[cfg(unix)]
+fn forward_remote_stream<S>(
+    conn: &mut S,
+    model_id: u32,
+    request: &InferenceRequest,
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<BinaryTensorPacket, EngineError>>,
+) -> Result<(), EngineError>
+where
+    S: Read + Write + ?Sized,
+{
+    wire::write_request_value(conn, model_id, OP_INFER_STREAM, request)
+        .map_err(remote_codec_error)?;
+
+    loop {
+        match wire::read_stream_packet(conn, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+            .map_err(remote_codec_error)?
+        {
+            StreamResponse::Chunk(packet) => {
+                if tx.send(Ok(packet)).is_err() {
+                    return Ok(());
+                }
+            }
+            StreamResponse::End => return Ok(()),
+        }
     }
 }
 
@@ -364,39 +408,7 @@ impl Engine for RemoteEngine {
         #[cfg(unix)]
         {
             let mut conn = self.connect()?;
-            let payload = bincode::serialize(request)
-                .map_err(|e| EngineError::backend(format!("IPC serialize failed: {}", e)))?;
-
-            let header = RequestHeader {
-                model_id: self.model_id,
-                op_code: OP_INFER,
-                payload_size: payload.len() as u32,
-            };
-
-            conn.write_all(&header.model_id.to_le_bytes())
-                .map_err(|e| EngineError::backend(format!("IPC write failed: {}", e)))?;
-            conn.write_all(&header.op_code.to_le_bytes())
-                .map_err(|e| EngineError::backend(format!("IPC write failed: {}", e)))?;
-            conn.write_all(&header.payload_size.to_le_bytes())
-                .map_err(|e| EngineError::backend(format!("IPC write failed: {}", e)))?;
-            conn.write_all(&payload)
-                .map_err(|e| EngineError::backend(format!("IPC write failed: {}", e)))?;
-
-            let resp = self.read_response_header(&mut conn)?;
-            let mut payload = vec![0u8; resp.payload_size as usize];
-            conn.read_exact(&mut payload)
-                .map_err(|e| EngineError::backend(format!("IPC read failed: {}", e)))?;
-
-            if resp.status == STATUS_OK {
-                bincode::deserialize::<BinaryTensorPacket>(&payload)
-                    .map_err(|e| EngineError::backend(format!("IPC decode failed: {}", e)))
-            } else {
-                let msg = String::from_utf8_lossy(&payload);
-                Err(EngineError::backend(format!(
-                    "Remote error (status {}): {}",
-                    resp.status, msg
-                )))
-            }
+            infer_remote_connection(&mut conn, self.model_id, request)
         }
     }
 
@@ -453,78 +465,8 @@ impl Engine for RemoteEngine {
                     return;
                 }
 
-                let payload = match bincode::serialize(&request) {
-                    Ok(payload) => payload,
-                    Err(e) => {
-                        let _ = tx.send(Err(EngineError::backend(format!(
-                            "IPC serialize failed: {}",
-                            e
-                        ))));
-                        return;
-                    }
-                };
-
-                let header = RequestHeader {
-                    model_id,
-                    op_code: OP_INFER_STREAM,
-                    payload_size: payload.len() as u32,
-                };
-
-                if conn.write_all(&header.model_id.to_le_bytes()).is_err()
-                    || conn.write_all(&header.op_code.to_le_bytes()).is_err()
-                    || conn.write_all(&header.payload_size.to_le_bytes()).is_err()
-                    || conn.write_all(&payload).is_err()
-                {
-                    let _ = tx.send(Err(EngineError::backend("IPC write failed".to_string())));
-                    return;
-                }
-
-                loop {
-                    let mut header_buf = [0u8; 8];
-                    if conn.read_exact(&mut header_buf).is_err() {
-                        let _ = tx.send(Err(EngineError::backend("IPC read failed".to_string())));
-                        return;
-                    }
-                    let status = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-                    let payload_size = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
-
-                    if status == STATUS_STREAM_END {
-                        break;
-                    }
-
-                    let mut payload = vec![0u8; payload_size as usize];
-                    if conn.read_exact(&mut payload).is_err() {
-                        let _ = tx.send(Err(EngineError::backend("IPC read failed".to_string())));
-                        return;
-                    }
-
-                    if status == STATUS_STREAM_CHUNK {
-                        match bincode::deserialize::<BinaryTensorPacket>(&payload) {
-                            Ok(packet) => {
-                                if tx.send(Ok(packet)).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                let _ = tx.send(Err(EngineError::backend(format!(
-                                    "IPC decode failed: {}",
-                                    e
-                                ))));
-                                return;
-                            }
-                        }
-                    } else if status == STATUS_ERR {
-                        let msg = String::from_utf8_lossy(&payload);
-                        let _ =
-                            tx.send(Err(EngineError::backend(format!("Remote error: {}", msg))));
-                        return;
-                    } else {
-                        let _ = tx.send(Err(EngineError::backend(format!(
-                            "Unexpected IPC status: {}",
-                            status
-                        ))));
-                        return;
-                    }
+                if let Err(error) = forward_remote_stream(&mut conn, model_id, &request, &tx) {
+                    let _ = tx.send(Err(error));
                 }
             });
 
@@ -591,6 +533,22 @@ impl Engine for RemoteEngine {
 mod remote_engine_tests {
     use super::*;
     use kapsl_engine_api::BatchingMode;
+    #[cfg(unix)]
+    use kapsl_engine_api::{RequestMetadata, TensorDtype};
+    #[cfg(unix)]
+    use kapsl_transport::protocol::{
+        blocking as test_wire, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, STATUS_OK, STATUS_STREAM_CHUNK,
+        STATUS_STREAM_END,
+    };
+
+    #[cfg(unix)]
+    fn test_packet(value: f32) -> BinaryTensorPacket {
+        BinaryTensorPacket {
+            shape: vec![1],
+            dtype: TensorDtype::Float32,
+            data: value.to_le_bytes().to_vec(),
+        }
+    }
 
     #[test]
     fn remote_engine_delegates_batching_and_forwards_priority() {
@@ -599,5 +557,120 @@ mod remote_engine_tests {
         assert_eq!(policy.mode, BatchingMode::Delegated);
         assert_eq!(policy.max_requests, 1);
         assert!(policy.supports_priority);
+    }
+
+    #[test]
+    fn isolated_worker_pool_requires_an_explicit_device_boundary() {
+        assert!(!is_explicit_worker_gpu_boundary(
+            "KAPSL_GPU_DEVICE_POOL_BYTES",
+            "8g"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            CUDA_DEVICE_MEMORY_LIMIT_ENV,
+            "8g"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            "CUDA_DEVICE_MEMORY_LIMIT_0",
+            "8589934592"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            KAPSL_GPU_MEMORY_LIMIT_MB_ENV,
+            "8192"
+        ));
+        assert!(is_explicit_worker_gpu_boundary(
+            ISOLATED_WORKER_GPU_POOL_ENV,
+            "true"
+        ));
+        assert!(!is_explicit_worker_gpu_boundary(
+            ISOLATED_WORKER_GPU_POOL_ENV,
+            "false"
+        ));
+        #[cfg(feature = "gpu-device-pool")]
+        {
+            assert!(!is_explicit_worker_gpu_boundary(
+                GPU_DEVICE_POOL_MODE_ENV,
+                "auto"
+            ));
+            assert!(!is_explicit_worker_gpu_boundary(
+                GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES_ENV,
+                "2g"
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unary_remote_connection_preserves_the_complete_request() {
+        let (mut client, mut server) = UnixStream::pair().expect("create Unix stream pair");
+        let server_thread = std::thread::spawn(move || {
+            let frame = test_wire::read_request_frame(&mut server, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .expect("read request frame");
+            assert_eq!(frame.header.model_id, 7);
+            let request = frame
+                .decode_inference_request()
+                .expect("decode inference request");
+            assert_eq!(request.session_id.as_deref(), Some("trace-session"));
+            let metadata = request.metadata.expect("request metadata");
+            assert_eq!(metadata.priority, Some(0));
+            assert_eq!(metadata.auth_token.as_deref(), Some("secret"));
+
+            test_wire::write_response_value(&mut server, STATUS_OK, &request.input)
+                .expect("write response");
+        });
+        let request = InferenceRequest::new(test_packet(1.0))
+            .with_session_id("trace-session")
+            .with_metadata(RequestMetadata {
+                priority: Some(0),
+                auth_token: Some("secret".to_string()),
+                ..RequestMetadata::default()
+            });
+
+        let output = infer_remote_connection(&mut client, 7, &request).expect("remote inference");
+        assert_eq!(output.data, request.input.data);
+        server_thread.join().expect("server thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_remote_connection_forwards_chunks_until_end() {
+        let (mut client, mut server) = UnixStream::pair().expect("create Unix stream pair");
+        let server_thread = std::thread::spawn(move || {
+            let frame = test_wire::read_request_frame(&mut server, DEFAULT_MAX_FRAME_PAYLOAD_BYTES)
+                .expect("read stream request");
+            assert_eq!(frame.header.model_id, 9);
+            assert_eq!(frame.header.op_code, OP_INFER_STREAM);
+            frame
+                .decode_inference_request()
+                .expect("decode stream request");
+
+            test_wire::write_response_value(&mut server, STATUS_STREAM_CHUNK, &test_packet(2.0))
+                .expect("write first chunk");
+            test_wire::write_response_value(&mut server, STATUS_STREAM_CHUNK, &test_packet(3.0))
+                .expect("write second chunk");
+            test_wire::write_response_bytes(&mut server, STATUS_STREAM_END, &[])
+                .expect("write stream end");
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        forward_remote_stream(
+            &mut client,
+            9,
+            &InferenceRequest::new(test_packet(1.0)),
+            &tx,
+        )
+        .expect("forward stream");
+        drop(tx);
+        let first = rx
+            .blocking_recv()
+            .expect("first chunk")
+            .expect("first result");
+        let second = rx
+            .blocking_recv()
+            .expect("second chunk")
+            .expect("second result");
+        assert_eq!(first.data, test_packet(2.0).data);
+        assert_eq!(second.data, test_packet(3.0).data);
+        assert!(rx.blocking_recv().is_none());
+        server_thread.join().expect("server thread");
     }
 }

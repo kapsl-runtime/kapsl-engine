@@ -1,0 +1,69 @@
+name: GPU Device Pool Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      ort_model_path:
+        description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
+        required: true
+        type: string
+      gguf_model_path:
+        description: Absolute path to a uniform-KV causal GGUF/AIMOD artifact on the GPU runner
+        required: true
+        type: string
+      ort_request_path:
+        description: Optional absolute path to a model-specific ONNX inference JSON request
+        required: false
+        type: string
+      pool_bytes:
+        description: Optional exact pool size (for example 8g); empty uses strict automatic sizing
+        required: false
+        type: string
+      cuda_visible_devices:
+        description: Exactly one CUDA device index, GPU UUID, or MIG UUID
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  ort-gguf-sharing:
+    # The runner must have a CUDA developer toolkit, ORT CUDA dependencies,
+    # nvidia-smi, curl, jq, and both model artifacts at the input paths.
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build stable shared-KV CUDA runtime
+        run: >-
+          cargo build --manifest-path kapsl-runtime/Cargo.toml
+          --release -p kapsl --no-default-features --features cuda
+
+      - name: Exercise ORT/GGUF sharing and both unload/reload cycles
+        env:
+          KAPSL_GPU_INTEGRATION: "1"
+          KAPSL_GPU_TEST_BINARY: ${{ github.workspace }}/kapsl-runtime/target/release/kapsl
+          KAPSL_GPU_TEST_ORT_MODEL: ${{ inputs.ort_model_path }}
+          KAPSL_GPU_TEST_GGUF_MODEL: ${{ inputs.gguf_model_path }}
+          KAPSL_GPU_TEST_ORT_REQUEST: ${{ inputs.ort_request_path }}
+          KAPSL_GPU_TEST_POOL_BYTES: ${{ inputs.pool_bytes }}
+          KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
+          KAPSL_GPU_TEST_OUTPUT_DIR: ${{ runner.temp }}/kapsl-gpu-pool-${{ github.run_id }}-${{ github.run_attempt }}
+        run: .github/scripts/test-gpu-device-pool-integration.sh
+
+      - name: Upload GPU integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-device-pool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kapsl-gpu-pool-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn

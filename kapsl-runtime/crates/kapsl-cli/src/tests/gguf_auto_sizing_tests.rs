@@ -151,3 +151,43 @@ fn llm_isolation_metadata_is_advisory_unless_strict_or_env_forces_it() {
         std::env::remove_var(LLM_ISOLATE_PROCESS_STRICT_ENV);
     }
 }
+
+#[test]
+fn sealed_runtime_does_not_touch_the_environment() {
+    let _guard = env_lock().lock().unwrap();
+    let old_prefill = std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV);
+    let old_target = std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV);
+    std::env::remove_var(GGUF_PREFILL_CHUNK_SIZE_ENV);
+    std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+
+    // Once the runtime is serving, exporting hints would mean calling set_var
+    // while inference threads may be reading those vars.
+    seal_env_auto_sizing();
+    export_gguf_auto_sizing_hint(&test_manifest("gguf"), 3, None);
+    assert!(
+        std::env::var_os(GGUF_TARGET_CONCURRENCY_ENV).is_none(),
+        "sealed runtime must not publish {}",
+        GGUF_TARGET_CONCURRENCY_ENV
+    );
+    assert!(
+        std::env::var_os(GGUF_PREFILL_CHUNK_SIZE_ENV).is_none(),
+        "sealed runtime must not publish {}",
+        GGUF_PREFILL_CHUNK_SIZE_ENV
+    );
+
+    // ...and unsealed it still does, so the seal is what changed behaviour.
+    unseal_env_auto_sizing();
+    export_gguf_auto_sizing_hint(&test_manifest("gguf"), 3, None);
+    assert_eq!(
+        std::env::var(GGUF_TARGET_CONCURRENCY_ENV).ok().as_deref(),
+        Some("3")
+    );
+
+    std::env::remove_var(GGUF_TARGET_CONCURRENCY_ENV);
+    if let Some(value) = old_prefill {
+        std::env::set_var(GGUF_PREFILL_CHUNK_SIZE_ENV, value);
+    }
+    if let Some(value) = old_target {
+        std::env::set_var(GGUF_TARGET_CONCURRENCY_ENV, value);
+    }
+}

@@ -25,7 +25,6 @@ Options:
 
 | Variable | Description |
 |----------|-------------|
-| `KAPSL_API_TOKEN` | Shared admin token (legacy fallback) |
 | `KAPSL_API_TOKEN_READER` | Reader role token |
 | `KAPSL_API_TOKEN_WRITER` | Writer role token |
 | `KAPSL_API_TOKEN_ADMIN` | Admin role token |
@@ -62,8 +61,8 @@ Options:
 | Variable | Description |
 |----------|-------------|
 | `KAPSL_REMOTE_URL` | Default remote registry URL |
-| `KAPSL_REMOTE_PLACEHOLDER_URL` | Placeholder URL displayed in the dashboard |
-| `KAPSL_REMOTE_PLACEHOLDER_DIR` | Default remote directory shown in the dashboard |
+| `KAPSL_REMOTE_TOKEN` | Bearer token for remote push/pull |
+| `KAPSL_REMOTE_TOKEN_STORE_PATH` | Path to the OAuth token store |
 
 ### Backend and inference
 
@@ -72,6 +71,72 @@ Options:
 | `KAPSL_PROVIDER_POLICY` | `fastest` (auto-select fastest backend) or `manifest` (use manifest-specified backend) |
 | `KAPSL_LLM_ISOLATE_PROCESS` | Set to `1` to run LLM backends in a subprocess for isolation |
 | `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS` | Disable automatic image/video-to-tensor preprocessing |
+
+### GPU memory and shared KV
+
+The stable CUDA application profile enables `gguf-cuda-shared-kv` and defaults
+the physical device pool to automatic sizing. Before any backend or ORT session
+is constructed, Kapsl plans the startup models and chooses, per used CUDA
+device:
+
+```text
+declared       = min(physical VRAM, configured process/device cap)
+safe budget    = min(declared, live free VRAM) - max(10% of declared, 512 MiB)
+pool capacity  = align_down(safe budget - known external weights - unpooled reserve, 2 MiB)
+```
+
+The result must also be at least the planned pooled ONNX weight footprint,
+including configured session concurrency; otherwise preflight fails before an
+ORT session is created. Remaining pooled capacity is available to ORT
+workspaces and paged KV.
+
+The default unpooled reserve is 20% of the safe budget with a 1 GiB floor and
+one-third cap. It protects room for backend scratch, native-KV compatibility
+fallback, and later model additions. The automatic pool minimum is 256 MiB.
+The backing allocation is process-lifetime and cannot grow or shrink; later
+model starts still pass admission only while the retained headroom is
+available. When the process starts without models, implicit automatic pool
+creation remains deferred until the first pooled model targets that device.
+
+| Variable | Description |
+|----------|-------------|
+| `KAPSL_GPU_DEVICE_POOL_MODE[_N]` | `auto`, `fixed`, or `off`. Per-device values win. Omitted means automatic in the stable shared-KV CUDA profile, fixed when bytes are supplied, and off in other profiles. |
+| `KAPSL_GPU_DEVICE_POOL_BYTES[_N]` | Exact positive fixed backing size; supports byte, `k`, `m`, and `g` suffixes. Never silently resized. |
+| `KAPSL_GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES[_N]` | Automatic-mode reserve for scratch/fallback/later models. Uses the same suffixes, permits zero, and is never silently reduced. |
+| `CUDA_DEVICE_MEMORY_LIMIT[_N]` | Strict process/device VRAM ceiling used by automatic sizing; malformed selected values fail startup. |
+| `KAPSL_GPU_MEMORY_LIMIT_MB` | Process VRAM ceiling in MiB when no CUDA-specific ceiling is set. |
+| `KAPSL_PROVIDER_MEMORY_LIMITS` | Hard limits for non-CPU/non-CUDA provider domains as `provider[:device]=size` entries, e.g. `metal=8g,directml:0=6g`. Exact-device entries override provider-wide values. |
+| `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
+| `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
+| `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
+
+Implicit automatic allocation failure logs a sizing breakdown and continues
+without a runtime-owned pool. Explicit `auto` and every `fixed` configuration
+fail fast. Isolated workers disable inherited pooling unless an exclusive
+GPU/MIG attestation or explicit process memory boundary is present. Pool mode,
+bytes, and reserve settings alone never qualify as that boundary. An isolated
+model targeting a device also suppresses a new implicit parent pool there, so
+the parent cannot reserve most VRAM before the child loads; explicit operator
+pool modes retain their stated behavior.
+Mode and byte settings are one configuration contract: a global byte override
+still conflicts with a per-device `auto` or `off` mode instead of being
+silently ignored.
+
+Every live backend is resampled on the two-second runtime monitor cadence.
+Changes to backend-owned host, CUDA, Metal/CoreML, DirectML, ROCm, or custom
+provider allocations atomically resize the owning memory lease. If physical
+usage has already crossed a hard limit, Kapsl retains the over-limit observed
+value in the authority snapshot, closes further admission, and enters the
+normal pressure policy rather than reverting to a stale reservation.
+
+`/metrics` samples the live allocator at scrape time. Pool-wide series are
+`kapsl_gpu_device_pool_allocated_bytes`, `_live_allocations`, `_free_bytes`,
+`_free_ranges`, `_largest_free_range_bytes`, and `_fragmentation_ratio`, each
+labelled by `device`. Per-owner usage, guaranteed/max quota, admission state,
+and immediately allocatable bytes use the same prefix plus an `owner` label
+(`onnx`, `gguf_kv:<model-id>`, or `native_kv:<model-id>`). Unloaded owner rows
+are removed on the next scrape. `kapsl_device_memory_pooled_bytes` remains the
+fixed backing capacity, not current usage.
 
 ### Observability
 

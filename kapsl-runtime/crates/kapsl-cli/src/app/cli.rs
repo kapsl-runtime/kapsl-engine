@@ -1,115 +1,5 @@
 use super::*;
 
-pub(crate) fn kapsl_help_styles() -> clap::builder::Styles {
-    use clap::builder::styling::{AnsiColor, Effects};
-    clap::builder::Styles::styled()
-        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .usage(AnsiColor::Cyan.on_default() | Effects::BOLD)
-        .literal(AnsiColor::BrightCyan.on_default() | Effects::BOLD)
-        .placeholder(AnsiColor::Cyan.on_default())
-        .error(AnsiColor::Red.on_default() | Effects::BOLD)
-        .invalid(AnsiColor::Yellow.on_default() | Effects::BOLD)
-        .valid(AnsiColor::Green.on_default())
-}
-
-pub(crate) fn cli_after_help() -> String {
-    use std::fmt::Write as _;
-    let a = Ansi::new();
-    let header = |s: &str| a.bold(&a.teal(s)).into_owned();
-    let cmd = |s: &str| a.bold(s).into_owned();
-    let comment = |s: &str| a.dim(s).into_owned();
-
-    let mut out = String::new();
-    let _ = writeln!(out, "{}", header("Examples:"));
-    let _ = writeln!(out, "  {}", comment("# Start the runtime with one model"));
-    let _ = writeln!(out, "  {}", cmd("kapsl run --model models/gpt2/gpt2.aimod"));
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Load an extra model into an already-running runtime (no restart)")
-    );
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl add-model --model models/llama/llama.aimod")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Package a model directory or single file")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl build ./models/gpt-llm"));
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl build ./model.onnx --output ./model.aimod")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Push / pull packages to/from a remote registry")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl push acme/gpt2:prod ./model.aimod"));
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl push acme/gpt2:prod ./model.aimod --remote-url oci://ghcr.io")
-    );
-    let _ = writeln!(
-        out,
-        "  {}",
-        cmd("kapsl pull acme/gpt2:prod --destination-dir ./models")
-    );
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Authenticate (opens browser; use --device-code for SSH/headless)")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl login"));
-    let _ = writeln!(out, "  {}", cmd("kapsl login --device-code"));
-    let _ = writeln!(out);
-    let _ = writeln!(
-        out,
-        "  {}",
-        comment("# Add optional Windows GPU acceleration")
-    );
-    let _ = writeln!(out, "  {}", cmd("kapsl provider install cuda12"));
-    let _ = writeln!(out, "  {}", cmd("kapsl provider install tensorrt10"));
-    let _ = writeln!(out);
-    let _ = writeln!(out, "{}", header("Environment variables:"));
-    for (name, desc) in [
-        (
-            "KAPSL_API_TOKEN",
-            "Shared fallback bearer token for /api routes",
-        ),
-        ("KAPSL_API_TOKEN_READER", "Read-only API token"),
-        ("KAPSL_API_TOKEN_WRITER", "Writer API token"),
-        ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),
-        ("KAPSL_REMOTE_URL", "Default remote registry URL"),
-        ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
-        (
-            "KAPSL_SHM_SIZE_MB",
-            "Shared-memory pool size (MiB) for shm/hybrid transport",
-        ),
-    ] {
-        let padded = format!("{:<26}", name);
-        let _ = writeln!(out, "  {}{}", a.teal(&padded), a.dim(desc));
-    }
-    let _ = writeln!(out);
-    let _ = writeln!(out, "{}", header("Compatibility:"));
-    let _ = writeln!(out, "  {}", cmd("kapsl --model models/gpt2/gpt2.aimod"));
-    let _ = write!(
-        out,
-        "    {}",
-        comment("(equivalent to `kapsl run --model models/gpt2/gpt2.aimod`)")
-    );
-    out
-}
-
 #[derive(Parser, Debug)]
 #[command(
     name = "kapsl",
@@ -150,6 +40,10 @@ pub(crate) enum KapslCommand {
     Provider(ProviderCommandArgs),
     /// Hot-load a model into an already-running runtime (no restart required)
     AddModel(AddModelCommandArgs),
+    /// List models loaded in a running Kapsl Engine
+    List(ListCommandArgs),
+    /// Stop, unload, and unregister a model from a running Kapsl Engine
+    RemoveModel(RemoveModelCommandArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -163,7 +57,7 @@ pub(crate) struct Args {
     /// socket — Unix domain socket (lowest latency, same host only).
     /// tcp    — TCP socket (cross-host).
     /// shm    — Shared memory (highest throughput, same host only).
-    /// hybrid — shm for local clients, tcp for remote.
+    /// hybrid — Unix socket control/data path with shared-memory tensor transfer.
     /// auto   — picks the best available transport automatically.
     #[arg(long, default_value = "socket")]
     pub(crate) transport: String,
@@ -173,7 +67,8 @@ pub(crate) struct Args {
     #[cfg_attr(windows, arg(short, long, default_value = r"\\.\pipe\kapsl"))]
     pub(crate) socket: String,
 
-    /// Bind address for the TCP inference server (used when --transport=tcp|hybrid|auto)
+    /// Bind address for the TCP inference server (used when --transport=tcp).
+    /// Non-loopback binds require KAPSL_TCP_AUTH_TOKEN.
     #[arg(long, default_value = "127.0.0.1")]
     pub(crate) bind: String,
 
@@ -295,224 +190,6 @@ pub(crate) struct Args {
     pub(crate) kv_compression_bits: Option<u8>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct OnnxTuningProfile {
-    pub(crate) global: OnnxRuntimeTuning,
-    pub(crate) per_model: HashMap<u32, OnnxRuntimeTuning>,
-}
-
-pub(crate) fn merge_onnx_runtime_tuning(
-    base: &OnnxRuntimeTuning,
-    overrides: &OnnxRuntimeTuning,
-) -> OnnxRuntimeTuning {
-    OnnxRuntimeTuning {
-        memory_pattern: overrides.memory_pattern.or(base.memory_pattern),
-        disable_cpu_mem_arena: overrides
-            .disable_cpu_mem_arena
-            .or(base.disable_cpu_mem_arena),
-        session_buckets: overrides.session_buckets.or(base.session_buckets),
-        bucket_dim_granularity: overrides
-            .bucket_dim_granularity
-            .or(base.bucket_dim_granularity),
-        bucket_max_dims: overrides.bucket_max_dims.or(base.bucket_max_dims),
-        peak_concurrency_hint: overrides
-            .peak_concurrency_hint
-            .or(base.peak_concurrency_hint),
-    }
-}
-
-impl OnnxTuningProfile {
-    pub(crate) fn resolve(&self, model_id: u32) -> OnnxRuntimeTuning {
-        if let Some(model_overrides) = self.per_model.get(&model_id) {
-            merge_onnx_runtime_tuning(&self.global, model_overrides)
-        } else {
-            self.global.clone()
-        }
-    }
-}
-
-pub(crate) fn parse_bool_literal(value: &str) -> Result<bool, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(format!("invalid boolean '{}'", value)),
-    }
-}
-
-pub(crate) fn apply_onnx_tuning_pair(
-    target: &mut OnnxRuntimeTuning,
-    key: &str,
-    value: &str,
-) -> Result<(), String> {
-    let normalized = key.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "memory_pattern" | "mem_pattern" => {
-            target.memory_pattern = Some(parse_bool_literal(value)?);
-        }
-        "disable_cpu_mem_arena" | "cpu_mem_arena_disabled" => {
-            target.disable_cpu_mem_arena = Some(parse_bool_literal(value)?);
-        }
-        "session_buckets" => {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| format!("invalid session_buckets '{}': {}", value, e))?;
-            target.session_buckets = Some(parsed.max(1));
-        }
-        "bucket_dim_granularity" => {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| format!("invalid bucket_dim_granularity '{}': {}", value, e))?;
-            target.bucket_dim_granularity = Some(parsed.max(1));
-        }
-        "bucket_max_dims" => {
-            let parsed = value
-                .trim()
-                .parse::<usize>()
-                .map_err(|e| format!("invalid bucket_max_dims '{}': {}", value, e))?;
-            target.bucket_max_dims = Some(parsed.max(1));
-        }
-        "peak_concurrency" | "peak_concurrency_hint" => {
-            let parsed = value
-                .trim()
-                .parse::<u32>()
-                .map_err(|e| format!("invalid peak_concurrency '{}': {}", value, e))?;
-            target.peak_concurrency_hint = Some(parsed.max(1));
-        }
-        other => {
-            return Err(format!(
-                "unknown ONNX tuning key '{}'; expected one of memory_pattern, disable_cpu_mem_arena, session_buckets, bucket_dim_granularity, bucket_max_dims, peak_concurrency",
-                other
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_env_bool_override(name: &str) -> Result<Option<bool>, String> {
-    optional_env_var(name)
-        .map(|value| parse_bool_literal(&value))
-        .transpose()
-}
-
-pub(crate) fn parse_env_usize_override(name: &str) -> Result<Option<usize>, String> {
-    optional_env_var(name)
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map(|parsed| parsed.max(1))
-                .map_err(|e| format!("invalid {} '{}': {}", name, value, e))
-        })
-        .transpose()
-}
-
-pub(crate) fn parse_env_u32_override(name: &str) -> Result<Option<u32>, String> {
-    optional_env_var(name)
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .map(|parsed| parsed.max(1))
-                .map_err(|e| format!("invalid {} '{}': {}", name, value, e))
-        })
-        .transpose()
-}
-
-pub(crate) fn auto_onnx_runtime_tuning(args: &Args) -> OnnxRuntimeTuning {
-    let batch_size = args.batch_size.max(1);
-    let session_pool = batch_size.min(logical_cpu_cores().max(1)).clamp(1, 4);
-    let session_buckets = batch_size.max(4).min(8);
-    OnnxRuntimeTuning {
-        memory_pattern: Some(true),
-        disable_cpu_mem_arena: Some(false),
-        session_buckets: Some(session_buckets),
-        bucket_dim_granularity: Some(64),
-        bucket_max_dims: Some(4),
-        peak_concurrency_hint: Some(session_pool as u32),
-    }
-}
-
-pub(crate) fn env_onnx_runtime_tuning() -> Result<OnnxRuntimeTuning, String> {
-    Ok(OnnxRuntimeTuning {
-        memory_pattern: parse_env_bool_override(ORT_MEMORY_PATTERN_ENV)?,
-        disable_cpu_mem_arena: parse_env_bool_override(ORT_DISABLE_CPU_MEM_ARENA_ENV)?,
-        session_buckets: parse_env_usize_override(ORT_SESSION_BUCKETS_ENV)?,
-        bucket_dim_granularity: parse_env_usize_override(ORT_BUCKET_DIM_GRANULARITY_ENV)?,
-        bucket_max_dims: parse_env_usize_override(ORT_BUCKET_MAX_DIMS_ENV)?,
-        peak_concurrency_hint: parse_env_u32_override(MODEL_PEAK_CONCURRENCY_ENV)?,
-    })
-}
-
-pub(crate) fn parse_onnx_model_tuning_spec(
-    spec: &str,
-) -> Result<(Option<u32>, OnnxRuntimeTuning), String> {
-    let (selector_raw, config_raw) = spec.split_once(':').ok_or_else(|| {
-        format!(
-            "invalid --onnx-model-tuning '{}': expected '<model_id|*>:k=v[,k=v...]'",
-            spec
-        )
-    })?;
-    let selector = selector_raw.trim();
-    let model_id = if selector == "*" {
-        None
-    } else {
-        Some(
-            selector
-                .parse::<u32>()
-                .map_err(|e| format!("invalid model selector '{}': {}", selector, e))?,
-        )
-    };
-
-    let mut tuning = OnnxRuntimeTuning::default();
-    for pair in config_raw.split(',') {
-        let trimmed = pair.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let (key, value) = trimmed
-            .split_once('=')
-            .ok_or_else(|| format!("invalid tuning pair '{}': expected k=v", trimmed))?;
-        apply_onnx_tuning_pair(&mut tuning, key, value)?;
-    }
-
-    Ok((model_id, tuning))
-}
-
-pub(crate) fn build_onnx_tuning_profile(args: &Args) -> Result<OnnxTuningProfile, String> {
-    let mut profile = OnnxTuningProfile {
-        global: auto_onnx_runtime_tuning(args),
-        per_model: HashMap::new(),
-    };
-
-    let env_tuning = env_onnx_runtime_tuning()?;
-    profile.global = merge_onnx_runtime_tuning(&profile.global, &env_tuning);
-    let cli_tuning = OnnxRuntimeTuning {
-        memory_pattern: args.onnx_memory_pattern,
-        disable_cpu_mem_arena: args.onnx_disable_cpu_mem_arena,
-        session_buckets: args.onnx_session_buckets,
-        bucket_dim_granularity: args.onnx_bucket_dim_granularity,
-        bucket_max_dims: args.onnx_bucket_max_dims,
-        peak_concurrency_hint: args.onnx_peak_concurrency_hint,
-    };
-    profile.global = merge_onnx_runtime_tuning(&profile.global, &cli_tuning);
-
-    for spec in &args.onnx_model_tuning {
-        let (model_id, tuning) = parse_onnx_model_tuning_spec(spec)?;
-        if let Some(model_id) = model_id {
-            let merged = profile
-                .per_model
-                .get(&model_id)
-                .map(|existing| merge_onnx_runtime_tuning(existing, &tuning))
-                .unwrap_or(tuning);
-            profile.per_model.insert(model_id, merged);
-        } else {
-            profile.global = merge_onnx_runtime_tuning(&profile.global, &tuning);
-        }
-    }
-
-    Ok(profile)
-}
-
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Build Options")]
 pub(crate) struct BuildCommandArgs {
@@ -574,8 +251,7 @@ pub(crate) struct PushCommandArgs {
     #[arg(long, alias = "kapsl-path", value_name = "PATH")]
     pub(crate) model: Option<PathBuf>,
 
-    /// Remote registry URL — overrides KAPSL_REMOTE_URL for this call.
-    /// Use an oci:// prefix to push to an OCI-compatible registry (e.g. oci://ghcr.io).
+    /// Remote registry URL — overrides KAPSL_REMOTE_URL for this call
     #[arg(long, value_name = "URL")]
     pub(crate) remote_url: Option<String>,
 
@@ -601,11 +277,6 @@ pub(crate) struct PullCommandArgs {
     /// Package to download (alternative to the positional argument)
     #[arg(long, alias = "target-ref", value_name = "TARGET")]
     pub(crate) model: Option<String>,
-
-    /// Pin to a specific OCI content digest when using an oci:// remote.
-    /// Accepts sha256:<hex> or @sha256:<hex>.
-    #[arg(long = "ref", value_name = "REF")]
-    pub(crate) reference: Option<String>,
 
     /// Directory where the downloaded .aimod file will be saved (defaults to current directory)
     #[arg(long, value_name = "DIR")]
@@ -688,6 +359,62 @@ pub(crate) struct AddModelCommandArgs {
     pub(crate) tp_degree: usize,
 
     /// HTTP request timeout (ms) for the load call — large models may take longer to respond
+    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    pub(crate) timeout_ms: u64,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(next_help_heading = "List Options")]
+pub(crate) struct ListCommandArgs {
+    /// HTTP port of the running runtime's API server
+    #[arg(long, default_value_t = 9095, value_name = "PORT")]
+    pub(crate) http_port: u16,
+
+    /// Hostname or IP of the running runtime's API server
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    pub(crate) http_host: String,
+
+    /// Full base URL of the running runtime (overrides --http-host / --http-port)
+    #[arg(long, value_name = "URL")]
+    pub(crate) http_url: Option<String>,
+
+    /// Bearer token if the runtime has API authentication enabled
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) auth_token: Option<String>,
+
+    /// Print the complete API response as JSON instead of a table
+    #[arg(long)]
+    pub(crate) json: bool,
+
+    /// HTTP request timeout (ms)
+    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    pub(crate) timeout_ms: u64,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(next_help_heading = "Remove-Model Options")]
+pub(crate) struct RemoveModelCommandArgs {
+    /// ID of the model to remove (shown by `kapsl list`)
+    #[arg(value_name = "MODEL_ID")]
+    pub(crate) model_id: u32,
+
+    /// HTTP port of the running runtime's API server
+    #[arg(long, default_value_t = 9095, value_name = "PORT")]
+    pub(crate) http_port: u16,
+
+    /// Hostname or IP of the running runtime's API server
+    #[arg(long, default_value = "127.0.0.1", value_name = "HOST")]
+    pub(crate) http_host: String,
+
+    /// Full base URL of the running runtime (overrides --http-host / --http-port)
+    #[arg(long, value_name = "URL")]
+    pub(crate) http_url: Option<String>,
+
+    /// Admin bearer token if the runtime has API authentication enabled
+    #[arg(long, value_name = "TOKEN")]
+    pub(crate) auth_token: Option<String>,
+
+    /// HTTP request timeout (ms)
     #[arg(long, default_value_t = 30000, value_name = "MS")]
     pub(crate) timeout_ms: u64,
 }
