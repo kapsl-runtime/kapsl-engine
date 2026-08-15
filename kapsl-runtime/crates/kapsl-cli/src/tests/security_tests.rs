@@ -1,5 +1,15 @@
 use super::*;
 
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn test_sysinfo_total_memory_is_already_reported_in_bytes() {
+    let sixteen_gib = 16_u64 * 1024 * 1024 * 1024;
+    assert_eq!(
+        system_memory_bytes_from_sysinfo(sixteen_gib),
+        Some(sixteen_gib as usize)
+    );
+}
+
 #[test]
 fn test_authorization_matches_token_plain_and_bearer() {
     assert!(authorization_matches_token(Some("token123"), "token123"));

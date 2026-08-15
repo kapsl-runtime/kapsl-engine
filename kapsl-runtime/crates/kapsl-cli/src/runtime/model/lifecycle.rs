@@ -20,11 +20,7 @@ fn model_authority_bytes(snapshot: &MemorySnapshot, model_id: u32) -> usize {
         .rows
         .iter()
         .filter(|row| row.owner.model_id == model_id)
-        .map(|row| {
-            row.reserved_bytes
-                .max(row.committed_bytes)
-                .max(row.observed_bytes)
-        })
+        .map(MemorySnapshotRow::used_bytes)
         .fold(0usize, usize::saturating_add)
 }
 

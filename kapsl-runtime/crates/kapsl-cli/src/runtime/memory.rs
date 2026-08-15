@@ -355,6 +355,16 @@ pub(crate) struct MemorySnapshotRow {
     pub(crate) observed_bytes: usize,
 }
 
+impl MemorySnapshotRow {
+    /// Live footprint without double-counting accounting states during a
+    /// reservation-to-observation transition.
+    pub(crate) fn used_bytes(&self) -> usize {
+        self.reserved_bytes
+            .max(self.committed_bytes)
+            .max(self.observed_bytes)
+    }
+}
+
 /// One independently-budgeted domain in a [`MemorySnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemoryDomainSnapshot {
@@ -365,6 +375,14 @@ pub(crate) struct MemoryDomainSnapshot {
     pub(crate) committed_bytes: usize,
     pub(crate) observed_bytes: usize,
     pub(crate) available_bytes: usize,
+}
+
+impl MemoryDomainSnapshot {
+    pub(crate) fn used_bytes(&self) -> usize {
+        self.reserved_bytes
+            .max(self.committed_bytes)
+            .max(self.observed_bytes)
+    }
 }
 
 /// Atomic point-in-time accounting across every memory adapter.
@@ -1829,11 +1847,7 @@ impl MemoryAuthority {
                         is_host(&row.domain)
                             && (row.class == MemoryAllocationClass::KvCache) == kv_group
                     })
-                    .map(|row| {
-                        row.reserved_bytes
-                            .max(row.committed_bytes)
-                            .max(row.observed_bytes)
-                    })
+                    .map(MemorySnapshotRow::used_bytes)
                     .fold(0usize, usize::saturating_add);
                 let class = if kv_group {
                     MemoryAllocationClass::KvCache
@@ -2551,6 +2565,14 @@ impl MemoryLease {
     }
 
     fn reconcile_locked(&mut self, report: &BackendMemoryReport) -> Result<(), String> {
+        // An empty report is the legacy/decorator signal for "no unified
+        // memory telemetry", not proof that a still-loaded backend owns zero
+        // bytes. Keep the admitted fallback rows until unload drops the lease.
+        // This is especially important for ONNX task wrappers using a shared
+        // CUDA allocator: their legacy external report is intentionally empty.
+        if report.allocations.is_empty() {
+            return Ok(());
+        }
         let owner = self.single_owner()?;
         let actual_plan = MemoryPlan::from_backend_report(owner, report);
         let actual = aggregate_claim_rows(actual_plan.claims());
@@ -2755,6 +2777,9 @@ impl MemoryLease {
     }
 
     fn record_loaded_report_locked(&mut self, report: &BackendMemoryReport) -> Result<(), String> {
+        if report.allocations.is_empty() {
+            return Ok(());
+        }
         let owner = self.single_owner()?;
         let actual_plan = MemoryPlan::from_backend_report(owner, report);
         let actual = aggregate_claim_rows(actual_plan.claims());
@@ -3986,6 +4011,41 @@ mod tests {
             5 * GIB,
             "a rejected reservation must still publish the physical overage"
         );
+    }
+
+    #[test]
+    fn empty_backend_report_preserves_admitted_fallback_rows() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(46, 4);
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::ModelSession,
+            GIB,
+        ));
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::TransientWorkspace,
+            MIB,
+        ));
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+        let before = authority.snapshot().rows;
+
+        lease
+            .record_loaded_report(&BackendMemoryReport::default())
+            .unwrap();
+        lease.reconcile(&BackendMemoryReport::default()).unwrap();
+
+        let rows = authority.snapshot().rows;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|row| row.planned_bytes).sum::<usize>(),
+            GIB + MIB
+        );
+        assert_eq!(rows, before);
     }
 
     #[test]

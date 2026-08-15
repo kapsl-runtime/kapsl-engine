@@ -241,7 +241,39 @@ Host-level runtime process stats, sampled by the monitor loop.
   "gpu_memory_total_bytes": 25769803776,
   "foreign_gpu_memory_bytes": 2147483648,
   "pressure_state": "normal",
-  "collected_at_ms": 1720353600000
+  "collected_at_ms": 1720353600000,
+  "memory_authority": {
+    "model_bytes": 9663676416,
+    "domain_used_bytes": 10737418240,
+    "domain_budget_bytes": 25769803776,
+    "domain_available_bytes": 15032385536,
+    "foreign_pressure_active": false,
+    "models": [
+      {
+        "model_id": 0,
+        "name": "qwen-7b",
+        "replica_count": 2,
+        "planned_bytes": 9663676416,
+        "reserved_bytes": 9663676416,
+        "committed_bytes": 9663676416,
+        "observed_bytes": 9663676416,
+        "used_bytes": 9663676416,
+        "percentage": 100.0
+      }
+    ],
+    "domains": [
+      {
+        "domain": "cuda:0",
+        "budget_bytes": 25769803776,
+        "planned_bytes": 9663676416,
+        "reserved_bytes": 9663676416,
+        "committed_bytes": 9663676416,
+        "observed_bytes": 10737418240,
+        "used_bytes": 10737418240,
+        "available_bytes": 15032385536
+      }
+    ]
+  }
 }
 ```
 
@@ -249,6 +281,12 @@ Host-level runtime process stats, sampled by the monitor loop.
 available. `foreign_gpu_memory_bytes` is the VRAM held by co-tenant processes
 sharing the GPU; it is `null` unless the co-tenancy guard is enabled.
 `pressure_state` is one of `normal`, `conserve`, or `emergency`.
+
+`memory_authority` is the backend-neutral host/device accounting snapshot. Each
+model's `used_bytes` sums the largest of reserved, committed, or observed bytes
+for every owned row, avoiding double-counting accounting states. Replicas are
+rolled up under their base `model_id`; `percentage` is their share of
+`model_bytes`.
 
 ### GET /metrics
 
