@@ -2092,6 +2092,7 @@ dependencies = [
  "sha2 0.10.9",
  "sysinfo",
  "tar",
+ "tokenizers",
  "tokio",
  "ureq",
  "warp",
