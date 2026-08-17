@@ -9,6 +9,8 @@
 use super::*;
 
 mod chat;
+mod embeddings;
+mod responses;
 mod types;
 
 use types::openai_error;
@@ -180,6 +182,16 @@ pub(crate) fn build_openai_routes(
             );
 
     let chat_completions = chat::build_chat_completions_route(chat::ChatCompletionsConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+        log_sensitive_ids,
+    });
+    let embeddings = embeddings::build_embeddings_route(embeddings::EmbeddingsConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+        log_sensitive_ids,
+    });
+    let responses = responses::build_responses_route(responses::ResponsesConfig {
         models,
         inference,
         log_sensitive_ids,
@@ -189,6 +201,10 @@ pub(crate) fn build_openai_routes(
         .or(get_model)
         .unify()
         .or(chat_completions)
+        .unify()
+        .or(embeddings)
+        .unify()
+        .or(responses)
         .unify()
         .map(reply_into_response)
         .boxed()
