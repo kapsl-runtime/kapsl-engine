@@ -41,8 +41,11 @@ pub(crate) fn build_embeddings_route(
         .and(warp::post())
         .and(warp::body::bytes())
         .and(warp::header::optional::<String>("x-kapsl-session"))
+        .and(warp::header::optional::<String>("authorization"))
         .and_then(
-            move |body: warp::hyper::body::Bytes, session_header: Option<String>| {
+            move |body: warp::hyper::body::Bytes,
+                  session_header: Option<String>,
+                  authorization: Option<String>| {
                 let models = models.clone();
                 let inference = inference.clone();
                 let tokenizer_cache = tokenizer_cache.clone();
@@ -51,6 +54,7 @@ pub(crate) fn build_embeddings_route(
                         handle_embeddings(
                             body,
                             session_header,
+                            authorization,
                             &models,
                             &inference,
                             &tokenizer_cache,
@@ -808,6 +812,7 @@ fn supports_embeddings(model: &ModelInfo) -> bool {
 async fn handle_embeddings(
     body: warp::hyper::body::Bytes,
     session_header: Option<String>,
+    authorization: Option<String>,
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
     tokenizer_cache: &Arc<TokenizerCache>,
@@ -951,7 +956,7 @@ async fn handle_embeddings(
         }
     };
 
-    let session_id = session_header
+    let client_session_id = session_header
         .map(|session| session.trim().to_string())
         .filter(|session| !session.is_empty())
         .or_else(|| {
@@ -961,6 +966,8 @@ async fn handle_embeddings(
                 .map(|user| user.trim().to_string())
                 .filter(|user| !user.is_empty())
         });
+    let session_id =
+        scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
     let requests = match build_inference_requests(
         prepared.token_ids,
         prepared.pad_token_id,
@@ -972,8 +979,10 @@ async fn handle_embeddings(
             return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
         }
     };
-    let session_id_for_log =
-        redact_identifier_for_logs(session_id.as_deref().unwrap_or("-"), log_sensitive_ids);
+    let session_id_for_log = redact_identifier_for_logs(
+        client_session_id.as_deref().unwrap_or("-"),
+        log_sensitive_ids,
+    );
 
     let mut embeddings = Vec::with_capacity(requests.len());
     for request in requests {

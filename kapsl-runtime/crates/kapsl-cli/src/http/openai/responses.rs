@@ -28,8 +28,11 @@ pub(crate) fn build_responses_route(
         .and(warp::post())
         .and(warp::body::bytes())
         .and(warp::header::optional::<String>("x-kapsl-session"))
+        .and(warp::header::optional::<String>("authorization"))
         .and_then(
-            move |body: warp::hyper::body::Bytes, session_header: Option<String>| {
+            move |body: warp::hyper::body::Bytes,
+                  session_header: Option<String>,
+                  authorization: Option<String>| {
                 let models = models.clone();
                 let inference = inference.clone();
                 async move {
@@ -37,6 +40,7 @@ pub(crate) fn build_responses_route(
                         handle_response(
                             body,
                             session_header,
+                            authorization,
                             &models,
                             &inference,
                             log_sensitive_ids,
@@ -253,6 +257,7 @@ struct ResponseContext {
 async fn handle_response(
     body: warp::hyper::body::Bytes,
     session_header: Option<String>,
+    authorization: Option<String>,
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
     log_sensitive_ids: bool,
@@ -309,17 +314,16 @@ async fn handle_response(
     let mut metadata = response_request.to_request_metadata();
     metadata.request_id = Some(response_id.clone());
     let mut request = InferenceRequest::new(input).with_metadata(metadata);
-    if let Some(session) = session_header
+    let client_session_id = session_header
         .map(|session| session.trim().to_string())
         .filter(|session| !session.is_empty())
-        .or_else(|| response_request.session_key())
-    {
-        request.session_id = Some(session);
-    }
+        .or_else(|| response_request.session_key());
+    request.session_id =
+        scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
 
     let scheduler_priority = inference.priority_for_request(&request);
     let session_id_for_log = redact_identifier_for_logs(
-        request.session_id.as_deref().unwrap_or("-"),
+        client_session_id.as_deref().unwrap_or("-"),
         log_sensitive_ids,
     );
     let prompt_tokens = estimate_tokens(&prompt);

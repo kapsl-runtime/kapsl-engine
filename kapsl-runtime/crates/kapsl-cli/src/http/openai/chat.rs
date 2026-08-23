@@ -23,8 +23,11 @@ pub(crate) fn build_chat_completions_route(
         .and(warp::post())
         .and(warp::body::bytes())
         .and(warp::header::optional::<String>("x-kapsl-session"))
+        .and(warp::header::optional::<String>("authorization"))
         .and_then(
-            move |body: warp::hyper::body::Bytes, session_header: Option<String>| {
+            move |body: warp::hyper::body::Bytes,
+                  session_header: Option<String>,
+                  authorization: Option<String>| {
                 let models = models.clone();
                 let inference = inference.clone();
                 async move {
@@ -32,6 +35,7 @@ pub(crate) fn build_chat_completions_route(
                         handle_chat_completion(
                             body,
                             session_header,
+                            authorization,
                             &models,
                             &inference,
                             log_sensitive_ids,
@@ -49,6 +53,7 @@ pub(crate) fn build_chat_completions_route(
 async fn handle_chat_completion(
     body: warp::hyper::body::Bytes,
     session_header: Option<String>,
+    authorization: Option<String>,
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
     log_sensitive_ids: bool,
@@ -116,7 +121,9 @@ async fn handle_chat_completion(
 
     let mut request = InferenceRequest::new(input).with_metadata(metadata);
     // KV affinity: an explicit session header wins, else the OpenAI end-user id.
-    if let Some(session) = session_header
+    // The internal key is credential-scoped because both values are controlled
+    // by the client and must not collide across authentication principals.
+    let client_session_id = session_header
         .map(|session| session.trim().to_string())
         .filter(|session| !session.is_empty())
         .or_else(|| {
@@ -124,14 +131,13 @@ async fn handle_chat_completion(
                 .as_ref()
                 .map(|user| user.trim().to_string())
                 .filter(|user| !user.is_empty())
-        })
-    {
-        request.session_id = Some(session);
-    }
+        });
+    request.session_id =
+        scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
 
     let scheduler_priority = inference.priority_for_request(&request);
     let session_id_for_log = redact_identifier_for_logs(
-        request.session_id.as_deref().unwrap_or("-"),
+        client_session_id.as_deref().unwrap_or("-"),
         log_sensitive_ids,
     );
 

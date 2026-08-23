@@ -30,8 +30,9 @@ pub(crate) fn build_model_infer_stream_route(
 
     warp::path!("api" / "models" / u32 / "infer" / "stream")
         .and(warp::post())
+        .and(warp::header::optional::<String>("authorization"))
         .and(warp::body::bytes())
-        .and_then(move |model_id: u32, body: warp::hyper::body::Bytes| {
+        .and_then(move |model_id: u32, authorization: Option<String>, body: warp::hyper::body::Bytes| {
             let models = models.clone();
             let inference = inference.clone();
             let request_adapters = request_adapters.clone();
@@ -153,12 +154,17 @@ pub(crate) fn build_model_infer_stream_route(
                     }
                 }
 
+                let client_session_id = request.session_id.clone();
+                request.session_id = scope_session_id_for_authorization(
+                    client_session_id.as_deref(),
+                    authorization.as_deref(),
+                );
                 let request_id = request
                     .metadata
                     .as_ref()
                     .and_then(|metadata| metadata.request_id.as_deref())
                     .unwrap_or("-");
-                let session_id = request.session_id.as_deref().unwrap_or("-");
+                let session_id = client_session_id.as_deref().unwrap_or("-");
                 let request_id_for_log = redact_identifier_for_logs(request_id, log_sensitive_ids);
                 let session_id_for_log = redact_identifier_for_logs(session_id, log_sensitive_ids);
 

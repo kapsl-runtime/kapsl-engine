@@ -24,6 +24,48 @@ fn test_authorization_matches_token_plain_and_bearer() {
 }
 
 #[test]
+fn test_session_scope_is_stable_and_normalizes_bearer_authorization() {
+    let plain = scope_session_id_for_authorization(Some(" session-1 "), Some("token123"));
+    let bearer = scope_session_id_for_authorization(Some("session-1"), Some("Bearer token123"));
+
+    assert_eq!(plain, bearer);
+    assert!(plain.as_deref().is_some_and(|id| id.starts_with("ks1_")));
+}
+
+#[test]
+fn test_session_scope_prevents_cross_credential_collisions() {
+    let first = scope_session_id_for_authorization(Some("shared-session"), Some("Bearer key-a"));
+    let second = scope_session_id_for_authorization(Some("shared-session"), Some("Bearer key-b"));
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn test_session_scope_separates_session_ids_and_hides_source_values() {
+    let first = scope_session_id_for_authorization(Some("session-a"), Some("secret-key"))
+        .expect("scoped session");
+    let second = scope_session_id_for_authorization(Some("session-b"), Some("secret-key"))
+        .expect("scoped session");
+
+    assert_ne!(first, second);
+    assert!(!first.contains("session-a"));
+    assert!(!first.contains("secret-key"));
+    assert_eq!(first.len(), 68);
+}
+
+#[test]
+fn test_session_scope_ignores_empty_session_ids() {
+    assert_eq!(
+        scope_session_id_for_authorization(Some("  "), Some("token123")),
+        None
+    );
+    assert_eq!(
+        scope_session_id_for_authorization(None, Some("token123")),
+        None
+    );
+}
+
+#[test]
 fn test_format_authorization_header_from_remote_token() {
     assert_eq!(
         format_authorization_header(Some("abc123")),

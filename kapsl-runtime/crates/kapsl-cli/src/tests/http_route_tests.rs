@@ -457,6 +457,39 @@ impl Engine for OpenAiTestEngine {
     }
 }
 
+struct SessionCaptureEngine {
+    observed_sessions: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[async_trait::async_trait]
+impl Engine for SessionCaptureEngine {
+    async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        self.observed_sessions
+            .lock()
+            .push(request.session_id.clone());
+        BinaryTensorPacket::new(vec![1, 2], TensorDtype::Utf8, b"ok".to_vec())
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> kapsl_engine_api::EngineStream {
+        let result = self.infer(request);
+        Box::pin(futures::stream::once(async move { result }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        EngineMetrics::default()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
 struct OpenAiEmbeddingTestEngine;
 
 #[async_trait::async_trait]
@@ -558,6 +591,38 @@ fn test_openai_routes_with_model() -> warp::filters::BoxedFilter<(warp::reply::R
     models.install_loaded(
         MODEL_ID,
         PathBuf::from("/tmp/test-model.aimod"),
+        Arc::new(pool),
+        vec![],
+    );
+    build_openai_routes(OpenAiRoutesConfig {
+        models: models.clone(),
+        inference: test_inference_service(models),
+        log_sensitive_ids: false,
+    })
+}
+
+fn test_openai_routes_with_session_capture(
+    observed_sessions: Arc<Mutex<Vec<Option<String>>>>,
+) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
+    const MODEL_ID: u32 = 9;
+    let registry = Arc::new(ModelRegistry::new());
+    registry.register(ModelInfo::new(
+        MODEL_ID,
+        "session-test-model".to_string(),
+        "1".to_string(),
+        "gguf".to_string(),
+        "cpu".to_string(),
+        "all".to_string(),
+        "/tmp/session-test-model.aimod".to_string(),
+    ));
+    let models = ModelManager::new(registry);
+    let engine: EngineHandle = Arc::new(SessionCaptureEngine { observed_sessions });
+    let scheduler = Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+    let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+    pool.add_replica(0, scheduler);
+    models.install_loaded(
+        MODEL_ID,
+        PathBuf::from("/tmp/session-test-model.aimod"),
         Arc::new(pool),
         vec![],
     );
@@ -694,6 +759,35 @@ async fn test_openai_chat_rejects_multiple_choices_before_touching_the_pool() {
         .as_str()
         .expect("message")
         .contains("n=3 is not supported"));
+}
+
+#[tokio::test]
+async fn test_openai_chat_scopes_same_session_id_to_authorization_credential() {
+    let observed_sessions = Arc::new(Mutex::new(Vec::new()));
+    let route = test_openai_routes_with_session_capture(Arc::clone(&observed_sessions));
+    let body = r#"{"model":"session-test-model","messages":[{"role":"user","content":"hi"}]}"#;
+
+    for credential in ["Bearer key-a", "Bearer key-b"] {
+        let response = warp::test::request()
+            .method("POST")
+            .path("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", credential)
+            .header("x-kapsl-session", "shared-session")
+            .body(body)
+            .reply(&route)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let observed = observed_sessions.lock();
+    assert_eq!(observed.len(), 2);
+    let first = observed[0].as_deref().expect("first scoped session");
+    let second = observed[1].as_deref().expect("second scoped session");
+    assert_ne!(first, second);
+    assert!(first.starts_with("ks1_"));
+    assert!(!first.contains("shared-session"));
+    assert!(!first.contains("key-a"));
 }
 
 #[tokio::test]
