@@ -341,10 +341,13 @@ fn model_info_for_plan(
         .graph_optimization_level
         .clone()
         .unwrap_or_else(|| "basic".to_string());
-    let path = plan.absolute_path.to_string_lossy().to_string();
+    // The registry's path is the persisted runtime asset, whose directory also
+    // contains package-side tokenizer/config files. ModelManager separately
+    // retains `absolute_path` for lifecycle reloads and autoscaling.
+    let path = plan.model_file_path.to_string_lossy().to_string();
     let device = selected_provider.to_string();
 
-    match role {
+    let model_info = match role {
         ReplicaLoadRole::Primary => ModelInfo::new(
             plan.base_model_id,
             manifest.project_name.clone(),
@@ -365,7 +368,14 @@ fn model_info_for_plan(
             optimization_level,
             path,
         ),
-    }
+    };
+
+    model_info.with_model_axes(
+        manifest.format.clone(),
+        manifest.model_type.clone(),
+        manifest.task.clone(),
+        manifest.preprocess_kind(),
+    )
 }
 
 fn log_package_plan(plan: &ModelLoadPlan) {
@@ -422,5 +432,22 @@ mod tests {
         let info = model_info_for_plan(&test_plan(), ReplicaLoadRole::Primary, "cpu");
 
         assert_eq!(info.device, "cpu");
+    }
+
+    #[test]
+    fn model_info_reports_runtime_assets_and_manifest_axes() {
+        let mut plan = test_plan();
+        plan.absolute_path = PathBuf::from("/source/model.aimod");
+        plan.model_file_path = PathBuf::from("/cache/model.onnx");
+        plan.loader.manifest.format = Some("onnx".to_string());
+        plan.loader.manifest.model_type = Some("embedding".to_string());
+        plan.loader.manifest.task = Some("embed".to_string());
+
+        let info = model_info_for_plan(&plan, ReplicaLoadRole::Primary, "cpu");
+
+        assert_eq!(info.model_path, "/cache/model.onnx");
+        assert_eq!(info.format.as_deref(), Some("onnx"));
+        assert_eq!(info.model_type.as_deref(), Some("embedding"));
+        assert_eq!(info.task.as_deref(), Some("embed"));
     }
 }
