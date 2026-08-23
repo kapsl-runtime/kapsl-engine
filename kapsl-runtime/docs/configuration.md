@@ -148,18 +148,27 @@ kapsl run \
   --kv-control-lease-ttl-ms 30000
 ```
 
-Registration accepts only `kv_connected` participants with opaque metadata and
-backend-owned KV. Every advertised cache pool must name a bounded physical
-host, CUDA, or provider domain. Reservations enter the same `MemoryAuthority`
-as built-in engines; admission is rejected before backend allocation when the
-domain budget is unavailable or exhausted. CUDA domains require a build with
-the CUDA memory authority (`gpu-device-pool`) enabled.
+Opaque `kv_connected` registrations use backend-owned KV. Every advertised
+cache pool must name a bounded physical host, CUDA, or provider domain.
+Reservations enter the same `MemoryAuthority` as built-in engines; admission
+is rejected before backend allocation when the domain budget is unavailable or
+exhausted. CUDA domains require a build with the CUDA memory authority
+(`gpu-device-pool`) enabled.
+
+ABI 1.1 also defines a provisioner boundary for runtime-owned `shared_pool`
+bindings, including epoch/generation-checked handles, synchronized release,
+zero-before-assignment, and quarantine after an unfenced expiry. The production
+listener currently starts without a CUDA IPC/NIXL provisioner, so external
+`shared_pool` registration fails closed until that physical data plane is
+configured.
 
 Participants heartbeat active leases. A requested TTL may be shorter than the
-runtime maximum but never longer. When heartbeats stop, the runtime expires the
-lease and returns its capacity to the authority. The listener is supervised:
-if it exits unexpectedly while configured, the runtime fails rather than
-silently continuing in unmanaged mode.
+runtime maximum but never longer. When heartbeats stop, an opaque lease returns
+its capacity to the authority. Blocks from an expired shared-pool lease are
+quarantined because timeout alone does not prove that another process has
+stopped using the mapping. The listener is supervised: if it exits unexpectedly
+while configured, the runtime fails rather than silently continuing in
+unmanaged mode.
 
 `/metrics` samples the live allocator at scrape time. Pool-wide series are
 `kapsl_gpu_device_pool_allocated_bytes`, `_live_allocations`, `_free_bytes`,

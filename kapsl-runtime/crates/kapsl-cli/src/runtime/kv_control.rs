@@ -9,13 +9,14 @@ use super::memory::{
     MemoryPlan,
 };
 use kapsl_kv_abi::{
-    dispatch_control_request, KvCacheOwnership, KvCommitRequest, KvContractError,
+    dispatch_control_request, KvBlockHandle, KvCacheOwnership, KvCommitRequest, KvContractError,
     KvControlRequestEnvelope, KvControlResponse, KvControlResponseEnvelope, KvGroupLease,
-    KvIntegrationTier, KvLease, KvMemoryDomain, KvMetadataMode, KvParticipantRegistration,
-    KvReserveRequest, KvSequenceKey, KAPSL_KV_ABI_VERSION,
+    KvGroupReservation, KvIntegrationTier, KvLease, KvMemoryDomain, KvMetadataMode,
+    KvParticipantRegistration, KvRegistrationReceipt, KvReleaseCompletion, KvReserveRequest,
+    KvSequenceKey, KvSharedPoolDescriptor, KAPSL_KV_ABI_VERSION,
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,9 +24,284 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 
+/// Physical data-plane storage retained for the lifetime of a provisioned
+/// shared pool. Implementations clear every newly assigned block before its
+/// handle is published to a participant.
+pub(crate) trait SharedPoolBacking: Send + Sync {
+    fn zero_blocks(
+        &self,
+        binding: &KvSharedPoolDescriptor,
+        block_indices: &[u64],
+    ) -> Result<(), KvContractError>;
+}
+
+pub(crate) struct ProvisionedSharedPools {
+    pub(crate) descriptors: Vec<KvSharedPoolDescriptor>,
+    pub(crate) backing: Arc<dyn SharedPoolBacking>,
+}
+
+/// Transport-specific provider boundary. A CUDA IPC implementation must
+/// allocate an isolated exportable allocation per participant; exporting the
+/// runtime's process-wide CUDA pool would violate model/session isolation. The
+/// returned backing must retain the corresponding `MemoryAuthority` lease for
+/// its full lifetime so physical capacity is charged once at pool creation,
+/// rather than once per logical request block.
+pub(crate) trait SharedPoolProvisioner: Send + Sync {
+    fn provision(
+        &self,
+        registration: &KvParticipantRegistration,
+        owner: MemoryOwner,
+        participant_epoch: u64,
+    ) -> Result<ProvisionedSharedPools, KvContractError>;
+}
+
+#[derive(Clone)]
+struct SharedGroupDefinition {
+    capacity_pool_id: String,
+    allocation_granularity_tokens: u32,
+}
+
+struct SharedPoolAllocatorState {
+    free_by_pool: HashMap<String, Vec<u64>>,
+    quarantined_by_pool: HashMap<String, BTreeSet<u64>>,
+}
+
+struct SharedPoolLeaseAllocation {
+    blocks_by_pool: BTreeMap<String, Vec<u64>>,
+}
+
+struct SharedPoolSet {
+    groups: HashMap<String, SharedGroupDefinition>,
+    bindings_by_pool: HashMap<String, Vec<KvSharedPoolDescriptor>>,
+    state: Mutex<SharedPoolAllocatorState>,
+    backing: Arc<dyn SharedPoolBacking>,
+}
+
+impl SharedPoolSet {
+    fn new(
+        registration: &KvParticipantRegistration,
+        receipt: &KvRegistrationReceipt,
+        provisioned: ProvisionedSharedPools,
+    ) -> Result<Arc<Self>, KvContractError> {
+        receipt.validate_for(registration)?;
+        if provisioned.descriptors != receipt.shared_pools {
+            return Err(KvContractError::Internal {
+                message: "shared-pool provisioner receipt changed during registration".to_string(),
+            });
+        }
+
+        let groups = registration
+            .capacity_model
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.group_id.clone(),
+                    SharedGroupDefinition {
+                        capacity_pool_id: group.pool_id.clone(),
+                        allocation_granularity_tokens: group.allocation_granularity_tokens,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut bindings_by_pool = HashMap::<String, Vec<KvSharedPoolDescriptor>>::new();
+        for descriptor in provisioned.descriptors {
+            bindings_by_pool
+                .entry(descriptor.capacity_pool_id.clone())
+                .or_default()
+                .push(descriptor);
+        }
+
+        let mut free_by_pool = HashMap::new();
+        let mut quarantined_by_pool = HashMap::new();
+        for (capacity_pool_id, bindings) in &bindings_by_pool {
+            let block_count = bindings
+                .first()
+                .expect("receipt validation requires a non-empty binding set")
+                .block_count;
+            if bindings
+                .iter()
+                .any(|binding| binding.block_count != block_count)
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "replicas of shared pool '{capacity_pool_id}' must expose the same block count"
+                )));
+            }
+            let block_count = usize::try_from(block_count).map_err(|_| {
+                KvContractError::invalid_capabilities(format!(
+                    "shared pool '{capacity_pool_id}' block count does not fit this runtime"
+                ))
+            })?;
+            free_by_pool.insert(
+                capacity_pool_id.clone(),
+                (0..block_count as u64).rev().collect(),
+            );
+            quarantined_by_pool.insert(capacity_pool_id.clone(), BTreeSet::new());
+        }
+
+        Ok(Arc::new(Self {
+            groups,
+            bindings_by_pool,
+            state: Mutex::new(SharedPoolAllocatorState {
+                free_by_pool,
+                quarantined_by_pool,
+            }),
+            backing: provisioned.backing,
+        }))
+    }
+
+    fn reserve(
+        &self,
+        reservations: &[KvGroupReservation],
+    ) -> Result<(Vec<KvGroupLease>, SharedPoolLeaseAllocation), KvContractError> {
+        let mut group_blocks = Vec::with_capacity(reservations.len());
+        let mut needed_by_pool = BTreeMap::<String, u64>::new();
+        for reservation in reservations {
+            let group = self.groups.get(&reservation.group_id).ok_or_else(|| {
+                KvContractError::invalid_request(format!(
+                    "reservation references unprovisioned shared group '{}'",
+                    reservation.group_id
+                ))
+            })?;
+            let granularity = u64::from(group.allocation_granularity_tokens);
+            let blocks = u64::from(reservation.token_capacity)
+                .div_ceil(granularity)
+                .max(u64::from(reservation.minimum_blocks.unwrap_or(0)));
+            group_blocks.push((reservation, group, blocks));
+            needed_by_pool
+                .entry(group.capacity_pool_id.clone())
+                .and_modify(|current| *current = (*current).max(blocks))
+                .or_insert(blocks);
+        }
+
+        let blocks_by_pool = {
+            let mut state = self.state.lock();
+            for (pool_id, needed) in &needed_by_pool {
+                let available = state
+                    .free_by_pool
+                    .get(pool_id)
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                if usize::try_from(*needed).map_or(true, |needed| needed > available) {
+                    return Err(KvContractError::CapacityExhausted {
+                        message: format!(
+                            "shared pool '{pool_id}' has {available} free blocks but needs {needed}"
+                        ),
+                    });
+                }
+            }
+            let mut allocated = BTreeMap::new();
+            for (pool_id, needed) in needed_by_pool {
+                let free = state
+                    .free_by_pool
+                    .get_mut(&pool_id)
+                    .expect("validated shared pool must have a free list");
+                let needed = usize::try_from(needed).expect("capacity checked above");
+                let blocks = (0..needed)
+                    .map(|_| free.pop().expect("capacity checked above"))
+                    .collect::<Vec<_>>();
+                allocated.insert(pool_id, blocks);
+            }
+            allocated
+        };
+
+        for (pool_id, blocks) in &blocks_by_pool {
+            let bindings = self
+                .bindings_by_pool
+                .get(pool_id)
+                .expect("validated shared pool must have physical bindings");
+            for binding in bindings {
+                if let Err(error) = self.backing.zero_blocks(binding, blocks) {
+                    self.return_blocks(&blocks_by_pool);
+                    return Err(error);
+                }
+            }
+        }
+
+        let public_groups = group_blocks
+            .into_iter()
+            .map(|(reservation, group, needed)| {
+                let blocks = blocks_by_pool
+                    .get(&group.capacity_pool_id)
+                    .expect("shared pool was allocated");
+                let bindings = self
+                    .bindings_by_pool
+                    .get(&group.capacity_pool_id)
+                    .expect("validated shared pool must have physical bindings");
+                let mut handles = Vec::new();
+                for block_index in blocks.iter().take(needed as usize) {
+                    for binding in bindings {
+                        handles.push(KvBlockHandle::RuntimePool {
+                            pool_id: binding.binding_id.clone(),
+                            block_index: *block_index,
+                            generation: binding.generation,
+                        });
+                    }
+                }
+                KvGroupLease {
+                    group_id: reservation.group_id.clone(),
+                    token_capacity: reservation.token_capacity,
+                    blocks: handles,
+                }
+            })
+            .collect();
+
+        Ok((public_groups, SharedPoolLeaseAllocation { blocks_by_pool }))
+    }
+
+    fn release(&self, allocation: SharedPoolLeaseAllocation) {
+        self.return_blocks(&allocation.blocks_by_pool);
+    }
+
+    fn quarantine(&self, allocation: SharedPoolLeaseAllocation) {
+        let mut state = self.state.lock();
+        for (pool_id, blocks) in allocation.blocks_by_pool {
+            state
+                .quarantined_by_pool
+                .get_mut(&pool_id)
+                .expect("validated shared pool must have a quarantine set")
+                .extend(blocks);
+        }
+    }
+
+    fn return_blocks(&self, blocks_by_pool: &BTreeMap<String, Vec<u64>>) {
+        let mut state = self.state.lock();
+        for (pool_id, blocks) in blocks_by_pool {
+            state
+                .free_by_pool
+                .get_mut(pool_id)
+                .expect("validated shared pool must have a free list")
+                .extend(blocks.iter().copied());
+        }
+    }
+
+    #[cfg(test)]
+    fn available_blocks(&self, pool_id: &str) -> usize {
+        self.state
+            .lock()
+            .free_by_pool
+            .get(pool_id)
+            .map(Vec::len)
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    fn quarantined_blocks(&self, pool_id: &str) -> usize {
+        self.state
+            .lock()
+            .quarantined_by_pool
+            .get(pool_id)
+            .map(BTreeSet::len)
+            .unwrap_or_default()
+    }
+}
+
 struct ParticipantRecord {
     registration: KvParticipantRegistration,
     owner: MemoryOwner,
+    receipt: KvRegistrationReceipt,
+    shared_pools: Option<Arc<SharedPoolSet>>,
 }
 
 struct ExternalLeaseRecord {
@@ -34,7 +310,9 @@ struct ExternalLeaseRecord {
     participant_id: String,
     ttl: Duration,
     expires_at: Instant,
-    memory: MemoryLease,
+    memory: Option<MemoryLease>,
+    shared_pools: Option<Arc<SharedPoolSet>>,
+    shared_allocation: Option<SharedPoolLeaseAllocation>,
 }
 
 #[derive(Default)]
@@ -46,21 +324,32 @@ struct CoordinatorState {
 
 /// Runtime implementation of the backend-neutral KV coordinator contract.
 ///
-/// This listener accepts only `kv_connected`/opaque participants. A
-/// `shared_pool` backend needs a negotiated data plane and cannot be promoted
-/// merely by reaching this control socket.
+/// Opaque participants use byte-accounted memory leases. Shared-pool
+/// participants are accepted only when a transport-specific provisioner is
+/// installed; the ordinary listener therefore remains fail-closed until its
+/// physical data plane is configured.
 pub(crate) struct ExternalKvCoordinator {
     memory: Arc<MemoryAuthority>,
     state: Mutex<CoordinatorState>,
     next_participant_slot: AtomicU32,
+    next_participant_epoch: AtomicU64,
     next_lease_id: AtomicU64,
     maximum_lease_ttl: Duration,
+    shared_pool_provisioner: Option<Arc<dyn SharedPoolProvisioner>>,
 }
 
 impl ExternalKvCoordinator {
     pub(crate) fn new(
         memory: Arc<MemoryAuthority>,
         maximum_lease_ttl: Duration,
+    ) -> Result<Arc<Self>, String> {
+        Self::new_with_shared_pool_provisioner(memory, maximum_lease_ttl, None)
+    }
+
+    pub(crate) fn new_with_shared_pool_provisioner(
+        memory: Arc<MemoryAuthority>,
+        maximum_lease_ttl: Duration,
+        shared_pool_provisioner: Option<Arc<dyn SharedPoolProvisioner>>,
     ) -> Result<Arc<Self>, String> {
         if maximum_lease_ttl.is_zero() {
             return Err("KV control lease TTL must be non-zero".to_string());
@@ -69,14 +358,16 @@ impl ExternalKvCoordinator {
             memory,
             state: Mutex::new(CoordinatorState::default()),
             next_participant_slot: AtomicU32::new(0),
+            next_participant_epoch: AtomicU64::new(1),
             next_lease_id: AtomicU64::new(1),
             maximum_lease_ttl,
+            shared_pool_provisioner,
         }))
     }
 
     pub(crate) fn expire_stale(&self) -> usize {
         let now = Instant::now();
-        let expired = {
+        let mut expired = {
             let mut state = self.state.lock();
             let lease_ids = state
                 .leases
@@ -97,9 +388,23 @@ impl ExternalKvCoordinator {
             expired
         };
         let count = expired.len();
+        let mut quarantined = 0usize;
+        for lease in &mut expired {
+            if let (Some(pools), Some(allocation)) =
+                (lease.shared_pools.as_ref(), lease.shared_allocation.take())
+            {
+                pools.quarantine(allocation);
+                quarantined += 1;
+            }
+        }
         drop(expired);
         if count > 0 {
             log::warn!("[kv-control] expired {count} stale capacity lease(s)");
+        }
+        if quarantined > 0 {
+            log::error!(
+                "[kv-control] quarantined blocks from {quarantined} expired shared-pool lease(s); unfenced blocks are never recycled"
+            );
         }
         count
     }
@@ -117,12 +422,25 @@ impl ExternalKvCoordinator {
     fn participant_registration(
         &self,
         participant_id: &str,
-    ) -> Result<(KvParticipantRegistration, MemoryOwner), KvContractError> {
+    ) -> Result<
+        (
+            KvParticipantRegistration,
+            MemoryOwner,
+            Option<Arc<SharedPoolSet>>,
+        ),
+        KvContractError,
+    > {
         self.state
             .lock()
             .participants
             .get(participant_id)
-            .map(|record| (record.registration.clone(), record.owner))
+            .map(|record| {
+                (
+                    record.registration.clone(),
+                    record.owner,
+                    record.shared_pools.clone(),
+                )
+            })
             .ok_or_else(|| KvContractError::NotFound {
                 message: format!("KV participant '{participant_id}' is not registered"),
             })
@@ -144,25 +462,33 @@ impl ExternalKvCoordinator {
 }
 
 impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
-    fn register(&self, registration: &KvParticipantRegistration) -> Result<(), KvContractError> {
+    fn register(
+        &self,
+        registration: &KvParticipantRegistration,
+    ) -> Result<KvRegistrationReceipt, KvContractError> {
         registration.validate()?;
-        if registration.capabilities.tier != KvIntegrationTier::KvConnected
-            || registration.capabilities.metadata_mode != KvMetadataMode::Opaque
-            || registration.capabilities.ownership != KvCacheOwnership::Backend
-        {
+        let is_opaque = registration.capabilities.tier == KvIntegrationTier::KvConnected
+            && registration.capabilities.metadata_mode == KvMetadataMode::Opaque
+            && registration.capabilities.ownership == KvCacheOwnership::Backend;
+        let is_shared = registration.capabilities.tier == KvIntegrationTier::SharedPool
+            && registration.capabilities.metadata_mode == KvMetadataMode::Structured
+            && registration.capabilities.ownership == KvCacheOwnership::KapslRuntime;
+        if !is_opaque && !is_shared {
             return Err(KvContractError::invalid_capabilities(
-                "the external control listener accepts only kv_connected/opaque/backend-owned participants",
+                "external KV participants must be opaque/backend-owned or use a provisioned runtime-owned shared pool",
             ));
         }
-
-        for domain in registration
-            .capacity_model
-            .groups
-            .iter()
-            .flat_map(|group| &group.memory_domains)
-        {
-            let runtime_domain = runtime_memory_domain(domain)?;
-            if !self.memory.supports_external_leases(&runtime_domain) {
+        if is_opaque {
+            for domain in registration
+                .capacity_model
+                .groups
+                .iter()
+                .flat_map(|group| &group.memory_domains)
+            {
+                let runtime_domain = runtime_memory_domain(domain)?;
+                if self.memory.supports_external_leases(&runtime_domain) {
+                    continue;
+                }
                 return Err(KvContractError::invalid_capabilities(format!(
                     "runtime has no bounded external-lease authority for KV domain {runtime_domain}"
                 )));
@@ -173,7 +499,7 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         let mut state = self.state.lock();
         if let Some(existing) = state.participants.get(&registration.participant_id) {
             if existing.registration == *registration {
-                return Ok(());
+                return Ok(existing.receipt.clone());
             }
             if state
                 .leases
@@ -185,35 +511,77 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     registration.participant_id
                 )));
             }
+            if existing.shared_pools.is_some() || is_shared {
+                return Err(KvContractError::invalid_request(format!(
+                    "shared-pool participant '{}' cannot replace its registration while imported pool mappings may still exist",
+                    registration.participant_id
+                )));
+            }
             let owner = existing.owner;
+            let participant_epoch = self.next_participant_epoch.fetch_add(1, Ordering::Relaxed);
+            let receipt = KvRegistrationReceipt::opaque(
+                registration.participant_id.clone(),
+                participant_epoch,
+            );
             state.participants.insert(
                 registration.participant_id.clone(),
                 ParticipantRecord {
                     registration: registration.clone(),
                     owner,
+                    receipt: receipt.clone(),
+                    shared_pools: None,
                 },
             );
-            return Ok(());
+            return Ok(receipt);
         }
 
         let slot = self.next_participant_slot.fetch_add(1, Ordering::Relaxed);
         let owner = MemoryOwner::external_kv(slot).ok_or_else(|| KvContractError::Internal {
             message: "external KV participant owner space exhausted".to_string(),
         })?;
+        let participant_epoch = self.next_participant_epoch.fetch_add(1, Ordering::Relaxed);
+        let (receipt, shared_pools) = if is_shared {
+            let provisioner = self.shared_pool_provisioner.as_ref().ok_or_else(|| {
+                KvContractError::invalid_capabilities(
+                    "shared_pool was requested but no isolated data-plane provisioner is configured",
+                )
+            })?;
+            let provisioned = provisioner.provision(registration, owner, participant_epoch)?;
+            let receipt = KvRegistrationReceipt {
+                participant_id: registration.participant_id.clone(),
+                participant_epoch,
+                shared_pools: provisioned.descriptors.clone(),
+            };
+            let pools = SharedPoolSet::new(registration, &receipt, provisioned)?;
+            (receipt, Some(pools))
+        } else {
+            (
+                KvRegistrationReceipt::opaque(
+                    registration.participant_id.clone(),
+                    participant_epoch,
+                ),
+                None,
+            )
+        };
         state.participants.insert(
             registration.participant_id.clone(),
             ParticipantRecord {
                 registration: registration.clone(),
                 owner,
+                receipt: receipt.clone(),
+                shared_pools,
             },
         );
         log::info!(
-            "[kv-control] registered participant '{}' backend={} model={} tier=kv_connected metadata=opaque",
+            "[kv-control] registered participant '{}' backend={} model={} tier={:?} metadata={:?} epoch={}",
             registration.participant_id,
             registration.backend,
-            registration.model_fingerprint
+            registration.model_fingerprint,
+            registration.capabilities.tier,
+            registration.capabilities.metadata_mode,
+            participant_epoch,
         );
-        Ok(())
+        Ok(receipt)
     }
 
     fn reserve(
@@ -224,7 +592,7 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         request.validate()?;
         self.expire_stale();
 
-        let (registration, owner) = self.participant_registration(participant_id)?;
+        let (registration, owner, shared_pools) = self.participant_registration(participant_id)?;
         if let Some(prefix) = &request.prefix {
             if prefix.model_fingerprint != registration.model_fingerprint {
                 return Err(KvContractError::invalid_request(
@@ -266,40 +634,42 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 "reservation references an unregistered cache group",
             ));
         }
-        let bytes_by_domain = registration
-            .capacity_model
-            .bytes_by_domain_for_reservations(&request.groups)
-            .ok_or_else(|| KvContractError::CapacityExhausted {
-                message: "reservation exceeds the participant capacity model or byte accounting overflowed"
-                    .to_string(),
-            })?;
-
+        let ttl = self.effective_ttl(request.ttl_ms)?;
         let numeric_id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
         let lease_id = format!("kapsl-kv-{numeric_id:016x}");
-        let mut plan = MemoryPlan::new();
-        for (domain, bytes) in bytes_by_domain {
-            let bytes = usize::try_from(bytes).map_err(|_| KvContractError::CapacityExhausted {
-                message: "KV reservation does not fit the runtime address space".to_string(),
-            })?;
-            plan.push(MemoryClaim::external(
-                runtime_memory_domain(&domain)?,
-                owner,
-                MemoryAllocationClass::KvCache,
-                format!("kv-participant:{participant_id}:{lease_id}"),
-                bytes,
-            ));
-        }
-        let memory = self
-            .memory
-            .admit(&plan)
-            .map_err(|message| KvContractError::CapacityExhausted { message })?;
-
-        let ttl = self.effective_ttl(request.ttl_ms)?;
-        let expires_at = Instant::now() + ttl;
-        let public = KvLease {
-            lease_id: lease_id.clone(),
-            sequence: request.sequence.clone(),
-            groups: request
+        let (memory, public_groups, mut shared_allocation) = if let Some(pools) =
+            shared_pools.as_ref()
+        {
+            let (groups, allocation) = pools.reserve(&request.groups)?;
+            (None, groups, Some(allocation))
+        } else {
+            let bytes_by_domain = registration
+                    .capacity_model
+                    .bytes_by_domain_for_reservations(&request.groups)
+                    .ok_or_else(|| KvContractError::CapacityExhausted {
+                        message: "reservation exceeds the participant capacity model or byte accounting overflowed"
+                            .to_string(),
+                    })?;
+            let mut plan = MemoryPlan::new();
+            for (domain, bytes) in bytes_by_domain {
+                let bytes =
+                    usize::try_from(bytes).map_err(|_| KvContractError::CapacityExhausted {
+                        message: "KV reservation does not fit the runtime address space"
+                            .to_string(),
+                    })?;
+                plan.push(MemoryClaim::external(
+                    runtime_memory_domain(&domain)?,
+                    owner,
+                    MemoryAllocationClass::KvCache,
+                    format!("kv-participant:{participant_id}:{lease_id}"),
+                    bytes,
+                ));
+            }
+            let memory = self
+                .memory
+                .admit(&plan)
+                .map_err(|message| KvContractError::CapacityExhausted { message })?;
+            let groups = request
                 .groups
                 .iter()
                 .map(|group| KvGroupLease {
@@ -307,25 +677,38 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     token_capacity: group.token_capacity,
                     blocks: Vec::new(),
                 })
-                .collect(),
+                .collect();
+            (Some(memory), groups, None)
+        };
+
+        let expires_at = Instant::now() + ttl;
+        let public = KvLease {
+            lease_id: lease_id.clone(),
+            sequence: request.sequence.clone(),
+            groups: public_groups,
             expires_at_unix_ms: Some(unix_ms_after(ttl)),
         };
-        public.validate()?;
+        if let Err(error) = public.validate() {
+            if let (Some(pools), Some(allocation)) =
+                (shared_pools.as_ref(), shared_allocation.take())
+            {
+                pools.release(allocation);
+            }
+            return Err(error);
+        }
 
-        let record = ExternalLeaseRecord {
-            public: public.clone(),
-            request: request.clone(),
-            participant_id: participant_id.to_string(),
-            ttl,
-            expires_at,
-            memory,
-        };
         let mut state = self.state.lock();
         if state
             .participants
             .get(participant_id)
             .is_none_or(|current| current.registration != registration)
         {
+            drop(state);
+            if let (Some(pools), Some(allocation)) =
+                (shared_pools.as_ref(), shared_allocation.take())
+            {
+                pools.release(allocation);
+            }
             return Err(KvContractError::invalid_request(
                 "participant registration changed while the reservation was being admitted; retry",
             ));
@@ -336,12 +719,35 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 .get(existing_id)
                 .expect("sequence index must reference a live lease");
             if existing.request == *request {
-                return Ok(existing.public.clone());
+                let existing = existing.public.clone();
+                drop(state);
+                if let (Some(pools), Some(allocation)) =
+                    (shared_pools.as_ref(), shared_allocation.take())
+                {
+                    pools.release(allocation);
+                }
+                return Ok(existing);
+            }
+            drop(state);
+            if let (Some(pools), Some(allocation)) =
+                (shared_pools.as_ref(), shared_allocation.take())
+            {
+                pools.release(allocation);
             }
             return Err(KvContractError::invalid_request(
                 "sequence acquired a conflicting lease concurrently",
             ));
         }
+        let record = ExternalLeaseRecord {
+            public: public.clone(),
+            request: request.clone(),
+            participant_id: participant_id.to_string(),
+            ttl,
+            expires_at,
+            memory,
+            shared_pools,
+            shared_allocation,
+        };
         state.sequences.insert(sequence_key, lease_id.clone());
         state.leases.insert(lease_id, record);
         Ok(public)
@@ -376,7 +782,9 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 "computed_tokens exceeds the reserved token capacity",
             ));
         }
-        lease.memory.commit_capacity();
+        if let Some(memory) = lease.memory.as_mut() {
+            memory.commit_capacity();
+        }
         Ok(())
     }
 
@@ -415,9 +823,17 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         Ok(())
     }
 
-    fn release(&self, participant_id: &str, lease_id: &str) -> Result<(), KvContractError> {
+    fn release(
+        &self,
+        participant_id: &str,
+        lease_id: &str,
+        completion: Option<&KvReleaseCompletion>,
+    ) -> Result<(), KvContractError> {
         self.expire_stale();
-        let released = {
+        if let Some(completion) = completion {
+            completion.validate()?;
+        }
+        let mut released = {
             let mut state = self.state.lock();
             let lease = state
                 .leases
@@ -426,6 +842,21 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     message: format!("KV lease '{lease_id}' does not exist"),
                 })?;
             ensure_lease_owner(lease, participant_id)?;
+            if lease.shared_allocation.is_some() {
+                match completion {
+                    Some(KvReleaseCompletion::BackendSynchronized) => {}
+                    Some(KvReleaseCompletion::TransportFence { .. }) => {
+                        return Err(KvContractError::unsupported(
+                            "shared_pool_release_transport_fence",
+                        ));
+                    }
+                    None => {
+                        return Err(KvContractError::invalid_request(
+                            "shared-pool release requires backend_synchronized completion or a supported transport fence",
+                        ));
+                    }
+                }
+            }
             let released = state.leases.remove(lease_id).expect("lease checked above");
             state.sequences.remove(&(
                 released.participant_id.clone(),
@@ -433,6 +864,12 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
             ));
             released
         };
+        if let (Some(pools), Some(allocation)) = (
+            released.shared_pools.as_ref(),
+            released.shared_allocation.take(),
+        ) {
+            pools.release(allocation);
+        }
         drop(released);
         Ok(())
     }
@@ -756,9 +1193,62 @@ mod tests {
     use super::*;
     use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
     use kapsl_kv_abi::{
-        KvBackendCapabilities, KvCapacityGroup, KvCapacityModel, KvControlRequest,
-        KvGroupReservation, KvMemoryDomain, KvSequenceKey,
+        KvBackendCapabilities, KvCacheGeometry, KvCacheGroup, KvCachePolicy, KvCapacityGroup,
+        KvCapacityModel, KvControlRequest, KvElementType, KvGroupReservation, KvLayerId,
+        KvMemoryDomain, KvSequenceKey, KvShard, KvTensorLayout, KvTopology, KvTransport,
     };
+
+    #[derive(Default)]
+    struct TestSharedBacking {
+        zeroed_blocks: AtomicU64,
+    }
+
+    impl SharedPoolBacking for TestSharedBacking {
+        fn zero_blocks(
+            &self,
+            _binding: &KvSharedPoolDescriptor,
+            block_indices: &[u64],
+        ) -> Result<(), KvContractError> {
+            self.zeroed_blocks
+                .fetch_add(block_indices.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    struct TestSharedProvisioner {
+        backing: Arc<TestSharedBacking>,
+    }
+
+    impl SharedPoolProvisioner for TestSharedProvisioner {
+        fn provision(
+            &self,
+            registration: &KvParticipantRegistration,
+            _owner: MemoryOwner,
+            participant_epoch: u64,
+        ) -> Result<ProvisionedSharedPools, KvContractError> {
+            let group = registration
+                .capacity_model
+                .groups
+                .first()
+                .expect("test shared registration group");
+            Ok(ProvisionedSharedPools {
+                descriptors: vec![KvSharedPoolDescriptor {
+                    binding_id: format!("test-binding-{participant_epoch}"),
+                    capacity_pool_id: group.pool_id.clone(),
+                    generation: participant_epoch,
+                    group_ids: vec![group.group_id.clone()],
+                    memory_domain: KvMemoryDomain::Host,
+                    block_count: group.max_allocations.expect("test block cap"),
+                    bytes_per_block: group.bytes_per_allocation,
+                    transport: KvTransport::Custom {
+                        name: "test_direct".to_string(),
+                    },
+                    descriptor: "test-shared-backing".to_string(),
+                }],
+                backing: self.backing.clone(),
+            })
+        }
+    }
 
     fn test_memory() -> Arc<MemoryAuthority> {
         let info = DeviceInfo {
@@ -807,6 +1297,48 @@ mod tests {
                 }],
             },
             topology: None,
+        }
+    }
+
+    fn shared_registration() -> KvParticipantRegistration {
+        let mut capabilities = KvBackendCapabilities::in_process_shared_pool();
+        capabilities.transports.clear();
+        capabilities.transports.insert(KvTransport::Custom {
+            name: "test_direct".to_string(),
+        });
+        KvParticipantRegistration {
+            participant_id: "vllm:test:scheduler".to_string(),
+            backend: "vllm".to_string(),
+            model_fingerprint: "sha256:test".to_string(),
+            capabilities,
+            capacity_model: KvCapacityModel {
+                groups: vec![KvCapacityGroup {
+                    group_id: "vllm.group.0".to_string(),
+                    pool_id: "vllm.pool.0".to_string(),
+                    allocation_granularity_tokens: 16,
+                    bytes_per_allocation: 4096,
+                    memory_domains: vec![KvMemoryDomain::Host],
+                    max_allocations: Some(4),
+                }],
+            },
+            topology: Some(KvTopology {
+                abi_version: KAPSL_KV_ABI_VERSION,
+                model_fingerprint: "sha256:test".to_string(),
+                shard: KvShard::default(),
+                cache_groups: vec![KvCacheGroup {
+                    group_id: "vllm.group.0".to_string(),
+                    layers: vec![KvLayerId::indexed(0)],
+                    geometry: KvCacheGeometry::PagedAttention {
+                        block_size_tokens: 16,
+                        kv_heads: 1,
+                        key_head_dim: 128,
+                        value_head_dim: 128,
+                        element_type: KvElementType::F16,
+                        layout: KvTensorLayout::BlockKvHeadTokenDim,
+                    },
+                    policy: KvCachePolicy::FullAttention,
+                }],
+            }),
         }
     }
 
@@ -876,7 +1408,7 @@ mod tests {
             .unwrap();
         coordinator.heartbeat("vllm:test:scheduler").unwrap();
         coordinator
-            .release("vllm:test:scheduler", &lease.lease_id)
+            .release("vllm:test:scheduler", &lease.lease_id, None)
             .unwrap();
         assert_eq!(coordinator.lease_count(), 0);
         assert!(memory
@@ -884,6 +1416,104 @@ mod tests {
             .rows
             .iter()
             .all(|row| !row.owner.is_external_kv()));
+    }
+
+    #[test]
+    fn shared_pool_issues_runtime_handles_and_requires_synchronized_release() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let backing = Arc::new(TestSharedBacking::default());
+        let provisioner = Arc::new(TestSharedProvisioner {
+            backing: backing.clone(),
+        });
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(provisioner),
+        )
+        .unwrap();
+        let receipt = coordinator.register(&shared_registration()).unwrap();
+        assert_eq!(receipt.shared_pools.len(), 1);
+        let pools = coordinator
+            .state
+            .lock()
+            .participants
+            .get("vllm:test:scheduler")
+            .unwrap()
+            .shared_pools
+            .clone()
+            .unwrap();
+
+        let lease = coordinator
+            .reserve("vllm:test:scheduler", &reservation(None))
+            .unwrap();
+        assert_eq!(lease.groups[0].blocks.len(), 2);
+        assert!(lease.groups[0].blocks.iter().all(|handle| matches!(
+            handle,
+            KvBlockHandle::RuntimePool {
+                pool_id,
+                generation: 1,
+                ..
+            } if pool_id == "test-binding-1"
+        )));
+        assert_eq!(backing.zeroed_blocks.load(Ordering::Relaxed), 2);
+        assert_eq!(pools.available_blocks("vllm.pool.0"), 2);
+
+        assert!(matches!(
+            coordinator.release("vllm:test:scheduler", &lease.lease_id, None),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+        assert_eq!(coordinator.lease_count(), 1);
+        coordinator
+            .release(
+                "vllm:test:scheduler",
+                &lease.lease_id,
+                Some(&KvReleaseCompletion::BackendSynchronized),
+            )
+            .unwrap();
+        assert_eq!(coordinator.lease_count(), 0);
+        assert_eq!(pools.available_blocks("vllm.pool.0"), 4);
+    }
+
+    #[test]
+    fn expired_shared_pool_blocks_are_quarantined_instead_of_reused() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let provisioner = Arc::new(TestSharedProvisioner {
+            backing: Arc::new(TestSharedBacking::default()),
+        });
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_millis(5),
+            Some(provisioner),
+        )
+        .unwrap();
+        coordinator.register(&shared_registration()).unwrap();
+        let pools = coordinator
+            .state
+            .lock()
+            .participants
+            .get("vllm:test:scheduler")
+            .unwrap()
+            .shared_pools
+            .clone()
+            .unwrap();
+        coordinator
+            .reserve("vllm:test:scheduler", &reservation(Some(5)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(coordinator.expire_stale(), 1);
+        assert_eq!(pools.available_blocks("vllm.pool.0"), 2);
+        assert_eq!(pools.quarantined_blocks("vllm.pool.0"), 2);
+
+        let mut too_large = reservation(Some(5));
+        too_large.sequence.request_id = "request-2".to_string();
+        too_large.sequence.sequence_id = "request-2".to_string();
+        too_large.groups[0].token_capacity = 48;
+        assert!(matches!(
+            coordinator.reserve("vllm:test:scheduler", &too_large),
+            Err(KvContractError::CapacityExhausted { .. })
+        ));
     }
 
     #[test]
@@ -919,6 +1549,10 @@ mod tests {
             vec![KvMemoryDomain::Cuda { device_id: 0 }];
         assert!(matches!(
             coordinator.register(&cuda_registration),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+        assert!(matches!(
+            coordinator.register(&shared_registration()),
             Err(KvContractError::InvalidCapabilities { .. })
         ));
 
@@ -969,7 +1603,10 @@ mod tests {
         reader.read_until(b'\n', &mut response).await.unwrap();
         let response: KvControlResponseEnvelope = serde_json::from_slice(&response).unwrap();
         assert_eq!(response.request_id, "rpc-register");
-        assert!(matches!(response.response, KvControlResponse::Registered));
+        assert!(matches!(
+            response.response,
+            KvControlResponse::Registered { .. }
+        ));
         assert_eq!(coordinator.participant_count(), 1);
 
         task.abort();

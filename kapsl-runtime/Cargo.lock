@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl-kv-abi"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
