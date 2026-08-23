@@ -192,6 +192,8 @@ kapsl pull alice/model:prod
 ## Most Useful Flags
 
 - `--transport <socket|tcp|shm|hybrid|auto>`
+- `--kv-control-socket <absolute-path>` (optional external KV participant control plane)
+- `--kv-control-lease-ttl-ms <milliseconds>` (default: `30000`)
 - `--http-bind <ip>`
 - `--metrics-port <port>`
 - `--state-dir <dir>`

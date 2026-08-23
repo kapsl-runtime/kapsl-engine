@@ -67,6 +67,20 @@ pub(crate) struct Args {
     #[cfg_attr(windows, arg(short, long, default_value = r"\\.\pipe\kapsl"))]
     pub(crate) socket: String,
 
+    /// Unix socket for versioned external KV participants such as vLLM.
+    /// Omit to disable the external KV control plane.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) kv_control_socket: Option<PathBuf>,
+
+    /// Maximum lifetime of an external KV lease without a participant heartbeat.
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        default_value_t = 30_000,
+        value_parser = clap::value_parser!(u64).range(1000..)
+    )]
+    pub(crate) kv_control_lease_ttl_ms: u64,
+
     /// Bind address for the TCP inference server (used when --transport=tcp).
     /// Non-loopback binds require KAPSL_TCP_AUTH_TOKEN.
     #[arg(long, default_value = "127.0.0.1")]

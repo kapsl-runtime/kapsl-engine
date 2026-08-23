@@ -11,6 +11,9 @@ Options:
   --model <PATH>              Path to an .aimod file (repeatable)
   --transport <TRANSPORT>     socket | tcp | shm | hybrid (default: socket)
   --socket-path <PATH>        Unix socket path (default: /tmp/kapsl.sock)
+  --kv-control-socket <PATH>  Local socket for versioned external KV participants
+  --kv-control-lease-ttl-ms <MILLISECONDS>
+                              Maximum heartbeat lease TTL (default: 30000)
   --tcp-port <PORT>           IPC TCP port (default: 9096)
   --http-host <HOST>          HTTP bind host (default: 127.0.0.1)
   --http-port <PORT>          HTTP/API/UI port (default: 9095)
@@ -128,6 +131,35 @@ provider allocations atomically resize the owning memory lease. If physical
 usage has already crossed a hard limit, Kapsl retains the over-limit observed
 value in the authority snapshot, closes further admission, and enters the
 normal pressure policy rather than reverting to a stale reservation.
+
+### External KV participants
+
+`--kv-control-socket <PATH>` enables the versioned local control plane used by
+out-of-process KV participants such as the Kapsl vLLM connector. It is disabled
+when the flag is omitted. The path must be absolute, its parent directory must
+already exist, and it must differ from the inference `--socket`. On Unix, the
+runtime creates it with mode `0600` and refuses to replace a non-socket path or
+an active listener.
+
+```bash
+install -d -m 0700 /run/kapsl
+kapsl run \
+  --kv-control-socket /run/kapsl/kv-control.sock \
+  --kv-control-lease-ttl-ms 30000
+```
+
+Registration accepts only `kv_connected` participants with opaque metadata and
+backend-owned KV. Every advertised cache pool must name a bounded physical
+host, CUDA, or provider domain. Reservations enter the same `MemoryAuthority`
+as built-in engines; admission is rejected before backend allocation when the
+domain budget is unavailable or exhausted. CUDA domains require a build with
+the CUDA memory authority (`gpu-device-pool`) enabled.
+
+Participants heartbeat active leases. A requested TTL may be shorter than the
+runtime maximum but never longer. When heartbeats stop, the runtime expires the
+lease and returns its capacity to the authority. The listener is supervised:
+if it exits unexpectedly while configured, the runtime fails rather than
+silently continuing in unmanaged mode.
 
 `/metrics` samples the live allocator at scrape time. Pool-wide series are
 `kapsl_gpu_device_pool_allocated_bytes`, `_live_allocations`, `_free_bytes`,

@@ -2073,6 +2073,7 @@ dependencies = [
  "kapsl-engine-api",
  "kapsl-hal",
  "kapsl-ipc",
+ "kapsl-kv-abi",
  "kapsl-llm",
  "kapsl-monitor",
  "kapsl-rag",
@@ -2208,6 +2209,14 @@ dependencies = [
  "kapsl-hal",
  "log",
  "rayon",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "kapsl-kv-abi"
+version = "0.1.2"
+dependencies = [
+ "serde",
  "thiserror 1.0.69",
 ]
 
