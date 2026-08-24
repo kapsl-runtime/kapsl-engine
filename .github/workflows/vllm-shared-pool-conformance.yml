@@ -1,0 +1,156 @@
+name: vLLM Shared-Pool Conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_ref:
+        description: Exact kapsl-sdk branch, tag, or commit containing the adapter
+        required: true
+        default: feature/backend-kv-adapter
+        type: string
+      vllm_wheel_path:
+        description: Absolute path to the CUDA-compatible vLLM wheel on the GPU runner
+        required: true
+        type: string
+      cuda_visible_devices:
+        description: Physical GPU ordinals/UUIDs exposed to the probe (for example 0 or 0,2)
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  flash-attn:
+    # The runner must have a CUDA developer toolkit and a wheel compatible with
+    # its driver. Multiple listed devices certify one tensor-parallel world.
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    env:
+      CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
+      CUDA_LAUNCH_BLOCKING: "1"
+      TORCH_SHOW_CPP_STACKTRACES: "1"
+      OUTPUT_DIR: ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+      VENV_DIR: ${{ runner.temp }}/kapsl-vllm-venv-${{ github.run_id }}-${{ github.run_attempt }}
+      VLLM_WHEEL_PATH: ${{ inputs.vllm_wheel_path }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ inputs.sdk_ref }}
+          path: sdk
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine/kapsl-runtime
+
+      - name: Build CUDA IPC runtime
+        working-directory: engine
+        run: >-
+          cargo build --manifest-path kapsl-runtime/Cargo.toml
+          --release -p kapsl --no-default-features --features gpu-device-pool
+
+      - name: Install exact adapter and backend artifacts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f "$VLLM_WHEEL_PATH"
+          mkdir -p "$OUTPUT_DIR/wheels"
+          python3 -m venv "$VENV_DIR"
+          "$VENV_DIR/bin/python" -m pip install --upgrade pip build
+          "$VENV_DIR/bin/python" -m pip install "$VLLM_WHEEL_PATH"
+          "$VENV_DIR/bin/python" -m build --wheel --outdir "$OUTPUT_DIR/wheels" sdk/integrations/vllm
+          "$VENV_DIR/bin/python" -m pip install "$OUTPUT_DIR"/wheels/kapsl_vllm_connector-*.whl
+
+      - name: Run dependency-free adapter contract suite
+        working-directory: sdk/integrations/vllm
+        run: $VENV_DIR/bin/python -m unittest discover -s tests -v
+
+      - name: Resolve exact profile and artifact digests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$OUTPUT_DIR"
+          adapter_wheel=$(find "$OUTPUT_DIR/wheels" -maxdepth 1 -name 'kapsl_vllm_connector-*.whl' -print -quit)
+          runtime_binary="$GITHUB_WORKSPACE/engine/kapsl-runtime/target/release/kapsl"
+          backend_version=$("$VENV_DIR/bin/python" -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))')
+          adapter_version=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ADAPTER_VERSION; print(ADAPTER_VERSION)')
+          profile_id=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ADAPTER_PROFILE_ID; print(ADAPTER_PROFILE_ID)')
+          adapter_digest="sha256:$(sha256sum "$adapter_wheel" | awk '{print $1}')"
+          backend_digest="sha256:$(sha256sum "$VLLM_WHEEL_PATH" | awk '{print $1}')"
+          runtime_digest="sha256:$(sha256sum "$runtime_binary" | awk '{print $1}')"
+          provisional_profile="kapsl-vllm-connector,$adapter_version,$backend_version,$profile_id"
+          visible_count=$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")
+          logical_devices=$(seq 0 $((visible_count - 1)) | paste -sd, -)
+          {
+            echo "RUNTIME_BINARY=$runtime_binary"
+            echo "ADAPTER_DIGEST=$adapter_digest"
+            echo "BACKEND_DIGEST=$backend_digest"
+            echo "RUNTIME_DIGEST=$runtime_digest"
+            echo "PROVISIONAL_PROFILE=$provisional_profile"
+            echo "LOGICAL_DEVICES=$logical_devices"
+          } >> "$GITHUB_ENV"
+
+      - name: Start isolated certification runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          socket_dir="$RUNNER_TEMP/kapsl-vllm-socket-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 0700 "$socket_dir"
+          kv_socket="$socket_dir/kv-control.sock"
+          inference_socket="$socket_dir/inference.sock"
+          "$RUNTIME_BINARY" run \
+            --socket "$inference_socket" \
+            --state-dir "$socket_dir/state" \
+            --metrics-port 0 \
+            --kv-control-socket "$kv_socket" \
+            --kv-control-lease-ttl-ms 30000 \
+            --kv-shared-pool-profile "$PROVISIONAL_PROFILE" \
+            >"$OUTPUT_DIR/runtime.log" 2>&1 &
+          runtime_pid=$!
+          echo "RUNTIME_PID=$runtime_pid" >> "$GITHUB_ENV"
+          echo "KV_ENDPOINT=unix://$kv_socket" >> "$GITHUB_ENV"
+          for _ in $(seq 1 100); do
+            test -S "$kv_socket" && exit 0
+            kill -0 "$runtime_pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          sed -n '1,240p' "$OUTPUT_DIR/runtime.log" >&2
+          exit 1
+
+      - name: Run allocator, native attention, lifecycle, and rank gates
+        run: >-
+          "$VENV_DIR/bin/kapsl-vllm-flash-attn-probe"
+          --endpoint "$KV_ENDPOINT"
+          --devices "$LOGICAL_DEVICES"
+          --adapter-build-id "$ADAPTER_DIGEST"
+          --backend-build-id "$BACKEND_DIGEST"
+          --runtime-build-id "$RUNTIME_DIGEST"
+          --report "$OUTPUT_DIR/report.json"
+          --allowlist-output "$OUTPUT_DIR/allowlist-profile.txt"
+
+      - name: Stop certification runtime
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${RUNTIME_PID:-}" ]] && kill -0 "$RUNTIME_PID" 2>/dev/null; then
+            kill "$RUNTIME_PID"
+            wait "$RUNTIME_PID" || true
+          fi
+
+      - name: Upload conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-shared-pool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.OUTPUT_DIR }}
+          if-no-files-found: error

@@ -149,7 +149,7 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.4.0,<vllm-version>,vllm-v1-packed-cuda-ipc'
+    'kapsl-vllm-connector,0.5.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four
@@ -161,6 +161,15 @@ The participant declares this tuple in registration, so a mismatch is rejected
 before the provisioner allocates or exports a device region.
 An empty allowlist still permits opaque `kv_connected` participants but rejects
 every external `shared_pool` registration.
+
+The vLLM tuple must come from the opt-in **vLLM Shared-Pool Conformance** GPU
+workflow. That job uses an exact vLLM wheel and SDK ref, invokes the production
+CUDA IPC allocator seam on every requested rank, and tests native
+FlashAttention writes, causal reads, guards, reuse, exhaustion, and synchronized
+detach. It uploads a JSON report on every run but creates the plain-text
+allowlist value only after every gate passes. Its temporary runtime necessarily
+uses the candidate tuple as a local provisional allowlist; this permits the
+test allocation and is not itself evidence of conformance.
 
 Opaque `kv_connected` registrations use backend-owned KV. Every advertised
 cache pool must name a bounded physical host, CUDA, or provider domain.
