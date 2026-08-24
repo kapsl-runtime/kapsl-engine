@@ -48,13 +48,13 @@ jobs:
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace
 
       # Exercise the optional CUDA memory authority without requiring nvcc or a
-      # GPU on the hosted runner. The fixed cudarc API feature takes precedence
-      # over cuda-version-from-build-system for this test build only.
+      # GPU on the hosted runner. The gpu-device-pool feature pins the stable
+      # cudarc CUDA API bindings used by production builds.
       - name: Test GPU device pool feature
         if: runner.os == 'Linux'
         run: >-
           cargo test --manifest-path kapsl-runtime/Cargo.toml -p kapsl
-          --features gpu-device-pool,cudarc/cuda-12040 -- --test-threads=1
+          --features gpu-device-pool -- --test-threads=1
 
       - name: Verify stable CUDA profile uses shared KV
         if: runner.os == 'Linux'
