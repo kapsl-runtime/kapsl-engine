@@ -13,7 +13,7 @@ use kapsl_kv_abi::{
     KvControlRequestEnvelope, KvControlResponse, KvControlResponseEnvelope, KvGroupLease,
     KvGroupReservation, KvIntegrationTier, KvLease, KvMemoryDomain, KvMetadataMode,
     KvParticipantRegistration, KvRegistrationReceipt, KvReleaseCompletion, KvReserveRequest,
-    KvSequenceKey, KvSharedPoolDescriptor, KAPSL_KV_ABI_VERSION,
+    KvSequenceKey, KvSharedPoolAllocationMode, KvSharedPoolDescriptor, KAPSL_KV_ABI_VERSION,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -68,11 +68,13 @@ struct SharedPoolAllocatorState {
 
 struct SharedPoolLeaseAllocation {
     blocks_by_pool: BTreeMap<String, Vec<u64>>,
+    requires_release_fence: bool,
 }
 
 struct SharedPoolSet {
     groups: HashMap<String, SharedGroupDefinition>,
     bindings_by_pool: HashMap<String, Vec<KvSharedPoolDescriptor>>,
+    allocation_modes: HashMap<String, KvSharedPoolAllocationMode>,
     state: Mutex<SharedPoolAllocatorState>,
     backing: Arc<dyn SharedPoolBacking>,
 }
@@ -113,6 +115,7 @@ impl SharedPoolSet {
                 .push(descriptor);
         }
 
+        let mut allocation_modes = HashMap::new();
         let mut free_by_pool = HashMap::new();
         let mut quarantined_by_pool = HashMap::new();
         for (capacity_pool_id, bindings) in &bindings_by_pool {
@@ -128,6 +131,16 @@ impl SharedPoolSet {
                     "replicas of shared pool '{capacity_pool_id}' must expose the same block count"
                 )));
             }
+            let allocation_mode = bindings[0].allocation_mode;
+            if bindings
+                .iter()
+                .any(|binding| binding.allocation_mode != allocation_mode)
+            {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "replicas of shared pool '{capacity_pool_id}' must use the same allocation mode"
+                )));
+            }
+            allocation_modes.insert(capacity_pool_id.clone(), allocation_mode);
             let block_count = usize::try_from(block_count).map_err(|_| {
                 KvContractError::invalid_capabilities(format!(
                     "shared pool '{capacity_pool_id}' block count does not fit this runtime"
@@ -143,6 +156,7 @@ impl SharedPoolSet {
         Ok(Arc::new(Self {
             groups,
             bindings_by_pool,
+            allocation_modes,
             state: Mutex::new(SharedPoolAllocatorState {
                 free_by_pool,
                 quarantined_by_pool,
@@ -207,6 +221,11 @@ impl SharedPoolSet {
         };
 
         for (pool_id, blocks) in &blocks_by_pool {
+            if self.allocation_modes.get(pool_id)
+                != Some(&KvSharedPoolAllocationMode::RuntimeLeased)
+            {
+                continue;
+            }
             let bindings = self
                 .bindings_by_pool
                 .get(pool_id)
@@ -230,13 +249,17 @@ impl SharedPoolSet {
                     .get(&group.capacity_pool_id)
                     .expect("validated shared pool must have physical bindings");
                 let mut handles = Vec::new();
-                for block_index in blocks.iter().take(needed as usize) {
-                    for binding in bindings {
-                        handles.push(KvBlockHandle::RuntimePool {
-                            pool_id: binding.binding_id.clone(),
-                            block_index: *block_index,
-                            generation: binding.generation,
-                        });
+                if self.allocation_modes.get(&group.capacity_pool_id)
+                    == Some(&KvSharedPoolAllocationMode::RuntimeLeased)
+                {
+                    for block_index in blocks.iter().take(needed as usize) {
+                        for binding in bindings {
+                            handles.push(KvBlockHandle::RuntimePool {
+                                pool_id: binding.binding_id.clone(),
+                                block_index: *block_index,
+                                generation: binding.generation,
+                            });
+                        }
                     }
                 }
                 KvGroupLease {
@@ -247,7 +270,16 @@ impl SharedPoolSet {
             })
             .collect();
 
-        Ok((public_groups, SharedPoolLeaseAllocation { blocks_by_pool }))
+        let requires_release_fence = blocks_by_pool.keys().any(|pool_id| {
+            self.allocation_modes.get(pool_id) == Some(&KvSharedPoolAllocationMode::RuntimeLeased)
+        });
+        Ok((
+            public_groups,
+            SharedPoolLeaseAllocation {
+                blocks_by_pool,
+                requires_release_fence,
+            },
+        ))
     }
 
     fn release(&self, allocation: SharedPoolLeaseAllocation) {
@@ -842,7 +874,11 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     message: format!("KV lease '{lease_id}' does not exist"),
                 })?;
             ensure_lease_owner(lease, participant_id)?;
-            if lease.shared_allocation.is_some() {
+            if lease
+                .shared_allocation
+                .as_ref()
+                .is_some_and(|allocation| allocation.requires_release_fence)
+            {
                 match completion {
                     Some(KvReleaseCompletion::BackendSynchronized) => {}
                     Some(KvReleaseCompletion::TransportFence { .. }) => {
@@ -1240,6 +1276,15 @@ mod tests {
                     memory_domain: KvMemoryDomain::Host,
                     block_count: group.max_allocations.expect("test block cap"),
                     bytes_per_block: group.bytes_per_allocation,
+                    allocation_mode: if registration
+                        .capabilities
+                        .features
+                        .contains(&kapsl_kv_abi::KvFeature::ParticipantBlockSelection)
+                    {
+                        KvSharedPoolAllocationMode::ParticipantManaged
+                    } else {
+                        KvSharedPoolAllocationMode::RuntimeLeased
+                    },
                     transport: KvTransport::Custom {
                         name: "test_direct".to_string(),
                     },
@@ -1472,6 +1517,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(coordinator.lease_count(), 0);
+        assert_eq!(pools.available_blocks("vllm.pool.0"), 4);
+    }
+
+    #[test]
+    fn participant_managed_pool_leases_capacity_without_rewriting_backend_indices() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let backing = Arc::new(TestSharedBacking::default());
+        let provisioner = Arc::new(TestSharedProvisioner {
+            backing: backing.clone(),
+        });
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(provisioner),
+        )
+        .unwrap();
+        let mut registration = shared_registration();
+        registration
+            .capabilities
+            .features
+            .insert(kapsl_kv_abi::KvFeature::ParticipantBlockSelection);
+        let receipt = coordinator.register(&registration).unwrap();
+        assert_eq!(
+            receipt.shared_pools[0].allocation_mode,
+            KvSharedPoolAllocationMode::ParticipantManaged
+        );
+        let pools = coordinator
+            .state
+            .lock()
+            .participants
+            .get("vllm:test:scheduler")
+            .unwrap()
+            .shared_pools
+            .clone()
+            .unwrap();
+
+        let lease = coordinator
+            .reserve("vllm:test:scheduler", &reservation(None))
+            .unwrap();
+        assert!(lease.groups[0].blocks.is_empty());
+        assert_eq!(backing.zeroed_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(pools.available_blocks("vllm.pool.0"), 2);
+        coordinator
+            .release("vllm:test:scheduler", &lease.lease_id, None)
+            .unwrap();
         assert_eq!(pools.available_blocks("vllm.pool.0"), 4);
     }
 

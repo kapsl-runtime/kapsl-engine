@@ -672,6 +672,16 @@ impl DeviceMemoryManager {
             .unwrap_or(0)
     }
 
+    /// CUDA context retained by the authority for allocations that must live
+    /// outside the process-wide suballocator (for example exportable CUDA IPC
+    /// regions). Callers still reserve those bytes through `MemoryAuthority`.
+    pub(crate) fn cuda_device(&self, device_id: usize) -> Result<Arc<CudaDevice>, String> {
+        self.devices
+            .get(&device_id)
+            .map(|authority| Arc::clone(&authority.cuda))
+            .ok_or_else(|| format!("CUDA device {device_id} is not managed by this runtime"))
+    }
+
     pub(crate) fn domain_budgets(&self) -> Vec<(usize, usize)> {
         let budget = self.budget.lock().unwrap();
         self.devices

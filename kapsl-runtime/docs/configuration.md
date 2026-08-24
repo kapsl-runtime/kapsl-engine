@@ -155,12 +155,20 @@ is rejected before backend allocation when the domain budget is unavailable or
 exhausted. CUDA domains require a build with the CUDA memory authority
 (`gpu-device-pool`) enabled.
 
-ABI 1.1 also defines a provisioner boundary for runtime-owned `shared_pool`
-bindings, including epoch/generation-checked handles, synchronized release,
-zero-before-assignment, and quarantine after an unfenced expiry. The production
-listener currently starts without a CUDA IPC/NIXL provisioner, so external
-`shared_pool` registration fails closed until that physical data plane is
-configured.
+ABI 1.2 defines two provisioned, runtime-owned `shared_pool` allocation modes.
+`runtime_leased` publishes epoch/generation-checked block handles, zeros blocks
+before assignment, requires synchronized release, and quarantines an unfenced
+expiry. `participant_managed` exports the whole isolated backing while leaving
+block-index selection to the backend; Kapsl still grants aggregate request
+capacity, but those leases contain no physical block handles.
+
+On Linux builds with `gpu-device-pool`, enabling the control socket
+automatically installs the CUDA IPC provisioner. It synchronously allocates and
+zeros a dedicated exportable region for each participant/pool/device, charges
+that physical region once through `MemoryAuthority`, and never exports the
+runtime's general CUDA allocator slab. Other builds retain opaque support and
+reject external `shared_pool` registration rather than accepting an
+unprovisioned data plane.
 
 Participants heartbeat active leases. A requested TTL may be shorter than the
 runtime maximum but never longer. When heartbeats stop, an opaque lease returns

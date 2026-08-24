@@ -137,7 +137,9 @@ runtime are immediately addressable through SHM.
 External backends such as vLLM use a separate versioned KV control socket. It
 is disabled by default and never shares the inference socket. When enabled,
 opaque backend reservations join Kapsl's process-wide memory authority before
-the backend allocates KV; this is `kv_connected`, not `shared_pool`. See the
+the backend allocates KV. Linux CUDA builds can also provision an isolated
+CUDA IPC backing for a backend that explicitly negotiates `shared_pool`; the
+backend's attention tensors must directly alias that allocation. See the
 [runtime configuration](../kapsl-runtime/docs/configuration.md#external-kv-participants)
 for placement, TTL, CUDA-build, and socket-permission requirements.
 

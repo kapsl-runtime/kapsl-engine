@@ -327,6 +327,15 @@ async fn main() -> Result<(), DynError> {
 
     #[cfg(unix)]
     let mut kv_control_task = if let Some(socket_path) = args.kv_control_socket.as_ref() {
+        #[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            resources.memory().clone(),
+            Duration::from_millis(args.kv_control_lease_ttl_ms),
+            Some(CudaIpcSharedPoolProvisioner::new(
+                resources.memory().clone(),
+            )),
+        )?;
+        #[cfg(not(all(feature = "gpu-device-pool", target_os = "linux")))]
         let coordinator = ExternalKvCoordinator::new(
             resources.memory().clone(),
             Duration::from_millis(args.kv_control_lease_ttl_ms),

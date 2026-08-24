@@ -1398,6 +1398,17 @@ impl MemoryAuthority {
             .unwrap_or(MemoryDomain::Host)
     }
 
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn cuda_device(
+        &self,
+        device_id: usize,
+    ) -> Result<Arc<cudarc::driver::CudaDevice>, String> {
+        self.cuda
+            .as_ref()
+            .ok_or_else(|| "runtime has no CUDA memory authority".to_string())?
+            .cuda_device(device_id)
+    }
+
     /// KV policy capacity for one HAL device. The authority owns the physical
     /// budget; callers only translate these bytes into logical blocks.
     pub(crate) fn kv_budget_bytes(&self, device_id: usize) -> usize {
