@@ -532,7 +532,7 @@ jobs:
             echo "Deleting superseded beta s3://kapsl-installer/runtime/beta/$version/"
             aws s3 rm "s3://kapsl-installer/runtime/beta/$version/" \
               --recursive \
-              --no-progress \
+              --only-show-errors \
               --endpoint-url "$R2_ENDPOINT"
             deleted=$((deleted + 1))
           done
