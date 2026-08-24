@@ -179,6 +179,53 @@ install_provider_pack() {
     tar -xzf "$pack_tmp" -C "$INSTALL_DIR"
 }
 
+install_vllm_backend_pack() {
+    if ! command -v bash >/dev/null 2>&1; then
+        echo "bash is required to install the certified managed-vLLM backend." >&2
+        exit 1
+    fi
+
+    pack_file="kapsl-backend-vllm-${VERSION}-${PLATFORM}.tar.gz"
+    pack_url="${BASE_URL}/${RUNTIME_PATH}/v${VERSION}/${pack_file}"
+    pack_tmp="${TMP_DIR}/${pack_file}"
+    checksum_tmp="${pack_tmp}.sha256"
+
+    echo "Installing certified Kapsl managed-vLLM backend..."
+    download "$pack_url" "$pack_tmp"
+    download "${pack_url}.sha256" "$checksum_tmp"
+    expected_hash="$(awk 'NR == 1 { print $1 }' "$checksum_tmp")"
+    actual_hash="$(sha256sum "$pack_tmp" | awk '{ print $1 }')"
+    if [ -z "$expected_hash" ] || [ "$actual_hash" != "$expected_hash" ]; then
+        echo "Managed-vLLM backend checksum mismatch." >&2
+        exit 1
+    fi
+
+    if ! tar -tzf "$pack_tmp" | awk '
+        $0 == "./" || $0 == "./backends/" || $0 == "./backends/vllm-bootstrap/" { next }
+        /^\.\/backends\/vllm-bootstrap\// && $0 !~ /(^|\/)\.\.(\/|$)/ { next }
+        { bad = 1 }
+        END { exit bad }
+    '; then
+        echo "Managed-vLLM backend archive contains an unexpected path." >&2
+        exit 1
+    fi
+
+    mkdir -p "$INSTALL_DIR/backends"
+    rm -rf "$INSTALL_DIR/backends/vllm-bootstrap"
+    tar -xzf "$pack_tmp" -C "$INSTALL_DIR"
+    rm -f "$pack_tmp"
+
+    bootstrap_root="$INSTALL_DIR/backends/vllm-bootstrap"
+    if [ ! -x "$bootstrap_root/bootstrap.sh" ]; then
+        echo "Managed-vLLM backend archive is missing bootstrap.sh." >&2
+        exit 1
+    fi
+    bash "$bootstrap_root/bootstrap.sh" \
+        "$bootstrap_root" \
+        "$INSTALL_DIR/backends/vllm"
+    rm -rf "$bootstrap_root"
+}
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -259,6 +306,16 @@ case "$ACCELERATOR" in
         install_provider_pack "tensorrt" "10"
         ;;
 esac
+case "$ACCELERATOR" in
+    cuda | cuda12 | tensorrt | tensorrt10)
+        # New shared-pool builds carry this certified profile marker. Install
+        # their exact Python/vLLM wheelhouse and materialize it beside Kapsl;
+        # old CUDA releases remain installable without an asset they predate.
+        if grep -aFq 'vllm-v1-packed-cuda-ipc/flash-attn' "${INSTALL_DIR}/${BIN_NAME}"; then
+            install_vllm_backend_pack
+        fi
+        ;;
+esac
 
 echo "Installed to ${INSTALL_DIR}/${BIN_NAME}"
 
@@ -277,6 +334,9 @@ if [ "$ACCELERATOR" != "cpu" ]; then
     echo "Installed accelerator profile: ${ACCELERATOR}"
     echo "GGUF models: CUDA compiled into this runtime build."
     echo "ONNX models: CUDA execution provider installed."
+    if [ -x "${INSTALL_DIR}/backends/vllm/bin/python" ]; then
+        echo "SafeTensors generation models: managed vLLM backend installed."
+    fi
     echo "A compatible NVIDIA driver is required."
 fi
 echo "Run 'kapsl --help' to get started."

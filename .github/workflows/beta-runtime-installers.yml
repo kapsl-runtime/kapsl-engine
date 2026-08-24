@@ -315,6 +315,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout certified vLLM connector
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: 3a4e626f919e11287e0a19bb720c547ec9216f7f
+          path: sdk-vllm
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -338,6 +345,17 @@ jobs:
       - name: Package CUDA runtime bundle
         shell: bash
         run: .github/scripts/package-linux-cuda-runtime.sh
+
+      - name: Reclaim CUDA build scratch before backend packaging
+        shell: bash
+        run: cargo clean --manifest-path kapsl-runtime/Cargo.toml
+
+      - name: Package certified managed-vLLM backend
+        shell: bash
+        env:
+          KAPSL_VLLM_SDK_DIR: sdk-vllm
+          KAPSL_VLLM_SDK_REF: 3a4e626f919e11287e0a19bb720c547ec9216f7f
+        run: .github/scripts/package-linux-vllm-backend.sh
 
       - name: Upload CUDA runtime artifact
         uses: actions/upload-artifact@v4
