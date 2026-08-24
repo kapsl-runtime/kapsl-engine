@@ -1,0 +1,257 @@
+name: vLLM Shared-Pool Conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_ref:
+        description: Exact kapsl-sdk branch, tag, or commit containing the adapter
+        required: true
+        default: 3a4e626f919e11287e0a19bb720c547ec9216f7f
+        type: string
+      cuda_visible_devices:
+        description: Physical GPU ordinals/UUIDs exposed to the probe (for example 0 or 0,2)
+        required: true
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  flash-attn:
+    # The host supplies only the NVIDIA driver and GPUs. The immutable job image
+    # pins the toolkit used by both the runtime build and the vLLM wheel.
+    runs-on: [self-hosted, linux, x64, gpu]
+    container:
+      image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
+      options: --gpus all
+    timeout-minutes: 90
+    env:
+      CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
+      CUDA_LAUNCH_BLOCKING: "1"
+      TORCH_SHOW_CPP_STACKTRACES: "1"
+      EXPECTED_CUDA_RUNTIME_VERSION: "13.0"
+      EXPECTED_PYTHON_VERSION: "3.12.3"
+      EXPECTED_TORCH_VERSION: "2.13.0+cu130"
+      EXPECTED_TORCHVISION_VERSION: "0.28.0+cu130"
+      EXPECTED_TORCHAUDIO_VERSION: "2.11.0+cu130"
+      EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
+      PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
+      VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
+      VLLM_WHEEL_URL: https://wheels.vllm.ai/2ec6f0d71ea3b350952630e310efcda1c744ff4d/vllm-0.26.1rc1.dev1130%2Bg2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl
+    steps:
+      - name: Install declared build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake curl git libclang-dev libssl-dev \
+            pkg-config python3-dev python3-venv
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Initialize isolated artifact paths
+        shell: bash
+        run: |
+          {
+            echo "OUTPUT_DIR=$RUNNER_TEMP/kapsl-vllm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "VENV_DIR=$RUNNER_TEMP/kapsl-vllm-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "VLLM_WHEEL_PATH=$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+        with:
+          path: engine
+
+      - uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ inputs.sdk_ref }}
+          path: sdk
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine/kapsl-runtime
+
+      - name: Build CUDA IPC runtime against the checked-out ABI
+        working-directory: engine
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cargo_patch="patch.crates-io.kapsl-kv-abi.path='$GITHUB_WORKSPACE/sdk/crates/kapsl-kv-abi'"
+          metadata_path="$RUNNER_TEMP/kapsl-cargo-metadata.json"
+          cargo metadata --manifest-path kapsl-runtime/Cargo.toml \
+            --locked --format-version 1 --config "$cargo_patch" > "$metadata_path"
+          python3 - "$metadata_path" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = (
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "sdk"
+              / "crates"
+              / "kapsl-kv-abi"
+              / "Cargo.toml"
+          ).resolve()
+          resolved = [
+              Path(package["manifest_path"]).resolve()
+              for package in metadata["packages"]
+              if package["name"] == "kapsl-kv-abi"
+          ]
+          if resolved != [expected]:
+              raise SystemExit(
+                  f"runtime resolved kapsl-kv-abi from {resolved}, expected {[expected]}"
+              )
+          PY
+          cargo build --manifest-path kapsl-runtime/Cargo.toml --locked \
+            --release -p kapsl --no-default-features --features gpu-device-pool \
+            --config "$cargo_patch"
+
+      - name: Install pinned adapter and backend artifacts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$OUTPUT_DIR/wheels"
+          curl --fail --location --retry 3 --output "$VLLM_WHEEL_PATH" "$VLLM_WHEEL_URL"
+          printf '%s  %s\n' "$VLLM_WHEEL_SHA256" "$VLLM_WHEEL_PATH" | sha256sum --check -
+          python3 -m venv "$VENV_DIR"
+          "$VENV_DIR/bin/python" -m pip install --upgrade pip build
+          "$VENV_DIR/bin/python" -m pip install \
+            --index-url "$PYTORCH_INDEX_URL" \
+            --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
+            "torch==$EXPECTED_TORCH_VERSION" \
+            "torchvision==$EXPECTED_TORCHVISION_VERSION" \
+            "torchaudio==$EXPECTED_TORCHAUDIO_VERSION"
+          "$VENV_DIR/bin/python" -m pip install \
+            --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
+            "$VLLM_WHEEL_PATH"
+          "$VENV_DIR/bin/python" -m build --wheel --outdir "$OUTPUT_DIR/wheels" sdk/integrations/vllm
+          "$VENV_DIR/bin/python" -m pip install \
+            --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
+            "$OUTPUT_DIR"/wheels/kapsl_vllm_connector-*.whl
+          "$VENV_DIR/bin/python" -m pip check
+
+      - name: Verify the pinned Python, PyTorch, vLLM, and CUDA tuple
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          "$VENV_DIR/bin/python" <<'PY'
+          import importlib.metadata
+          import os
+          import platform
+
+          import torch
+
+          actual = {
+              "python": platform.python_version(),
+              "torch": torch.__version__,
+              "torchvision": importlib.metadata.version("torchvision"),
+              "torchaudio": importlib.metadata.version("torchaudio"),
+              "vllm": importlib.metadata.version("vllm"),
+              "cuda_runtime": torch.version.cuda,
+          }
+          expected = {
+              "python": os.environ["EXPECTED_PYTHON_VERSION"],
+              "torch": os.environ["EXPECTED_TORCH_VERSION"],
+              "torchvision": os.environ["EXPECTED_TORCHVISION_VERSION"],
+              "torchaudio": os.environ["EXPECTED_TORCHAUDIO_VERSION"],
+              "vllm": os.environ["EXPECTED_VLLM_VERSION"],
+              "cuda_runtime": os.environ["EXPECTED_CUDA_RUNTIME_VERSION"],
+          }
+          if actual != expected:
+              raise SystemExit(f"binary environment mismatch: {actual!r} != {expected!r}")
+          if not torch.cuda.is_available():
+              raise SystemExit("the pinned PyTorch build cannot access a CUDA device")
+          print(actual)
+          PY
+
+      - name: Run dependency-free adapter contract suite
+        working-directory: sdk/integrations/vllm
+        run: $VENV_DIR/bin/python -m unittest discover -s tests -v
+
+      - name: Resolve exact profile and artifact digests
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$OUTPUT_DIR"
+          adapter_wheel=$(find "$OUTPUT_DIR/wheels" -maxdepth 1 -name 'kapsl_vllm_connector-*.whl' -print -quit)
+          runtime_binary="$GITHUB_WORKSPACE/engine/kapsl-runtime/target/release/kapsl"
+          backend_version=$("$VENV_DIR/bin/python" -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))')
+          adapter_version=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ADAPTER_VERSION; print(ADAPTER_VERSION)')
+          profile_id=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ADAPTER_PROFILE_ID; print(ADAPTER_PROFILE_ID)')
+          adapter_digest="sha256:$(sha256sum "$adapter_wheel" | awk '{print $1}')"
+          backend_digest="sha256:$(sha256sum "$VLLM_WHEEL_PATH" | awk '{print $1}')"
+          runtime_digest="sha256:$(sha256sum "$runtime_binary" | awk '{print $1}')"
+          provisional_profile="kapsl-vllm-connector,$adapter_version,$backend_version,$profile_id"
+          visible_count=$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")
+          logical_devices=$(seq 0 $((visible_count - 1)) | paste -sd, -)
+          {
+            echo "RUNTIME_BINARY=$runtime_binary"
+            echo "ADAPTER_DIGEST=$adapter_digest"
+            echo "BACKEND_DIGEST=$backend_digest"
+            echo "RUNTIME_DIGEST=$runtime_digest"
+            echo "PROVISIONAL_PROFILE=$provisional_profile"
+            echo "LOGICAL_DEVICES=$logical_devices"
+          } >> "$GITHUB_ENV"
+
+      - name: Start isolated certification runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          socket_dir="$RUNNER_TEMP/kapsl-vllm-socket-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 0700 "$socket_dir"
+          kv_socket="$socket_dir/kv-control.sock"
+          inference_socket="$socket_dir/inference.sock"
+          "$RUNTIME_BINARY" run \
+            --socket "$inference_socket" \
+            --state-dir "$socket_dir/state" \
+            --metrics-port 0 \
+            --kv-control-socket "$kv_socket" \
+            --kv-control-lease-ttl-ms 30000 \
+            --kv-shared-pool-profile "$PROVISIONAL_PROFILE" \
+            >"$OUTPUT_DIR/runtime.log" 2>&1 &
+          runtime_pid=$!
+          echo "RUNTIME_PID=$runtime_pid" >> "$GITHUB_ENV"
+          echo "KV_ENDPOINT=unix://$kv_socket" >> "$GITHUB_ENV"
+          for _ in $(seq 1 100); do
+            test -S "$kv_socket" && exit 0
+            kill -0 "$runtime_pid" 2>/dev/null || break
+            sleep 0.1
+          done
+          sed -n '1,240p' "$OUTPUT_DIR/runtime.log" >&2
+          exit 1
+
+      - name: Run allocator, native attention, lifecycle, and rank gates
+        run: >-
+          "$VENV_DIR/bin/kapsl-vllm-flash-attn-probe"
+          --endpoint "$KV_ENDPOINT"
+          --devices "$LOGICAL_DEVICES"
+          --adapter-build-id "$ADAPTER_DIGEST"
+          --backend-build-id "$BACKEND_DIGEST"
+          --runtime-build-id "$RUNTIME_DIGEST"
+          --report "$OUTPUT_DIR/report.json"
+          --allowlist-output "$OUTPUT_DIR/allowlist-profile.txt"
+
+      - name: Stop certification runtime
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${RUNTIME_PID:-}" ]] && kill -0 "$RUNTIME_PID" 2>/dev/null; then
+            kill "$RUNTIME_PID"
+            wait "$RUNTIME_PID" || true
+          fi
+
+      - name: Upload conformance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-shared-pool-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error

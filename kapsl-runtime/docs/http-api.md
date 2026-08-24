@@ -251,6 +251,7 @@ Host-level runtime process stats, sampled by the monitor loop.
     "models": [
       {
         "model_id": 0,
+        "owner_kind": "model",
         "name": "qwen-7b",
         "replica_count": 2,
         "planned_bytes": 9663676416,
@@ -283,9 +284,11 @@ sharing the GPU; it is `null` unless the co-tenancy guard is enabled.
 `pressure_state` is one of `normal`, `conserve`, or `emergency`.
 
 `memory_authority` is the backend-neutral host/device accounting snapshot. Each
-model's `used_bytes` sums the largest of reserved, committed, or observed bytes
-for every owned row, avoiding double-counting accounting states. Replicas are
-rolled up under their base `model_id`; `percentage` is their share of
+workload's `used_bytes` sums the largest of reserved, committed, or observed
+bytes for every owned row, avoiding double-counting accounting states.
+`owner_kind` is `model` for in-process models and `external_kv_participant` for
+an opaque backend admitted through the KV control listener. Model replicas are
+rolled up under their base `model_id`; `percentage` is the workload's share of
 `model_bytes`.
 
 ### GET /metrics

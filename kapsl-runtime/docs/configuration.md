@@ -11,6 +11,11 @@ Options:
   --model <PATH>              Path to an .aimod file (repeatable)
   --transport <TRANSPORT>     socket | tcp | shm | hybrid (default: socket)
   --socket-path <PATH>        Unix socket path (default: /tmp/kapsl.sock)
+  --kv-control-socket <PATH>  Local socket for versioned external KV participants
+  --kv-control-lease-ttl-ms <MILLISECONDS>
+                              Maximum heartbeat lease TTL (default: 30000)
+  --kv-shared-pool-profile <PROFILE>
+                              Exact conformance-tested adapter profile (repeatable)
   --tcp-port <PORT>           IPC TCP port (default: 9096)
   --http-host <HOST>          HTTP bind host (default: 127.0.0.1)
   --http-port <PORT>          HTTP/API/UI port (default: 9095)
@@ -107,6 +112,8 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GPU_MEMORY_LIMIT_MB` | Process VRAM ceiling in MiB when no CUDA-specific ceiling is set. |
 | `KAPSL_PROVIDER_MEMORY_LIMITS` | Hard limits for non-CPU/non-CUDA provider domains as `provider[:device]=size` entries, e.g. `metal=8g,directml:0=6g`. Exact-device entries override provider-wide values. |
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
+| `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. A packaged installation discovers a beside-binary bundle automatically. |
+| `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -128,6 +135,137 @@ provider allocations atomically resize the owning memory lease. If physical
 usage has already crossed a hard limit, Kapsl retains the over-limit observed
 value in the authority snapshot, closes further admission, and enters the
 normal pressure policy rather than reverting to a stale reservation.
+
+### Serving backend policy
+
+The package field `metadata.serving.backend` selects a deployment target, not
+a CUDA execution provider. Use `kapsl backend-plan <MODEL>` to resolve it for
+the current host. GGUF selects llama.cpp; an explicitly policy-tagged
+SafeTensors causal-LM generation package may select managed vLLM on CUDA; all
+other `auto` cases retain the built-in backend factory. A built-in SafeTensors
+decision requires a binary compiled with the `native` feature; otherwise the
+load is rejected before ONNX Runtime is constructed. Packages without the
+field retain their legacy selection, subject to the same backend-availability
+check.
+
+For a vLLM package, the normal command is:
+
+```bash
+kapsl run --model ./qwen.aimod
+```
+
+Kapsl creates a private KV control socket, installs the certified shared-pool
+profile, starts vLLM on an ephemeral loopback port, waits for readiness, routes
+the existing Kapsl and OpenAI-compatible APIs to it, supervises bounded
+restarts, and stops the complete vLLM process group when the model is unloaded
+or Kapsl exits. The vLLM endpoint is an implementation detail and is not
+exposed as a second public server.
+
+This path requires a Linux `gpu-device-pool` build and the certified
+managed-vLLM bundle installed beside the Kapsl binary. The Linux CUDA shell
+installer downloads and materializes that bundle automatically. Kapsl validates the
+complete binary tuple before allocating GPU memory:
+Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
+`2.11.0+cu130`, CUDA runtime `13.0`, vLLM
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.5.0` with profile
+`vllm-v1-packed-cuda-ipc/flash-attn`. A missing or different bundle fails
+closed; Kapsl never falls back to ONNX Runtime, native SafeTensors, or another
+attention implementation. Source/development builds can point to the same
+certified environment with `KAPSL_VLLM_PYTHON=/path/to/venv/bin/python`.
+
+Optional package-level settings live under `metadata.serving.vllm`:
+
+```yaml
+metadata:
+  serving:
+    backend: vllm
+    vllm:
+      max_model_len: 4096
+      gpu_memory_utilization: 0.5
+      startup_timeout_seconds: 300
+```
+
+The defaults are `1024`, `0.5`, and `300` seconds respectively. Managed vLLM
+currently uses one selected CUDA device per Kapsl replica. Use
+`CUDA_VISIBLE_DEVICES` to select or isolate GPUs.
+
+### External KV participants
+
+`--kv-control-socket <PATH>` enables the versioned local control plane used by
+independently managed out-of-process KV participants. Managed vLLM configures
+this listener automatically; users do not need this flag for
+`kapsl run --model`. When supplied explicitly, the path must be absolute, its
+parent directory must already exist, and it must differ from the inference
+`--socket`. On Unix, the runtime creates it with mode `0600` and refuses to
+replace a non-socket path or an active listener.
+
+```bash
+install -d -m 0700 /run/kapsl
+kapsl run \
+  --kv-control-socket /run/kapsl/kv-control.sock \
+  --kv-control-lease-ttl-ms 30000 \
+  --kv-shared-pool-profile \
+    'kapsl-vllm-connector,0.5.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
+```
+
+The profile flag is required only for `shared_pool` and is repeatable. Its four
+comma-separated fields are the exact adapter ID, adapter version, backend
+version, and compatibility profile emitted by a conformance-tested adapter.
+Do not add a tuple merely to make registration pass: it is the deployment
+allowlist for builds whose backend-native attention write/read probes passed.
+The participant declares this tuple in registration, so a mismatch is rejected
+before the provisioner allocates or exports a device region.
+An empty allowlist still permits opaque `kv_connected` participants but rejects
+every external `shared_pool` registration.
+
+The vLLM tuple must come from the opt-in **vLLM Shared-Pool Conformance** GPU
+workflow. That job uses an exact vLLM wheel and SDK ref, invokes the production
+CUDA IPC allocator seam on every requested rank, and tests native
+FlashAttention writes, causal reads, guards, reuse, exhaustion, and synchronized
+detach. It uploads a JSON report on every run but creates the plain-text
+allowlist value only after every gate passes. Its temporary runtime necessarily
+uses the candidate tuple as a local provisional allowlist; this permits the
+test allocation and is not itself evidence of conformance.
+
+Opaque `kv_connected` registrations use backend-owned KV. Every advertised
+cache pool must name a bounded physical host, CUDA, or provider domain.
+Reservations enter the same `MemoryAuthority` as built-in engines; admission
+is rejected before backend allocation when the domain budget is unavailable or
+exhausted. CUDA domains require a build with the CUDA memory authority
+(`gpu-device-pool`) enabled.
+
+ABI 1.2 defines two provisioned, runtime-owned `shared_pool` allocation modes.
+`runtime_leased` publishes epoch/generation-checked block handles, zeros blocks
+before assignment, requires synchronized release, and quarantines an unfenced
+expiry. `participant_managed` exports the whole isolated backing while leaving
+block-index selection to the backend; Kapsl still grants aggregate request
+capacity, but those leases contain no physical block handles.
+
+ABI 1.3 adds a fail-closed activation lifecycle. Registration only provisions
+the isolated bindings. Every backend worker must then report its exact
+epoch-bound binding, shard, adapter profile, imported byte size, and bounded
+cache-layer views. The runtime accepts those attachments only when their exact
+profile is allowlisted and all bindings have distinct expected ranks. An
+explicit activation succeeds only after every receipt binding is attached;
+request reservations are rejected before that point. Detach requires no live
+leases plus backend-synchronized completion, and the backing is released only
+after the coordinator lock is dropped.
+
+On Linux builds with `gpu-device-pool`, enabling the control socket
+automatically installs the CUDA IPC provisioner. It synchronously allocates and
+zeros a dedicated exportable region for each participant/pool/device, charges
+that physical region once through `MemoryAuthority`, and never exports the
+runtime's general CUDA allocator slab. Other builds retain opaque support and
+reject external `shared_pool` registration rather than accepting an
+unprovisioned data plane.
+
+Participants heartbeat active leases. A requested TTL may be shorter than the
+runtime maximum but never longer. When heartbeats stop, an opaque lease returns
+its capacity to the authority. Blocks from an expired shared-pool lease are
+quarantined because timeout alone does not prove that another process has
+stopped using the mapping. The listener is supervised: if it exits unexpectedly
+while configured, the runtime fails rather than silently continuing in
+unmanaged mode.
 
 `/metrics` samples the live allocator at scrape time. Pool-wide series are
 `kapsl_gpu_device_pool_allocated_bytes`, `_live_allocations`, `_free_bytes`,

@@ -9,7 +9,9 @@
   - A compatible NVIDIA display driver on Windows; the provider packs include
     the required CUDA 12, cuDNN 9, and TensorRT 10 user-space runtime libraries
   - A compatible NVIDIA driver on Linux; the CUDA installer includes the CUDA
-    12, cuDNN 9, and NCCL user-space libraries. Bare-metal TensorRT installs
+    12, cuDNN 9, and NCCL user-space libraries for GGUF/ONNX, plus the certified
+    CUDA 13.0 Python wheel environment used by managed vLLM. The driver must
+    support CUDA 13.0 when serving through vLLM. Bare-metal TensorRT installs
     additionally require compatible TensorRT 10 system libraries
   - Xcode command line tools for Metal (macOS)
 
@@ -31,9 +33,21 @@ Install the Linux x86_64 CUDA 12 runtime:
 curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
 ```
 
-That single archive contains the CUDA-compiled GGUF runtime and the ONNX CUDA
-execution provider, plus their user-space CUDA dependencies. It requires only a
-compatible host NVIDIA driver, like a Triton GPU image.
+The command downloads the CUDA-compiled GGUF/ONNX runtime archive and, for a
+shared-pool-capable release, a separate checksummed managed-vLLM pack. The pack
+contains standalone Python and a fully locked offline wheelhouse; installation
+materializes it under `backends/vllm` beside the Kapsl executable. This first
+install is several gigabytes because PyTorch, vLLM, and their CUDA libraries are
+self-contained. Subsequent inference needs no Python package installation or
+network resolver. The host still needs a compatible NVIDIA driver, like a
+Triton GPU image.
+
+After packaging an explicit SafeTensors causal-LM deployment for vLLM, the
+serving command remains the same as every other Kapsl model:
+
+```bash
+kapsl run --model ./model.aimod
+```
 
 The stable CUDA runtime uses Kapsl's paged shared-KV path for supported GGUF
 architectures. Models rejected by its compatibility policy use llama.cpp's

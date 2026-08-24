@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Serialize)]
 struct ModelMemoryUsageResponse {
     model_id: u32,
+    owner_kind: &'static str,
     name: String,
     replica_count: usize,
     planned_bytes: usize,
@@ -28,7 +29,7 @@ struct MemoryDomainUsageResponse {
 
 #[derive(Debug, Serialize)]
 struct MemoryAuthorityResponse {
-    /// Sum of live, model-attributed rows. A row contributes the largest of
+    /// Sum of live, workload-attributed rows. A row contributes the largest of
     /// reserved, committed, or observed bytes so accounting states are not
     /// double-counted while a backend transitions between them.
     model_bytes: usize,
@@ -61,9 +62,11 @@ fn summarize_memory_authority(
     models: &ModelManager,
     snapshot: MemorySnapshot,
 ) -> MemoryAuthorityResponse {
-    let mut by_model = BTreeMap::<u32, ModelMemoryAggregate>::new();
+    let mut by_model = BTreeMap::<(bool, u32), ModelMemoryAggregate>::new();
     for row in &snapshot.rows {
-        let aggregate = by_model.entry(row.owner.model_id).or_default();
+        let aggregate = by_model
+            .entry((row.owner.is_external_kv(), row.owner.model_id))
+            .or_default();
         aggregate.replicas.insert(row.owner.replica_id);
         aggregate.planned_bytes = aggregate.planned_bytes.saturating_add(row.planned_bytes);
         aggregate.reserved_bytes = aggregate.reserved_bytes.saturating_add(row.reserved_bytes);
@@ -79,12 +82,19 @@ fn summarize_memory_authority(
     });
     let mut model_usage = by_model
         .into_iter()
-        .map(|(model_id, aggregate)| {
-            let name = models
-                .registry()
-                .get(model_id)
-                .map(|model| model.name)
-                .unwrap_or_else(|| format!("Model {model_id}"));
+        .map(|((external_kv, model_id), aggregate)| {
+            let name = if external_kv {
+                format!(
+                    "External KV participant {}",
+                    model_id & !MemoryOwner::EXTERNAL_KV_BASE
+                )
+            } else {
+                models
+                    .registry()
+                    .get(model_id)
+                    .map(|model| model.name)
+                    .unwrap_or_else(|| format!("Model {model_id}"))
+            };
             let percentage = if model_bytes == 0 {
                 0.0
             } else {
@@ -92,6 +102,11 @@ fn summarize_memory_authority(
             };
             ModelMemoryUsageResponse {
                 model_id,
+                owner_kind: if external_kv {
+                    "external_kv_participant"
+                } else {
+                    "model"
+                },
                 name,
                 replica_count: aggregate.replicas.len(),
                 planned_bytes: aggregate.planned_bytes,

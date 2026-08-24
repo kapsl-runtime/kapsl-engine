@@ -12,6 +12,8 @@ pub(crate) struct PackageKapslRequest {
     pub(crate) model_type: Option<String>,
     #[serde(default)]
     pub(crate) task: Option<String>,
+    #[serde(default)]
+    pub(crate) serving_backend: Option<ServingBackendPolicy>,
     pub(crate) version: Option<String>,
     pub(crate) metadata: Option<serde_json::Value>,
 }

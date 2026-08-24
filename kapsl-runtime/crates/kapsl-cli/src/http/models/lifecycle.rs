@@ -336,7 +336,12 @@ pub(crate) fn build_model_lifecycle_routes(
                     );
                 }
 
-                stop_model_and_replicas(model_id, &models, &resources);
+                if let Err(error) = stop_model_and_replicas(model_id, &models, &resources) {
+                    return warp::reply::with_status(
+                        warp::reply::json(&ErrorResponse { error }),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
 
                 warp::reply::with_status(
                     warp::reply::json(&SuccessResponse {
@@ -383,7 +388,15 @@ pub(crate) fn build_model_lifecycle_routes(
 
                 let base_model_id = model_info.base_model_id;
                 let _lifecycle_guard = models.lock_lifecycle(base_model_id).await;
-                let replicas = stop_model_and_replicas(base_model_id, &models, &resources);
+                let replicas = match stop_model_and_replicas(base_model_id, &models, &resources) {
+                    Ok(replicas) => replicas,
+                    Err(error) => {
+                        return warp::reply::with_status(
+                            warp::reply::json(&ErrorResponse { error }),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        );
+                    }
+                };
                 models.remove(base_model_id);
 
                 for replica in replicas {

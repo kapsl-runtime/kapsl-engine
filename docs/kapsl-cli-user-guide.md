@@ -121,6 +121,8 @@ Useful run options:
 
 - `--transport <socket|tcp|shm|hybrid|auto>` (default: `socket`)
 - `--socket /tmp/kapsl.sock`
+- `--kv-control-socket /run/kapsl/kv-control.sock` (enables the local external-KV participant control plane)
+- `--kv-control-lease-ttl-ms 30000` (maximum heartbeat TTL for external KV leases)
 - `--bind 127.0.0.1`
 - `--port 9096`
 - `--http-bind 127.0.0.1`
@@ -131,6 +133,15 @@ Useful run options:
 `hybrid` means Unix socket plus shared-memory tensor transfer; it does not open
 a TCP listener. SHM and `auto` use the live model registry, so models added at
 runtime are immediately addressable through SHM.
+
+External backends such as vLLM use a separate versioned KV control socket. It
+is disabled by default and never shares the inference socket. When enabled,
+opaque backend reservations join Kapsl's process-wide memory authority before
+the backend allocates KV. Linux CUDA builds can also provision an isolated
+CUDA IPC backing for a backend that explicitly negotiates `shared_pool`; the
+backend's attention tensors must directly alias that allocation. See the
+[runtime configuration](../kapsl-runtime/docs/configuration.md#external-kv-participants)
+for placement, TTL, CUDA-build, and socket-permission requirements.
 
 Example with TCP transport:
 

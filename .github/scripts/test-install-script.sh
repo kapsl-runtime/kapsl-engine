@@ -51,6 +51,7 @@ EOF
     chmod +x "${payload}/kapsl"
     echo "core sidecar" > "${payload}/libonnxruntime.so.1"
     if [ "${accelerator}" = "cuda" ]; then
+        echo '# vllm-v1-packed-cuda-ipc/flash-attn' >> "${payload}/kapsl"
         echo '{}' > "${payload}/kapsl-provider-cuda12.json"
         echo "cuda provider" > "${payload}/libonnxruntime_providers_cuda.so"
         echo "cudnn" > "${payload}/libcudnn.so.9"
@@ -62,6 +63,35 @@ portable_asset="kapsl-${version}-linux-x86_64.tar.gz"
 cuda_asset="kapsl-${version}-linux-x86_64-cuda12.tar.gz"
 make_bundle "${portable_asset}" "portable" cpu
 make_bundle "${cuda_asset}" "cuda12" cuda
+
+make_vllm_pack() {
+    destination="$1"
+    backend_asset="kapsl-backend-vllm-${version}-linux-x86_64.tar.gz"
+    backend_payload="${test_root}/payload-vllm"
+    rm -rf "${backend_payload}"
+    mkdir -p "${backend_payload}/backends/vllm-bootstrap"
+    cat > "${backend_payload}/backends/vllm-bootstrap/bootstrap.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+bootstrap_root="$1"
+target_root="$2"
+mkdir -p "$target_root/bin"
+cp "$bootstrap_root/fake-python" "$target_root/bin/python"
+chmod 755 "$target_root/bin/python"
+printf 'fixture managed backend\n' > "$target_root/kapsl-vllm-backend.json"
+EOF
+    cat > "${backend_payload}/backends/vllm-bootstrap/fake-python" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+    chmod 755 \
+        "${backend_payload}/backends/vllm-bootstrap/bootstrap.sh" \
+        "${backend_payload}/backends/vllm-bootstrap/fake-python"
+    tar -czf "${destination}/${backend_asset}" -C "${backend_payload}" .
+    (cd "${destination}" && sha256sum "${backend_asset}" > "${backend_asset}.sha256")
+}
+
+make_vllm_pack "${asset_dir}"
 
 for provider in cuda12 tensorrt10; do
     provider_payload="${test_root}/payload-provider-${provider}"
@@ -83,6 +113,8 @@ EOF
 cp install.sh "${release_dir}/install.sh"
 cp install.sh "${release_dir}/install-beta-base.sh"
 cp "${asset_dir}/${cuda_asset}" "${beta_asset_dir}/${cuda_asset}"
+cp "${asset_dir}/kapsl-backend-vllm-${version}-linux-x86_64.tar.gz" "${beta_asset_dir}/"
+cp "${asset_dir}/kapsl-backend-vllm-${version}-linux-x86_64.tar.gz.sha256" "${beta_asset_dir}/"
 
 # --- fixture server ---------------------------------------------------------
 python3 -m http.server 18081 \
@@ -192,8 +224,11 @@ expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
 expect_file "libcudnn.so.9"
+expect_file "backends/vllm/bin/python"
+expect_file "backends/vllm/kapsl-vllm-backend.json"
 expect_log "GGUF models: CUDA compiled"
 expect_log "ONNX models: CUDA execution provider installed"
+expect_log "managed vLLM backend installed"
 reject_log "legacy split"
 
 echo "case: direct CUDA wrapper selects the same merged bundle"
@@ -202,6 +237,7 @@ expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
+expect_file "backends/vllm/bin/python"
 
 echo "case: beta CUDA wrapper selects the merged beta bundle"
 run_cuda_wrapper "beta-cuda-wrapper" install-beta-cuda.sh
@@ -209,6 +245,7 @@ expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
+expect_file "backends/vllm/bin/python"
 
 echo "case: TensorRT adds only its provider to the merged CUDA bundle"
 run_install "tensorrt" tensorrt
@@ -217,6 +254,7 @@ expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
 expect_file "kapsl-provider-tensorrt10.json"
+expect_file "backends/vllm/bin/python"
 reject_log "legacy split"
 
 echo "case: CPU and the default install remain portable"
@@ -239,6 +277,28 @@ expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
 expect_log "legacy split ONNX CUDA provider pack"
 cp "${test_root}/merged-cuda.tar.gz" "${asset_dir}/${cuda_asset}"
+
+echo "case: missing managed-vLLM pack fails closed"
+backend_asset="kapsl-backend-vllm-${version}-linux-x86_64.tar.gz"
+mv "${asset_dir}/${backend_asset}" "${test_root}/held-vllm.tar.gz"
+run_install "vllm-missing" cuda
+if [ "${install_status}" -eq 0 ]; then
+    fail "missing managed-vLLM pack unexpectedly succeeded"
+fi
+if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
+    fail "missing managed-vLLM pack installed a backend"
+fi
+mv "${test_root}/held-vllm.tar.gz" "${asset_dir}/${backend_asset}"
+
+echo "case: corrupt managed-vLLM pack fails checksum validation"
+cp "${asset_dir}/${backend_asset}" "${test_root}/valid-vllm.tar.gz"
+printf 'corrupt' > "${asset_dir}/${backend_asset}"
+run_install "vllm-corrupt" cuda
+if [ "${install_status}" -eq 0 ]; then
+    fail "corrupt managed-vLLM pack unexpectedly succeeded"
+fi
+expect_log "Managed-vLLM backend checksum mismatch"
+cp "${test_root}/valid-vllm.tar.gz" "${asset_dir}/${backend_asset}"
 
 echo "case: missing CUDA bundle fails instead of silently installing CPU"
 mv "${asset_dir}/${cuda_asset}" "${test_root}/held-cuda.tar.gz"

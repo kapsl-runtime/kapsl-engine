@@ -672,6 +672,17 @@ impl DeviceMemoryManager {
             .unwrap_or(0)
     }
 
+    /// CUDA context retained by the authority for allocations that must live
+    /// outside the process-wide suballocator (for example exportable CUDA IPC
+    /// regions). Callers still reserve those bytes through `MemoryAuthority`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn cuda_device(&self, device_id: usize) -> Result<Arc<CudaDevice>, String> {
+        self.devices
+            .get(&device_id)
+            .map(|authority| Arc::clone(&authority.cuda))
+            .ok_or_else(|| format!("CUDA device {device_id} is not managed by this runtime"))
+    }
+
     pub(crate) fn domain_budgets(&self) -> Vec<(usize, usize)> {
         let budget = self.budget.lock().unwrap();
         self.devices
@@ -924,6 +935,7 @@ impl DeviceMemoryManager {
             pool_owner,
             reservations,
             free_before_load,
+            ledger_used_before_load: snapshot.used_bytes(),
             _load_guard: Some(load_guard),
             reconciled: false,
             committed: false,
@@ -1309,6 +1321,7 @@ pub(crate) struct DeviceMemoryAdmission {
     pool_owner: PoolOwner,
     reservations: Vec<ExternalReservation>,
     free_before_load: usize,
+    ledger_used_before_load: usize,
     _load_guard: Option<OwnedMutexGuard<()>>,
     reconciled: bool,
     committed: bool,
@@ -1325,6 +1338,28 @@ impl DeviceMemoryAdmission {
     ) -> Result<(), String> {
         let free_after_load = self.manager.free_device_bytes(self.device_id)?;
         let observed_external_bytes = self.free_before_load.saturating_sub(free_after_load);
+        // A supervised backend can ask Kapsl to provision runtime-owned memory
+        // while it is loading. Managed vLLM does exactly that when its
+        // connector registers and Kapsl allocates the isolated CUDA IPC KV
+        // pool. Those bytes are already charged by MemoryAuthority, but they
+        // also appear in the device-wide before/after free-memory sample. Keep
+        // the sample useful for unreported backend overhead without charging
+        // newly-authorized runtime allocations a second time.
+        let ledger_used_after_load = self
+            .manager
+            .budget
+            .lock()
+            .unwrap()
+            .snapshot(self.device_id)
+            .ok_or_else(|| {
+                format!(
+                    "CUDA device {} has no runtime memory authority",
+                    self.device_id
+                )
+            })?
+            .used_bytes();
+        let newly_authorized_bytes =
+            ledger_used_after_load.saturating_sub(self.ledger_used_before_load);
         let mut actual_by_id = HashMap::<String, usize>::new();
         for allocation in actual_report
             .allocations
@@ -1372,7 +1407,18 @@ impl DeviceMemoryAdmission {
             }
         }
 
-        let residual_bytes = observed_external_bytes.saturating_sub(newly_charged_reported_bytes);
+        let residual_bytes = untracked_observed_bytes(
+            observed_external_bytes,
+            newly_charged_reported_bytes,
+            newly_authorized_bytes,
+        );
+        if newly_authorized_bytes > 0 {
+            log::info!(
+                "[device-memory] CUDA device {} load sample excluded {} bytes newly authorized elsewhere by the runtime",
+                self.device_id,
+                newly_authorized_bytes,
+            );
+        }
         if residual_bytes > 0 {
             let allocation_id = format!(
                 "runtime-observed:{}:{}",
@@ -1416,6 +1462,14 @@ impl DeviceMemoryAdmission {
             reservations: std::mem::take(&mut self.reservations),
         }
     }
+}
+
+fn untracked_observed_bytes(
+    observed_bytes: usize,
+    reported_bytes: usize,
+    newly_authorized_bytes: usize,
+) -> usize {
+    observed_bytes.saturating_sub(reported_bytes.saturating_add(newly_authorized_bytes))
 }
 
 impl Drop for DeviceMemoryAdmission {
@@ -1985,6 +2039,18 @@ mod tests {
         let (budget, reserve) = auto_safe_budget_from_inputs(4 * GIB, None, 256 * 1024 * 1024);
         assert_eq!(reserve, 512 * 1024 * 1024);
         assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn load_sampling_does_not_double_charge_runtime_allocations() {
+        // The physical sample includes backend weights, a runtime-owned shared
+        // KV pool provisioned during load, and a small unreported overhead.
+        assert_eq!(untracked_observed_bytes(10_400, 1_650, 8_250), 500);
+        assert_eq!(untracked_observed_bytes(10_400, 1_650, 0), 8_750);
+
+        // Conservative accounting saturates instead of underflowing when the
+        // reported and separately-authorized rows cover the full sample.
+        assert_eq!(untracked_observed_bytes(100, 80, 30), 0);
     }
 
     #[test]

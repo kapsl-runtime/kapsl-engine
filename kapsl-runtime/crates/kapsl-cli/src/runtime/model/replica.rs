@@ -62,6 +62,10 @@ pub(super) async fn load_replica(
 ) -> Result<LoadedReplica, DynError> {
     log_package_plan(&plan);
 
+    if plan.serving_backend.selected == ResolvedServingBackend::Vllm {
+        return load_managed_vllm_replica(plan, role, device_info, resources, shared_metrics).await;
+    }
+
     let needs_mesh = role.is_primary() || plan.use_pipeline_backend;
     let (mut device_mesh, mut logical_provider) = if needs_mesh {
         use kapsl_hal::device_mesh::DeviceMesh;
@@ -288,6 +292,101 @@ pub(super) async fn load_replica(
     })
 }
 
+async fn load_managed_vllm_replica(
+    plan: ModelLoadPlan,
+    role: ReplicaLoadRole,
+    device_info: &DeviceInfo,
+    resources: Arc<RuntimeResources>,
+    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
+) -> Result<LoadedReplica, DynError> {
+    if plan.isolate_process {
+        log::info!(
+            "Ignoring generic process-isolation metadata for model {}: managed vLLM already runs in a supervised child process",
+            plan.base_model_id
+        );
+    }
+    if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
+        return Err(
+            "managed vLLM currently supports one CUDA device per Kapsl replica; use CUDA_VISIBLE_DEVICES to select the device and keep --tp-degree=1"
+                .into(),
+        );
+    }
+    let deployment = resources.managed_vllm().ok_or_else(|| {
+        "managed vLLM was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
+            .to_string()
+    })?;
+    let selection = select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
+        .map_err(|error| {
+        format!(
+            "Failed to select a CUDA device for {}: {}",
+            role.selection_context(&plan),
+            error
+        )
+    })?;
+    let cuda_device_ids = selection
+        .devices
+        .iter()
+        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+        .map(|device| device.id)
+        .collect::<Vec<_>>();
+    if cuda_device_ids.is_empty() {
+        return Err("managed vLLM device selection produced no CUDA device".into());
+    }
+    let device_index = if role.is_primary() {
+        0
+    } else {
+        plan.replica_id as usize % cuda_device_ids.len()
+    };
+    let device_id = cuda_device_ids[device_index];
+    let backend = ManagedVllmEngine::create(
+        deployment,
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        plan.base_model_id,
+        plan.replica_id,
+        vec![device_id],
+        1,
+    )?;
+    let backend = load_runtime_backend(
+        backend,
+        &plan.model_file_path,
+        &[MemoryDomain::Cuda { device_id }],
+        &resources,
+        plan.base_model_id,
+        plan.replica_id,
+        EngineKind::Native,
+        plan.priority_weight,
+        &role.load_context(&plan, Some(device_id)),
+    )
+    .await?;
+    let engine = monitor_runtime_backend(
+        backend,
+        plan.base_model_id,
+        &plan.loader.manifest.version,
+        shared_metrics,
+    );
+    let swap_handles = vec![engine.clone()];
+    let scheduler = Arc::new(
+        Scheduler::new(
+            vec![engine],
+            plan.batch_size,
+            1,
+            plan.scheduler_queue_size,
+            true,
+            plan.scheduler_max_micro_batch,
+            plan.scheduler_queue_delay_ms,
+            None,
+        )
+        .with_queue_overflow_policy(plan.queue_overflow_policy),
+    );
+    log::info!("✓ Loaded managed vLLM engine instance");
+    Ok(LoadedReplica {
+        scheduler,
+        swap_handles,
+        model_info: model_info_for_plan(&plan, role, "vllm"),
+    })
+}
+
 fn create_pipeline_backend(
     plan: &ModelLoadPlan,
     logical_provider: &str,
@@ -390,6 +489,11 @@ fn log_package_plan(plan: &ModelLoadPlan) {
     log::info!("  Framework: {}", plan.loader.manifest.framework);
     log::info!("  Version: {}", plan.loader.manifest.version);
     log::info!(
+        "  Serving backend: {} ({})",
+        plan.serving_backend.selected.as_str(),
+        plan.serving_backend.reason
+    );
+    log::info!(
         "  Queue overflow policy: {}",
         plan.queue_overflow_policy.as_str()
     );
@@ -409,6 +513,11 @@ mod tests {
             absolute_path: model_path.clone(),
             loader: PackageLoader::from_raw_file(&model_path).expect("test package loader"),
             model_file_path: model_path,
+            serving_backend: ServingBackendDecision {
+                requested: None,
+                selected: ResolvedServingBackend::Builtin,
+                reason: "test",
+            },
             batch_size: 1,
             scheduler_queue_size: 1,
             scheduler_max_micro_batch: 1,

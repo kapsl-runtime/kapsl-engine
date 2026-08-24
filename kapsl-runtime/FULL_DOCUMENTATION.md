@@ -169,7 +169,7 @@ kapsl build
 Context mode behavior:
 
 - Reads optional `metadata.json` in context.
-- Auto-finds model file (`.onnx`, `.gguf`, `.safetensors`, `.pt`, `.pth`, `.pb`) when unambiguous.
+- Auto-finds a supported model file (`.onnx`, `.gguf`, `.safetensors`) when unambiguous.
 - Includes context files in archive, excluding generated `metadata.json` and `.aimod` outputs.
 
 ### 4.3 Push / Pull Commands

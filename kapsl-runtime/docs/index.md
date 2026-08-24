@@ -4,7 +4,7 @@
 
 ## What it does
 
-- **Loads and serves packaged models** — `.aimod` archives containing ONNX, GGUF, SafeTensors, or PyTorch weights
+- **Loads and serves packaged models** — `.aimod` archives containing ONNX, GGUF, or SafeTensors weights
 - **Multiple transports** — Unix socket, TCP, shared memory, and hybrid IPC
 - **REST HTTP API** — model management, inference, RAG, extensions, auth
 - **Web dashboard** — browser UI for monitoring, model control, and extension management
@@ -17,6 +17,8 @@
 | Backend | Hardware |
 |---------|----------|
 | ONNX Runtime | CPU (all platforms) |
+| llama.cpp | CPU or NVIDIA GPU, for GGUF generation packages |
+| Managed vLLM | NVIDIA GPU, for explicit SafeTensors causal-LM generation packages |
 | TensorRT | NVIDIA GPU |
 | Metal | Apple Silicon (experimental) |
 | ROCm | AMD GPU |
@@ -24,7 +26,10 @@
 
 ## Supported model formats
 
-`.aimod` packages can contain models in: ONNX (`.onnx`), GGUF (`.gguf`), SafeTensors (`.safetensors`), PyTorch (`.pt`, `.pth`), TensorFlow SavedModel (`.pb`).
+`.aimod` packages can contain models in ONNX (`.onnx`), GGUF (`.gguf`), or
+SafeTensors (`.safetensors`) format. Raw PyTorch (`.pt`, `.pth`) and TensorFlow
+(`.pb`) weights are rejected rather than being misrouted into ONNX Runtime;
+export them to a supported serving format first.
 
 ## Navigation
 

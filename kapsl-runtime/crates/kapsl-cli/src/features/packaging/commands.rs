@@ -52,6 +52,7 @@ pub(crate) fn execute_context_build(
     framework_override: Option<&str>,
     version_override: Option<&str>,
     metadata_override: Option<&serde_json::Value>,
+    serving_backend_override: Option<ServingBackendPolicy>,
     axes: AxisOverrides,
 ) -> Result<PackageKapslResponse, DynError> {
     let interactive_metadata_setup = cli_stdin_is_tty() && context_metadata_missing(context_path);
@@ -64,6 +65,7 @@ pub(crate) fn execute_context_build(
             framework_override,
             version_override,
             metadata_override,
+            serving_backend_override,
             axes,
             interactive_metadata_setup,
         )
@@ -206,6 +208,7 @@ pub(crate) fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynErr
                     args.framework.as_deref(),
                     args.version.as_deref(),
                     metadata.as_ref(),
+                    args.serving_backend,
                     AxisOverrides {
                         format: args.format.as_deref(),
                         model_type: args.model_type.as_deref(),
@@ -228,6 +231,7 @@ pub(crate) fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynErr
                     format: args.format.clone(),
                     model_type: args.model_type.clone(),
                     task: args.task.clone(),
+                    serving_backend: args.serving_backend,
                     version: args.version.clone(),
                     metadata: metadata.clone(),
                 };
@@ -241,6 +245,7 @@ pub(crate) fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynErr
                     args.framework.as_deref(),
                     args.version.as_deref(),
                     metadata.as_ref(),
+                    args.serving_backend,
                     AxisOverrides {
                         format: args.format.as_deref(),
                         model_type: args.model_type.as_deref(),
@@ -259,6 +264,7 @@ pub(crate) fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynErr
                     format: args.format,
                     model_type: args.model_type,
                     task: args.task,
+                    serving_backend: args.serving_backend,
                     version: args.version,
                     metadata,
                 };
@@ -274,6 +280,7 @@ pub(crate) fn execute_build_command(args: BuildCommandArgs) -> Result<(), DynErr
                     args.framework.as_deref(),
                     args.version.as_deref(),
                     metadata.as_ref(),
+                    args.serving_backend,
                     AxisOverrides {
                         format: args.format.as_deref(),
                         model_type: args.model_type.as_deref(),

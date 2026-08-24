@@ -28,6 +28,8 @@ pub(crate) enum KapslCommand {
     Run(Args),
     /// Package a model file or directory into a portable .aimod archive
     Build(BuildCommandArgs),
+    /// Resolve a package's deployment backend policy for this host
+    BackendPlan(BackendPlanCommandArgs),
     /// Upload a .aimod package to a remote registry
     Push(PushCommandArgs),
     /// Download a .aimod package from a remote registry
@@ -66,6 +68,30 @@ pub(crate) struct Args {
     #[cfg_attr(unix, arg(short, long, default_value = "/tmp/kapsl.sock"))]
     #[cfg_attr(windows, arg(short, long, default_value = r"\\.\pipe\kapsl"))]
     pub(crate) socket: String,
+
+    /// Unix socket for versioned external KV participants. Managed vLLM
+    /// configures a private socket automatically.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) kv_control_socket: Option<PathBuf>,
+
+    /// Maximum lifetime of an external KV lease without a participant heartbeat.
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        default_value_t = 30_000,
+        value_parser = clap::value_parser!(u64).range(1000..)
+    )]
+    pub(crate) kv_control_lease_ttl_ms: u64,
+
+    /// Exact conformance-tested shared-pool adapter profiles to allow.
+    /// Managed vLLM adds its certified profile automatically.
+    /// Format: adapter_id,adapter_version,backend_version,profile_id.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        action = clap::ArgAction::Append
+    )]
+    pub(crate) kv_shared_pool_profile: Vec<String>,
 
     /// Bind address for the TCP inference server (used when --transport=tcp).
     /// Non-loopback binds require KAPSL_TCP_AUTH_TOKEN.
@@ -226,6 +252,11 @@ pub(crate) struct BuildCommandArgs {
     /// Serving operation: generate, embed, classify, rerank, forward
     #[arg(long)]
     pub(crate) task: Option<String>,
+
+    /// Deployment backend policy: auto, llama_cpp, or vllm.
+    /// Stored as metadata.serving.backend; omitted for legacy behavior.
+    #[arg(long, value_enum, value_name = "BACKEND")]
+    pub(crate) serving_backend: Option<ServingBackendPolicy>,
 
     /// Override the version string embedded in the package
     #[arg(long)]

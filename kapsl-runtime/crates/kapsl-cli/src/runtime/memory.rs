@@ -302,27 +302,61 @@ impl fmt::Display for MemoryAllocationClass {
 
 /// Stable workload identity carried through every admission adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum MemoryOwnerKind {
+    Model,
+    ExternalKv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MemoryOwner {
+    kind: MemoryOwnerKind,
     pub(crate) model_id: u32,
     pub(crate) replica_id: u32,
 }
 
 impl MemoryOwner {
+    pub(crate) const EXTERNAL_KV_BASE: u32 = 1 << 31;
+
     pub(crate) const fn new(model_id: u32, replica_id: u32) -> Self {
         Self {
+            kind: MemoryOwnerKind::Model,
             model_id,
             replica_id,
+        }
+    }
+
+    pub(crate) fn external_kv(participant_slot: u32) -> Option<Self> {
+        (participant_slot < Self::EXTERNAL_KV_BASE).then_some(Self {
+            kind: MemoryOwnerKind::ExternalKv,
+            model_id: Self::EXTERNAL_KV_BASE | participant_slot,
+            replica_id: 0,
+        })
+    }
+
+    pub(crate) const fn is_external_kv(self) -> bool {
+        matches!(self.kind, MemoryOwnerKind::ExternalKv)
+    }
+
+    pub(crate) const fn external_kv_slot(self) -> Option<u32> {
+        if self.is_external_kv() {
+            Some(self.model_id & !Self::EXTERNAL_KV_BASE)
+        } else {
+            None
         }
     }
 }
 
 impl fmt::Display for MemoryOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "model {} replica {}",
-            self.model_id, self.replica_id
-        )
+        if let Some(slot) = self.external_kv_slot() {
+            write!(formatter, "external KV participant {slot}")
+        } else {
+            write!(
+                formatter,
+                "model {} replica {}",
+                self.model_id, self.replica_id
+            )
+        }
     }
 }
 
@@ -1364,6 +1398,17 @@ impl MemoryAuthority {
             .unwrap_or(MemoryDomain::Host)
     }
 
+    #[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+    pub(crate) fn cuda_device(
+        &self,
+        device_id: usize,
+    ) -> Result<Arc<cudarc::driver::CudaDevice>, String> {
+        self.cuda
+            .as_ref()
+            .ok_or_else(|| "runtime has no CUDA memory authority".to_string())?
+            .cuda_device(device_id)
+    }
+
     /// KV policy capacity for one HAL device. The authority owns the physical
     /// budget; callers only translate these bytes into logical blocks.
     pub(crate) fn kv_budget_bytes(&self, device_id: usize) -> usize {
@@ -1397,6 +1442,35 @@ impl MemoryAuthority {
             .collect();
         budgets.sort_unstable_by_key(|(device_id, _)| *device_id);
         budgets
+    }
+
+    /// Hard admission budget for a backend-declared physical domain. External
+    /// KV participants use this during registration so an unknown device or an
+    /// unbounded provider fails before its first request.
+    pub(crate) fn domain_budget_bytes(&self, domain: &MemoryDomain) -> usize {
+        self.budget_for_domain(domain)
+    }
+
+    pub(crate) fn supports_external_leases(&self, domain: &MemoryDomain) -> bool {
+        if self.domain_budget_bytes(domain) == 0 {
+            return false;
+        }
+        match domain {
+            MemoryDomain::Cuda { .. } => {
+                #[cfg(feature = "gpu-device-pool")]
+                {
+                    self.cuda.is_some()
+                }
+                #[cfg(not(feature = "gpu-device-pool"))]
+                {
+                    false
+                }
+            }
+            MemoryDomain::Host
+            | MemoryDomain::HostPinned { .. }
+            | MemoryDomain::HostMapped { .. }
+            | MemoryDomain::Provider { .. } => true,
+        }
     }
 
     pub(crate) fn observe_process_memory(&self, bytes: usize) {
@@ -2434,6 +2508,12 @@ impl MemoryLease {
             .filter(|claim| claim.class == class)
             .map(|claim| claim.bytes)
             .fold(0usize, usize::saturating_add)
+    }
+
+    /// Move a request-time reservation into committed accounting while keeping
+    /// the same physical authority leases alive.
+    pub(crate) fn commit_capacity(&mut self) {
+        self.mark_committed();
     }
 
     /// Atomically reserve additional bytes before the backing allocator may

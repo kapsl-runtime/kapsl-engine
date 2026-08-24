@@ -96,10 +96,24 @@ async fn handle_chat_completion(
             return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
         }
     };
+    let stops = chat.stop_sequences();
+    let is_managed_vllm = models
+        .registry()
+        .get(resolved.id)
+        .is_some_and(|model| model.device == "vllm");
 
     // A UTF-8 prompt tensor is shaped `[1, byte_len]`, matching the RAG and
     // native inference path. `[1]` only validates for a one-byte prompt.
-    let data = prompt.as_bytes().to_vec();
+    let data = if is_managed_vllm {
+        match managed_vllm_chat_input(&chat.messages, &stops) {
+            Ok(data) => data,
+            Err(error) => {
+                return openai_error(StatusCode::BAD_REQUEST, error, "invalid_request_error");
+            }
+        }
+    } else {
+        prompt.as_bytes().to_vec()
+    };
     let input = match BinaryTensorPacket::new(
         vec![1, data.len() as i64],
         kapsl_engine_api::TensorDtype::Utf8,
@@ -146,7 +160,6 @@ async fn handle_chat_completion(
         .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
         .clone();
 
-    let stops = chat.stop_sequences();
     let created = now_unix_seconds();
     let prompt_tokens = estimate_tokens(&prompt);
 

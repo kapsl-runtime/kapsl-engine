@@ -68,11 +68,13 @@ mod app;
 mod features;
 mod http;
 mod runtime;
+mod serving_backend;
 
 use app::*;
 use features::*;
 use http::*;
 use runtime::*;
+use serving_backend::*;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(test)]
@@ -93,6 +95,7 @@ async fn main() -> Result<(), DynError> {
     } = Cli::parse_from(&raw_argv);
     match command {
         Some(KapslCommand::Build(args)) => return execute_build_command(args),
+        Some(KapslCommand::BackendPlan(args)) => return execute_backend_plan_command(args),
         Some(KapslCommand::Push(args)) => return execute_push_command(args),
         Some(KapslCommand::Pull(args)) => return execute_pull_command(args),
         Some(KapslCommand::Login(args)) => return execute_login_command(args),
@@ -271,7 +274,6 @@ async fn main() -> Result<(), DynError> {
         }
         _ => {}
     }
-
     let registry = Arc::new(Registry::new());
     let model_registry = Arc::new(ModelRegistry::new());
     let models = ModelManager::new(model_registry.clone());
@@ -301,6 +303,38 @@ async fn main() -> Result<(), DynError> {
         startup_plans.push((model_path.clone(), plan));
     }
 
+    let managed_vllm = if startup_plans
+        .iter()
+        .any(|(_, plan)| plan.uses_managed_vllm())
+    {
+        Some(ManagedVllmDeployment::prepare(&mut args)?)
+    } else {
+        None
+    };
+
+    // Managed backends may populate the private KV listener and certified
+    // allowlist automatically, so validate the final configuration only after
+    // every startup package has been planned.
+    #[cfg(not(unix))]
+    if args.kv_control_socket.is_some() {
+        return Err("--kv-control-socket currently requires a Unix host".into());
+    }
+    if args.kv_control_socket.is_none() && !args.kv_shared_pool_profile.is_empty() {
+        return Err("--kv-shared-pool-profile requires --kv-control-socket".into());
+    }
+    #[cfg(not(all(feature = "gpu-device-pool", target_os = "linux")))]
+    if !args.kv_shared_pool_profile.is_empty() {
+        return Err("--kv-shared-pool-profile requires a Linux gpu-device-pool build".into());
+    }
+    #[cfg(unix)]
+    if let Some(kv_socket) = args.kv_control_socket.as_ref() {
+        let inference_uses_socket = matches!(args.transport.as_str(), "socket" | "hybrid")
+            || (args.transport == "auto" && !ShmServer::is_available());
+        if inference_uses_socket && kv_socket == Path::new(&args.socket) {
+            return Err("--kv-control-socket must differ from the inference --socket path".into());
+        }
+    }
+
     // One process-owned facade for logical KV, physical device memory, and
     // pressure state. Pool registration completes before any backend/session
     // construction begins.
@@ -312,6 +346,41 @@ async fn main() -> Result<(), DynError> {
     };
     #[cfg(not(feature = "gpu-device-pool"))]
     let resources = RuntimeResources::new(&device_info)?;
+    if let Some(deployment) = managed_vllm {
+        resources.install_managed_vllm(deployment)?;
+    }
+
+    #[cfg(unix)]
+    let mut kv_control_task = if let Some(socket_path) = args.kv_control_socket.as_ref() {
+        #[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            resources.memory().clone(),
+            Duration::from_millis(args.kv_control_lease_ttl_ms),
+            Some(CudaIpcSharedPoolProvisioner::new(
+                resources.memory().clone(),
+            )),
+            parse_shared_pool_profiles(&args.kv_shared_pool_profile)?,
+        )?;
+        #[cfg(not(all(feature = "gpu-device-pool", target_os = "linux")))]
+        let coordinator = ExternalKvCoordinator::new(
+            resources.memory().clone(),
+            Duration::from_millis(args.kv_control_lease_ttl_ms),
+        )?;
+        if let Some(deployment) = resources.managed_vllm() {
+            deployment.install_coordinator(coordinator.clone())?;
+        }
+        let control_server = KvControlServer::bind(socket_path, coordinator).await?;
+        log::info!(
+            "KV participant control: unix://{} (maximum lease TTL={}ms)",
+            socket_path.display(),
+            args.kv_control_lease_ttl_ms
+        );
+        Some(tokio::spawn(control_server.run()))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let mut kv_control_task: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
 
     let auto_scaler = Arc::new(RwLock::new(AutoScaler::new()));
     let runtime_samples = Arc::new(RwLock::new(RuntimeSamples::default()));
@@ -944,10 +1013,29 @@ async fn main() -> Result<(), DynError> {
         http_bound_addr.port(),
     );
 
-    server
-        .run()
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    if let Some(mut control_task) = kv_control_task.take() {
+        let mut transport_task = Box::pin(server.run());
+        tokio::select! {
+            result = &mut transport_task => {
+                control_task.abort();
+                let _ = control_task.await;
+                result.map_err(|error| Box::new(error) as DynError)?;
+            }
+            result = &mut control_task => {
+                let message = match result {
+                    Ok(Ok(())) => "KV control listener stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("KV control listener failed: {error}"),
+                    Err(error) => format!("KV control listener task failed: {error}"),
+                };
+                return Err(message.into());
+            }
+        }
+    } else {
+        server
+            .run()
+            .await
+            .map_err(|error| Box::new(error) as DynError)?;
+    }
 
     Ok(())
 }

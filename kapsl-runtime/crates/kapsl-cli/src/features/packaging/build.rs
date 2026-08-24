@@ -10,7 +10,7 @@ pub(crate) fn infer_framework_from_model_path(model_path: &Path) -> String {
     match ext.as_str() {
         "onnx" => "onnx".to_string(),
         "gguf" => "gguf".to_string(),
-        "safetensors" => "pytorch".to_string(),
+        "safetensors" => "safetensors".to_string(),
         "pt" | "pth" => "pytorch".to_string(),
         "pb" => "tensorflow".to_string(),
         _ => "onnx".to_string(),
@@ -228,7 +228,10 @@ pub(crate) fn create_kapsl_package(
             .map_err(|e| format!("System clock error: {}", e))?
             .as_secs();
 
-        let metadata = match request.metadata.as_ref() {
+        let metadata = match apply_serving_backend_override(
+            request.metadata.clone(),
+            request.serving_backend,
+        )? {
             Some(metadata) => Some(
                 serde_yaml::to_value(metadata)
                     .map_err(|e| format!("Failed to convert metadata payload: {}", e))?,
@@ -249,7 +252,8 @@ pub(crate) fn create_kapsl_package(
             hardware_requirements,
             cron_jobs: Vec::new(),
         };
-        EngineKind::validate(&manifest)?;
+        validate_model_contract(&manifest)?;
+        validate_serving_backend_declaration(&manifest)?;
 
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
@@ -316,6 +320,7 @@ pub(crate) fn create_kapsl_package(
 pub(crate) fn find_model_file_in_context(context_dir: &Path) -> Result<PathBuf, String> {
     let mut stack = vec![context_dir.to_path_buf()];
     let mut matches = Vec::new();
+    let mut unsupported_weights = Vec::new();
     while let Some(dir) = stack.pop() {
         let entries = fs::read_dir(&dir)
             .map_err(|e| format!("Failed to read context directory {}: {}", dir.display(), e))?;
@@ -337,17 +342,29 @@ pub(crate) fn find_model_file_in_context(context_dir: &Path) -> Result<PathBuf, 
                 .and_then(|v| v.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if matches!(
-                ext.as_str(),
-                "onnx" | "gguf" | "safetensors" | "pt" | "pth" | "pb"
-            ) {
-                matches.push(path);
+            match ext.as_str() {
+                "onnx" | "gguf" | "safetensors" => matches.push(path),
+                "pt" | "pth" | "pb" => unsupported_weights.push(path),
+                _ => {}
             }
         }
     }
 
     matches.sort();
     if matches.is_empty() {
+        unsupported_weights.sort();
+        if !unsupported_weights.is_empty() {
+            return Err(format!(
+                "Context {} contains unsupported model weights: {}. Export them to ONNX, GGUF, \
+                 or a supported SafeTensors deployment before building.",
+                context_dir.display(),
+                unsupported_weights
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         return Err(format!(
             "No model file found in context {}. Pass --model explicitly.",
             context_dir.display()
