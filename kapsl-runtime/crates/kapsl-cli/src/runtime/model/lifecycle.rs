@@ -85,7 +85,14 @@ pub(crate) async fn reclaim_one_lower_priority_model(
                 replica_id: replica.replica_id,
             }
         } else {
-            stop_model_and_replicas(candidate.model_id, models, resources);
+            if let Err(error) = stop_model_and_replicas(candidate.model_id, models, resources) {
+                log::warn!(
+                    "Priority arbiter could not stop model {}: {}",
+                    candidate.model_id,
+                    error,
+                );
+                continue;
+            }
             PriorityReclaimAction::Model
         };
 
@@ -131,8 +138,29 @@ pub(crate) fn stop_model_and_replicas(
     base_model_id: u32,
     models: &ModelManager,
     resources: &RuntimeResources,
-) -> Vec<ModelInfo> {
+) -> Result<Vec<ModelInfo>, String> {
     let replicas = models.registry().list_replicas(base_model_id);
+
+    // A managed child imports Kapsl-owned CUDA IPC memory. Prove that its
+    // complete process group has exited and retire the participant before
+    // removing scheduler/engine handles that release ordinary model authority.
+    // If the fence fails, preserve the existing runtime and its charges.
+    if let Some(deployment) = resources.managed_vllm() {
+        match deployment.shutdown_model(base_model_id) {
+            Ok(count) if count > 0 => log::info!(
+                "Stopped {} managed vLLM runtime(s) for model {}",
+                count,
+                base_model_id
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "managed vLLM teardown for model {} did not complete: {}",
+                    base_model_id, error
+                ));
+            }
+        }
+    }
 
     for replica in &replicas {
         if let Err(error) = models
@@ -177,7 +205,7 @@ pub(crate) fn stop_model_and_replicas(
         }
     }
 
-    replicas
+    Ok(replicas)
 }
 
 #[cfg(test)]
@@ -263,7 +291,7 @@ mod tests {
         let resources = RuntimeResources::new(&test_device_info()).expect("runtime resources");
         let _lifecycle_guard = models.lock_lifecycle(7).await;
 
-        let stopped = stop_model_and_replicas(7, &models, &resources);
+        let stopped = stop_model_and_replicas(7, &models, &resources).unwrap();
         let mut stopped_ids: Vec<_> = stopped.into_iter().map(|model| model.id).collect();
         stopped_ids.sort_unstable();
 

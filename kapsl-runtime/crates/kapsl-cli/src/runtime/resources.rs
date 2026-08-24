@@ -37,6 +37,7 @@ pub(crate) struct RuntimeResources {
     memory: Arc<MemoryAuthority>,
     priority: Arc<PriorityArbiter>,
     pressure: Arc<ResourcePressure>,
+    managed_vllm: RwLock<Option<Arc<ManagedVllmDeployment>>>,
 }
 
 impl RuntimeResources {
@@ -54,6 +55,7 @@ impl RuntimeResources {
                 memory,
                 priority: PriorityArbiter::new(),
                 pressure: ResourcePressure::from_env(),
+                managed_vllm: RwLock::new(None),
             }))
         }
     }
@@ -69,6 +71,7 @@ impl RuntimeResources {
             memory,
             priority: PriorityArbiter::new(),
             pressure: ResourcePressure::from_env(),
+            managed_vllm: RwLock::new(None),
         }))
     }
 
@@ -86,6 +89,22 @@ impl RuntimeResources {
 
     pub(crate) fn priority(&self) -> &Arc<PriorityArbiter> {
         &self.priority
+    }
+
+    pub(crate) fn install_managed_vllm(
+        &self,
+        deployment: Arc<ManagedVllmDeployment>,
+    ) -> Result<(), String> {
+        let mut current = self.managed_vllm.write();
+        if current.is_some() {
+            return Err("managed vLLM deployment is already configured".to_string());
+        }
+        *current = Some(deployment);
+        Ok(())
+    }
+
+    pub(crate) fn managed_vllm(&self) -> Option<Arc<ManagedVllmDeployment>> {
+        self.managed_vllm.read().clone()
     }
 
     #[cfg(any(

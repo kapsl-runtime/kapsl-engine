@@ -17,6 +17,7 @@ mod host_memory;
 pub(crate) mod inference_service;
 #[cfg(unix)]
 pub(crate) mod kv_control;
+pub(crate) mod managed_vllm;
 pub(crate) mod memory;
 pub(crate) mod model;
 pub(crate) mod model_manager;
@@ -37,6 +38,7 @@ pub(crate) use device_memory::*;
 pub(crate) use inference_service::*;
 #[cfg(unix)]
 pub(crate) use kv_control::*;
+pub(crate) use managed_vllm::*;
 pub(crate) use memory::*;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use model::load_plan::device_memory_bootstrap_plan;

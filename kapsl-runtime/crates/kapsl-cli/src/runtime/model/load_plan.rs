@@ -10,6 +10,7 @@ pub(crate) struct ModelLoadPlan {
     pub(super) absolute_path: PathBuf,
     pub(super) loader: PackageLoader,
     pub(super) model_file_path: PathBuf,
+    pub(super) serving_backend: ServingBackendDecision,
     pub(super) batch_size: usize,
     pub(super) scheduler_queue_size: usize,
     pub(super) scheduler_max_micro_batch: usize,
@@ -30,6 +31,10 @@ pub(crate) struct ModelLoadPlan {
 impl ModelLoadPlan {
     pub(crate) fn base_model_id(&self) -> u32 {
         self.base_model_id
+    }
+
+    pub(crate) fn uses_managed_vllm(&self) -> bool {
+        self.serving_backend.selected == ResolvedServingBackend::Vllm
     }
 }
 
@@ -58,8 +63,61 @@ pub(super) fn build_model_load_plan(
             std::env::current_dir().unwrap_or_default()
         )
     })?;
+    let policy_manifest = inspect_serving_manifest(&absolute_path).map_err(|error| {
+        format!(
+            "Failed to inspect serving backend policy for model {} replica {}: {}",
+            base_model_id, replica_id, error
+        )
+    })?;
+    validate_model_contract(&policy_manifest).map_err(|error| {
+        format!(
+            "Model contract rejected model {} replica {}: {}",
+            base_model_id, replica_id, error
+        )
+    })?;
+    let preflight_serving_backend = resolve_serving_backend(&policy_manifest, device_info.has_cuda)
+        .map_err(|error| {
+            format!(
+                "Serving backend policy rejected model {} replica {}: {}",
+                base_model_id, replica_id, error
+            )
+        })?;
+    validate_runtime_serving_backend(&policy_manifest, preflight_serving_backend).map_err(
+        |error| {
+            format!(
+                "Serving backend policy rejected model {} replica {}: {}",
+                base_model_id, replica_id, error
+            )
+        },
+    )?;
     let loader = resolve_package_loader(&absolute_path, base_model_id)?;
     let model_file_path = loader.get_model_path();
+    validate_model_contract(&loader.manifest).map_err(|error| {
+        format!(
+            "Model contract rejected model {} replica {} after package load: {}",
+            base_model_id, replica_id, error
+        )
+    })?;
+    let serving_backend =
+        resolve_serving_backend(&loader.manifest, device_info.has_cuda).map_err(|error| {
+            format!(
+                "Serving backend policy rejected model {} replica {} after package load: {}",
+                base_model_id, replica_id, error
+            )
+        })?;
+    validate_runtime_serving_backend(&loader.manifest, serving_backend).map_err(|error| {
+        format!(
+            "Serving backend policy rejected model {} replica {} after package load: {}",
+            base_model_id, replica_id, error
+        )
+    })?;
+    if serving_backend != preflight_serving_backend {
+        return Err(format!(
+            "Serving backend policy for model {} replica {} changed while the package was loading; refusing a time-of-check/time-of-use mismatch",
+            base_model_id, replica_id
+        )
+        .into());
+    }
     let queue_overflow_policy = resolve_queue_overflow_policy(&loader.manifest);
     log_queue_policy_caveat(queue_overflow_policy);
     let (scheduler_max_micro_batch, scheduler_queue_delay_ms) =
@@ -100,6 +158,7 @@ pub(super) fn build_model_load_plan(
         replica_id,
         absolute_path,
         model_file_path,
+        serving_backend,
         batch_size,
         scheduler_queue_size,
         scheduler_max_micro_batch,

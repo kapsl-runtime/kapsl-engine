@@ -1398,7 +1398,7 @@ impl MemoryAuthority {
             .unwrap_or(MemoryDomain::Host)
     }
 
-    #[cfg(feature = "gpu-device-pool")]
+    #[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
     pub(crate) fn cuda_device(
         &self,
         device_id: usize,

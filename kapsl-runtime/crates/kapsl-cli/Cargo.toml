@@ -15,7 +15,10 @@ cuda = ["gguf-cuda-shared-kv"]
 # a GGUF CUDA backend.
 gpu-device-pool = [
     "dep:cudarc",
-    "cudarc/cuda-version-from-build-system",
+    # cudarc 0.12 only publishes bindings through CUDA 12.6. Pin that stable
+    # driver API instead of rejecting newer, backward-compatible toolkits at
+    # build time (the conformance image currently carries CUDA 13.0).
+    "cudarc/cuda-12060",
     "kapsl-backends/onnx-cuda-pool",
     "kapsl-hal/cuda",
 ]
@@ -68,3 +71,4 @@ rust-embed = "8.0"
 mime_guess = "2.0"
 dirs = "6.0.0"
 cudarc = { version = "0.12", optional = true }
+libc = "0.2"

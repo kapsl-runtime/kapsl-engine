@@ -621,6 +621,85 @@ impl ExternalKvCoordinator {
         count
     }
 
+    /// Retire every control-plane object owned by a participant after its
+    /// backend process tree has been reaped.
+    ///
+    /// This is the runtime-side lifecycle fence for supervised backends. A
+    /// worker cannot reliably send the ordinary detach RPC after process exit,
+    /// but once the supervisor has proved that no importer survives, retaining
+    /// its registration would leak the isolated CUDA IPC backing indefinitely.
+    #[cfg(test)]
+    pub(crate) fn retire_participant_after_backend_exit(&self, participant_id: &str) -> bool {
+        self.retire_one_participant_after_backend_exit(participant_id)
+    }
+
+    /// Retire every concrete participant identity derived from one supervised
+    /// base ID. vLLM appends its generated engine UUID to the configured Kapsl
+    /// participant ID, so the parent knows the stable namespace rather than
+    /// the final registration key. The delimiter check prevents one model's
+    /// base (for example `model-1`) from matching an unrelated `model-10`.
+    pub(crate) fn retire_participants_after_backend_exit(&self, participant_base: &str) -> usize {
+        let participant_ids = self
+            .state
+            .lock()
+            .participants
+            .keys()
+            .filter(|participant_id| {
+                participant_id.as_str() == participant_base
+                    || participant_id
+                        .strip_prefix(participant_base)
+                        .is_some_and(|suffix| suffix.starts_with(':'))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        participant_ids
+            .iter()
+            .filter(|participant_id| self.retire_one_participant_after_backend_exit(participant_id))
+            .count()
+    }
+
+    fn retire_one_participant_after_backend_exit(&self, participant_id: &str) -> bool {
+        let (participant, mut leases) = {
+            let mut state = self.state.lock();
+            let Some(participant) = state.participants.remove(participant_id) else {
+                return false;
+            };
+            let lease_ids = state
+                .leases
+                .iter()
+                .filter(|(_, lease)| lease.participant_id == participant_id)
+                .map(|(lease_id, _)| lease_id.clone())
+                .collect::<Vec<_>>();
+            let leases = lease_ids
+                .into_iter()
+                .filter_map(|lease_id| state.leases.remove(&lease_id))
+                .collect::<Vec<_>>();
+            state
+                .sequences
+                .retain(|(candidate, _), _| candidate != participant_id);
+            (participant, leases)
+        };
+
+        for lease in &mut leases {
+            if let (Some(pools), Some(allocation)) =
+                (lease.shared_pools.as_ref(), lease.shared_allocation.take())
+            {
+                pools.release(allocation);
+            }
+        }
+        let lease_count = leases.len();
+        drop(leases);
+        // The participant owns the provisioned transport backing. Drop it only
+        // after every lease has released its references and blocks.
+        drop(participant);
+        log::info!(
+            "[kv-control] retired participant '{}' after supervised backend exit (released_leases={})",
+            participant_id,
+            lease_count,
+        );
+        true
+    }
+
     #[cfg(test)]
     fn participant_count(&self) -> usize {
         self.state.lock().participants.len()
@@ -2058,6 +2137,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(coordinator.participant_count(), 0);
+    }
+
+    #[test]
+    fn supervised_backend_retirement_releases_participant_pool_and_leases() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let backing = Arc::new(TestSharedBacking::default());
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: backing.clone(),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let baseline_refs = Arc::strong_count(&backing);
+        let receipt = coordinator.register(&shared_registration()).unwrap();
+        activate_shared(&coordinator, &receipt);
+        coordinator
+            .reserve("vllm:test:scheduler", &reservation(None))
+            .unwrap();
+        assert_eq!(coordinator.participant_count(), 1);
+        assert_eq!(coordinator.lease_count(), 1);
+        assert!(Arc::strong_count(&backing) > baseline_refs);
+
+        assert!(coordinator.retire_participant_after_backend_exit("vllm:test:scheduler"));
+        assert_eq!(coordinator.participant_count(), 0);
+        assert_eq!(coordinator.lease_count(), 0);
+        assert_eq!(Arc::strong_count(&backing), baseline_refs);
+        assert!(!coordinator.retire_participant_after_backend_exit("vllm:test:scheduler"));
+    }
+
+    #[test]
+    fn supervised_base_retirement_matches_engine_suffix_but_not_prefix_collision() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let backing = Arc::new(TestSharedBacking::default());
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: backing.clone(),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let baseline_refs = Arc::strong_count(&backing);
+
+        let mut target = shared_registration();
+        target.participant_id = "kapsl-model-1:engine-uuid".to_string();
+        coordinator.register(&target).unwrap();
+        let mut collision = shared_registration();
+        collision.participant_id = "kapsl-model-10:engine-uuid".to_string();
+        coordinator.register(&collision).unwrap();
+        assert_eq!(coordinator.participant_count(), 2);
+
+        assert_eq!(
+            coordinator.retire_participants_after_backend_exit("kapsl-model-1"),
+            1
+        );
+        assert_eq!(coordinator.participant_count(), 1);
+        assert!(coordinator
+            .state
+            .lock()
+            .participants
+            .contains_key("kapsl-model-10:engine-uuid"));
+        assert_eq!(Arc::strong_count(&backing), baseline_refs + 1);
     }
 
     #[test]

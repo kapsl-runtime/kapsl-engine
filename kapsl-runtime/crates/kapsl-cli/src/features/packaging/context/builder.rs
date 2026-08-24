@@ -11,6 +11,7 @@ pub(crate) fn create_kapsl_package_from_context(
     framework_override: Option<&str>,
     version_override: Option<&str>,
     metadata_override: Option<&serde_json::Value>,
+    serving_backend_override: Option<ServingBackendPolicy>,
     axes: AxisOverrides,
     interactive_metadata_setup: bool,
 ) -> Result<PackageKapslResponse, String> {
@@ -43,6 +44,9 @@ pub(crate) fn create_kapsl_package_from_context(
         framework_from_manifest,
         version_from_manifest,
         model_file_from_manifest,
+        format_from_manifest,
+        model_type_from_manifest,
+        task_from_manifest,
         hardware_requirements_from_manifest,
         metadata_from_manifest,
     ) = parse_context_manifest(&context_dir)?;
@@ -133,11 +137,11 @@ pub(crate) fn create_kapsl_package_from_context(
 
     let mut hardware_requirements = hardware_requirements_from_manifest.unwrap_or_default();
 
-    // Orthogonal model axes; populated from CLI overrides and/or the interactive
-    // flow, else None so the loader infers them from `framework`.
-    let mut format_axis: Option<String> = None;
-    let mut model_type_axis: Option<String> = None;
-    let mut task_axis: Option<String> = None;
+    // Orthogonal model axes; CLI overrides win, otherwise preserve the source
+    // manifest before falling back to legacy `framework` inference.
+    let mut format_axis = format_from_manifest;
+    let mut model_type_axis = model_type_from_manifest;
+    let mut task_axis = task_from_manifest;
 
     // Non-interactive: --format / --model-type / --task fill the axes.
     if axes.any() {
@@ -219,14 +223,15 @@ pub(crate) fn create_kapsl_package_from_context(
             .as_secs()
             .to_string();
 
-        let metadata_value = metadata_override
-            .cloned()
-            .or(metadata_from_manifest)
-            .map(|value| {
-                serde_yaml::to_value(value)
-                    .map_err(|e| format!("Failed to convert metadata payload: {}", e))
-            })
-            .transpose()?;
+        let metadata_value = apply_serving_backend_override(
+            metadata_override.cloned().or(metadata_from_manifest),
+            serving_backend_override,
+        )?
+        .map(|value| {
+            serde_yaml::to_value(value)
+                .map_err(|e| format!("Failed to convert metadata payload: {}", e))
+        })
+        .transpose()?;
 
         let primary_model_ext = model_path
             .extension()
@@ -273,7 +278,8 @@ pub(crate) fn create_kapsl_package_from_context(
             hardware_requirements,
             cron_jobs: Vec::new(),
         };
-        EngineKind::validate(&manifest)?;
+        validate_model_contract(&manifest)?;
+        validate_serving_backend_declaration(&manifest)?;
 
         let output_file = File::create(&output_path).map_err(|e| {
             format!(

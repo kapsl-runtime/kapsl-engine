@@ -112,6 +112,8 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GPU_MEMORY_LIMIT_MB` | Process VRAM ceiling in MiB when no CUDA-specific ceiling is set. |
 | `KAPSL_PROVIDER_MEMORY_LIMITS` | Hard limits for non-CPU/non-CUDA provider domains as `provider[:device]=size` entries, e.g. `metal=8g,directml:0=6g`. Exact-device entries override provider-wide values. |
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
+| `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. A packaged installation discovers a beside-binary bundle automatically. |
+| `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -134,14 +136,68 @@ usage has already crossed a hard limit, Kapsl retains the over-limit observed
 value in the authority snapshot, closes further admission, and enters the
 normal pressure policy rather than reverting to a stale reservation.
 
+### Serving backend policy
+
+The package field `metadata.serving.backend` selects a deployment target, not
+a CUDA execution provider. Use `kapsl backend-plan <MODEL>` to resolve it for
+the current host. GGUF selects llama.cpp; an explicitly policy-tagged
+SafeTensors causal-LM generation package may select managed vLLM on CUDA; all
+other `auto` cases retain the built-in backend factory. A built-in SafeTensors
+decision requires a binary compiled with the `native` feature; otherwise the
+load is rejected before ONNX Runtime is constructed. Packages without the
+field retain their legacy selection, subject to the same backend-availability
+check.
+
+For a vLLM package, the normal command is:
+
+```bash
+kapsl run --model ./qwen.aimod
+```
+
+Kapsl creates a private KV control socket, installs the certified shared-pool
+profile, starts vLLM on an ephemeral loopback port, waits for readiness, routes
+the existing Kapsl and OpenAI-compatible APIs to it, supervises bounded
+restarts, and stops the complete vLLM process group when the model is unloaded
+or Kapsl exits. The vLLM endpoint is an implementation detail and is not
+exposed as a second public server.
+
+This path requires a Linux `gpu-device-pool` build and the certified
+managed-vLLM bundle installed beside the Kapsl binary. The Linux CUDA shell
+installer downloads and materializes that bundle automatically. Kapsl validates the
+complete binary tuple before allocating GPU memory:
+Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
+`2.11.0+cu130`, CUDA runtime `13.0`, vLLM
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.5.0` with profile
+`vllm-v1-packed-cuda-ipc/flash-attn`. A missing or different bundle fails
+closed; Kapsl never falls back to ONNX Runtime, native SafeTensors, or another
+attention implementation. Source/development builds can point to the same
+certified environment with `KAPSL_VLLM_PYTHON=/path/to/venv/bin/python`.
+
+Optional package-level settings live under `metadata.serving.vllm`:
+
+```yaml
+metadata:
+  serving:
+    backend: vllm
+    vllm:
+      max_model_len: 4096
+      gpu_memory_utilization: 0.5
+      startup_timeout_seconds: 300
+```
+
+The defaults are `1024`, `0.5`, and `300` seconds respectively. Managed vLLM
+currently uses one selected CUDA device per Kapsl replica. Use
+`CUDA_VISIBLE_DEVICES` to select or isolate GPUs.
+
 ### External KV participants
 
 `--kv-control-socket <PATH>` enables the versioned local control plane used by
-out-of-process KV participants such as the Kapsl vLLM connector. It is disabled
-when the flag is omitted. The path must be absolute, its parent directory must
-already exist, and it must differ from the inference `--socket`. On Unix, the
-runtime creates it with mode `0600` and refuses to replace a non-socket path or
-an active listener.
+independently managed out-of-process KV participants. Managed vLLM configures
+this listener automatically; users do not need this flag for
+`kapsl run --model`. When supplied explicitly, the path must be absolute, its
+parent directory must already exist, and it must differ from the inference
+`--socket`. On Unix, the runtime creates it with mode `0600` and refuses to
+replace a non-socket path or an active listener.
 
 ```bash
 install -d -m 0700 /run/kapsl

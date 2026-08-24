@@ -91,9 +91,70 @@ curl -X POST http://127.0.0.1:9095/api/models/start \
 |--------|-----------|-------|
 | ONNX | `.onnx` | Recommended — widest backend support |
 | GGUF | `.gguf` | LLMs (llama.cpp compatible) |
-| SafeTensors | `.safetensors` | Hugging Face models |
-| PyTorch | `.pt`, `.pth` | TorchScript or state-dict |
-| TensorFlow | `.pb` | SavedModel format |
+| SafeTensors | `.safetensors` | Native-enabled runtime or managed vLLM on Linux with the certified bundle |
+
+PyTorch (`.pt`, `.pth`), TensorFlow (`.pb`), and unknown primary model
+extensions are rejected during build and load. Kapsl never treats these bytes
+as ONNX. Export the model to ONNX, GGUF, or a supported SafeTensors deployment
+first.
+
+## Serving backend policy
+
+Packages may declare a deployment-time policy at
+`metadata.serving.backend`. The supported values are `auto`, `llama_cpp`, and
+`vllm`. Omitting the field preserves the backend-factory behavior used before
+this policy existed; an old package is never redirected to vLLM merely because
+it is loaded on a CUDA host.
+
+The build command writes the field without replacing other metadata:
+
+```bash
+# A GGUF package that must use llama.cpp.
+kapsl build ./model.gguf \
+  --format gguf --model-type causal-lm --task generate \
+  --serving-backend llama_cpp
+
+# A deployment-portable policy. On a CUDA host with the certified bundle, this
+# SafeTensors contract resolves to managed vLLM; without CUDA it requires a
+# native-enabled Kapsl binary.
+kapsl build ./model.safetensors \
+  --format safetensors --model-type causal-lm --task generate \
+  --serving-backend auto
+```
+
+Selection is deterministic:
+
+| Policy | Package/hardware | Selected target |
+|--------|------------------|-----------------|
+| omitted | any | Existing built-in backend factory |
+| `llama_cpp` | GGUF | llama.cpp; other formats are rejected |
+| `vllm` | CUDA + explicit SafeTensors/causal-lm/generate axes | Managed vLLM; other contracts are rejected |
+| `auto` | GGUF | llama.cpp |
+| `auto` | CUDA + explicit SafeTensors/causal-lm/generate axes | Managed vLLM |
+| `auto` | SafeTensors without a matching external target | Built-in native backend when compiled; otherwise rejected before ONNX Runtime |
+| `auto` | anything else | Existing built-in backend factory |
+
+Inspect the decision on the current host, or override CUDA detection when
+planning for another deployment host:
+
+```bash
+kapsl backend-plan ./model.aimod
+kapsl backend-plan ./model.aimod --cuda true
+```
+
+The command emits machine-readable JSON including `selected_backend`,
+`external_process`, and the reason for the decision. `external_process` is true
+for vLLM because Kapsl supervises a separate Python process; it does not mean
+the user starts or addresses a second server. Run the package normally:
+
+```bash
+kapsl run --model ./model.aimod
+```
+
+Kapsl generates the `KapslConnectorV1` configuration and shared-pool allowlist,
+waits for vLLM readiness, and keeps the Kapsl HTTP/native endpoints in front.
+The exact bundle and fail-closed checks are described in
+[Configuration](./configuration.md#serving-backend-policy).
 
 ## Model lifecycle
 

@@ -11,7 +11,7 @@ use super::*;
 mod chat;
 mod embeddings;
 mod responses;
-mod types;
+pub(crate) mod types;
 
 use types::openai_error;
 

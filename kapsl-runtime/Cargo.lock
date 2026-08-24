@@ -2081,6 +2081,7 @@ dependencies = [
  "kapsl-scheduler",
  "kapsl-shm",
  "kapsl-transport",
+ "libc",
  "log",
  "mime_guess",
  "parking_lot",
@@ -2215,6 +2216,8 @@ dependencies = [
 [[package]]
 name = "kapsl-kv-abi"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0ba83ca963d3e8bd0f857f11fc0e49c6c862b28cb27e98d258f3f577e9bc2f7"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
