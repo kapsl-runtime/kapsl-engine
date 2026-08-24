@@ -14,6 +14,8 @@ Options:
   --kv-control-socket <PATH>  Local socket for versioned external KV participants
   --kv-control-lease-ttl-ms <MILLISECONDS>
                               Maximum heartbeat lease TTL (default: 30000)
+  --kv-shared-pool-profile <PROFILE>
+                              Exact conformance-tested adapter profile (repeatable)
   --tcp-port <PORT>           IPC TCP port (default: 9096)
   --http-host <HOST>          HTTP bind host (default: 127.0.0.1)
   --http-port <PORT>          HTTP/API/UI port (default: 9095)
@@ -145,8 +147,20 @@ an active listener.
 install -d -m 0700 /run/kapsl
 kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
-  --kv-control-lease-ttl-ms 30000
+  --kv-control-lease-ttl-ms 30000 \
+  --kv-shared-pool-profile \
+    'kapsl-vllm-connector,0.4.0,<vllm-version>,vllm-v1-packed-cuda-ipc'
 ```
+
+The profile flag is required only for `shared_pool` and is repeatable. Its four
+comma-separated fields are the exact adapter ID, adapter version, backend
+version, and compatibility profile emitted by a conformance-tested adapter.
+Do not add a tuple merely to make registration pass: it is the deployment
+allowlist for builds whose backend-native attention write/read probes passed.
+The participant declares this tuple in registration, so a mismatch is rejected
+before the provisioner allocates or exports a device region.
+An empty allowlist still permits opaque `kv_connected` participants but rejects
+every external `shared_pool` registration.
 
 Opaque `kv_connected` registrations use backend-owned KV. Every advertised
 cache pool must name a bounded physical host, CUDA, or provider domain.
@@ -161,6 +175,16 @@ before assignment, requires synchronized release, and quarantines an unfenced
 expiry. `participant_managed` exports the whole isolated backing while leaving
 block-index selection to the backend; Kapsl still grants aggregate request
 capacity, but those leases contain no physical block handles.
+
+ABI 1.3 adds a fail-closed activation lifecycle. Registration only provisions
+the isolated bindings. Every backend worker must then report its exact
+epoch-bound binding, shard, adapter profile, imported byte size, and bounded
+cache-layer views. The runtime accepts those attachments only when their exact
+profile is allowlisted and all bindings have distinct expected ranks. An
+explicit activation succeeds only after every receipt binding is attached;
+request reservations are rejected before that point. Detach requires no live
+leases plus backend-synchronized completion, and the backing is released only
+after the coordinator lock is dropped.
 
 On Linux builds with `gpu-device-pool`, enabling the control socket
 automatically installs the CUDA IPC provisioner. It synchronously allocates and

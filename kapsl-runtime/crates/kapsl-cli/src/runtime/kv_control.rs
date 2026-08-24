@@ -9,11 +9,12 @@ use super::memory::{
     MemoryPlan,
 };
 use kapsl_kv_abi::{
-    dispatch_control_request, KvBlockHandle, KvCacheOwnership, KvCommitRequest, KvContractError,
-    KvControlRequestEnvelope, KvControlResponse, KvControlResponseEnvelope, KvGroupLease,
-    KvGroupReservation, KvIntegrationTier, KvLease, KvMemoryDomain, KvMetadataMode,
-    KvParticipantRegistration, KvRegistrationReceipt, KvReleaseCompletion, KvReserveRequest,
-    KvSequenceKey, KvSharedPoolAllocationMode, KvSharedPoolDescriptor, KAPSL_KV_ABI_VERSION,
+    dispatch_control_request, KvAdapterProfile, KvBlockHandle, KvCacheOwnership, KvCommitRequest,
+    KvContractError, KvControlRequestEnvelope, KvControlResponse, KvControlResponseEnvelope,
+    KvFeature, KvGroupLease, KvGroupReservation, KvIntegrationTier, KvLease, KvMemoryDomain,
+    KvMetadataMode, KvParticipantRegistration, KvRegistrationReceipt, KvReleaseCompletion,
+    KvReserveRequest, KvSequenceKey, KvSharedPoolAllocationMode, KvSharedPoolAttachment,
+    KvSharedPoolDescriptor, KvSharedPoolDetachRequest, KAPSL_KV_ABI_VERSION,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -334,6 +335,19 @@ struct ParticipantRecord {
     owner: MemoryOwner,
     receipt: KvRegistrationReceipt,
     shared_pools: Option<Arc<SharedPoolSet>>,
+    shared_activation: Option<SharedPoolActivation>,
+}
+
+struct ParticipantSnapshot {
+    registration: KvParticipantRegistration,
+    owner: MemoryOwner,
+    shared_pools: Option<Arc<SharedPoolSet>>,
+    active: bool,
+}
+
+struct SharedPoolActivation {
+    attachments: BTreeMap<String, KvSharedPoolAttachment>,
+    active: bool,
 }
 
 struct ExternalLeaseRecord {
@@ -354,6 +368,169 @@ struct CoordinatorState {
     sequences: HashMap<(String, KvSequenceKey), String>,
 }
 
+/// Parse exact adapter/backend tuples produced by the hardware conformance
+/// suite. This is an operator allowlist, not remote attestation: the local
+/// control socket remains the trust boundary for participant identity.
+#[cfg(any(test, all(feature = "gpu-device-pool", target_os = "linux")))]
+pub(crate) fn parse_shared_pool_profiles(
+    values: &[String],
+) -> Result<BTreeSet<KvAdapterProfile>, String> {
+    values
+        .iter()
+        .map(|value| {
+            let fields = value.split(',').map(str::trim).collect::<Vec<_>>();
+            if fields.len() != 4 {
+                return Err(format!(
+                    "invalid --kv-shared-pool-profile '{value}': expected adapter_id,adapter_version,backend_version,profile_id"
+                ));
+            }
+            let profile = KvAdapterProfile {
+                adapter_id: fields[0].to_string(),
+                adapter_version: fields[1].to_string(),
+                backend_version: fields[2].to_string(),
+                profile_id: fields[3].to_string(),
+            };
+            profile.validate().map_err(|error| {
+                format!("invalid --kv-shared-pool-profile '{value}': {error}")
+            })?;
+            Ok(profile)
+        })
+        .collect()
+}
+
+fn validate_shared_attachment(
+    record: &ParticipantRecord,
+    attachment: &KvSharedPoolAttachment,
+) -> Result<(), KvContractError> {
+    attachment.validate()?;
+    if record.receipt.participant_epoch != attachment.participant_epoch {
+        return Err(KvContractError::invalid_request(
+            "shared-pool attachment epoch does not match the registration receipt",
+        ));
+    }
+    if !record
+        .registration
+        .capabilities
+        .features
+        .contains(&KvFeature::ExternalPoolAttachment)
+    {
+        return Err(KvContractError::invalid_capabilities(
+            "participant did not advertise external shared-pool attachment",
+        ));
+    }
+    let binding = record
+        .receipt
+        .shared_pools
+        .iter()
+        .find(|binding| binding.binding_id == attachment.binding_id)
+        .ok_or_else(|| {
+            KvContractError::invalid_request(
+                "attachment references a binding outside the registration receipt",
+            )
+        })?;
+    let expected_bytes = binding
+        .block_count
+        .checked_mul(binding.bytes_per_block)
+        .ok_or_else(|| KvContractError::Internal {
+            message: "validated shared-pool byte size overflowed".to_string(),
+        })?;
+    if attachment.imported_bytes != expected_bytes {
+        return Err(KvContractError::invalid_request(format!(
+            "attachment imported {} bytes for binding '{}', expected {expected_bytes}",
+            attachment.imported_bytes, binding.binding_id
+        )));
+    }
+
+    let topology = record
+        .registration
+        .topology
+        .as_ref()
+        .expect("validated shared-pool registration has structured topology");
+    if attachment.shard.tensor_parallel_world_size != topology.shard.tensor_parallel_world_size
+        || attachment.shard.pipeline_parallel_world_size
+            != topology.shard.pipeline_parallel_world_size
+    {
+        return Err(KvContractError::invalid_topology(
+            "attachment shard world sizes do not match the registered topology",
+        ));
+    }
+
+    let bound_groups = binding.group_ids.iter().collect::<BTreeSet<_>>();
+    let expected_layers = topology
+        .cache_groups
+        .iter()
+        .filter(|group| bound_groups.contains(&group.group_id))
+        .flat_map(|group| {
+            group
+                .layers
+                .iter()
+                .map(|layer| (group.group_id.as_str(), layer.index, layer.name.as_deref()))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut attached_layers = BTreeSet::new();
+    for view in &attachment.views {
+        let end = view
+            .offset_bytes
+            .checked_add(view.length_bytes)
+            .expect("attachment validation checked view overflow");
+        if end > attachment.imported_bytes {
+            return Err(KvContractError::invalid_request(format!(
+                "attachment view for group '{}' layer {} exceeds binding '{}'",
+                view.group_id, view.layer.index, binding.binding_id
+            )));
+        }
+        attached_layers.insert((
+            view.group_id.as_str(),
+            view.layer.index,
+            view.layer.name.as_deref(),
+        ));
+    }
+    if attached_layers != expected_layers {
+        return Err(KvContractError::invalid_request(
+            "attachment views do not cover the binding's registered cache layers",
+        ));
+    }
+
+    let activation = record
+        .shared_activation
+        .as_ref()
+        .expect("shared participant has activation state");
+    if activation
+        .attachments
+        .values()
+        .any(|existing| existing.profile != attachment.profile)
+    {
+        return Err(KvContractError::invalid_request(
+            "all participant bindings must use the same certified adapter profile",
+        ));
+    }
+    if record.registration.adapter_profile.as_ref() != Some(&attachment.profile) {
+        return Err(KvContractError::invalid_request(
+            "attachment profile does not match the profile declared before provisioning",
+        ));
+    }
+    if activation.attachments.values().any(|existing| {
+        existing.binding_id != attachment.binding_id
+            && record
+                .receipt
+                .shared_pools
+                .iter()
+                .find(|binding| binding.binding_id == existing.binding_id)
+                .is_some_and(|existing_binding| {
+                    existing_binding.capacity_pool_id == binding.capacity_pool_id
+                        && existing.shard.tensor_parallel_rank
+                            == attachment.shard.tensor_parallel_rank
+                        && existing.shard.pipeline_parallel_rank
+                            == attachment.shard.pipeline_parallel_rank
+                })
+    }) {
+        return Err(KvContractError::invalid_request(
+            "replicas of one capacity pool must attach from distinct parallel ranks",
+        ));
+    }
+    Ok(())
+}
+
 /// Runtime implementation of the backend-neutral KV coordinator contract.
 ///
 /// Opaque participants use byte-accounted memory leases. Shared-pool
@@ -368,6 +545,7 @@ pub(crate) struct ExternalKvCoordinator {
     next_lease_id: AtomicU64,
     maximum_lease_ttl: Duration,
     shared_pool_provisioner: Option<Arc<dyn SharedPoolProvisioner>>,
+    allowed_shared_pool_profiles: BTreeSet<KvAdapterProfile>,
 }
 
 impl ExternalKvCoordinator {
@@ -375,13 +553,14 @@ impl ExternalKvCoordinator {
         memory: Arc<MemoryAuthority>,
         maximum_lease_ttl: Duration,
     ) -> Result<Arc<Self>, String> {
-        Self::new_with_shared_pool_provisioner(memory, maximum_lease_ttl, None)
+        Self::new_with_shared_pool_provisioner(memory, maximum_lease_ttl, None, BTreeSet::new())
     }
 
     pub(crate) fn new_with_shared_pool_provisioner(
         memory: Arc<MemoryAuthority>,
         maximum_lease_ttl: Duration,
         shared_pool_provisioner: Option<Arc<dyn SharedPoolProvisioner>>,
+        allowed_shared_pool_profiles: BTreeSet<KvAdapterProfile>,
     ) -> Result<Arc<Self>, String> {
         if maximum_lease_ttl.is_zero() {
             return Err("KV control lease TTL must be non-zero".to_string());
@@ -394,6 +573,7 @@ impl ExternalKvCoordinator {
             next_lease_id: AtomicU64::new(1),
             maximum_lease_ttl,
             shared_pool_provisioner,
+            allowed_shared_pool_profiles,
         }))
     }
 
@@ -454,24 +634,19 @@ impl ExternalKvCoordinator {
     fn participant_registration(
         &self,
         participant_id: &str,
-    ) -> Result<
-        (
-            KvParticipantRegistration,
-            MemoryOwner,
-            Option<Arc<SharedPoolSet>>,
-        ),
-        KvContractError,
-    > {
+    ) -> Result<ParticipantSnapshot, KvContractError> {
         self.state
             .lock()
             .participants
             .get(participant_id)
-            .map(|record| {
-                (
-                    record.registration.clone(),
-                    record.owner,
-                    record.shared_pools.clone(),
-                )
+            .map(|record| ParticipantSnapshot {
+                registration: record.registration.clone(),
+                owner: record.owner,
+                shared_pools: record.shared_pools.clone(),
+                active: record
+                    .shared_activation
+                    .as_ref()
+                    .is_none_or(|activation| activation.active),
             })
             .ok_or_else(|| KvContractError::NotFound {
                 message: format!("KV participant '{participant_id}' is not registered"),
@@ -526,6 +701,36 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 )));
             }
         }
+        if is_shared && self.allowed_shared_pool_profiles.is_empty() {
+            return Err(KvContractError::invalid_capabilities(
+                "shared_pool requires at least one deployment-allowlisted conformance profile",
+            ));
+        }
+        if is_shared {
+            if !registration
+                .capabilities
+                .features
+                .contains(&KvFeature::ExternalPoolAttachment)
+            {
+                return Err(KvContractError::invalid_capabilities(
+                    "external shared_pool requires the external_pool_attachment feature",
+                ));
+            }
+            let profile = registration.adapter_profile.as_ref().ok_or_else(|| {
+                KvContractError::invalid_capabilities(
+                    "external shared_pool requires an adapter profile before provisioning",
+                )
+            })?;
+            if !self.allowed_shared_pool_profiles.contains(profile) {
+                return Err(KvContractError::invalid_capabilities(format!(
+                    "shared-pool adapter profile '{}:{}:{}:{}' is not allowlisted by this deployment",
+                    profile.adapter_id,
+                    profile.adapter_version,
+                    profile.backend_version,
+                    profile.profile_id,
+                )));
+            }
+        }
 
         self.expire_stale();
         let mut state = self.state.lock();
@@ -562,6 +767,7 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     owner,
                     receipt: receipt.clone(),
                     shared_pools: None,
+                    shared_activation: None,
                 },
             );
             return Ok(receipt);
@@ -602,6 +808,10 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 owner,
                 receipt: receipt.clone(),
                 shared_pools,
+                shared_activation: is_shared.then(|| SharedPoolActivation {
+                    attachments: BTreeMap::new(),
+                    active: false,
+                }),
             },
         );
         log::info!(
@@ -616,6 +826,127 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         Ok(receipt)
     }
 
+    fn attach(
+        &self,
+        participant_id: &str,
+        attachment: &KvSharedPoolAttachment,
+    ) -> Result<(), KvContractError> {
+        attachment.validate()?;
+        let mut state = self.state.lock();
+        let record =
+            state
+                .participants
+                .get(participant_id)
+                .ok_or_else(|| KvContractError::NotFound {
+                    message: format!("KV participant '{participant_id}' is not registered"),
+                })?;
+        if !self
+            .allowed_shared_pool_profiles
+            .contains(&attachment.profile)
+        {
+            return Err(KvContractError::invalid_capabilities(format!(
+                "shared-pool adapter profile '{}:{}:{}:{}' is not allowlisted by this deployment",
+                attachment.profile.adapter_id,
+                attachment.profile.adapter_version,
+                attachment.profile.backend_version,
+                attachment.profile.profile_id,
+            )));
+        }
+        validate_shared_attachment(record, attachment)?;
+        let activation = record.shared_activation.as_ref().ok_or_else(|| {
+            KvContractError::invalid_request(
+                "opaque participants cannot attach shared-pool bindings",
+            )
+        })?;
+        if let Some(existing) = activation.attachments.get(&attachment.binding_id) {
+            if existing == attachment {
+                return Ok(());
+            }
+            return Err(KvContractError::invalid_request(format!(
+                "binding '{}' is already attached with different evidence",
+                attachment.binding_id
+            )));
+        }
+        if activation.active {
+            return Err(KvContractError::invalid_request(
+                "an active participant cannot add or replace attachments",
+            ));
+        }
+
+        state
+            .participants
+            .get_mut(participant_id)
+            .and_then(|record| record.shared_activation.as_mut())
+            .expect("shared activation checked above")
+            .attachments
+            .insert(attachment.binding_id.clone(), attachment.clone());
+        log::info!(
+            "[kv-control] attached binding '{}' for participant '{}' rank={}/{} epoch={}",
+            attachment.binding_id,
+            participant_id,
+            attachment.shard.tensor_parallel_rank,
+            attachment.shard.tensor_parallel_world_size,
+            attachment.participant_epoch,
+        );
+        Ok(())
+    }
+
+    fn activate(
+        &self,
+        participant_id: &str,
+        participant_epoch: u64,
+    ) -> Result<(), KvContractError> {
+        let mut state = self.state.lock();
+        let record = state.participants.get_mut(participant_id).ok_or_else(|| {
+            KvContractError::NotFound {
+                message: format!("KV participant '{participant_id}' is not registered"),
+            }
+        })?;
+        if record.receipt.participant_epoch != participant_epoch {
+            return Err(KvContractError::invalid_request(
+                "activation epoch does not match the registration receipt",
+            ));
+        }
+        let activation = record.shared_activation.as_mut().ok_or_else(|| {
+            KvContractError::invalid_request(
+                "opaque participants do not require shared-pool activation",
+            )
+        })?;
+        if activation.active {
+            return Ok(());
+        }
+        let expected_bindings = record
+            .receipt
+            .shared_pools
+            .iter()
+            .map(|binding| binding.binding_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let attached_bindings = activation
+            .attachments
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if attached_bindings != expected_bindings {
+            let missing = expected_bindings
+                .difference(&attached_bindings)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(KvContractError::invalid_request(format!(
+                "shared-pool participant '{participant_id}' cannot activate before every binding attaches; missing: {missing}"
+            )));
+        }
+
+        activation.active = true;
+        log::info!(
+            "[kv-control] activated shared-pool participant '{}' epoch={} bindings={}",
+            participant_id,
+            participant_epoch,
+            activation.attachments.len(),
+        );
+        Ok(())
+    }
+
     fn reserve(
         &self,
         participant_id: &str,
@@ -624,7 +955,17 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         request.validate()?;
         self.expire_stale();
 
-        let (registration, owner, shared_pools) = self.participant_registration(participant_id)?;
+        let ParticipantSnapshot {
+            registration,
+            owner,
+            shared_pools,
+            active,
+        } = self.participant_registration(participant_id)?;
+        if shared_pools.is_some() && !active {
+            return Err(KvContractError::invalid_request(format!(
+                "shared-pool participant '{participant_id}' is provisioned but not active"
+            )));
+        }
         if let Some(prefix) = &request.prefix {
             if prefix.model_fingerprint != registration.model_fingerprint {
                 return Err(KvContractError::invalid_request(
@@ -733,7 +1074,14 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         if state
             .participants
             .get(participant_id)
-            .is_none_or(|current| current.registration != registration)
+            .is_none_or(|current| {
+                current.registration != registration
+                    || (shared_pools.is_some()
+                        && current
+                            .shared_activation
+                            .as_ref()
+                            .is_none_or(|activation| !activation.active))
+            })
         {
             drop(state);
             if let (Some(pools), Some(allocation)) =
@@ -907,6 +1255,77 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
             pools.release(allocation);
         }
         drop(released);
+        Ok(())
+    }
+
+    fn detach(
+        &self,
+        participant_id: &str,
+        request: &KvSharedPoolDetachRequest,
+    ) -> Result<(), KvContractError> {
+        request.validate()?;
+        if !matches!(request.completion, KvReleaseCompletion::BackendSynchronized) {
+            return Err(KvContractError::unsupported(
+                "shared_pool_detach_transport_fence",
+            ));
+        }
+        let mut state = self.state.lock();
+        if state
+            .leases
+            .values()
+            .any(|lease| lease.participant_id == participant_id)
+        {
+            return Err(KvContractError::invalid_request(format!(
+                "shared-pool participant '{participant_id}' cannot detach while leases are active"
+            )));
+        }
+        let remove_participant = {
+            let record = state.participants.get_mut(participant_id).ok_or_else(|| {
+                KvContractError::NotFound {
+                    message: format!("KV participant '{participant_id}' is not registered"),
+                }
+            })?;
+            if record.receipt.participant_epoch != request.participant_epoch {
+                return Err(KvContractError::invalid_request(
+                    "detach epoch does not match the registration receipt",
+                ));
+            }
+            let activation = record.shared_activation.as_mut().ok_or_else(|| {
+                KvContractError::invalid_request(
+                    "opaque participants cannot detach shared-pool bindings",
+                )
+            })?;
+            for binding_id in &request.binding_ids {
+                let attachment = activation.attachments.get(binding_id).ok_or_else(|| {
+                    KvContractError::invalid_request(format!(
+                        "binding '{binding_id}' is not attached"
+                    ))
+                })?;
+                if attachment.shard != request.shard {
+                    return Err(KvContractError::invalid_request(format!(
+                        "binding '{binding_id}' was attached by a different shard"
+                    )));
+                }
+            }
+            activation.active = false;
+            for binding_id in &request.binding_ids {
+                activation.attachments.remove(binding_id);
+            }
+            activation.attachments.is_empty()
+        };
+        let removed = remove_participant
+            .then(|| state.participants.remove(participant_id))
+            .flatten();
+        drop(state);
+        // Dropping the participant releases its transport backing and may
+        // synchronize a device. Never do that while holding coordinator state.
+        drop(removed);
+        log::info!(
+            "[kv-control] detached {} shared-pool binding(s) for participant '{}' epoch={}",
+            request.binding_ids.len(),
+            participant_id,
+            request.participant_epoch,
+        );
         Ok(())
     }
 }
@@ -1229,9 +1648,9 @@ mod tests {
     use super::*;
     use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
     use kapsl_kv_abi::{
-        KvBackendCapabilities, KvCacheGeometry, KvCacheGroup, KvCachePolicy, KvCapacityGroup,
-        KvCapacityModel, KvControlRequest, KvElementType, KvGroupReservation, KvLayerId,
-        KvMemoryDomain, KvSequenceKey, KvShard, KvTensorLayout, KvTopology, KvTransport,
+        KvAttachmentView, KvBackendCapabilities, KvCacheGeometry, KvCacheGroup, KvCachePolicy,
+        KvCapacityGroup, KvCapacityModel, KvControlRequest, KvElementType, KvGroupReservation,
+        KvLayerId, KvMemoryDomain, KvSequenceKey, KvShard, KvTensorLayout, KvTopology, KvTransport,
     };
 
     #[derive(Default)]
@@ -1341,6 +1760,7 @@ mod tests {
                     max_allocations: Some(1024),
                 }],
             },
+            adapter_profile: None,
             topology: None,
         }
     }
@@ -1351,6 +1771,9 @@ mod tests {
         capabilities.transports.insert(KvTransport::Custom {
             name: "test_direct".to_string(),
         });
+        capabilities
+            .features
+            .insert(KvFeature::ExternalPoolAttachment);
         KvParticipantRegistration {
             participant_id: "vllm:test:scheduler".to_string(),
             backend: "vllm".to_string(),
@@ -1366,6 +1789,12 @@ mod tests {
                     max_allocations: Some(4),
                 }],
             },
+            adapter_profile: Some(KvAdapterProfile {
+                adapter_id: "kapsl-test-adapter".to_string(),
+                adapter_version: "1.0.0".to_string(),
+                backend_version: "test-backend-1".to_string(),
+                profile_id: "test-direct-v1".to_string(),
+            }),
             topology: Some(KvTopology {
                 abi_version: KAPSL_KV_ABI_VERSION,
                 model_fingerprint: "sha256:test".to_string(),
@@ -1402,6 +1831,93 @@ mod tests {
             priority: 0,
             ttl_ms,
         }
+    }
+
+    fn shared_attachment(receipt: &KvRegistrationReceipt) -> KvSharedPoolAttachment {
+        let binding = receipt.shared_pools.first().expect("test shared binding");
+        KvSharedPoolAttachment {
+            participant_epoch: receipt.participant_epoch,
+            binding_id: binding.binding_id.clone(),
+            shard: KvShard::default(),
+            profile: KvAdapterProfile {
+                adapter_id: "kapsl-test-adapter".to_string(),
+                adapter_version: "1.0.0".to_string(),
+                backend_version: "test-backend-1".to_string(),
+                profile_id: "test-direct-v1".to_string(),
+            },
+            imported_bytes: binding.block_count * binding.bytes_per_block,
+            views: vec![KvAttachmentView {
+                group_id: "vllm.group.0".to_string(),
+                layer: KvLayerId::indexed(0),
+                offset_bytes: 0,
+                length_bytes: binding.block_count * binding.bytes_per_block,
+            }],
+        }
+    }
+
+    fn allowed_test_profiles() -> BTreeSet<KvAdapterProfile> {
+        BTreeSet::from([KvAdapterProfile {
+            adapter_id: "kapsl-test-adapter".to_string(),
+            adapter_version: "1.0.0".to_string(),
+            backend_version: "test-backend-1".to_string(),
+            profile_id: "test-direct-v1".to_string(),
+        }])
+    }
+
+    #[test]
+    fn shared_pool_profile_allowlist_is_exact_and_validated() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let values = vec!["kapsl-vllm-connector,0.4.0,0.10.2,vllm-v1-packed-cuda-ipc".to_string()];
+        let profiles = parse_shared_pool_profiles(&values).unwrap();
+        assert!(profiles.contains(&KvAdapterProfile {
+            adapter_id: "kapsl-vllm-connector".to_string(),
+            adapter_version: "0.4.0".to_string(),
+            backend_version: "0.10.2".to_string(),
+            profile_id: "vllm-v1-packed-cuda-ipc".to_string(),
+        }));
+        assert!(parse_shared_pool_profiles(&["missing,fields".to_string()]).is_err());
+        assert!(parse_shared_pool_profiles(&["adapter,,backend,profile".to_string()]).is_err());
+
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.register(&shared_registration()),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            profiles,
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.register(&shared_registration()),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+        assert_eq!(coordinator.participant_count(), 0);
+    }
+
+    fn activate_shared(coordinator: &ExternalKvCoordinator, receipt: &KvRegistrationReceipt) {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        coordinator
+            .attach("vllm:test:scheduler", &shared_attachment(receipt))
+            .unwrap();
+        coordinator
+            .activate("vllm:test:scheduler", receipt.participant_epoch)
+            .unwrap();
     }
 
     #[test]
@@ -1464,6 +1980,87 @@ mod tests {
     }
 
     #[test]
+    fn shared_pool_is_not_reservable_until_every_binding_is_activated() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let provisioner = Arc::new(TestSharedProvisioner {
+            backing: Arc::new(TestSharedBacking::default()),
+        });
+        let mut allowed_profiles = allowed_test_profiles();
+        allowed_profiles.insert(KvAdapterProfile {
+            adapter_id: "kapsl-test-adapter".to_string(),
+            adapter_version: "1.0.0".to_string(),
+            backend_version: "untested-build".to_string(),
+            profile_id: "test-direct-v1".to_string(),
+        });
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(provisioner),
+            allowed_profiles,
+        )
+        .unwrap();
+        let receipt = coordinator.register(&shared_registration()).unwrap();
+
+        assert!(matches!(
+            coordinator.reserve("vllm:test:scheduler", &reservation(None)),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+        assert!(matches!(
+            coordinator.activate("vllm:test:scheduler", receipt.participant_epoch),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+
+        let attachment = shared_attachment(&receipt);
+        let mut untested_attachment = attachment.clone();
+        untested_attachment.profile.backend_version = "untested-build".to_string();
+        assert!(matches!(
+            coordinator.attach("vllm:test:scheduler", &untested_attachment),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+        coordinator
+            .attach("vllm:test:scheduler", &attachment)
+            .unwrap();
+        coordinator
+            .activate("vllm:test:scheduler", receipt.participant_epoch)
+            .unwrap();
+        let lease = coordinator
+            .reserve("vllm:test:scheduler", &reservation(None))
+            .unwrap();
+        assert!(matches!(
+            coordinator.detach(
+                "vllm:test:scheduler",
+                &KvSharedPoolDetachRequest {
+                    participant_epoch: receipt.participant_epoch,
+                    binding_ids: vec![attachment.binding_id.clone()],
+                    shard: attachment.shard,
+                    completion: KvReleaseCompletion::BackendSynchronized,
+                },
+            ),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+        coordinator
+            .release(
+                "vllm:test:scheduler",
+                &lease.lease_id,
+                Some(&KvReleaseCompletion::BackendSynchronized),
+            )
+            .unwrap();
+        coordinator
+            .detach(
+                "vllm:test:scheduler",
+                &KvSharedPoolDetachRequest {
+                    participant_epoch: receipt.participant_epoch,
+                    binding_ids: vec![attachment.binding_id],
+                    shard: attachment.shard,
+                    completion: KvReleaseCompletion::BackendSynchronized,
+                },
+            )
+            .unwrap();
+        assert_eq!(coordinator.participant_count(), 0);
+    }
+
+    #[test]
     fn shared_pool_issues_runtime_handles_and_requires_synchronized_release() {
         use kapsl_kv_abi::KvCoordinator as _;
 
@@ -1475,10 +2072,12 @@ mod tests {
             test_memory(),
             Duration::from_secs(30),
             Some(provisioner),
+            allowed_test_profiles(),
         )
         .unwrap();
         let receipt = coordinator.register(&shared_registration()).unwrap();
         assert_eq!(receipt.shared_pools.len(), 1);
+        activate_shared(&coordinator, &receipt);
         let pools = coordinator
             .state
             .lock()
@@ -1532,6 +2131,7 @@ mod tests {
             test_memory(),
             Duration::from_secs(30),
             Some(provisioner),
+            allowed_test_profiles(),
         )
         .unwrap();
         let mut registration = shared_registration();
@@ -1544,6 +2144,7 @@ mod tests {
             receipt.shared_pools[0].allocation_mode,
             KvSharedPoolAllocationMode::ParticipantManaged
         );
+        activate_shared(&coordinator, &receipt);
         let pools = coordinator
             .state
             .lock()
@@ -1577,9 +2178,11 @@ mod tests {
             test_memory(),
             Duration::from_millis(5),
             Some(provisioner),
+            allowed_test_profiles(),
         )
         .unwrap();
-        coordinator.register(&shared_registration()).unwrap();
+        let receipt = coordinator.register(&shared_registration()).unwrap();
+        activate_shared(&coordinator, &receipt);
         let pools = coordinator
             .state
             .lock()

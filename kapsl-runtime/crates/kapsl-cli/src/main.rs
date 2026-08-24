@@ -275,6 +275,13 @@ async fn main() -> Result<(), DynError> {
     if args.kv_control_socket.is_some() {
         return Err("--kv-control-socket currently requires a Unix host".into());
     }
+    if args.kv_control_socket.is_none() && !args.kv_shared_pool_profile.is_empty() {
+        return Err("--kv-shared-pool-profile requires --kv-control-socket".into());
+    }
+    #[cfg(not(all(feature = "gpu-device-pool", target_os = "linux")))]
+    if !args.kv_shared_pool_profile.is_empty() {
+        return Err("--kv-shared-pool-profile requires a Linux gpu-device-pool build".into());
+    }
     #[cfg(unix)]
     if let Some(kv_socket) = args.kv_control_socket.as_ref() {
         let inference_uses_socket = matches!(args.transport.as_str(), "socket" | "hybrid")
@@ -334,6 +341,7 @@ async fn main() -> Result<(), DynError> {
             Some(CudaIpcSharedPoolProvisioner::new(
                 resources.memory().clone(),
             )),
+            parse_shared_pool_profiles(&args.kv_shared_pool_profile)?,
         )?;
         #[cfg(not(all(feature = "gpu-device-pool", target_os = "linux")))]
         let coordinator = ExternalKvCoordinator::new(

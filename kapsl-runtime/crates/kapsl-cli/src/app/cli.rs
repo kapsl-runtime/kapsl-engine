@@ -81,6 +81,15 @@ pub(crate) struct Args {
     )]
     pub(crate) kv_control_lease_ttl_ms: u64,
 
+    /// Exact conformance-tested shared-pool adapter profiles to allow.
+    /// Format: adapter_id,adapter_version,backend_version,profile_id.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        action = clap::ArgAction::Append
+    )]
+    pub(crate) kv_shared_pool_profile: Vec<String>,
+
     /// Bind address for the TCP inference server (used when --transport=tcp).
     /// Non-loopback binds require KAPSL_TCP_AUTH_TOKEN.
     #[arg(long, default_value = "127.0.0.1")]
