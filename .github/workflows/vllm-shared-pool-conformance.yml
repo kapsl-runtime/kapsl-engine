@@ -8,10 +8,6 @@ on:
         required: true
         default: feature/backend-kv-adapter
         type: string
-      vllm_wheel_path:
-        description: Absolute path to the CUDA-compatible vLLM wheel on the GPU runner
-        required: true
-        type: string
       cuda_visible_devices:
         description: Physical GPU ordinals/UUIDs exposed to the probe (for example 0 or 0,2)
         required: true
@@ -23,18 +19,43 @@ permissions:
 
 jobs:
   flash-attn:
-    # The runner must have a CUDA developer toolkit and a wheel compatible with
-    # its driver. Multiple listed devices certify one tensor-parallel world.
+    # The host supplies only the NVIDIA driver and GPUs. The immutable job image
+    # pins the toolkit used by both the runtime build and the vLLM wheel.
     runs-on: [self-hosted, linux, x64, gpu]
+    container:
+      image: nvidia/cuda:12.9.1-devel-ubuntu24.04@sha256:020bc241a628776338f4d4053fed4c38f6f7f3d7eb5919fecb8de313bb8ba47c
+      options: --gpus all
     timeout-minutes: 90
     env:
       CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
       CUDA_LAUNCH_BLOCKING: "1"
       TORCH_SHOW_CPP_STACKTRACES: "1"
-      OUTPUT_DIR: ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
-      VENV_DIR: ${{ runner.temp }}/kapsl-vllm-venv-${{ github.run_id }}-${{ github.run_attempt }}
-      VLLM_WHEEL_PATH: ${{ inputs.vllm_wheel_path }}
+      EXPECTED_CUDA_RUNTIME_VERSION: "12.9"
+      EXPECTED_PYTHON_VERSION: "3.12.3"
+      EXPECTED_TORCH_VERSION: "2.13.0+cu129"
+      EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
+      VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
+      VLLM_WHEEL_URL: https://wheels.vllm.ai/2ec6f0d71ea3b350952630e310efcda1c744ff4d/vllm-0.26.1rc1.dev1130%2Bg2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl
     steps:
+      - name: Install declared build dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git libclang-dev libssl-dev \
+            pkg-config python3-venv
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Initialize isolated artifact paths
+        shell: bash
+        run: |
+          {
+            echo "OUTPUT_DIR=$RUNNER_TEMP/kapsl-vllm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "VENV_DIR=$RUNNER_TEMP/kapsl-vllm-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+            echo "VLLM_WHEEL_PATH=$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
+          } >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
         with:
           path: engine
@@ -53,23 +74,85 @@ jobs:
         with:
           workspaces: engine/kapsl-runtime
 
-      - name: Build CUDA IPC runtime
+      - name: Build CUDA IPC runtime against the checked-out ABI
         working-directory: engine
-        run: >-
-          cargo build --manifest-path kapsl-runtime/Cargo.toml
-          --release -p kapsl --no-default-features --features gpu-device-pool
-
-      - name: Install exact adapter and backend artifacts
         shell: bash
         run: |
           set -Eeuo pipefail
-          test -f "$VLLM_WHEEL_PATH"
+          cargo_patch="patch.crates-io.kapsl-kv-abi.path='$GITHUB_WORKSPACE/sdk/crates/kapsl-kv-abi'"
+          metadata_path="$RUNNER_TEMP/kapsl-cargo-metadata.json"
+          cargo metadata --manifest-path kapsl-runtime/Cargo.toml \
+            --locked --format-version 1 --config "$cargo_patch" > "$metadata_path"
+          python3 - "$metadata_path" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected = (
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "sdk"
+              / "crates"
+              / "kapsl-kv-abi"
+              / "Cargo.toml"
+          ).resolve()
+          resolved = [
+              Path(package["manifest_path"]).resolve()
+              for package in metadata["packages"]
+              if package["name"] == "kapsl-kv-abi"
+          ]
+          if resolved != [expected]:
+              raise SystemExit(
+                  f"runtime resolved kapsl-kv-abi from {resolved}, expected {[expected]}"
+              )
+          PY
+          cargo build --manifest-path kapsl-runtime/Cargo.toml --locked \
+            --release -p kapsl --no-default-features --features gpu-device-pool \
+            --config "$cargo_patch"
+
+      - name: Install pinned adapter and backend artifacts
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           mkdir -p "$OUTPUT_DIR/wheels"
+          curl --fail --location --retry 3 --output "$VLLM_WHEEL_PATH" "$VLLM_WHEEL_URL"
+          printf '%s  %s\n' "$VLLM_WHEEL_SHA256" "$VLLM_WHEEL_PATH" | sha256sum --check -
           python3 -m venv "$VENV_DIR"
           "$VENV_DIR/bin/python" -m pip install --upgrade pip build
           "$VENV_DIR/bin/python" -m pip install "$VLLM_WHEEL_PATH"
           "$VENV_DIR/bin/python" -m build --wheel --outdir "$OUTPUT_DIR/wheels" sdk/integrations/vllm
           "$VENV_DIR/bin/python" -m pip install "$OUTPUT_DIR"/wheels/kapsl_vllm_connector-*.whl
+
+      - name: Verify the pinned Python, PyTorch, vLLM, and CUDA tuple
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          "$VENV_DIR/bin/python" <<'PY'
+          import importlib.metadata
+          import os
+          import platform
+
+          import torch
+
+          actual = {
+              "python": platform.python_version(),
+              "torch": torch.__version__,
+              "vllm": importlib.metadata.version("vllm"),
+              "cuda_runtime": torch.version.cuda,
+          }
+          expected = {
+              "python": os.environ["EXPECTED_PYTHON_VERSION"],
+              "torch": os.environ["EXPECTED_TORCH_VERSION"],
+              "vllm": os.environ["EXPECTED_VLLM_VERSION"],
+              "cuda_runtime": os.environ["EXPECTED_CUDA_RUNTIME_VERSION"],
+          }
+          if actual != expected:
+              raise SystemExit(f"binary environment mismatch: {actual!r} != {expected!r}")
+          if not torch.cuda.is_available():
+              raise SystemExit("the pinned PyTorch build cannot access a CUDA device")
+          print(actual)
+          PY
 
       - name: Run dependency-free adapter contract suite
         working-directory: sdk/integrations/vllm
@@ -152,5 +235,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vllm-shared-pool-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.OUTPUT_DIR }}
+          path: ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error
