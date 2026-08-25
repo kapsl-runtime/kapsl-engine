@@ -4,7 +4,9 @@ use super::*;
 fn test_state_dir_namespaces_runtime_state_paths() {
     let state_dir = PathBuf::from("state");
     let args = Args {
+        input: vec![],
         model: vec![],
+        offline: false,
         transport: "socket".to_string(),
         socket: "dummy.sock".to_string(),
         kv_control_socket: None,

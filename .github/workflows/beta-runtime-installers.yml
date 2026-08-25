@@ -69,6 +69,7 @@ jobs:
       KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
       KAPSL_NUMERIC_VERSION: ${{ needs.prepare-version.outputs.numeric_version }}
       KAPSL_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
     strategy:
       fail-fast: false
       matrix:
@@ -298,13 +299,14 @@ jobs:
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       CUDA_PATH: /usr/local/cuda
       KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
     steps:
       - name: Install CUDA build dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev patchelf pkg-config
+            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
@@ -316,6 +318,14 @@ jobs:
           repository: kapsl-runtime/kapsl-sdk
           ref: 3a4e626f919e11287e0a19bb720c547ec9216f7f
           path: sdk-vllm
+
+      - name: Checkout certified llama.cpp shared-pool SDK
+        if: ${{ vars.KAPSL_LLAMA_SDK_REF != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ vars.KAPSL_LLAMA_SDK_REF }}
+          path: sdk-llama
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -329,9 +339,24 @@ jobs:
         shell: bash
         run: .github/scripts/collect-ort-sidecars.sh
 
+      - name: Collect TensorRT 10 user-space runtime
+        shell: bash
+        run: .github/scripts/collect-linux-tensorrt-runtime.sh
+
       - name: Package CUDA runtime bundle
         shell: bash
         run: .github/scripts/package-linux-cuda-runtime.sh
+
+      - name: Package split ONNX backend packs
+        shell: bash
+        run: .github/scripts/package-linux-onnx-backend-packs.sh
+
+      - name: Package native llama.cpp backend packs
+        shell: bash
+        env:
+          KAPSL_LLAMA_SDK_DIR: ${{ vars.KAPSL_LLAMA_SDK_REF != '' && 'sdk-llama' || '' }}
+          KAPSL_LLAMA_SDK_REF: ${{ vars.KAPSL_LLAMA_SDK_REF }}
+        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
 
       - name: Reclaim CUDA build scratch before backend packaging
         shell: bash
@@ -343,6 +368,30 @@ jobs:
           KAPSL_VLLM_SDK_DIR: sdk-vllm
           KAPSL_VLLM_SDK_REF: 3a4e626f919e11287e0a19bb720c547ec9216f7f
         run: .github/scripts/package-linux-vllm-backend.sh
+
+      - name: Generate signed backend index
+        shell: bash
+        env:
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_PUBLIC_KEYS" ]; then
+            echo "Backend signing key and embedded public key are required." >&2
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          trap 'rm -f "$key_file"' EXIT
+          .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" \
+            --artifacts-dir dist \
+            --output dist/backend-index.json \
+            --signing-key "$key_file" \
+            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
+            --channel beta
+          rm -f "$key_file" dist/*.manifest.json
+          trap - EXIT
 
       - name: Upload CUDA runtime artifact
         uses: actions/upload-artifact@v4
@@ -379,6 +428,9 @@ jobs:
           while IFS= read -r -d '' file; do
             found=1
             name="$(basename "$file")"
+            case "$name" in
+              backend-index.json|backend-index.json.sig) continue ;;
+            esac
             if [[ "$name" != *"$EXPECTED_VERSION"* && "$name" != *"$EXPECTED_DEB_VERSION"* ]]; then
               echo "Artifact '$name' does not contain the run version '$EXPECTED_VERSION' (or Debian form '$EXPECTED_DEB_VERSION')." >&2
               mismatch=1
@@ -468,6 +520,10 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}
+
           # Keep the mutable latest directory as an exact mirror. Artifact names
           # contain their version, so --delete prevents old betas accumulating here.
           aws s3 sync release-assets/ \
@@ -509,13 +565,20 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-      - name: Delete superseded beta installers from R2
+          aws s3 cp install-beta.sh \
+            s3://kapsl-installer/install-beta.sh \
+            --content-type "text/plain" \
+            --no-progress \
+            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+      - name: Retain current and rollback-compatible beta installers in R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
           R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
           CURRENT_BETA_VERSION: v${{ needs.prepare-version.outputs.version }}
+          KEEP_LATEST: "3"
         shell: bash
         run: |
           set -euo pipefail
@@ -526,14 +589,18 @@ jobs:
             printf '%s\n' "$listing" \
               | awk '$NF ~ /^v.*\/$/ { sub(/\/$/, "", $NF); print $NF }'
           )
+          protected_versions="$(printf '%s\n' "${versions[@]}" | sort -V | tail -n "$KEEP_LATEST")"
 
           deleted=0
           for version in "${versions[@]}"; do
             if [ "$version" = "$CURRENT_BETA_VERSION" ]; then
               continue
             fi
+            if grep -Fxq "$version" <<< "$protected_versions"; then
+              continue
+            fi
 
-            echo "Deleting superseded beta s3://kapsl-installer/runtime/beta/$version/"
+            echo "Deleting beta outside rollback window s3://kapsl-installer/runtime/beta/$version/"
             aws s3 rm "s3://kapsl-installer/runtime/beta/$version/" \
               --recursive \
               --only-show-errors \
@@ -541,4 +608,4 @@ jobs:
             deleted=$((deleted + 1))
           done
 
-          echo "Deleted $deleted superseded beta version(s); retained $CURRENT_BETA_VERSION."
+          echo "Deleted $deleted beta version(s); retained the newest $KEEP_LATEST plus $CURRENT_BETA_VERSION."

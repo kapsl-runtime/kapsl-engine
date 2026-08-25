@@ -28,9 +28,11 @@ EOF
 chmod 755 "$bootstrap_root/python/bin/python3.12"
 printf 'fixture wheel\n' > "$bootstrap_root/wheels/fixture.whl"
 printf 'fixture==1.0\n' > "$bootstrap_root/requirements.lock"
+printf '%s\n' '{"profile":"vllm-v1-packed-cuda-ipc/flash-attn"}' \
+  > "$bootstrap_root/installed-manifest.json"
 (cd "$bootstrap_root" && {
   find python wheels -type f -print0
-  printf 'requirements.lock\0'
+  printf 'requirements.lock\0installed-manifest.json\0'
 } | sort -z | xargs -0 sha256sum > SHA256SUMS)
 
 printf 'old installation\n' > "$target_root/old-installation"

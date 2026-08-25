@@ -1,0 +1,35 @@
+[package]
+name = "kapsl-backend-llama-cpp"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+license = "Apache-2.0"
+description = "Native llama.cpp backend pack for Kapsl"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda12 = ["kapsl-llm/gguf-cuda"]
+# Release/certification builds enable this with an exact kapsl-sdk source patch
+# and KAPSL_LLAMA_EXTERNAL_POOL_SDK=1. Keeping it distinct preserves the
+# published native-KV rollback pack.
+external-pool-contract = [
+    "dep:llama-cpp-sys-2",
+]
+cuda12-shared-pool = [
+    "cuda12",
+    "external-pool-contract",
+]
+
+[dependencies]
+futures = "0.3"
+kapsl-backend-abi = { path = "../kapsl-backend-abi" }
+kapsl-engine-api = "0.1.3"
+kapsl-llm = { version = "0.1.3", default-features = false, features = ["gguf"] }
+llama-cpp-sys-2 = { package = "kapsl-llama-cpp-sys-2", version = "=0.1.146-kapsl.1", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "sync", "time"] }

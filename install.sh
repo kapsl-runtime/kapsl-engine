@@ -10,6 +10,7 @@ INSTALL_DIR="${KAPSL_INSTALL_DIR:-$HOME/.local/bin}"
 ACCELERATOR="${KAPSL_ACCELERATOR:-cpu}"
 CHANNEL="${KAPSL_CHANNEL:-stable}"
 VERSION="${KAPSL_VERSION:-}"
+PREFETCH_BACKENDS="${KAPSL_PREFETCH_BACKENDS:-}"
 
 usage() {
     cat <<'EOF'
@@ -18,6 +19,7 @@ Install Kapsl
 Usage:
   install.sh [--accelerator cpu|cuda|tensorrt] [--channel stable|beta]
              [--version VERSION] [--install-dir DIR] [--base-url URL]
+             [--prefetch-backends vllm]
 
 Examples:
   curl -fsSL https://downloads.kapsl.net/install.sh | sh
@@ -51,6 +53,11 @@ while [ "$#" -gt 0 ]; do
         --base-url)
             [ "$#" -ge 2 ] || { echo "--base-url requires a value" >&2; exit 1; }
             BASE_URL="$2"
+            shift 2
+            ;;
+        --prefetch-backends)
+            [ "$#" -ge 2 ] || { echo "--prefetch-backends requires a value" >&2; exit 1; }
+            PREFETCH_BACKENDS="$2"
             shift 2
             ;;
         -h | --help)
@@ -239,6 +246,14 @@ case "$ACCELERATOR" in
         ;;
 esac
 
+case "$PREFETCH_BACKENDS" in
+    "" | none | vllm | all) ;;
+    *)
+        echo "Unsupported backend prefetch '${PREFETCH_BACKENDS}'. Use vllm, all, or none." >&2
+        exit 1
+        ;;
+esac
+
 case "$ACCELERATOR" in
     cuda | cuda12 | tensorrt | tensorrt10)
         if [ "$PLATFORM" != "linux-x86_64" ]; then
@@ -308,10 +323,10 @@ case "$ACCELERATOR" in
 esac
 case "$ACCELERATOR" in
     cuda | cuda12 | tensorrt | tensorrt10)
-        # New shared-pool builds carry this certified profile marker. Install
-        # their exact Python/vLLM wheelhouse and materialize it beside Kapsl;
-        # old CUDA releases remain installable without an asset they predate.
-        if grep -aFq 'vllm-v1-packed-cuda-ipc/flash-attn' "${INSTALL_DIR}/${BIN_NAME}"; then
+        # Compatibility prefetch is explicit. Normal installations leave this
+        # multi-gigabyte pack to Kapsl's signed lazy backend manager.
+        if { [ "$PREFETCH_BACKENDS" = "vllm" ] || [ "$PREFETCH_BACKENDS" = "all" ]; } \
+            && grep -aFq 'vllm-v1-packed-cuda-ipc/flash-attn' "${INSTALL_DIR}/${BIN_NAME}"; then
             install_vllm_backend_pack
         fi
         ;;
@@ -336,6 +351,8 @@ if [ "$ACCELERATOR" != "cpu" ]; then
     echo "ONNX models: CUDA execution provider installed."
     if [ -x "${INSTALL_DIR}/backends/vllm/bin/python" ]; then
         echo "SafeTensors generation models: managed vLLM backend installed."
+    else
+        echo "SafeTensors generation models: managed vLLM will be verified and installed on first eligible run."
     fi
     echo "A compatible NVIDIA driver is required."
 fi

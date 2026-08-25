@@ -12,10 +12,12 @@ python_source="$bootstrap_root/python"
 wheelhouse="$bootstrap_root/wheels"
 checksums="$bootstrap_root/SHA256SUMS"
 requirements_lock="$bootstrap_root/requirements.lock"
+installed_manifest="$bootstrap_root/installed-manifest.json"
 
 for required in \
   "$python_source/bin/python3.12" \
   "$requirements_lock" \
+  "$installed_manifest" \
   "$checksums"; do
   if [ ! -e "$required" ]; then
     echo "Incomplete managed-vLLM bootstrap: missing $required" >&2
@@ -46,6 +48,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 cp -a "$python_source/." "$staging_root/"
+if [ -d "$bootstrap_root/licenses" ]; then
+  cp -a "$bootstrap_root/licenses" "$staging_root/licenses"
+fi
 ln -sfn python3.12 "$staging_root/bin/python3"
 ln -sfn python3.12 "$staging_root/bin/python"
 
@@ -113,19 +118,7 @@ done < <(find "$staging_root/bin" -maxdepth 1 -type f -perm -u+x -print)
 find "$staging_root" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$staging_root" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-cat > "$staging_root/kapsl-vllm-backend.json" <<'EOF'
-{
-  "schema_version": 1,
-  "python": "3.12.3",
-  "torch": "2.13.0+cu130",
-  "torchvision": "0.28.0+cu130",
-  "torchaudio": "2.11.0+cu130",
-  "cuda_runtime": "13.0",
-  "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-  "connector": "0.5.0",
-  "profile": "vllm-v1-packed-cuda-ipc/flash-attn"
-}
-EOF
+cp "$installed_manifest" "$staging_root/kapsl-vllm-backend.json"
 
 if [ -e "$target_root" ]; then
   backup_root="$(mktemp -d "$target_parent/.${target_name}.previous.XXXXXX")"

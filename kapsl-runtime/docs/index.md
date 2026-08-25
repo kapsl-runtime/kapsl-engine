@@ -36,6 +36,7 @@ export them to a supported serving format first.
 | Page | Description |
 |------|-------------|
 | [Deployment](./deployment.md) | Build, install, and run the runtime |
+| [Lazy Backend Packs](./backend-packs.md) | Signed backend resolution, cache management, and offline bundles |
 | [Model Packaging](./model-packaging.md) | Create and manage `.aimod` packages |
 | [HTTP API](./http-api.md) | REST API reference |
 | [Authentication](./authentication.md) | Token roles, API keys, access control |

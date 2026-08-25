@@ -72,12 +72,17 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
           R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
           BETA_RETENTION_DAYS: ${{ github.event.inputs.beta_retention_days || '1' }}
+          KEEP_LATEST: ${{ github.event.inputs.keep_latest || '3' }}
         shell: bash
         run: |
           set -euo pipefail
 
           if ! [[ "$BETA_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
             echo "beta_retention_days must be a non-negative integer." >&2
+            exit 1
+          fi
+          if ! [[ "$KEEP_LATEST" =~ ^[1-9][0-9]*$ ]]; then
+            echo "keep_latest must be a positive integer." >&2
             exit 1
           fi
 
@@ -119,9 +124,13 @@ jobs:
             fi
           done <<< "$objects"
 
+          protected_versions="$(printf '%s\n' "${!newest_object_by_version[@]}" | sort -V | tail -n "$KEEP_LATEST")"
           deleted=0
           for version in "${!newest_object_by_version[@]}"; do
             if [ "$version" = "$current_version" ]; then
+              continue
+            fi
+            if grep -Fxq "$version" <<< "$protected_versions"; then
               continue
             fi
             if (( newest_object_by_version[$version] >= cutoff_epoch )); then
@@ -136,4 +145,4 @@ jobs:
             deleted=$((deleted + 1))
           done
 
-          echo "Deleted $deleted beta version(s) older than $BETA_RETENTION_DAYS day(s); retained $current_version."
+          echo "Deleted $deleted beta version(s) older than $BETA_RETENTION_DAYS day(s); retained at least the newest $KEEP_LATEST plus $current_version."

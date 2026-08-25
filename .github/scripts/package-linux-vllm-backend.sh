@@ -45,6 +45,8 @@ downloads="$build_root/downloads"
 payload="$build_root/payload/backends/vllm-bootstrap"
 python_extract="$build_root/python-extract"
 mkdir -p "$downloads" "$payload/wheels" "$python_extract" dist
+mkdir -p "$payload/licenses"
+cp LICENSE NOTICE "$payload/licenses/"
 
 python_archive="$downloads/$python_archive_name"
 curl --fail --location --retry 3 --output "$python_archive" "$python_archive_url"
@@ -111,9 +113,22 @@ cp .github/scripts/bootstrap-vllm-backend.sh "$payload/bootstrap.sh"
 cp "$requirements_lock" "$payload/requirements.lock"
 chmod 755 "$payload/bootstrap.sh"
 requirements_lock_sha256="$(sha256sum "$requirements_lock" | awk '{ print $1 }')"
+cat > "$payload/installed-manifest.json" <<'EOF'
+{
+  "schema_version": 1,
+  "python": "3.12.3",
+  "torch": "2.13.0+cu130",
+  "torchvision": "0.28.0+cu130",
+  "torchaudio": "2.11.0+cu130",
+  "cuda_runtime": "13.0",
+  "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
+  "connector": "0.5.0",
+  "profile": "vllm-v1-packed-cuda-ipc/flash-attn"
+}
+EOF
 (cd "$payload" && {
   find python wheels -type f -print0
-  printf 'requirements.lock\0'
+  printf 'requirements.lock\0installed-manifest.json\0'
 } | sort -z | xargs -0 sha256sum > SHA256SUMS)
 
 cat > "$payload/manifest.json" <<EOF
@@ -135,6 +150,38 @@ cat > "$payload/manifest.json" <<EOF
 }
 EOF
 
+cat > "$payload/backend-pack.json" <<EOF
+{
+  "schema_version": 1,
+  "backend": "vllm",
+  "profile": "cu130-flash-attn",
+  "pack_version": "0.26.1rc1.dev1130+g2ec6f0d71",
+  "runtime_abi": 1,
+  "platform": "linux-x86_64",
+  "execution_mode": "external",
+  "entrypoint": "bin/python"
+}
+EOF
+
+installed_bytes="$($bootstrap_python - "$payload/python" "$payload/wheels" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+python_root = pathlib.Path(sys.argv[1])
+wheel_root = pathlib.Path(sys.argv[2])
+total = sum(path.stat().st_size for path in python_root.rglob("*") if path.is_file())
+for wheel in wheel_root.glob("*.whl"):
+    with zipfile.ZipFile(wheel) as archive:
+        total += sum(item.file_size for item in archive.infolist() if not item.is_dir())
+print(total)
+PY
+)"
+python_entrypoint_sha256="$(sha256sum "$payload/python/bin/python3.12" | awk '{ print $1 }')"
+installed_manifest_sha256="$(sha256sum "$payload/installed-manifest.json" | awk '{ print $1 }')"
+license_sha256="$(sha256sum "$payload/licenses/LICENSE" | awk '{ print $1 }')"
+notice_sha256="$(sha256sum "$payload/licenses/NOTICE" | awk '{ print $1 }')"
+
 archive_name="kapsl-backend-vllm-${KAPSL_VERSION}-linux-x86_64.tar.gz"
 archive_path="dist/$archive_name"
 # Wheels are already compressed, so gzip level 1 is materially faster with
@@ -143,6 +190,46 @@ archive_path="dist/$archive_name"
 # retaining both a full wheelhouse and full tarball.
 tar --remove-files -C "$build_root/payload" -I 'gzip -1' -cf "$archive_path" .
 (cd dist && sha256sum "$archive_name" > "$archive_name.sha256")
+
+cat > "dist/${archive_name}.manifest.json" <<EOF
+{
+  "schema_version": 1,
+  "backend": "vllm",
+  "profile": "cu130-flash-attn",
+  "pack_version": "0.26.1rc1.dev1130+g2ec6f0d71",
+  "runtime_abi": 1,
+  "compatible_kapsl": "=$KAPSL_VERSION",
+  "platform": "linux-x86_64",
+  "architecture": "x86_64",
+  "accelerator_profile": "cuda",
+  "minimum_cuda": "13.0",
+  "minimum_driver": "580.65.06",
+  "execution_mode": "external",
+  "entrypoint": "bin/python",
+  "installed_bytes": $installed_bytes,
+  "memory": {
+    "host_bytes": 536870912,
+    "accelerator_bytes": 0,
+    "workspace_weight_ppm": 125000,
+    "minimum_workspace_bytes": 268435456
+  },
+  "installer": {
+    "kind": "bootstrap",
+    "path": "bootstrap.sh"
+  },
+  "files": {
+    "bin/python": "$python_entrypoint_sha256",
+    "kapsl-vllm-backend.json": "$installed_manifest_sha256",
+    "licenses/LICENSE": "$license_sha256",
+    "licenses/NOTICE": "$notice_sha256"
+  },
+  "licenses": [
+    {"name": "Kapsl", "path": "licenses/LICENSE"},
+    {"name": "Kapsl notices", "path": "licenses/NOTICE"}
+  ],
+  "priority": 100
+}
+EOF
 
 echo "Packaged $archive_path"
 du -h "$archive_path"

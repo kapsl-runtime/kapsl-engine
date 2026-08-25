@@ -1,0 +1,122 @@
+name: Lazy llama.cpp Backend Pack GPU Certification
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend_index_url:
+        description: Public HTTPS URL of the signed candidate backend-index.json
+        required: true
+        type: string
+      backend_public_keys:
+        description: Base64 or ed25519-prefixed public key trusted by the candidate index
+        required: true
+        type: string
+      gguf_model_path:
+        description: Absolute path to a uniform-KV causal GGUF/AIMOD artifact on the GPU runner
+        required: true
+        type: string
+      ort_model_path:
+        description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
+        required: true
+        type: string
+      ort_request_path:
+        description: Optional absolute path to a model-specific ONNX inference JSON request
+        required: false
+        type: string
+      pool_bytes:
+        description: Optional exact device-pool size; empty uses strict automatic sizing
+        required: false
+        type: string
+      cuda_visible_devices:
+        description: Exactly one CUDA device index, GPU UUID, or MIG UUID
+        required: true
+        default: "0"
+        type: string
+      benchmark_requests:
+        description: Measured streaming requests for each eager/lazy performance case
+        required: true
+        default: "20"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  certify:
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Confirm candidate index and signature are publicly reachable
+        shell: bash
+        env:
+          BACKEND_INDEX_URL: ${{ inputs.backend_index_url }}
+        run: |
+          set -euo pipefail
+          [[ "$BACKEND_INDEX_URL" == https://* ]]
+          curl -fsS "$BACKEND_INDEX_URL" -o "${RUNNER_TEMP}/backend-index.json"
+          curl -fsS "${BACKEND_INDEX_URL}.sig" -o "${RUNNER_TEMP}/backend-index.json.sig"
+          jq -e '.packs | map(select(.backend == "llama-cpp" and .profile == "cuda12" and .kv_mode == "shared_pool")) | length > 0' \
+            "${RUNNER_TEMP}/backend-index.json"
+
+      - name: Build eager shared-KV reference runtime
+        run: >-
+          cargo build --manifest-path kapsl-runtime/Cargo.toml
+          --release --target-dir kapsl-runtime/target-cert-eager
+          -p kapsl --no-default-features --features cuda
+
+      - name: Build lazy-pack candidate core
+        run: >-
+          cargo build --manifest-path kapsl-runtime/Cargo.toml
+          --release --target-dir kapsl-runtime/target-cert-lazy
+          -p kapsl --no-default-features --features gpu-device-pool
+
+      - name: Certify public download, shared ownership, contention, and reload cleanup
+        env:
+          KAPSL_GPU_INTEGRATION: "1"
+          KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK: "1"
+          KAPSL_GPU_TEST_BINARY: ${{ github.workspace }}/kapsl-runtime/target-cert-lazy/release/kapsl
+          KAPSL_GPU_TEST_ORT_MODEL: ${{ inputs.ort_model_path }}
+          KAPSL_GPU_TEST_GGUF_MODEL: ${{ inputs.gguf_model_path }}
+          KAPSL_GPU_TEST_ORT_REQUEST: ${{ inputs.ort_request_path }}
+          KAPSL_GPU_TEST_POOL_BYTES: ${{ inputs.pool_bytes }}
+          KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
+          KAPSL_GPU_TEST_OUTPUT_DIR: ${{ runner.temp }}/lazy-llama-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          KAPSL_LAZY_LLAMA_CPP_PACKS: "1"
+          KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV: "0"
+          KAPSL_BACKEND_INDEX_URL: ${{ inputs.backend_index_url }}
+          KAPSL_BACKEND_PUBLIC_KEYS: ${{ inputs.backend_public_keys }}
+          KAPSL_BACKEND_CACHE_DIR: ${{ runner.temp }}/lazy-llama-integration-cache-${{ github.run_id }}-${{ github.run_attempt }}
+        run: .github/scripts/test-gpu-device-pool-integration.sh
+
+      - name: Enforce native-pack performance budgets
+        env:
+          KAPSL_GPU_CERTIFICATION: "1"
+          KAPSL_GPU_CERT_EAGER_BINARY: ${{ github.workspace }}/kapsl-runtime/target-cert-eager/release/kapsl
+          KAPSL_GPU_CERT_LAZY_BINARY: ${{ github.workspace }}/kapsl-runtime/target-cert-lazy/release/kapsl
+          KAPSL_GPU_CERT_GGUF_MODEL: ${{ inputs.gguf_model_path }}
+          KAPSL_GPU_CERT_BACKEND_INDEX_URL: ${{ inputs.backend_index_url }}
+          KAPSL_GPU_CERT_BACKEND_PUBLIC_KEYS: ${{ inputs.backend_public_keys }}
+          KAPSL_GPU_CERT_CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
+          KAPSL_GPU_CERT_REQUESTS: ${{ inputs.benchmark_requests }}
+          KAPSL_GPU_CERT_OUTPUT_DIR: ${{ runner.temp }}/lazy-llama-performance-${{ github.run_id }}-${{ github.run_attempt }}
+        run: .github/scripts/certify-llama-cpp-backend-pack-performance.sh
+
+      - name: Upload certification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lazy-llama-cpp-certification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/lazy-llama-integration-${{ github.run_id }}-${{ github.run_attempt }}
+            ${{ runner.temp }}/lazy-llama-performance-${{ github.run_id }}-${{ github.run_attempt }}
+            ${{ runner.temp }}/backend-index.json
+            ${{ runner.temp }}/backend-index.json.sig
+          if-no-files-found: warn

@@ -5,10 +5,11 @@ The runtime is configured via CLI flags and environment variables. Environment v
 ## CLI flags
 
 ```
-kapsl [OPTIONS] --model <PATH>
+kapsl run [OPTIONS] [MODEL_OR_BUNDLE]...
 
 Options:
-  --model <PATH>              Path to an .aimod file (repeatable)
+  --model <PATH>              Backward-compatible .aimod path (repeatable)
+  --offline                   Disable backend network access
   --transport <TRANSPORT>     socket | tcp | shm | hybrid (default: socket)
   --socket-path <PATH>        Unix socket path (default: /tmp/kapsl.sock)
   --kv-control-socket <PATH>  Local socket for versioned external KV participants
@@ -76,6 +77,16 @@ Options:
 | `KAPSL_PROVIDER_POLICY` | `fastest` (auto-select fastest backend) or `manifest` (use manifest-specified backend) |
 | `KAPSL_LLM_ISOLATE_PROCESS` | Set to `1` to run LLM backends in a subprocess for isolation |
 | `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS` | Disable automatic image/video-to-tensor preprocessing |
+| `KAPSL_BACKEND_CACHE_DIR` | Override the runtime-versioned lazy backend cache root |
+| `KAPSL_BUNDLE_CACHE_DIR` | Override the verified offline-bundle extraction cache |
+| `KAPSL_OFFLINE` | Set to `1` to forbid backend-index and artifact network access |
+| `KAPSL_LAZY_BACKENDS` | Set to `0` to require lazy backends to be preinstalled |
+| `KAPSL_LAZY_ONNX_PACKS` | Linux x86_64 beta switch for signed `onnx/cpu`, `onnx/cuda12`, and `onnx/tensorrt10` packs; set to `0` for the eager compatibility layout |
+| `KAPSL_LAZY_LLAMA_CPP_PACKS` | Linux x86_64 beta switch for signed `llama-cpp/cpu` and `llama-cpp/cuda12` native packs; the CPU profile defaults on only when no eager GGUF backend is compiled |
+| `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV` | Set to `1` to permit only a signed CUDA pack whose `kv_mode` is `native`; the shared-pool pack does not use this rollback override |
+| `KAPSL_BACKEND_INDEX_URL` | Override the signed backend index URL |
+| `KAPSL_BACKEND_INDEX_PATH` | Use a local signed index and adjacent `.sig` file |
+| `KAPSL_BACKEND_PUBLIC_KEYS` | Additional trusted raw Ed25519 public keys for development or controlled rotation |
 
 ### GPU memory and shared KV
 
@@ -112,7 +123,7 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GPU_MEMORY_LIMIT_MB` | Process VRAM ceiling in MiB when no CUDA-specific ceiling is set. |
 | `KAPSL_PROVIDER_MEMORY_LIMITS` | Hard limits for non-CPU/non-CUDA provider domains as `provider[:device]=size` entries, e.g. `metal=8g,directml:0=6g`. Exact-device entries override provider-wide values. |
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
-| `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. A packaged installation discovers a beside-binary bundle automatically. |
+| `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. Packaged installs discover the verified lazy cache and legacy beside-binary bundle automatically. |
 | `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
@@ -151,7 +162,7 @@ check.
 For a vLLM package, the normal command is:
 
 ```bash
-kapsl run --model ./qwen.aimod
+kapsl run ./qwen.aimod
 ```
 
 Kapsl creates a private KV control socket, installs the certified shared-pool
@@ -161,10 +172,12 @@ restarts, and stops the complete vLLM process group when the model is unloaded
 or Kapsl exits. The vLLM endpoint is an implementation detail and is not
 exposed as a second public server.
 
-This path requires a Linux `gpu-device-pool` build and the certified
-managed-vLLM bundle installed beside the Kapsl binary. The Linux CUDA shell
-installer downloads and materializes that bundle automatically. Kapsl validates the
-complete binary tuple before allocating GPU memory:
+This path requires a Linux `gpu-device-pool` build. On the first eligible run,
+Kapsl performs preliminary GPU admission and then installs the certified
+managed-vLLM pack from the signed backend index if it is not cached. The CUDA
+installer no longer downloads this multi-gigabyte pack by default; pass
+`--prefetch-backends vllm` to retain eager installation. Kapsl validates the
+complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
 `0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.5.0` with profile
@@ -172,6 +185,8 @@ Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 closed; Kapsl never falls back to ONNX Runtime, native SafeTensors, or another
 attention implementation. Source/development builds can point to the same
 certified environment with `KAPSL_VLLM_PYTHON=/path/to/venv/bin/python`.
+See [Lazy Backend Packs](./backend-packs.md) for cache, offline, and trust
+configuration.
 
 Optional package-level settings live under `metadata.serving.vllm`:
 

@@ -20,7 +20,14 @@ pub(crate) fn kapsl_help_styles() -> clap::builder::Styles {
 const HELP_EXAMPLES: &[(&str, &[&str])] = &[
     (
         "# Start the runtime with one model",
-        &["kapsl run --model models/gpt2/gpt2.aimod"],
+        &["kapsl run models/gpt2/gpt2.aimod"],
+    ),
+    (
+        "# Prepare and run a no-network deployment bundle",
+        &[
+            "kapsl bundle model.aimod --output model.kapsl-bundle",
+            "kapsl run model.kapsl-bundle",
+        ],
     ),
     (
         "# Load an extra model into an already-running runtime (no restart)",
@@ -68,6 +75,8 @@ const HELP_ENV_VARS: &[(&str, &str)] = &[
     ("KAPSL_API_TOKEN_ADMIN", "Admin API token"),
     ("KAPSL_REMOTE_URL", "Default remote registry URL"),
     ("KAPSL_REMOTE_TOKEN", "Bearer token for push/pull"),
+    ("KAPSL_OFFLINE", "Disable lazy-backend network access"),
+    ("KAPSL_BACKEND_CACHE_DIR", "Lazy backend cache root"),
     (
         "KAPSL_TCP_AUTH_TOKEN",
         "Required native-inference token for non-loopback TCP",

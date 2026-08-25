@@ -143,18 +143,31 @@ kapsl backend-plan ./model.aimod --cuda true
 ```
 
 The command emits machine-readable JSON including `selected_backend`,
-`external_process`, and the reason for the decision. `external_process` is true
+`installed`, `download_required`, `download_bytes`, `memory_admission`,
+`execution_mode`, and the reason for the decision. `external_process` is true
 for vLLM because Kapsl supervises a separate Python process; it does not mean
 the user starts or addresses a second server. Run the package normally:
 
 ```bash
-kapsl run --model ./model.aimod
+kapsl run ./model.aimod
 ```
 
 Kapsl generates the `KapslConnectorV1` configuration and shared-pool allowlist,
 waits for vLLM readiness, and keeps the Kapsl HTTP/native endpoints in front.
 The exact bundle and fail-closed checks are described in
 [Configuration](./configuration.md#serving-backend-policy).
+
+For offline deployment, bundle one or more packages with their deduplicated
+signed backend artifacts:
+
+```bash
+kapsl bundle model-a.aimod model-b.aimod \
+  --target linux-x86_64-cuda \
+  --output production.kapsl-bundle
+kapsl run production.kapsl-bundle
+```
+
+See [Lazy Backend Packs](./backend-packs.md) for verification and cache details.
 
 ## Model lifecycle
 

@@ -186,6 +186,26 @@ impl ManagedVllmDeployment {
             failures.join(", ")
         ))
     }
+
+    /// Fence every managed process group before the core runtime exits.
+    /// Ordinary model removal uses `shutdown_model`; this aggregate boundary
+    /// is for process-wide signals where no managed child may outlive Kapsl.
+    pub(crate) fn shutdown_all(&self) -> Result<usize, String> {
+        let model_ids = self.runtimes.lock().keys().copied().collect::<Vec<_>>();
+        let mut stopped = 0usize;
+        let mut failures = Vec::new();
+        for model_id in model_ids {
+            match self.shutdown_model(model_id) {
+                Ok(count) => stopped = stopped.saturating_add(count),
+                Err(error) => failures.push(format!("model {model_id}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(stopped)
+        } else {
+            Err(failures.join("; "))
+        }
+    }
 }
 
 fn managed_vllm_runtime_root(state_dir: Option<&Path>) -> PathBuf {
@@ -263,7 +283,63 @@ fn discover_certified_vllm_python() -> Result<PathBuf, String> {
     ))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CertifiedManagedVllmSource {
+    Missing,
+    LazyCache,
+    Other,
+}
+
+/// Identify whether the certified environment selected by the normal vLLM
+/// discovery order came from the signed lazy-pack cache. Cache candidates must
+/// still pass through `BackendManager` on every run so a valid version probe
+/// cannot bypass the signed install record and critical-file hashes. In
+/// particular, this function never executes a cache entrypoint before the
+/// manager has validated it.
+pub(crate) fn certified_managed_vllm_source() -> CertifiedManagedVllmSource {
+    // An explicit Python is wholly operator-managed. `prepare` still performs
+    // the complete version/profile probe and reports an invalid override; the
+    // lazy manager must not silently replace it.
+    if std::env::var_os(MANAGED_VLLM_PYTHON_ENV).is_some() {
+        return CertifiedManagedVllmSource::Other;
+    }
+
+    let cached_python = managed_vllm_cache_python_candidate();
+    for candidate in managed_vllm_pre_cache_candidates() {
+        if cached_python.as_ref() != Some(&candidate)
+            && validate_certified_vllm_python(&candidate).is_ok()
+        {
+            return CertifiedManagedVllmSource::Other;
+        }
+    }
+    if cached_python
+        .as_deref()
+        .is_some_and(|path| fs::symlink_metadata(path).is_ok())
+    {
+        return CertifiedManagedVllmSource::LazyCache;
+    }
+    if validate_certified_vllm_python(Path::new("python3")).is_ok() {
+        CertifiedManagedVllmSource::Other
+    } else {
+        CertifiedManagedVllmSource::Missing
+    }
+}
+
 fn managed_vllm_python_candidates() -> Vec<PathBuf> {
+    let mut candidates = managed_vllm_pre_cache_candidates();
+    if let Some(python) = managed_vllm_cache_python_candidate() {
+        candidates.push(python);
+    }
+    candidates.push(PathBuf::from("python3"));
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect()
+}
+
+fn managed_vllm_pre_cache_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(bundle) = std::env::var_os(MANAGED_VLLM_BUNDLE_ENV) {
         candidates.push(PathBuf::from(bundle).join("bin/python"));
@@ -274,21 +350,17 @@ fn managed_vllm_python_candidates() -> Vec<PathBuf> {
             candidates.push(parent.join("../backends/vllm/bin/python"));
         }
     }
-    if let Some(cache) = dirs::cache_dir() {
-        candidates.push(
-            cache
-                .join("kapsl/backends/vllm")
-                .join(MANAGED_VLLM_BACKEND_VERSION)
-                .join("bin/python"),
-        );
-    }
-    candidates.push(PathBuf::from("python3"));
-
-    let mut seen = HashSet::new();
     candidates
-        .into_iter()
-        .filter(|candidate| seen.insert(candidate.clone()))
-        .collect()
+}
+
+fn managed_vllm_cache_python_candidate() -> Option<PathBuf> {
+    backend_cache_root().map(|cache| {
+        cache
+            .join(runtime_release_version())
+            .join("vllm")
+            .join(MANAGED_VLLM_PACK_PROFILE)
+            .join("bin/python")
+    })
 }
 
 fn validate_certified_vllm_python(python: &Path) -> Result<(), String> {
@@ -468,6 +540,7 @@ impl ManagedVllmProcess {
         command
             .arg("-m")
             .arg("vllm.entrypoints.openai.api_server")
+            .arg("--model")
             .arg(&self.spec.model_root)
             .args(["--served-model-name", &self.spec.served_model_name])
             .args(["--host", "127.0.0.1"])
@@ -1367,12 +1440,21 @@ fn build_kv_transfer_config(
     .map_err(|error| format!("serialize managed vLLM KV transfer config: {error}"))
 }
 
-fn managed_vllm_memory_report(
-    model_root: &Path,
+pub(crate) fn managed_vllm_memory_report(
+    model_path: &Path,
     device_ids: &[usize],
     model_id: u32,
     replica_id: u32,
 ) -> Result<MemoryReport, String> {
+    // PackageLoader exposes the manifest's primary model file, while vLLM
+    // consumes the complete Hugging Face directory beside that file. Accept
+    // either representation so preliminary admission and the real backend
+    // load estimate the same weights.
+    let model_root = if model_path.is_dir() {
+        model_path
+    } else {
+        model_path.parent().unwrap_or(model_path)
+    };
     let weight_bytes = std::fs::read_dir(model_root)
         .map_err(|error| format!("read model directory {}: {error}", model_root.display()))?
         .filter_map(Result::ok)
@@ -1489,6 +1571,51 @@ mod tests {
         if std::env::var_os("CUDA_VISIBLE_DEVICES").is_none() {
             assert_eq!(child_cuda_visibility(&[0, 2]).unwrap(), "0,2");
         }
+    }
+
+    #[test]
+    fn memory_report_accepts_the_package_primary_model_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_file = directory.path().join("model.safetensors");
+        std::fs::write(&model_file, vec![0_u8; 123]).unwrap();
+
+        let from_directory = managed_vllm_memory_report(directory.path(), &[0], 7, 0).unwrap();
+        let from_model_file = managed_vllm_memory_report(&model_file, &[0], 7, 0).unwrap();
+
+        assert_eq!(from_model_file.allocations, from_directory.allocations);
+        assert_eq!(from_model_file.allocations[0].bytes, 123);
+    }
+
+    #[test]
+    fn managed_process_passes_the_model_as_a_named_vllm_argument() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("model");
+        std::fs::create_dir(&model_root).unwrap();
+        let process = ManagedVllmProcess::new(ManagedVllmProcessSpec {
+            python: PathBuf::from("python"),
+            model_root: model_root.clone(),
+            served_model_name: "test-model".to_string(),
+            endpoint: "http://127.0.0.1:12345".to_string(),
+            port: 12345,
+            kv_transfer_config: "{}".to_string(),
+            log_path: directory.path().join("vllm.log"),
+            settings: ManagedVllmSettings {
+                gpu_memory_utilization: 0.25,
+                max_model_len: 512,
+                startup_timeout: Duration::from_secs(30),
+            },
+            tensor_parallel_size: 1,
+            cuda_visible_devices: "0".to_string(),
+        });
+
+        let command = process.build_command().unwrap();
+        let arguments = command
+            .get_args()
+            .map(std::ffi::OsStr::to_os_string)
+            .collect::<Vec<_>>();
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == std::ffi::OsString::from("--model") && pair[1] == model_root.as_os_str()
+        }));
     }
 
     #[test]

@@ -65,14 +65,23 @@ use tokio::sync::Mutex as AsyncMutex;
 use warp::Filter;
 
 mod app;
+mod backend_bundle;
+mod backend_manager;
 mod features;
 mod http;
+mod llama_cpp_backend_pack;
+mod llama_cpp_shared_pool;
+mod onnx_backend_pack;
 mod runtime;
 mod serving_backend;
 
 use app::*;
+use backend_bundle::*;
+use backend_manager::*;
 use features::*;
 use http::*;
+use llama_cpp_backend_pack::*;
+use onnx_backend_pack::*;
 use runtime::*;
 use serving_backend::*;
 
@@ -86,6 +95,37 @@ fn system_memory_bytes_from_sysinfo(bytes: u64) -> Option<usize> {
     usize::try_from(bytes).ok()
 }
 
+#[cfg(unix)]
+async fn runtime_shutdown_signal() -> Result<&'static str, std::io::Error> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            Ok("SIGINT")
+        }
+        _ = terminate.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+async fn runtime_shutdown_signal() -> Result<&'static str, std::io::Error> {
+    tokio::signal::ctrl_c().await?;
+    Ok("interrupt")
+}
+
+fn shutdown_managed_backends(resources: &RuntimeResources) -> Result<(), DynError> {
+    let Some(deployment) = resources.managed_vllm() else {
+        return Ok(());
+    };
+    let stopped = deployment
+        .shutdown_all()
+        .map_err(|error| format!("managed backend shutdown failed: {error}"))?;
+    if stopped > 0 {
+        log::info!("Stopped {stopped} managed vLLM runtime(s) during core shutdown");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     let raw_argv: Vec<String> = std::env::args().collect();
@@ -95,7 +135,9 @@ async fn main() -> Result<(), DynError> {
     } = Cli::parse_from(&raw_argv);
     match command {
         Some(KapslCommand::Build(args)) => return execute_build_command(args),
+        Some(KapslCommand::Bundle(args)) => return execute_bundle_command(args),
         Some(KapslCommand::BackendPlan(args)) => return execute_backend_plan_command(args),
+        Some(KapslCommand::Backend(args)) => return execute_backend_command(args),
         Some(KapslCommand::Push(args)) => return execute_push_command(args),
         Some(KapslCommand::Pull(args)) => return execute_pull_command(args),
         Some(KapslCommand::Login(args)) => return execute_login_command(args),
@@ -109,6 +151,10 @@ async fn main() -> Result<(), DynError> {
 
     let runtime_argv = runtime_argv_from_invocation(&raw_argv);
     let (mut args, matches) = parse_runtime_args_and_matches(&runtime_argv)?;
+    args.model.extend(std::mem::take(&mut args.input));
+    configure_llama_cpp_backend_packs(args.offline);
+    configure_onnx_backend_packs(args.offline)
+        .map_err(|error| format!("Configure lazy ONNX backend packs: {error}"))?;
     let applied_tuning = apply_performance_profile(&mut args, &matches);
     let onnx_tuning_profile = Arc::new(
         build_onnx_tuning_profile(&args)
@@ -259,6 +305,8 @@ async fn main() -> Result<(), DynError> {
     );
     log::info!("Best provider: {}\n", device_info.get_best_provider());
 
+    args.model = expand_run_bundles(&args.model, &device_info)?;
+
     if args.worker {
         return run_worker(&args, &device_info, onnx_tuning_profile.as_ref()).await;
     }
@@ -303,14 +351,56 @@ async fn main() -> Result<(), DynError> {
         startup_plans.push((model_path.clone(), plan));
     }
 
-    let managed_vllm = if startup_plans
+    let uses_managed_vllm = startup_plans
         .iter()
-        .any(|(_, plan)| plan.uses_managed_vllm())
-    {
+        .any(|(_, plan)| plan.uses_managed_vllm());
+
+    // One process-owned facade for logical KV, physical device memory, and
+    // pressure state. Pool registration completes before any backend/session
+    // construction begins. This also establishes the authority used for the
+    // pre-download managed-vLLM admission below.
+    #[cfg(feature = "gpu-device-pool")]
+    let resources = {
+        let bootstrap =
+            device_memory_bootstrap_plan(startup_plans.iter().map(|(_, plan)| plan), &device_info)?;
+        RuntimeResources::new_with_device_memory_plan(&device_info, &bootstrap)?
+    };
+    #[cfg(not(feature = "gpu-device-pool"))]
+    let resources = RuntimeResources::new(&device_info)?;
+
+    let preliminary_vllm_admission =
+        preflight_managed_vllm_admission(&startup_plans, &device_info, &resources).await?;
+    let certified_vllm_source = uses_managed_vllm.then(certified_managed_vllm_source);
+    if let Some(certified_vllm_source) = certified_vllm_source {
+        let lazy_enabled = std::env::var("KAPSL_LAZY_BACKENDS")
+            .ok()
+            .is_none_or(|value| {
+                !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            });
+        let validate_lazy_cache = certified_vllm_source == CertifiedManagedVllmSource::LazyCache;
+        let install_missing =
+            certified_vllm_source == CertifiedManagedVllmSource::Missing && lazy_enabled;
+        if validate_lazy_cache || install_missing {
+            // Even when automatic downloads are disabled, an environment
+            // selected from the lazy cache must retain a verified signed index
+            // and install record. Forcing the manager offline turns `ensure`
+            // into validation of an already-installed pack.
+            let manager = BackendManager::from_env(args.offline || !lazy_enabled)?;
+            let target = BackendTarget::current(&device_info);
+            manager.ensure_vllm(&target)?;
+        }
+    }
+    let managed_vllm = if uses_managed_vllm {
         Some(ManagedVllmDeployment::prepare(&mut args)?)
     } else {
         None
     };
+    // Final model-load transactions repeat admission and retain real leases.
+    // Releasing this aggregate guard now prevents double charging.
+    drop(preliminary_vllm_admission);
 
     // Managed backends may populate the private KV listener and certified
     // allowlist automatically, so validate the final configuration only after
@@ -335,17 +425,6 @@ async fn main() -> Result<(), DynError> {
         }
     }
 
-    // One process-owned facade for logical KV, physical device memory, and
-    // pressure state. Pool registration completes before any backend/session
-    // construction begins.
-    #[cfg(feature = "gpu-device-pool")]
-    let resources = {
-        let bootstrap =
-            device_memory_bootstrap_plan(startup_plans.iter().map(|(_, plan)| plan), &device_info)?;
-        RuntimeResources::new_with_device_memory_plan(&device_info, &bootstrap)?
-    };
-    #[cfg(not(feature = "gpu-device-pool"))]
-    let resources = RuntimeResources::new(&device_info)?;
     if let Some(deployment) = managed_vllm {
         resources.install_managed_vllm(deployment)?;
     }
@@ -1015,6 +1094,7 @@ async fn main() -> Result<(), DynError> {
 
     if let Some(mut control_task) = kv_control_task.take() {
         let mut transport_task = Box::pin(server.run());
+        let mut shutdown_signal = Box::pin(runtime_shutdown_signal());
         tokio::select! {
             result = &mut transport_task => {
                 control_task.abort();
@@ -1029,12 +1109,27 @@ async fn main() -> Result<(), DynError> {
                 };
                 return Err(message.into());
             }
+            signal = &mut shutdown_signal => {
+                let signal = signal?;
+                log::info!("Received {signal}; shutting down managed backends");
+                shutdown_managed_backends(&resources)?;
+                control_task.abort();
+                let _ = control_task.await;
+            }
         }
     } else {
-        server
-            .run()
-            .await
-            .map_err(|error| Box::new(error) as DynError)?;
+        let mut transport_task = Box::pin(server.run());
+        let mut shutdown_signal = Box::pin(runtime_shutdown_signal());
+        tokio::select! {
+            result = &mut transport_task => {
+                result.map_err(|error| Box::new(error) as DynError)?;
+            }
+            signal = &mut shutdown_signal => {
+                let signal = signal?;
+                log::info!("Received {signal}; shutting down managed backends");
+                shutdown_managed_backends(&resources)?;
+            }
+        }
     }
 
     Ok(())

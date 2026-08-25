@@ -35,6 +35,11 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "${fake_bin}/uname"
+cat > "${fake_bin}/nvidia-smi" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+chmod +x "${fake_bin}/nvidia-smi"
 
 # --- fixture payloads -------------------------------------------------------
 make_bundle() {
@@ -112,6 +117,7 @@ EOF
 # install-cuda.sh fetches the general installer from the same origin.
 cp install.sh "${release_dir}/install.sh"
 cp install.sh "${release_dir}/install-beta-base.sh"
+cp "${asset_dir}/${portable_asset}" "${beta_asset_dir}/${portable_asset}"
 cp "${asset_dir}/${cuda_asset}" "${beta_asset_dir}/${cuda_asset}"
 cp "${asset_dir}/kapsl-backend-vllm-${version}-linux-x86_64.tar.gz" "${beta_asset_dir}/"
 cp "${asset_dir}/kapsl-backend-vllm-${version}-linux-x86_64.tar.gz.sha256" "${beta_asset_dir}/"
@@ -139,6 +145,7 @@ done
 run_install() {
     case_name="$1"
     accelerator="$2"
+    prefetch="${3:-}"
     install_dir="${test_root}/install-${case_name}"
     log_file="${test_root}/log-${case_name}"
     rm -rf "${install_dir}"
@@ -146,6 +153,9 @@ run_install() {
     set -- --version "${version}" --base-url "${base_url}" --install-dir "${install_dir}"
     if [ "${accelerator}" != "-" ]; then
         set -- "$@" --accelerator "${accelerator}"
+    fi
+    if [ -n "${prefetch}" ]; then
+        set -- "$@" --prefetch-backends "${prefetch}"
     fi
 
     set +e
@@ -157,6 +167,7 @@ run_install() {
 run_cuda_wrapper() {
     case_name="$1"
     wrapper="$2"
+    prefetch="${3:-}"
     install_dir="${test_root}/install-${case_name}"
     log_file="${test_root}/log-${case_name}"
     rm -rf "${install_dir}"
@@ -165,6 +176,7 @@ run_cuda_wrapper() {
     KAPSL_BASE_URL="${base_url}" \
     KAPSL_VERSION="${version}" \
     KAPSL_INSTALL_DIR="${install_dir}" \
+    KAPSL_PREFETCH_BACKENDS="${prefetch}" \
     PATH="${fake_bin}:${PATH}" \
         sh "${wrapper}" >"${log_file}" 2>&1
     install_status=$?
@@ -224,11 +236,12 @@ expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
 expect_file "libcudnn.so.9"
-expect_file "backends/vllm/bin/python"
-expect_file "backends/vllm/kapsl-vllm-backend.json"
+if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
+    fail "default CUDA install eagerly installed managed vLLM"
+fi
 expect_log "GGUF models: CUDA compiled"
 expect_log "ONNX models: CUDA execution provider installed"
-expect_log "managed vLLM backend installed"
+expect_log "installed on first eligible run"
 reject_log "legacy split"
 
 echo "case: direct CUDA wrapper selects the same merged bundle"
@@ -237,7 +250,9 @@ expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
-expect_file "backends/vllm/bin/python"
+if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
+    fail "direct CUDA wrapper eagerly installed managed vLLM"
+fi
 
 echo "case: beta CUDA wrapper selects the merged beta bundle"
 run_cuda_wrapper "beta-cuda-wrapper" install-beta-cuda.sh
@@ -245,7 +260,35 @@ expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
+if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
+    fail "beta CUDA wrapper eagerly installed managed vLLM"
+fi
+
+echo "case: generic beta wrapper selects portable runtime without an NVIDIA driver"
+run_cuda_wrapper "beta-wrapper-cpu" install-beta.sh
+expect_status 0
+expect_binary "portable"
+
+echo "case: generic beta wrapper detects a working NVIDIA driver"
+cat > "${fake_bin}/nvidia-smi" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+    -L) echo 'GPU 0: fixture' ;;
+esac
+exit 0
+EOF
+chmod +x "${fake_bin}/nvidia-smi"
+run_cuda_wrapper "beta-wrapper-cuda" install-beta.sh
+expect_status 0
+expect_binary "cuda12"
+expect_file "kapsl-provider-cuda12.json"
+
+echo "case: managed-vLLM eager compatibility prefetch remains explicit"
+run_install "cuda-prefetch" cuda vllm
+expect_status 0
 expect_file "backends/vllm/bin/python"
+expect_file "backends/vllm/kapsl-vllm-backend.json"
+expect_log "managed vLLM backend installed"
 
 echo "case: TensorRT adds only its provider to the merged CUDA bundle"
 run_install "tensorrt" tensorrt
@@ -254,7 +297,9 @@ expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
 expect_file "libonnxruntime_providers_cuda.so"
 expect_file "kapsl-provider-tensorrt10.json"
-expect_file "backends/vllm/bin/python"
+if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
+    fail "TensorRT install eagerly installed managed vLLM"
+fi
 reject_log "legacy split"
 
 echo "case: CPU and the default install remain portable"
@@ -281,7 +326,7 @@ cp "${test_root}/merged-cuda.tar.gz" "${asset_dir}/${cuda_asset}"
 echo "case: missing managed-vLLM pack fails closed"
 backend_asset="kapsl-backend-vllm-${version}-linux-x86_64.tar.gz"
 mv "${asset_dir}/${backend_asset}" "${test_root}/held-vllm.tar.gz"
-run_install "vllm-missing" cuda
+run_install "vllm-missing" cuda vllm
 if [ "${install_status}" -eq 0 ]; then
     fail "missing managed-vLLM pack unexpectedly succeeded"
 fi
@@ -293,7 +338,7 @@ mv "${test_root}/held-vllm.tar.gz" "${asset_dir}/${backend_asset}"
 echo "case: corrupt managed-vLLM pack fails checksum validation"
 cp "${asset_dir}/${backend_asset}" "${test_root}/valid-vllm.tar.gz"
 printf 'corrupt' > "${asset_dir}/${backend_asset}"
-run_install "vllm-corrupt" cuda
+run_install "vllm-corrupt" cuda vllm
 if [ "${install_status}" -eq 0 ]; then
     fail "corrupt managed-vLLM pack unexpectedly succeeded"
 fi

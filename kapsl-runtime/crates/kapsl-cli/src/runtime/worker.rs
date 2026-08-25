@@ -41,6 +41,7 @@ pub(crate) struct WorkerSpec {
     topology: String,
     tp_degree: usize,
     onnx_tuning: OnnxRuntimeTuning,
+    offline: bool,
 }
 
 pub(crate) struct WorkerProcess {
@@ -204,6 +205,9 @@ pub(crate) fn build_worker_command(
         .arg("--tp-degree")
         .arg(spec.tp_degree.to_string())
         .env(LLM_ISOLATE_PROCESS_ENV, "0");
+    if spec.offline {
+        command.arg("--offline");
+    }
     if !isolated_worker_gpu_pool_allowed() {
         // DeviceMemoryManager still runs in the child for planned-vs-actual
         // accounting, but no process-local arena may reserve the same global
@@ -262,6 +266,7 @@ pub(crate) fn spawn_worker_process(
         topology: topology.to_string(),
         tp_degree,
         onnx_tuning: onnx_tuning.clone(),
+        offline: backend_packs_are_offline(),
     };
 
     #[cfg(not(unix))]

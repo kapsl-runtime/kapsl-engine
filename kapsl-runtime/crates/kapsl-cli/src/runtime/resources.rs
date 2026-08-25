@@ -107,11 +107,7 @@ impl RuntimeResources {
         self.managed_vllm.read().clone()
     }
 
-    #[cfg(any(
-        feature = "native",
-        feature = "gguf-native",
-        feature = "gguf-cuda-shared-kv"
-    ))]
+    #[cfg(feature = "gpu-device-pool")]
     pub(crate) fn device_pool(
         &self,
         device_id: usize,

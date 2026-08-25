@@ -315,21 +315,29 @@ pub(super) fn create_runtime_backend_for_device(
     model_id: u32,
     replica_id: u32,
 ) -> Result<Box<dyn kapsl_engine_api::Engine>, String> {
+    let engine_kind = EngineKind::resolve(manifest);
     #[cfg(not(any(
         feature = "native",
         feature = "gguf-native",
         feature = "gguf-cuda-shared-kv"
     )))]
     let _ = (resources, model_id, replica_id);
-    #[cfg(any(
-        feature = "native",
-        feature = "gguf-native",
-        feature = "gguf-cuda-shared-kv"
-    ))]
-    let kind = EngineKind::resolve(manifest);
+
+    if engine_kind.is_gguf() {
+        if let Some(backend) = create_llama_cpp_pack_engine(
+            manifest,
+            device_info,
+            resources,
+            device_id,
+            model_id,
+            replica_id,
+        )? {
+            return Ok(backend);
+        }
+    }
 
     #[cfg(feature = "gguf-native")]
-    if kind.is_gguf() {
+    if engine_kind.is_gguf() {
         let backend = if let Some(pool) = resources.device_pool(device_id) {
             BackendFactory::create_gguf_native_device_pool_for_replica(
                 device_id as i32,
@@ -344,7 +352,7 @@ pub(super) fn create_runtime_backend_for_device(
     }
 
     #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-    if kind.is_gguf() {
+    if engine_kind.is_gguf() {
         let backend = if let Some(pool) = resources.device_pool(device_id) {
             BackendFactory::create_gguf_cuda_device_pool_for_replica(
                 device_id as i32,
@@ -359,7 +367,7 @@ pub(super) fn create_runtime_backend_for_device(
     }
 
     #[cfg(feature = "native")]
-    if kind == EngineKind::Native {
+    if engine_kind == EngineKind::Native {
         if let Some(pool) = resources.device_pool(device_id) {
             return BackendFactory::create_native_device_pool_for_replica(
                 device_id as i32,
@@ -371,86 +379,21 @@ pub(super) fn create_runtime_backend_for_device(
         }
     }
 
+    if engine_kind.is_onnx_generate() {
+        // The SDK's automatic ONNX-generate constructor may fall back to CPU.
+        // Bind the exact provider chosen by Kapsl policy so a missing CUDA or
+        // TensorRT pack fails closed just like the tensor-pipeline path.
+        let backend = LLMBackend::with_device(provider.to_owned(), device_id as i32)
+            .with_memory_owner(model_id, replica_id);
+        #[cfg(feature = "gpu-device-pool")]
+        let backend = backend.with_env_allocators(resources.uses_env_allocators(device_id));
+        return Ok(Box::new(backend));
+    }
+
     BackendFactory::create_backend_for_device_with_tuning_and_owner(
         manifest,
         provider,
         device_id,
-        device_info,
-        tuning,
-        model_id,
-        replica_id,
-    )
-}
-
-pub(super) fn create_runtime_best_backend(
-    manifest: &Manifest,
-    device_info: &DeviceInfo,
-    tuning: &OnnxRuntimeTuning,
-    resources: &RuntimeResources,
-    model_id: u32,
-    replica_id: u32,
-) -> Result<Box<dyn kapsl_engine_api::Engine>, String> {
-    #[cfg(not(any(
-        feature = "native",
-        feature = "gguf-native",
-        feature = "gguf-cuda-shared-kv"
-    )))]
-    let _ = (resources, model_id, replica_id);
-    #[cfg(any(
-        feature = "native",
-        feature = "gguf-native",
-        feature = "gguf-cuda-shared-kv"
-    ))]
-    {
-        let kind = EngineKind::resolve(manifest);
-        let device_id = manifest.hardware_requirements.device_id.unwrap_or(0) as usize;
-
-        #[cfg(feature = "gguf-native")]
-        if kind.is_gguf() {
-            let backend = if let Some(pool) = resources.device_pool(device_id) {
-                BackendFactory::create_gguf_native_device_pool_for_replica(
-                    device_id as i32,
-                    pool,
-                    model_id,
-                    replica_id,
-                )?
-            } else {
-                BackendFactory::create_gguf_native(device_id as i32, None)?
-            };
-            return Ok(Box::new(backend));
-        }
-
-        #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-        if kind.is_gguf() {
-            let backend = if let Some(pool) = resources.device_pool(device_id) {
-                BackendFactory::create_gguf_cuda_device_pool_for_replica(
-                    device_id as i32,
-                    pool,
-                    model_id,
-                    replica_id,
-                )?
-            } else {
-                BackendFactory::create_gguf_cuda_shared_kv(device_id as i32, None)?
-            };
-            return Ok(Box::new(backend));
-        }
-
-        #[cfg(feature = "native")]
-        if kind == EngineKind::Native {
-            if let Some(pool) = resources.device_pool(device_id) {
-                return BackendFactory::create_native_device_pool_for_replica(
-                    device_id as i32,
-                    pool,
-                    model_id,
-                    replica_id,
-                )
-                .map(|backend| Box::new(backend) as Box<dyn kapsl_engine_api::Engine>);
-            }
-        }
-    }
-
-    BackendFactory::create_best_backend_with_tuning_and_owner(
-        manifest,
         device_info,
         tuning,
         model_id,

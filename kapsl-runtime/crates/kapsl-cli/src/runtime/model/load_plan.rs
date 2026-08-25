@@ -213,10 +213,10 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
         let kind = EngineKind::resolve(&plan.loader.manifest);
         let wants_pool = kind.uses_onnx_session()
             || (kind.is_gguf()
-                && cfg!(any(
+                && (cfg!(any(
                     feature = "gguf-native",
                     feature = "gguf-cuda-shared-kv"
-                )))
+                )) || crate::llama_cpp_backend_pack::lazy_llama_cpp_packs_enabled()))
             || (kind == EngineKind::Native && cfg!(feature = "native"));
         if wants_pool {
             for &device_id in &cuda_device_ids {

@@ -6,14 +6,35 @@ on:
       - "install.sh"
       - "install-cuda.sh"
       - "install-beta-cuda.sh"
+      - "install-beta.sh"
       - ".github/scripts/test-install-script.sh"
       - ".github/scripts/package-linux-cuda-runtime.sh"
       - ".github/scripts/test-package-linux-cuda-runtime.sh"
+      - ".github/scripts/package-linux-onnx-backend-packs.sh"
+      - ".github/scripts/collect-linux-tensorrt-runtime.sh"
+      - ".github/scripts/onnx-backend-pack-entrypoint.c"
+      - ".github/scripts/test-package-linux-onnx-backend-packs.sh"
+      - ".github/scripts/test-onnx-backend-release-contract.sh"
+      - ".github/licenses/ONNX-RUNTIME-LICENSE"
+      - ".github/scripts/package-linux-llama-cpp-backend-packs.sh"
+      - ".github/scripts/test-package-linux-llama-cpp-backend-packs.sh"
+      - ".github/scripts/test-llama-cpp-backend-release-contract.sh"
+      - ".github/scripts/benchmark-llama-cpp-backend-pack.py"
+      - ".github/scripts/certify-llama-cpp-backend-pack-performance.sh"
+      - ".github/scripts/test-gpu-device-pool-integration.sh"
+      - ".github/workflows/lazy-llama-cpp-backend-pack-gpu-certification.yml"
+      - ".github/licenses/LLAMA-CPP-LICENSE"
+      - "kapsl-runtime/include/kapsl_llama_cpp_backend.h"
+      - "kapsl-runtime/crates/kapsl-backend-abi/**"
+      - "kapsl-runtime/crates/kapsl-backend-llama-cpp/**"
       - ".github/scripts/bootstrap-vllm-backend.sh"
       - ".github/scripts/package-linux-vllm-backend.sh"
       - ".github/scripts/managed-vllm-cu130.lock"
       - ".github/scripts/test-bootstrap-vllm-backend.sh"
       - ".github/scripts/test-managed-vllm-release-contract.sh"
+      - ".github/scripts/generate-backend-index.py"
+      - ".github/scripts/test-generate-backend-index.sh"
+      - ".github/scripts/verify-public-backend-release.sh"
       - ".github/workflows/installer-smoke.yml"
   workflow_dispatch:
 
@@ -35,13 +56,29 @@ jobs:
           sh -n install.sh
           sh -n install-cuda.sh
           sh -n install-beta-cuda.sh
+          sh -n install-beta.sh
           sh -n .github/scripts/test-install-script.sh
           bash -n .github/scripts/package-linux-cuda-runtime.sh
           bash -n .github/scripts/test-package-linux-cuda-runtime.sh
+          bash -n .github/scripts/package-linux-onnx-backend-packs.sh
+          bash -n .github/scripts/collect-linux-tensorrt-runtime.sh
+          bash -n .github/scripts/test-package-linux-onnx-backend-packs.sh
+          bash -n .github/scripts/test-onnx-backend-release-contract.sh
+          bash -n .github/scripts/package-linux-llama-cpp-backend-packs.sh
+          bash -n .github/scripts/test-package-linux-llama-cpp-backend-packs.sh
+          bash -n .github/scripts/test-llama-cpp-backend-release-contract.sh
+          bash -n .github/scripts/certify-llama-cpp-backend-pack-performance.sh
           bash -n .github/scripts/bootstrap-vllm-backend.sh
           bash -n .github/scripts/package-linux-vllm-backend.sh
           bash -n .github/scripts/test-bootstrap-vllm-backend.sh
           bash -n .github/scripts/test-managed-vllm-release-contract.sh
+          bash -n .github/scripts/test-generate-backend-index.sh
+          bash -n .github/scripts/verify-public-backend-release.sh
+          python3 -m py_compile .github/scripts/generate-backend-index.py
+          python3 -m py_compile .github/scripts/benchmark-llama-cpp-backend-pack.py
+
+      - name: Test llama.cpp performance threshold math
+        run: .github/scripts/benchmark-llama-cpp-backend-pack.py self-test
 
       - name: Test merged accelerator selection and compatibility
         run: .github/scripts/test-install-script.sh
@@ -49,8 +86,23 @@ jobs:
       - name: Test merged CUDA archive contents
         run: .github/scripts/test-package-linux-cuda-runtime.sh
 
+      - name: Test split ONNX backend packs
+        run: .github/scripts/test-package-linux-onnx-backend-packs.sh
+
+      - name: Test ONNX backend release contract
+        run: .github/scripts/test-onnx-backend-release-contract.sh
+
+      - name: Test native llama.cpp backend packs
+        run: .github/scripts/test-package-linux-llama-cpp-backend-packs.sh
+
+      - name: Test llama.cpp backend release contract
+        run: .github/scripts/test-llama-cpp-backend-release-contract.sh
+
       - name: Test managed-vLLM backend bootstrap
         run: .github/scripts/test-bootstrap-vllm-backend.sh
 
       - name: Test managed-vLLM release pins
         run: .github/scripts/test-managed-vllm-release-contract.sh
+
+      - name: Test signed backend-index generation
+        run: .github/scripts/test-generate-backend-index.sh

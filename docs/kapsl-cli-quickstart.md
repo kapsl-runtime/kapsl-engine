@@ -40,8 +40,8 @@ Package a GGUF model you already have and serve it:
 # 1) Build an .aimod package from the model file
 kapsl build ./qwen2.5-7b-instruct-q4_k_m.gguf --output ./qwen.aimod
 
-# 2) Start the runtime
-kapsl run --model ./qwen.aimod
+# 2) Start the runtime (any required lazy pack is installed automatically)
+kapsl run ./qwen.aimod
 ```
 
 Then talk to it with any OpenAI client — no Kapsl-specific code:
@@ -76,8 +76,17 @@ cargo run -p kapsl -- --model models/mnist/mnist.aimod
 Run model package:
 
 ```bash
-kapsl run --model ./model.aimod
+kapsl run ./model.aimod
 ```
+
+Prepare the same model for a no-network machine:
+
+```bash
+kapsl bundle ./model.aimod --output ./model.kapsl-bundle
+kapsl run ./model.kapsl-bundle
+```
+
+`--model ./model.aimod` remains supported for existing scripts.
 
 Add a model to an already-running runtime (no restart needed):
 

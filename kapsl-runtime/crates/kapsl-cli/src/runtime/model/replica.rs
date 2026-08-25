@@ -66,6 +66,22 @@ pub(super) async fn load_replica(
         return load_managed_vllm_replica(plan, role, device_info, resources, shared_metrics).await;
     }
 
+    // Resolve and verify native packs before any backend library or model
+    // session is constructed. Preliminary admission runs before a download.
+    let memory_snapshot = resources.memory().snapshot();
+    ensure_llama_cpp_backend_pack(
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        device_info,
+        Some(&memory_snapshot),
+    )?;
+    ensure_onnx_backend_pack(
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        device_info,
+        Some(&memory_snapshot),
+    )?;
+
     let needs_mesh = role.is_primary() || plan.use_pipeline_backend;
     let (mut device_mesh, mut logical_provider) = if needs_mesh {
         use kapsl_hal::device_mesh::DeviceMesh;
@@ -221,14 +237,24 @@ pub(super) async fn load_replica(
             )
         })?;
         logical_provider = Some(selection.logical_provider.clone());
-        let device_id = plan
-            .loader
-            .manifest
-            .hardware_requirements
-            .device_id
-            .unwrap_or(0) as usize;
-        let backend = create_runtime_best_backend(
+        let device_id = selection
+            .devices
+            .first()
+            .map(|device| device.id)
+            .unwrap_or_else(|| {
+                plan.loader
+                    .manifest
+                    .hardware_requirements
+                    .device_id
+                    .unwrap_or(0) as usize
+            });
+        // Use the exact provider selected from the manifest/fallback policy.
+        // The generic factory's final CPU fallback would otherwise let an
+        // autoscaled CUDA/TensorRT replica silently change execution mode.
+        let backend = create_runtime_backend_for_device(
             &plan.loader.manifest,
+            &selection.logical_provider,
+            device_id,
             device_info,
             onnx_tuning,
             &resources,
@@ -394,7 +420,9 @@ fn create_pipeline_backend(
     resources: &RuntimeResources,
 ) -> Box<dyn kapsl_engine_api::Engine> {
     let backend_device_ids: Vec<i32> = device_ids.iter().map(|&id| id as i32).collect();
-    let mut backend = if provider_policy() == "manifest" {
+    let mut backend = if EngineKind::resolve(&plan.loader.manifest).uses_onnx_session()
+        || provider_policy() == "manifest"
+    {
         LLMBackend::with_devices(logical_provider.to_owned(), backend_device_ids.clone())
     } else {
         LLMBackend::with_device_ids(backend_device_ids.clone())

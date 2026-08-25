@@ -28,8 +28,12 @@ pub(crate) enum KapslCommand {
     Run(Args),
     /// Package a model file or directory into a portable .aimod archive
     Build(BuildCommandArgs),
+    /// Create a self-contained model and backend bundle for offline deployment
+    Bundle(BundleCommandArgs),
     /// Resolve a package's deployment backend policy for this host
     BackendPlan(BackendPlanCommandArgs),
+    /// Inspect and manage lazily installed inference backends
+    Backend(BackendCommandArgs),
     /// Upload a .aimod package to a remote registry
     Push(PushCommandArgs),
     /// Download a .aimod package from a remote registry
@@ -51,9 +55,19 @@ pub(crate) enum KapslCommand {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Run Options")]
 pub(crate) struct Args {
+    /// Model package or offline bundle to load. Positional paths may be mixed
+    /// with the backward-compatible --model option.
+    #[arg(value_name = "MODEL_OR_BUNDLE")]
+    pub(crate) input: Vec<PathBuf>,
+
     /// Path to one or more .aimod model packages to load at startup (repeatable)
     #[arg(short, long)]
     pub(crate) model: Vec<PathBuf>,
+
+    /// Disable network access. Required backend packs must already be cached or
+    /// be carried by a .kapsl-bundle.
+    #[arg(long)]
+    pub(crate) offline: bool,
 
     /// IPC transport used between the runtime and clients.
     /// socket — Unix domain socket (lowest latency, same host only).
@@ -265,6 +279,22 @@ pub(crate) struct BuildCommandArgs {
     /// Arbitrary JSON object merged into the package manifest metadata
     #[arg(long, value_name = "JSON")]
     pub(crate) metadata_json: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+#[command(next_help_heading = "Bundle Options")]
+pub(crate) struct BundleCommandArgs {
+    /// One or more .aimod packages to include
+    #[arg(required = true, value_name = "MODEL")]
+    pub(crate) model: Vec<PathBuf>,
+
+    /// Output .kapsl-bundle path
+    #[arg(long, required = true, value_name = "PATH")]
+    pub(crate) output: PathBuf,
+
+    /// Target host, for example linux-x86_64-cuda or linux-x86_64-cpu
+    #[arg(long, value_name = "TARGET")]
+    pub(crate) target: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -500,6 +530,47 @@ pub(crate) struct ProviderCommandArgs {
     pub(crate) command: ProviderSubcommand,
 }
 
+#[derive(clap::Args, Debug)]
+pub(crate) struct BackendCommandArgs {
+    #[command(subcommand)]
+    pub(crate) command: BackendSubcommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum BackendSubcommand {
+    /// Resolve, verify, and cache every backend required by a model
+    Ensure(BackendEnsureCommandArgs),
+    /// List installed backend packs
+    List(BackendListCommandArgs),
+    /// Remove interrupted staging data and, optionally, old runtime caches
+    Prune(BackendPruneCommandArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct BackendEnsureCommandArgs {
+    /// Model package(s) whose backend should be prepared
+    #[arg(required = true, value_name = "MODEL")]
+    pub(crate) model: Vec<PathBuf>,
+
+    /// Refuse network access and report any missing pack
+    #[arg(long)]
+    pub(crate) offline: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct BackendListCommandArgs {
+    /// Emit a JSON array instead of a table
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct BackendPruneCommandArgs {
+    /// Also remove caches belonging to Kapsl runtime versions other than this one
+    #[arg(long)]
+    pub(crate) old_versions: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum ProviderSubcommand {
     /// Download and install a provider pack matching this Kapsl release
@@ -583,4 +654,56 @@ pub(crate) struct AppliedPerformanceTuning {
     pub(crate) rust_log: Option<String>,
     /// Populated when Auto profile is used; emitted after env_logger::init().
     pub(crate) auto_tune_rationale: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_accepts_positional_and_backward_compatible_model_paths() {
+        let cli = Cli::try_parse_from([
+            "kapsl",
+            "run",
+            "online.aimod",
+            "offline.kapsl-bundle",
+            "--model",
+            "legacy.aimod",
+            "--offline",
+        ])
+        .unwrap();
+        let Some(KapslCommand::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args.input,
+            [
+                PathBuf::from("online.aimod"),
+                PathBuf::from("offline.kapsl-bundle")
+            ]
+        );
+        assert_eq!(args.model, [PathBuf::from("legacy.aimod")]);
+        assert!(args.offline);
+    }
+
+    #[test]
+    fn bundle_accepts_multiple_models_and_cross_target() {
+        let cli = Cli::try_parse_from([
+            "kapsl",
+            "bundle",
+            "model-a.aimod",
+            "model-b.aimod",
+            "--target",
+            "linux-x86_64-cuda",
+            "--output",
+            "production.kapsl-bundle",
+        ])
+        .unwrap();
+        let Some(KapslCommand::Bundle(args)) = cli.command else {
+            panic!("expected bundle command");
+        };
+        assert_eq!(args.model.len(), 2);
+        assert_eq!(args.target.as_deref(), Some("linux-x86_64-cuda"));
+        assert_eq!(args.output, PathBuf::from("production.kapsl-bundle"));
+    }
 }

@@ -14,6 +14,10 @@ pub(crate) struct BackendPlanCommandArgs {
     /// Override detected CUDA availability when planning for another host.
     #[arg(long, value_name = "BOOL")]
     pub(crate) cuda: Option<bool>,
+
+    /// Do not fetch a backend index; use only a previously verified cached copy.
+    #[arg(long)]
+    pub(crate) offline: bool,
 }
 
 /// Deployment-time serving policy embedded in `metadata.serving.backend`.
@@ -76,6 +80,22 @@ pub(crate) struct ServingBackendDecision {
     pub(crate) requested: Option<ServingBackendPolicy>,
     pub(crate) selected: ResolvedServingBackend,
     pub(crate) reason: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryAdmissionStatus {
+    Accepted,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreliminaryMemoryAdmission {
+    pub(crate) status: MemoryAdmissionStatus,
+    pub(crate) required_bytes: Option<u64>,
+    pub(crate) available_bytes: Option<u64>,
+    pub(crate) reason: String,
 }
 
 /// Validate the model format at the CLI boundary before either packaging or
@@ -375,6 +395,176 @@ pub(crate) fn inspect_serving_manifest(path: &Path) -> Result<Manifest, String> 
     ))
 }
 
+/// A host-only gate used before a multi-gigabyte backend download. The normal
+/// memory authority still performs the final transactional admission directly
+/// before model initialization; this estimate exists only to reject obvious
+/// over-capacity vLLM deployments early.
+pub(crate) fn preliminary_memory_admission(
+    model_path: &Path,
+    manifest: &Manifest,
+    decision: ServingBackendDecision,
+    device_info: &DeviceInfo,
+) -> Result<PreliminaryMemoryAdmission, String> {
+    if decision.selected != ResolvedServingBackend::Vllm {
+        return Ok(PreliminaryMemoryAdmission {
+            status: MemoryAdmissionStatus::Accepted,
+            required_bytes: None,
+            available_bytes: None,
+            reason:
+                "the selected in-process backend performs authoritative admission at model load"
+                    .to_string(),
+        });
+    }
+
+    let weight_bytes = inspect_model_weight_bytes(model_path, manifest)?;
+    let declared_bytes = manifest
+        .hardware_requirements
+        .gpu_memory_reservation_mb
+        .or(manifest.hardware_requirements.gpu_memory_limit_mb)
+        .or(manifest.hardware_requirements.min_vram_mb)
+        .map(|mib| mib.saturating_mul(1024 * 1024));
+    let estimated_bytes = weight_bytes.map(|weights| {
+        let workspace = (weights / 8).max(256 * 1024 * 1024);
+        weights.saturating_add(workspace)
+    });
+    let required = match (declared_bytes, estimated_bytes) {
+        (Some(declared), Some(estimated)) => Some(declared.max(estimated)),
+        (Some(declared), None) => Some(declared),
+        (None, estimated) => estimated,
+    };
+    let allowed_ids = &manifest.hardware_requirements.gpu_device_ids;
+    let requested_id = manifest.hardware_requirements.device_id;
+    let available = device_info
+        .devices
+        .iter()
+        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+        .filter(|device| {
+            (allowed_ids.is_empty() || allowed_ids.contains(&(device.id as i32)))
+                && requested_id.is_none_or(|id| id == device.id as i32)
+        })
+        // Keep a conservative ten-percent driver/runtime guard. The runtime's
+        // device authority may apply a stricter configured ceiling later.
+        .map(|device| {
+            device
+                .memory_mb
+                .saturating_mul(1024 * 1024)
+                .saturating_mul(9)
+                / 10
+        })
+        .max();
+
+    match (required, available) {
+        (Some(required), Some(available)) if required > available => {
+            Ok(PreliminaryMemoryAdmission {
+                status: MemoryAdmissionStatus::Rejected,
+                required_bytes: Some(required),
+                available_bytes: Some(available),
+                reason: format!(
+                    "estimated model weights and workspace require {required} bytes, but the largest eligible GPU has {available} guarded bytes"
+                ),
+            })
+        }
+        (Some(required), Some(available)) => Ok(PreliminaryMemoryAdmission {
+            status: MemoryAdmissionStatus::Accepted,
+            required_bytes: Some(required),
+            available_bytes: Some(available),
+            reason: format!(
+                "estimated model weights and workspace require {required} bytes within a guarded {available} byte GPU budget"
+            ),
+        }),
+        (_, None) => Ok(PreliminaryMemoryAdmission {
+            status: MemoryAdmissionStatus::Rejected,
+            required_bytes: required,
+            available_bytes: None,
+            reason: "no eligible CUDA GPU is available".to_string(),
+        }),
+        (None, Some(available)) => Ok(PreliminaryMemoryAdmission {
+            status: MemoryAdmissionStatus::Unknown,
+            required_bytes: None,
+            available_bytes: Some(available),
+            reason: "the package did not expose enough size information for a host-only estimate"
+                .to_string(),
+        }),
+    }
+}
+
+pub(crate) fn inspect_model_weight_bytes(
+    path: &Path,
+    manifest: &Manifest,
+) -> Result<Option<u64>, String> {
+    if path.is_dir() {
+        return sum_safetensors_in_directory(path).map(Some);
+    }
+    if looks_like_model_file_path(path) {
+        return fs::metadata(path)
+            .map(|metadata| Some(metadata.len()))
+            .map_err(|error| format!("Failed to inspect model size {}: {error}", path.display()));
+    }
+
+    let file = File::open(path)
+        .map_err(|error| format!("Failed to open package {}: {error}", path.display()))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    let mut bytes = 0_u64;
+    let mut found = false;
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("Failed to inspect package {}: {error}", path.display()))?;
+    for (index, entry) in entries.enumerate() {
+        if index >= 100_000 {
+            return Err("Package contains too many entries for backend planning".to_string());
+        }
+        let entry = entry.map_err(|error| format!("Failed to inspect package entry: {error}"))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let entry_path = entry
+            .path()
+            .map_err(|error| format!("Failed to inspect package entry path: {error}"))?;
+        let is_safetensors = entry_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("safetensors"));
+        let is_declared_model = entry_path.as_ref() == Path::new(&manifest.model_file);
+        if is_safetensors || is_declared_model {
+            found = true;
+            bytes = bytes.saturating_add(entry.size());
+        }
+    }
+    Ok(found.then_some(bytes))
+}
+
+fn sum_safetensors_in_directory(path: &Path) -> Result<u64, String> {
+    fn visit(path: &Path, depth: usize, total: &mut u64) -> Result<(), String> {
+        if depth > 8 {
+            return Err("Model directory nesting exceeds the planning limit".to_string());
+        }
+        for entry in fs::read_dir(path)
+            .map_err(|error| format!("Failed to inspect {}: {error}", path.display()))?
+        {
+            let entry = entry.map_err(|error| format!("Failed to inspect model entry: {error}"))?;
+            let metadata = entry.metadata().map_err(|error| {
+                format!("Failed to inspect {}: {error}", entry.path().display())
+            })?;
+            if metadata.is_dir() {
+                visit(&entry.path(), depth + 1, total)?;
+            } else if metadata.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("safetensors"))
+            {
+                *total = total.saturating_add(metadata.len());
+            }
+        }
+        Ok(())
+    }
+    let mut total = 0;
+    visit(path, 0, &mut total)?;
+    Ok(total)
+}
+
 pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Result<(), DynError> {
     let absolute_path = args.model.canonicalize().map_err(|error| {
         format!(
@@ -389,6 +579,149 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
         None => (DeviceInfo::probe().has_cuda, "detected"),
     };
     let decision = resolve_serving_backend(&manifest, has_cuda)?;
+    let mut planned_device_info = DeviceInfo::probe();
+    planned_device_info.has_cuda = has_cuda;
+    let mut memory =
+        preliminary_memory_admission(&absolute_path, &manifest, decision, &planned_device_info)?;
+    let synthetic_cuda_target = args.cuda == Some(true)
+        && !planned_device_info
+            .devices
+            .iter()
+            .any(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"));
+    if synthetic_cuda_target && memory.status == MemoryAdmissionStatus::Rejected {
+        memory.status = MemoryAdmissionStatus::Unknown;
+        memory.reason = "CUDA was enabled by --cuda, but this host exposes no GPU capacity; final memory admission must run on the target host".to_string();
+    }
+    let onnx_profile = if crate::onnx_backend_pack::lazy_onnx_packs_enabled() {
+        match args.cuda {
+            Some(true) => crate::onnx_backend_pack::onnx_pack_profile_for_target(
+                &manifest,
+                BackendAccelerator::Cuda,
+            )?,
+            Some(false) => crate::onnx_backend_pack::onnx_pack_profile_for_target(
+                &manifest,
+                BackendAccelerator::Cpu,
+            )?,
+            None => crate::onnx_backend_pack::onnx_pack_profile_for_manifest(
+                &manifest,
+                &planned_device_info,
+            )?,
+        }
+    } else {
+        None
+    };
+    let llama_profile = if crate::llama_cpp_backend_pack::lazy_llama_cpp_packs_enabled() {
+        match args.cuda {
+            Some(true) => crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_target(
+                &manifest,
+                BackendAccelerator::Cuda,
+            ),
+            Some(false) => crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_target(
+                &manifest,
+                BackendAccelerator::Cpu,
+            ),
+            None => crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_manifest(
+                &manifest,
+                &planned_device_info,
+            ),
+        }
+    } else {
+        None
+    };
+    let (selected_backend, installed, download_required, download_bytes, execution_mode, profile) =
+        if decision.selected == ResolvedServingBackend::Vllm
+            && memory.status != MemoryAdmissionStatus::Rejected
+        {
+            let mut target = BackendTarget::current(&planned_device_info);
+            if synthetic_cuda_target {
+                // `--cuda true` is a contract-planning override, so allow the
+                // signed CUDA profile to resolve without pretending that this
+                // host measured a particular target driver/runtime version.
+                target.cuda_version = Some("999.0".to_string());
+                target.driver_version = Some("9999.0".to_string());
+            }
+            let manager = BackendManager::from_env(args.offline)?;
+            let plan = manager.plan_vllm(&target)?;
+            (
+                "vllm".to_string(),
+                plan.installed,
+                plan.download_required,
+                plan.download_bytes,
+                plan.execution_mode,
+                Some(plan.profile),
+            )
+        } else if decision.selected == ResolvedServingBackend::Vllm {
+            (
+                "vllm".to_string(),
+                false,
+                false,
+                0,
+                "external".to_string(),
+                None,
+            )
+        } else if let Some(onnx_profile) = onnx_profile {
+            let mut target = BackendTarget::current(&planned_device_info);
+            target.accelerator = onnx_profile.accelerator();
+            if onnx_profile == OnnxBackendPackProfile::Cpu {
+                target.cuda_version = None;
+                target.driver_version = None;
+            } else if synthetic_cuda_target {
+                target.cuda_version = Some("999.0".to_string());
+                target.driver_version = Some("9999.0".to_string());
+            }
+            let manager = BackendManager::from_env(args.offline)?;
+            let plan = manager.plan_onnx(onnx_profile, &target)?;
+            (
+                "onnx".to_string(),
+                plan.installed,
+                plan.download_required,
+                plan.download_bytes,
+                plan.execution_mode,
+                Some(plan.profile),
+            )
+        } else if let Some(llama_profile) = llama_profile {
+            let mut target = BackendTarget::current(&planned_device_info);
+            target.accelerator = llama_profile.accelerator();
+            if llama_profile == LlamaCppBackendPackProfile::Cpu {
+                target.cuda_version = None;
+                target.driver_version = None;
+            } else if synthetic_cuda_target {
+                target.cuda_version = Some("999.0".to_string());
+                target.driver_version = Some("9999.0".to_string());
+            }
+            let manager = BackendManager::from_env(args.offline)?;
+            let plan = manager.plan_llama_cpp(llama_profile, &target)?;
+            memory = crate::llama_cpp_backend_pack::preliminary_llama_cpp_memory_admission(
+                llama_profile,
+                &absolute_path,
+                &manifest,
+                &planned_device_info,
+                &plan.manifest,
+                None,
+            )?;
+            if synthetic_cuda_target && memory.status == MemoryAdmissionStatus::Rejected {
+                memory.status = MemoryAdmissionStatus::Unknown;
+                memory.reason = "CUDA was enabled by --cuda, but this host exposes no GPU capacity; final memory admission must run on the target host".to_string();
+            }
+            let admitted = memory.status != MemoryAdmissionStatus::Rejected;
+            (
+                "llama_cpp".to_string(),
+                plan.installed,
+                admitted && plan.download_required,
+                if admitted { plan.download_bytes } else { 0 },
+                plan.execution_mode,
+                Some(plan.profile),
+            )
+        } else {
+            (
+                decision.selected.as_str().to_string(),
+                true,
+                false,
+                0,
+                "native".to_string(),
+                None,
+            )
+        };
     let policy = decision
         .requested
         .map(ServingBackendPolicy::as_str)
@@ -396,7 +729,16 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
     let output = serde_json::json!({
         "model": manifest.project_name,
         "policy": policy,
-        "selected_backend": decision.selected.as_str(),
+        "selected_backend": selected_backend,
+        "profile": profile,
+        "installed": installed,
+        "download_required": download_required,
+        "download_bytes": download_bytes,
+        "memory_admission": memory.status,
+        "memory_required_bytes": memory.required_bytes,
+        "memory_available_bytes": memory.available_bytes,
+        "memory_reason": memory.reason,
+        "execution_mode": execution_mode,
         "external_process": decision.selected == ResolvedServingBackend::Vllm,
         "cuda": has_cuda,
         "cuda_source": cuda_source,
@@ -413,6 +755,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kapsl_hal::device::{Device, DeviceBackend};
 
     fn manifest(format: &str, model_type: &str, task: &str) -> Manifest {
         Manifest {
@@ -580,5 +923,46 @@ mod tests {
         assert_eq!(merged["owner"], "test");
         assert_eq!(merged["serving"]["max_context"], 4096);
         assert_eq!(merged["serving"]["backend"], "llama_cpp");
+    }
+
+    #[test]
+    fn preliminary_vllm_admission_rejects_an_undersized_gpu() {
+        let root = tempfile::tempdir().unwrap();
+        let model_path = root.path().join("model.safetensors");
+        fs::write(&model_path, b"small fixture").unwrap();
+        let mut manifest = manifest("safetensors", "causal-lm", "generate");
+        set_policy(&mut manifest, "vllm");
+        let decision = resolve_serving_backend(&manifest, true).unwrap();
+        let device_info = DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 1024 * 1024 * 1024,
+            os_type: "linux".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: true,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: vec![Device {
+                id: 0,
+                name: "fixture GPU".to_string(),
+                backend: DeviceBackend::Cuda,
+                memory_mb: 128,
+                compute_units: 1,
+                pci_bus_id: None,
+                partition_id: None,
+                driver_version: Some("999.0".to_string()),
+                cuda_version: Some("999.0".to_string()),
+                compute_capability: Some("9.0".to_string()),
+                utilization_gpu_pct: None,
+                temperature_c: None,
+                supports_fp16: true,
+                supports_int8: true,
+            }],
+        };
+
+        let admission =
+            preliminary_memory_admission(&model_path, &manifest, decision, &device_info).unwrap();
+        assert_eq!(admission.status, MemoryAdmissionStatus::Rejected);
+        assert!(admission.required_bytes.unwrap() > admission.available_bytes.unwrap());
     }
 }

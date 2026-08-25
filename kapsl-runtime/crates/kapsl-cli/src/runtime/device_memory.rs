@@ -647,11 +647,7 @@ impl DeviceMemoryManager {
         }
     }
 
-    #[cfg(any(
-        feature = "native",
-        feature = "gguf-native",
-        feature = "gguf-cuda-shared-kv"
-    ))]
+    #[cfg(feature = "gpu-device-pool")]
     pub(crate) fn pool(&self, device_id: usize) -> Option<Arc<GpuDevicePool>> {
         self.pools.lock().unwrap().get(&device_id).cloned()
     }

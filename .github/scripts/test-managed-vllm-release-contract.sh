@@ -4,6 +4,7 @@ set -euo pipefail
 lock_file=".github/scripts/managed-vllm-cu130.lock"
 bootstrap=".github/scripts/bootstrap-vllm-backend.sh"
 packager=".github/scripts/package-linux-vllm-backend.sh"
+index_generator=".github/scripts/generate-backend-index.py"
 runtime="kapsl-runtime/crates/kapsl-cli/src/runtime/managed_vllm.rs"
 sdk_ref="3a4e626f919e11287e0a19bb720c547ec9216f7f"
 
@@ -33,12 +34,19 @@ require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_CUDA_RUNTIME_VERSION: 
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";'
 require_literal "$packager" '--constraint "$requirements_lock"'
 require_literal "$bootstrap" '--constraint "$requirements_lock"'
+require_literal "$packager" '"profile": "cu130-flash-attn"'
+require_literal "$packager" '"runtime_abi": 1'
+require_literal "$index_generator" 'kapsl-backend-index-v1\0'
+require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
 
 for workflow in \
   .github/workflows/release-runtime-installers.yml \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/vllm-shared-pool-conformance.yml; do
   require_literal "$workflow" "$sdk_ref"
+  if [ "$workflow" != ".github/workflows/vllm-shared-pool-conformance.yml" ]; then
+    require_literal "$workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
+  fi
 done
 require_literal "$packager" "$sdk_ref"
 

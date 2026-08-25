@@ -237,3 +237,73 @@ pub(crate) async fn load_prepared_model(
 
     Ok((Arc::new(pool), swap_handles))
 }
+
+/// Reserve the aggregate managed-vLLM weight/workspace estimate before Kapsl
+/// performs any backend download or starts a backend child. The reservation is
+/// intentionally temporary: ordinary per-model load transactions repeat the
+/// admission after installation and retain the authoritative leases.
+pub(crate) async fn preflight_managed_vllm_admission(
+    plans: &[(PathBuf, ModelLoadPlan)],
+    device_info: &DeviceInfo,
+    resources: &Arc<RuntimeResources>,
+) -> Result<Option<MemoryAdmission>, DynError> {
+    use kapsl_engine_api::MemoryReport;
+
+    let mut report = MemoryReport::default();
+    let mut domains = Vec::new();
+    for (_, plan) in plans.iter().filter(|(_, plan)| plan.uses_managed_vllm()) {
+        if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
+            return Err(
+                "managed vLLM currently supports one CUDA device per Kapsl replica; keep --tp-degree=1"
+                    .into(),
+            );
+        }
+        let selection =
+            select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info).map_err(
+                |error| {
+                    format!(
+                "Failed to select a CUDA device for preliminary admission of model {}: {error}",
+                plan.base_model_id
+            )
+                },
+            )?;
+        let device_id = selection
+            .devices
+            .iter()
+            .find(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+            .map(|device| device.id)
+            .ok_or("managed vLLM preliminary admission selected no CUDA device")?;
+        let model_report = managed_vllm_memory_report(
+            &plan.model_file_path,
+            &[device_id],
+            plan.base_model_id,
+            plan.replica_id,
+        )?;
+        report.allocations.extend(model_report.allocations);
+        let domain = MemoryDomain::Cuda { device_id };
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    if report.allocations.is_empty() {
+        return Ok(None);
+    }
+
+    // One synthetic owner lets all startup models targeting the same device be
+    // checked atomically under one device load lock. The admission is dropped
+    // after backend installation, before real model IDs acquire their leases.
+    let owner = MemoryOwner::new(u32::MAX, u32::MAX);
+    let plan = resources
+        .memory()
+        .model_load_plan_with_report(&domains, owner, 0, 0, &report)?;
+    let admission = resources
+        .memory()
+        .begin_load(&plan, EngineKind::Native)
+        .await
+        .map_err(|error| {
+            format!(
+                "preliminary managed-vLLM memory admission rejected before backend download: {error}"
+            )
+        })?;
+    Ok(Some(admission))
+}
