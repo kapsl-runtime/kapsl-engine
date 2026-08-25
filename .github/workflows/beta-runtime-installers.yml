@@ -370,6 +370,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_VERSION: ${{ needs.prepare-version.outputs.version }}
+          EXPECTED_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
         run: |
           set -euo pipefail
 
@@ -378,8 +379,8 @@ jobs:
           while IFS= read -r -d '' file; do
             found=1
             name="$(basename "$file")"
-            if [[ "$name" != *"$EXPECTED_VERSION"* ]]; then
-              echo "Artifact '$name' does not contain the run version '$EXPECTED_VERSION'." >&2
+            if [[ "$name" != *"$EXPECTED_VERSION"* && "$name" != *"$EXPECTED_DEB_VERSION"* ]]; then
+              echo "Artifact '$name' does not contain the run version '$EXPECTED_VERSION' (or Debian form '$EXPECTED_DEB_VERSION')." >&2
               mismatch=1
             fi
           done < <(find release-assets -type f -print0)
