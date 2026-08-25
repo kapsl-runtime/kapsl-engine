@@ -1234,6 +1234,7 @@ mod tests {
             "runtime_abi": BACKEND_RUNTIME_ABI,
             "platform": "linux-x86_64",
             "execution_mode": "native",
+            "kv_mode": "native",
             "entrypoint": "lib/libkapsl_backend_llama_cpp.so"
         });
         append_bytes(
