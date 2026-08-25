@@ -1516,7 +1516,10 @@ mod tests {
         let installed = manager.list().unwrap();
         assert_eq!(installed.len(), 1);
         assert_eq!(installed[0].backend, "llama-cpp");
-        assert_eq!(installed[0].profile, LLAMA_CPP_CPU_PACK_PROFILE);
+        assert_eq!(
+            installed[0].profile,
+            crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE
+        );
         assert!(installed[0].valid);
     }
 
