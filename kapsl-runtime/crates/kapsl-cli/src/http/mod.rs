@@ -12,6 +12,7 @@ pub(crate) mod metrics;
 pub(crate) mod models;
 pub(crate) mod openai;
 pub(crate) mod rag;
+pub(crate) mod server;
 pub(crate) mod static_files;
 pub(crate) mod system;
 
@@ -22,5 +23,6 @@ pub(crate) use metrics::*;
 pub(crate) use models::*;
 pub(crate) use openai::*;
 pub(crate) use rag::*;
+pub(crate) use server::*;
 pub(crate) use static_files::*;
 pub(crate) use system::*;

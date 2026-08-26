@@ -12,19 +12,19 @@ type InferenceStream =
 pub(crate) struct InferenceService {
     models: Arc<ModelManager>,
     pressure: Arc<ResourcePressure>,
-    latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
+    telemetry: Arc<ModelTelemetry>,
 }
 
 impl InferenceService {
     pub(crate) fn new(
         models: Arc<ModelManager>,
         pressure: Arc<ResourcePressure>,
-        latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
+        telemetry: Arc<ModelTelemetry>,
     ) -> Arc<Self> {
         Arc::new(Self {
             models,
             pressure,
-            latency_samples,
+            telemetry,
         })
     }
 
@@ -65,7 +65,8 @@ impl InferenceService {
         };
 
         if result.is_ok() {
-            self.latency_samples
+            self.telemetry
+                .latency_samples
                 .write()
                 .entry(model_id)
                 .or_default()
@@ -335,8 +336,7 @@ mod tests {
             vec![],
         );
         let pressure = ResourcePressure::new(state, pressure_config());
-        let service =
-            InferenceService::new(models, pressure, Arc::new(RwLock::new(HashMap::new())));
+        let service = InferenceService::new(models, pressure, Arc::new(ModelTelemetry::default()));
         (service, seen_cap)
     }
 
@@ -402,7 +402,7 @@ mod tests {
         let service = InferenceService::new(
             models.clone(),
             pressure,
-            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(ModelTelemetry::default()),
         );
         assert!(service.scheduler_for_transport(MODEL_ID).is_none());
 

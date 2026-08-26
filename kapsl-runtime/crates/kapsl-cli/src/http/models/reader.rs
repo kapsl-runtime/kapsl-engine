@@ -3,10 +3,7 @@ use super::*;
 pub(crate) struct ModelReaderRoutesConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) shared_metrics: kapsl_monitor::metrics::KapslMetrics,
-    pub(crate) throughput_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
-    pub(crate) generated_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
-    pub(crate) total_token_samples: Arc<RwLock<HashMap<u32, ThroughputSample>>>,
-    pub(crate) latency_samples: Arc<RwLock<HashMap<u32, LatencyWindow>>>,
+    pub(crate) telemetry: Arc<ModelTelemetry>,
 }
 
 pub(crate) fn build_model_reader_routes(
@@ -15,18 +12,12 @@ pub(crate) fn build_model_reader_routes(
     let ModelReaderRoutesConfig {
         models,
         shared_metrics: shared_metrics_clone,
-        throughput_samples: throughput_samples_clone,
-        generated_token_samples: generated_token_samples_clone,
-        total_token_samples: total_token_samples_clone,
-        latency_samples: latency_samples_clone,
+        telemetry,
     } = config;
 
     let models_for_list = models.clone();
     let metrics_for_list = shared_metrics_clone.clone();
-    let throughput_samples_for_list = throughput_samples_clone.clone();
-    let generated_token_samples_for_list = generated_token_samples_clone.clone();
-    let total_token_samples_for_list = total_token_samples_clone.clone();
-    let latency_samples_for_list = latency_samples_clone.clone();
+    let telemetry_for_list = telemetry.clone();
     let list_models = warp::path!("api" / "models").and(warp::get()).map(move || {
         #[derive(Serialize)]
         struct ModelStatus {
@@ -61,10 +52,10 @@ pub(crate) fn build_model_reader_routes(
         let mut statuses = Vec::new();
         let now = Instant::now();
         let mut seen_ids = HashSet::new();
-        let mut throughput_samples = throughput_samples_for_list.write();
-        let mut latency_samples = latency_samples_for_list.write();
-        let mut generated_token_samples = generated_token_samples_for_list.write();
-        let mut total_token_samples = total_token_samples_for_list.write();
+        let mut throughput_samples = telemetry_for_list.throughput_samples.write();
+        let mut latency_samples = telemetry_for_list.latency_samples.write();
+        let mut generated_token_samples = telemetry_for_list.generated_token_samples.write();
+        let mut total_token_samples = telemetry_for_list.total_token_samples.write();
 
         for model in model_infos {
             seen_ids.insert(model.id);
@@ -193,9 +184,7 @@ pub(crate) fn build_model_reader_routes(
 
     let models_for_get = models.clone();
     let metrics_for_get = shared_metrics_clone.clone();
-    let throughput_samples_for_get = throughput_samples_clone.clone();
-    let generated_token_samples_for_get = generated_token_samples_clone.clone();
-    let total_token_samples_for_get = total_token_samples_clone.clone();
+    let telemetry_for_get = telemetry;
     let get_model =
         warp::path!("api" / "models" / u32)
             .and(warp::get())
@@ -296,7 +285,8 @@ pub(crate) fn build_model_reader_routes(
                         let gpu_utilization = engine_gpu_util;
                         let throughput = {
                             let now = Instant::now();
-                            let mut throughput_samples = throughput_samples_for_get.write();
+                            let mut throughput_samples =
+                                telemetry_for_get.throughput_samples.write();
                             update_throughput(
                                 &mut throughput_samples,
                                 model.id,
@@ -307,8 +297,9 @@ pub(crate) fn build_model_reader_routes(
                         let (generated_tokens_per_sec, total_tokens_per_sec) = {
                             let now = Instant::now();
                             let mut generated_token_samples =
-                                generated_token_samples_for_get.write();
-                            let mut total_token_samples = total_token_samples_for_get.write();
+                                telemetry_for_get.generated_token_samples.write();
+                            let mut total_token_samples =
+                                telemetry_for_get.total_token_samples.write();
                             (
                                 update_throughput(
                                     &mut generated_token_samples,

@@ -49,8 +49,19 @@ pub(crate) struct ManagedVllmDeployment {
     coordinator: parking_lot::RwLock<Option<Arc<ExternalKvCoordinator>>>,
 }
 
+/// Deployment plus the KV-control settings derived during preparation.
+pub(crate) struct PreparedManagedVllmDeployment {
+    pub(crate) deployment: Arc<ManagedVllmDeployment>,
+    pub(crate) control_socket: PathBuf,
+    pub(crate) shared_pool_profile: String,
+}
+
 impl ManagedVllmDeployment {
-    pub(crate) fn prepare(args: &mut Args) -> Result<Arc<Self>, String> {
+    pub(crate) fn prepare(
+        state_dir: Option<&Path>,
+        requested_control_socket: Option<&Path>,
+        lease_ttl_ms: u64,
+    ) -> Result<PreparedManagedVllmDeployment, String> {
         if !cfg!(all(feature = "gpu-device-pool", target_os = "linux")) {
             return Err(
                 "managed vLLM requires a Linux Kapsl build with `gpu-device-pool` enabled"
@@ -58,7 +69,7 @@ impl ManagedVllmDeployment {
             );
         }
 
-        let runtime_root = managed_vllm_runtime_root(args.state_dir.as_deref());
+        let runtime_root = managed_vllm_runtime_root(state_dir);
         std::fs::create_dir_all(&runtime_root).map_err(|error| {
             format!(
                 "create managed vLLM runtime directory {}: {error}",
@@ -75,20 +86,11 @@ impl ManagedVllmDeployment {
             },
         )?;
 
-        let socket_path = match args.kv_control_socket.as_ref() {
+        let socket_path = match requested_control_socket {
             Some(path) => absolute_path(path)?,
             None => runtime_root.join("kv-control.sock"),
         };
-        args.kv_control_socket = Some(socket_path.clone());
-
-        let profile = certified_vllm_profile();
-        if !args
-            .kv_shared_pool_profile
-            .iter()
-            .any(|candidate| candidate == &profile)
-        {
-            args.kv_shared_pool_profile.push(profile);
-        }
+        let shared_pool_profile = certified_vllm_profile();
 
         let python = discover_certified_vllm_python()?;
         log::info!(
@@ -99,15 +101,20 @@ impl ManagedVllmDeployment {
             MANAGED_VLLM_PROFILE_ID
         );
 
-        Ok(Arc::new(Self {
+        let deployment = Arc::new(Self {
             python,
             control_endpoint: format!("unix://{}", socket_path.display()),
             runtime_root,
-            lease_ttl_ms: args.kv_control_lease_ttl_ms,
+            lease_ttl_ms,
             runtimes: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(unix)]
             coordinator: parking_lot::RwLock::new(None),
-        }))
+        });
+        Ok(PreparedManagedVllmDeployment {
+            deployment,
+            control_socket: socket_path,
+            shared_pool_profile,
+        })
     }
 
     #[cfg(unix)]
