@@ -2,34 +2,16 @@ use super::*;
 
 pub(crate) struct AutoScalerTaskConfig {
     pub(crate) auto_scaler: Arc<RwLock<AutoScaler>>,
-    pub(crate) models: Arc<ModelManager>,
-    pub(crate) device_info: Arc<DeviceInfo>,
-    pub(crate) shared_metrics: kapsl_monitor::metrics::KapslMetrics,
-    pub(crate) resources: Arc<RuntimeResources>,
-    pub(crate) batch_size: usize,
-    pub(crate) scheduler_queue_size: usize,
-    pub(crate) scheduler_max_micro_batch: usize,
-    pub(crate) scheduler_queue_delay_ms: u64,
-    pub(crate) topology: String,
-    pub(crate) tp_degree: usize,
-    pub(crate) onnx_tuning_profile: Arc<OnnxTuningProfile>,
+    pub(crate) model_runtime: Arc<ModelRuntime>,
 }
 
 pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
     let AutoScalerTaskConfig {
         auto_scaler: auto_scaler_clone,
-        models: models_for_scaler,
-        device_info: device_info_for_scaler,
-        shared_metrics: shared_metrics_for_scaler,
-        resources: resources_for_scaler,
-        batch_size: batch_size_for_scaler,
-        scheduler_queue_size: scheduler_queue_size_for_scaler,
-        scheduler_max_micro_batch: scheduler_max_micro_batch_for_scaler,
-        scheduler_queue_delay_ms: scheduler_queue_delay_ms_for_scaler,
-        topology: topology_for_scaler,
-        tp_degree: tp_degree_for_scaler,
-        onnx_tuning_profile: onnx_tuning_profile_for_scaler,
+        model_runtime,
     } = config;
+    let models_for_scaler = model_runtime.models().clone();
+    let shared_metrics_for_scaler = model_runtime.shared_metrics().clone();
 
     tokio::spawn(async move {
         use std::time::Duration;
@@ -106,7 +88,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                     // load growth: a new replica would land on the same starved
                     // device and thrash. Skip and re-evaluate next tick — the
                     // ceiling's grow-slow recovery provides the hysteresis.
-                    let memory_snapshot = resources_for_scaler.memory().snapshot();
+                    let memory_snapshot = model_runtime.memory_snapshot();
                     if memory_snapshot.foreign_pressure_active {
                         log::warn!(
                             "Auto-scaler: model {} queue depth {} exceeds threshold, but a \
@@ -119,7 +101,6 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                         );
                         continue;
                     }
-                    let onnx_tuning = onnx_tuning_profile_for_scaler.resolve(base_model_id);
                     let capped_target = memory_snapshot.cap_replica_target(
                         base_model_id,
                         current_replicas,
@@ -165,24 +146,9 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                             .get_next_replica_id(base_model_id, &existing_replica_ids);
                         let unique_id = models_for_scaler.next_replica_unique_id();
 
-                        match scale_up_model(
-                            base_model_id,
-                            next_replica_id,
-                            unique_id,
-                            &model_path,
-                            &device_info_for_scaler,
-                            resources_for_scaler.clone(),
-                            batch_size_for_scaler,
-                            scheduler_queue_size_for_scaler,
-                            scheduler_max_micro_batch_for_scaler,
-                            scheduler_queue_delay_ms_for_scaler,
-                            topology_for_scaler.as_str(),
-                            tp_degree_for_scaler,
-                            models_for_scaler.registry(),
-                            &shared_metrics_for_scaler,
-                            onnx_tuning.clone(),
-                        )
-                        .await
+                        match model_runtime
+                            .scale_up_model(base_model_id, next_replica_id, unique_id, &model_path)
+                            .await
                         {
                             Ok((scheduler, handle)) => {
                                 // Add new replica to the pool
@@ -234,13 +200,9 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                         replica_ids.iter().take(replicas_to_remove as usize)
                     {
                         let _operation = models_for_scaler.lock_lifecycle(base_model_id).await;
-                        if let Err(e) = scale_down_model(
-                            base_model_id,
-                            *replica_id,
-                            *unique_id,
-                            &models_for_scaler,
-                        )
-                        .await
+                        if let Err(e) = model_runtime
+                            .scale_down_model(base_model_id, *replica_id, *unique_id)
+                            .await
                         {
                             log::error!("Failed to scale down model {}: {}", base_model_id, e);
                         }

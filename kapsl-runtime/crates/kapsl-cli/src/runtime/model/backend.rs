@@ -1,4 +1,5 @@
 use super::*;
+use kapsl_backends::OnnxRuntimeTuning;
 use kapsl_engine_api::{
     EngineStream, ExternalDeviceMemoryReport, MemoryReport, RequestMemoryAdmission,
 };
@@ -310,7 +311,7 @@ pub(super) fn create_runtime_backend_for_device(
     provider: &str,
     device_id: usize,
     device_info: &DeviceInfo,
-    tuning: &OnnxRuntimeTuning,
+    tuning: Option<&OnnxRuntimeTuning>,
     resources: &RuntimeResources,
     model_id: u32,
     replica_id: u32,
@@ -389,6 +390,20 @@ pub(super) fn create_runtime_backend_for_device(
         let backend = backend.with_env_allocators(resources.uses_env_allocators(device_id));
         return Ok(Box::new(backend));
     }
+
+    let default_tuning = OnnxRuntimeTuning::default();
+    let tuning = match tuning {
+        Some(tuning) => tuning,
+        None if engine_kind.uses_onnx_session() => {
+            return Err(format!(
+                "missing ONNX runtime tuning for {} backend",
+                engine_kind.label()
+            ));
+        }
+        // The SDK factory still accepts an ONNX tuning reference at its
+        // backend-neutral boundary. Non-ONNX branches ignore this default.
+        None => &default_tuning,
+    };
 
     BackendFactory::create_backend_for_device_with_tuning_and_owner(
         manifest,

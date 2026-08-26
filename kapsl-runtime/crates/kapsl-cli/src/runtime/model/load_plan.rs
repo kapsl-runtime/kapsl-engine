@@ -1,4 +1,112 @@
 use super::*;
+use kapsl_backends::OnnxRuntimeTuning;
+
+/// Immutable runtime defaults injected into model-load planning.
+///
+/// CLI parsing is intentionally kept outside the planner. The composition root
+/// translates CLI values into this domain configuration once, and every startup,
+/// lifecycle, worker, and autoscaling path shares the same defaults.
+#[derive(Clone, Debug)]
+pub(crate) struct ModelLoadDefaults {
+    pub(crate) batch_size: usize,
+    pub(crate) scheduler_queue_size: usize,
+    pub(crate) scheduler_max_micro_batch: usize,
+    pub(crate) scheduler_queue_delay_ms: u64,
+    pub(crate) placement: ModelLoadPlacement,
+}
+
+/// Requested topology for one model load.
+///
+/// Most loads use [`ModelLoadDefaults::placement`], while API-triggered loads can
+/// inject an explicit request-scoped placement without rebuilding the planner.
+#[derive(Clone, Debug)]
+pub(crate) struct ModelLoadPlacement {
+    pub(crate) topology: String,
+    pub(crate) tp_degree: usize,
+}
+
+impl ModelLoadPlacement {
+    pub(crate) fn new(topology: impl Into<String>, tp_degree: usize) -> Self {
+        Self {
+            topology: topology.into(),
+            tp_degree,
+        }
+    }
+}
+
+/// Backend-specific tuning resolved after a package's engine kind is known.
+///
+/// Keeping this on [`ModelLoadPlan`] prevents ONNX settings from appearing in
+/// backend-neutral load APIs. Additional backend families can add variants
+/// without changing every caller.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum BackendLoadTuning {
+    #[default]
+    None,
+    Onnx(OnnxRuntimeTuning),
+}
+
+impl BackendLoadTuning {
+    pub(crate) fn onnx(&self) -> Option<&OnnxRuntimeTuning> {
+        match self {
+            Self::Onnx(tuning) => Some(tuning),
+            Self::None => None,
+        }
+    }
+}
+
+/// Injected source of backend-specific model tuning.
+pub(crate) trait BackendTuningProvider: Send + Sync {
+    fn resolve(&self, model_id: u32, engine_kind: EngineKind) -> BackendLoadTuning;
+}
+
+/// Plans model loads from immutable defaults and an injected tuning provider.
+#[derive(Clone)]
+pub(crate) struct ModelLoadPlanner {
+    device_info: Arc<DeviceInfo>,
+    defaults: ModelLoadDefaults,
+    tuning_provider: Arc<dyn BackendTuningProvider>,
+}
+
+impl ModelLoadPlanner {
+    pub(crate) fn new(
+        device_info: Arc<DeviceInfo>,
+        defaults: ModelLoadDefaults,
+        tuning_provider: Arc<dyn BackendTuningProvider>,
+    ) -> Self {
+        Self {
+            device_info,
+            defaults,
+            tuning_provider,
+        }
+    }
+
+    /// Returns the immutable hardware snapshot shared by every load plan.
+    pub(crate) fn device_info(&self) -> &DeviceInfo {
+        self.device_info.as_ref()
+    }
+
+    /// Creates an immutable plan, applying an optional request-scoped placement.
+    pub(crate) fn prepare(
+        &self,
+        base_model_id: u32,
+        runtime_model_id: u32,
+        replica_id: u32,
+        model_path: &Path,
+        placement: Option<&ModelLoadPlacement>,
+    ) -> Result<ModelLoadPlan, DynError> {
+        build_model_load_plan(
+            base_model_id,
+            runtime_model_id,
+            replica_id,
+            model_path,
+            self.device_info(),
+            &self.defaults,
+            placement.unwrap_or(&self.defaults.placement),
+            self.tuning_provider.as_ref(),
+        )
+    }
+}
 
 /// Immutable inputs derived once before any backend allocation starts.
 /// Primary loads and scale-up replicas consume the same package, policy, and
@@ -22,6 +130,7 @@ pub(crate) struct ModelLoadPlan {
     pub(super) worker_topology: &'static str,
     pub(super) worker_tp_degree: usize,
     pub(super) use_pipeline_backend: bool,
+    pub(super) backend_tuning: BackendLoadTuning,
     #[cfg(feature = "gpu-device-pool")]
     pub(super) onnx_peak_concurrency: usize,
     pub(super) isolate_process: bool,
@@ -45,16 +154,10 @@ pub(super) fn build_model_load_plan(
     replica_id: u32,
     model_path: &Path,
     device_info: &DeviceInfo,
-    batch_size: usize,
-    scheduler_queue_size: usize,
-    scheduler_max_micro_batch: usize,
-    scheduler_queue_delay_ms: u64,
-    topology: &str,
-    tp_degree: usize,
-    onnx_tuning: &OnnxRuntimeTuning,
+    defaults: &ModelLoadDefaults,
+    placement: &ModelLoadPlacement,
+    tuning_provider: &dyn BackendTuningProvider,
 ) -> Result<ModelLoadPlan, Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(not(feature = "gpu-device-pool"))]
-    let _ = onnx_tuning;
     let absolute_path = model_path.canonicalize().map_err(|error| {
         format!(
             "Invalid model path {:?}: {} (CWD: {:?})",
@@ -123,8 +226,8 @@ pub(super) fn build_model_load_plan(
     let (scheduler_max_micro_batch, scheduler_queue_delay_ms) =
         resolve_scheduler_tuning_for_framework(
             &loader.manifest,
-            scheduler_max_micro_batch,
-            scheduler_queue_delay_ms,
+            defaults.scheduler_max_micro_batch,
+            defaults.scheduler_queue_delay_ms,
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, base_model_id);
     let pipeline_stages = manifest_llm_pipeline_stages(&loader.manifest);
@@ -135,8 +238,8 @@ pub(super) fn build_model_load_plan(
         use_pipeline_backend,
     } = resolve_effective_topology_choice(
         &loader.manifest,
-        topology,
-        tp_degree,
+        &placement.topology,
+        placement.tp_degree,
         pipeline_stages.as_deref(),
     );
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
@@ -148,9 +251,11 @@ pub(super) fn build_model_load_plan(
         })?;
     export_gguf_auto_sizing_hint(
         &loader.manifest,
-        batch_size,
+        defaults.batch_size,
         Some(model_file_path.as_path()),
     );
+    let engine_kind = EngineKind::resolve(&loader.manifest);
+    let backend_tuning = tuning_provider.resolve(base_model_id, engine_kind);
 
     Ok(ModelLoadPlan {
         base_model_id,
@@ -159,8 +264,8 @@ pub(super) fn build_model_load_plan(
         absolute_path,
         model_file_path,
         serving_backend,
-        batch_size,
-        scheduler_queue_size,
+        batch_size: defaults.batch_size,
+        scheduler_queue_size: defaults.scheduler_queue_size,
         scheduler_max_micro_batch,
         scheduler_queue_delay_ms,
         queue_overflow_policy,
@@ -170,11 +275,14 @@ pub(super) fn build_model_load_plan(
         worker_topology,
         worker_tp_degree,
         use_pipeline_backend,
+        backend_tuning: backend_tuning.clone(),
         #[cfg(feature = "gpu-device-pool")]
-        onnx_peak_concurrency: if EngineKind::resolve(&loader.manifest).is_onnx_generate() {
-            1
-        } else {
-            onnx_tuning.peak_concurrency_hint.unwrap_or(1).max(1) as usize
+        onnx_peak_concurrency: match &backend_tuning {
+            BackendLoadTuning::Onnx(_) if engine_kind.is_onnx_generate() => 1,
+            BackendLoadTuning::Onnx(tuning) => {
+                tuning.peak_concurrency_hint.unwrap_or(1).max(1) as usize
+            }
+            BackendLoadTuning::None => 1,
         },
         isolate_process: resolve_isolate_process(&loader.manifest),
         isolate_strict: resolve_isolate_process_strict(&loader.manifest),
@@ -370,7 +478,6 @@ fn planned_external_weight_bytes(kind: EngineKind, model_path: &Path) -> Result<
 
 pub(super) async fn start_isolated_worker(
     plan: &ModelLoadPlan,
-    onnx_tuning: &OnnxRuntimeTuning,
 ) -> Result<Option<Arc<WorkerProcess>>, Box<dyn std::error::Error + Send + Sync>> {
     if !plan.isolate_process {
         return Ok(None);
@@ -391,7 +498,7 @@ pub(super) async fn start_isolated_worker(
         plan.scheduler_queue_delay_ms,
         plan.worker_topology,
         plan.worker_tp_degree,
-        onnx_tuning,
+        plan.backend_tuning.onnx(),
     ) {
         Ok(worker) => {
             let worker = Arc::new(worker);

@@ -1,4 +1,5 @@
 use super::*;
+use kapsl_backends::OnnxRuntimeTuning;
 #[cfg(unix)]
 use kapsl_transport::protocol::{
     blocking as wire, CodecError, StreamResponse, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_INFER_STREAM,
@@ -40,7 +41,7 @@ pub(crate) struct WorkerSpec {
     scheduler_queue_delay_ms: u64,
     topology: String,
     tp_degree: usize,
-    onnx_tuning: OnnxRuntimeTuning,
+    onnx_tuning: Option<OnnxRuntimeTuning>,
     offline: bool,
 }
 
@@ -214,30 +215,31 @@ pub(crate) fn build_worker_command(
         // pool capacity as its siblings.
         command.env(GPU_DEVICE_POOL_DISABLED_ENV, "1");
     }
-    let onnx_tuning = &spec.onnx_tuning;
-    if let Some(value) = onnx_tuning.memory_pattern {
-        command.arg("--onnx-memory-pattern").arg(value.to_string());
-    }
-    if let Some(value) = onnx_tuning.disable_cpu_mem_arena {
-        command
-            .arg("--onnx-disable-cpu-mem-arena")
-            .arg(value.to_string());
-    }
-    if let Some(value) = onnx_tuning.session_buckets {
-        command.arg("--onnx-session-buckets").arg(value.to_string());
-    }
-    if let Some(value) = onnx_tuning.bucket_dim_granularity {
-        command
-            .arg("--onnx-bucket-dim-granularity")
-            .arg(value.to_string());
-    }
-    if let Some(value) = onnx_tuning.bucket_max_dims {
-        command.arg("--onnx-bucket-max-dims").arg(value.to_string());
-    }
-    if let Some(value) = onnx_tuning.peak_concurrency_hint {
-        command
-            .arg("--onnx-peak-concurrency-hint")
-            .arg(value.to_string());
+    if let Some(onnx_tuning) = &spec.onnx_tuning {
+        if let Some(value) = onnx_tuning.memory_pattern {
+            command.arg("--onnx-memory-pattern").arg(value.to_string());
+        }
+        if let Some(value) = onnx_tuning.disable_cpu_mem_arena {
+            command
+                .arg("--onnx-disable-cpu-mem-arena")
+                .arg(value.to_string());
+        }
+        if let Some(value) = onnx_tuning.session_buckets {
+            command.arg("--onnx-session-buckets").arg(value.to_string());
+        }
+        if let Some(value) = onnx_tuning.bucket_dim_granularity {
+            command
+                .arg("--onnx-bucket-dim-granularity")
+                .arg(value.to_string());
+        }
+        if let Some(value) = onnx_tuning.bucket_max_dims {
+            command.arg("--onnx-bucket-max-dims").arg(value.to_string());
+        }
+        if let Some(value) = onnx_tuning.peak_concurrency_hint {
+            command
+                .arg("--onnx-peak-concurrency-hint")
+                .arg(value.to_string());
+        }
     }
     Ok(command)
 }
@@ -254,7 +256,7 @@ pub(crate) fn spawn_worker_process(
     scheduler_queue_delay_ms: u64,
     topology: &str,
     tp_degree: usize,
-    onnx_tuning: &OnnxRuntimeTuning,
+    onnx_tuning: Option<&OnnxRuntimeTuning>,
 ) -> Result<WorkerProcess, Box<dyn std::error::Error + Send + Sync>> {
     let spec = WorkerSpec {
         model_id,
@@ -265,7 +267,7 @@ pub(crate) fn spawn_worker_process(
         scheduler_queue_delay_ms,
         topology: topology.to_string(),
         tp_degree,
-        onnx_tuning: onnx_tuning.clone(),
+        onnx_tuning: onnx_tuning.cloned(),
         offline: backend_packs_are_offline(),
     };
 
