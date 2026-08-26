@@ -3,11 +3,83 @@
 use super::types::*;
 use super::*;
 use futures::StreamExt;
+use kapsl_engine_api::{
+    OpenAiWireEndpoint, OpenAiWireFormat, OpenAiWireHeader, OpenAiWireMetadata, OpenAiWireRequest,
+    OpenAiWireResponse, OpenAiWireResponseHead, OpenAiWireStreamResponse,
+};
+use warp::hyper::body::Buf;
+
+const VLLM_BRIDGE_MODE_ENV: &str = "KAPSL_VLLM_BRIDGE_MODE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedVllmOpenAiMode {
+    Translated,
+    Wire,
+}
+
+impl ManagedVllmOpenAiMode {
+    fn from_environment() -> Self {
+        match std::env::var(VLLM_BRIDGE_MODE_ENV) {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "wire" => Self::Wire,
+                "legacy" | "async-translated" | "translated" | "" => Self::Translated,
+                other => {
+                    log::warn!(
+                        "Ignoring unsupported {VLLM_BRIDGE_MODE_ENV}={other:?}; expected wire, async-translated, or legacy"
+                    );
+                    Self::Translated
+                }
+            },
+            Err(_) => Self::Translated,
+        }
+    }
+}
 
 pub(crate) struct ChatCompletionsConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
+}
+
+enum BoundedChatBody {
+    Bytes(warp::hyper::body::Bytes),
+    TooLarge,
+    ReadError(String),
+}
+
+fn bounded_chat_body(
+) -> impl warp::Filter<Extract = (BoundedChatBody,), Error = warp::Rejection> + Clone {
+    warp::body::stream().then(collect_bounded_chat_body)
+}
+
+async fn collect_bounded_chat_body<S, B>(body: S) -> BoundedChatBody
+where
+    S: futures::Stream<Item = Result<B, warp::Error>>,
+    B: Buf,
+{
+    futures::pin_mut!(body);
+    let limit = kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES;
+    let mut collected = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let mut chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => return BoundedChatBody::ReadError(error.to_string()),
+        };
+        let Some(next_len) = collected.len().checked_add(chunk.remaining()) else {
+            return BoundedChatBody::TooLarge;
+        };
+        if next_len > limit {
+            return BoundedChatBody::TooLarge;
+        }
+        collected.reserve(chunk.remaining());
+        while chunk.has_remaining() {
+            let bytes = chunk.chunk();
+            let length = bytes.len();
+            collected.extend_from_slice(bytes);
+            chunk.advance(length);
+        }
+    }
+    BoundedChatBody::Bytes(warp::hyper::body::Bytes::from(collected))
 }
 
 pub(crate) fn build_chat_completions_route(
@@ -18,14 +90,15 @@ pub(crate) fn build_chat_completions_route(
         inference,
         log_sensitive_ids,
     } = config;
+    let managed_vllm_mode = ManagedVllmOpenAiMode::from_environment();
 
     warp::path!("v1" / "chat" / "completions")
         .and(warp::post())
-        .and(warp::body::bytes())
+        .and(bounded_chat_body())
         .and(warp::header::optional::<String>("x-kapsl-session"))
         .and(warp::header::optional::<String>("authorization"))
         .and_then(
-            move |body: warp::hyper::body::Bytes,
+            move |body: BoundedChatBody,
                   session_header: Option<String>,
                   authorization: Option<String>| {
                 let models = models.clone();
@@ -39,6 +112,7 @@ pub(crate) fn build_chat_completions_route(
                             &models,
                             &inference,
                             log_sensitive_ids,
+                            managed_vllm_mode,
                         )
                         .await,
                     )
@@ -51,16 +125,48 @@ pub(crate) fn build_chat_completions_route(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_chat_completion(
-    body: warp::hyper::body::Bytes,
+    body: BoundedChatBody,
     session_header: Option<String>,
     authorization: Option<String>,
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
     log_sensitive_ids: bool,
+    managed_vllm_mode: ManagedVllmOpenAiMode,
 ) -> warp::reply::Response {
     use warp::http::StatusCode;
 
-    let chat: ChatCompletionRequest = match serde_json::from_slice(body.as_ref()) {
+    let body = match body {
+        BoundedChatBody::Bytes(body) => body,
+        BoundedChatBody::TooLarge => {
+            return openai_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Chat completion payload exceeds the {}-byte limit",
+                    kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
+                ),
+                "invalid_request_error",
+            );
+        }
+        BoundedChatBody::ReadError(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read chat completion payload: {error}"),
+                "invalid_request_error",
+            );
+        }
+    };
+
+    let mut normalized_body: serde_json::Value = match serde_json::from_slice(body.as_ref()) {
+        Ok(value) => value,
+        Err(error) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid chat completion payload: {error}"),
+                "invalid_request_error",
+            );
+        }
+    };
+    let chat: ChatCompletionRequest = match serde_json::from_value(normalized_body.clone()) {
         Ok(chat) => chat,
         Err(error) => {
             return openai_error(
@@ -90,6 +196,57 @@ async fn handle_chat_completion(
         );
     }
 
+    let is_managed_vllm = models
+        .registry()
+        .get(resolved.id)
+        .is_some_and(|model| model.device == "vllm");
+
+    let request_id = completion_id();
+    // KV affinity: an explicit session header wins, else the OpenAI end-user id.
+    // The internal key is credential-scoped because both values are controlled
+    // by the client and must not collide across authentication principals.
+    let client_session_id = session_header
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+        .or_else(|| {
+            chat.user
+                .as_ref()
+                .map(|user| user.trim().to_string())
+                .filter(|user| !user.is_empty())
+        });
+    let scoped_session_id =
+        scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
+    let session_id_for_log = redact_identifier_for_logs(
+        client_session_id.as_deref().unwrap_or("-"),
+        log_sensitive_ids,
+    );
+
+    if is_managed_vllm && managed_vllm_mode == ManagedVllmOpenAiMode::Wire {
+        if let Some(object) = normalized_body.as_object_mut() {
+            object.insert(
+                "model".to_string(),
+                serde_json::Value::String(resolved.name.clone()),
+            );
+        } else {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "Chat completion payload must be a JSON object",
+                "invalid_request_error",
+            );
+        }
+        return relay_managed_vllm_wire(ManagedVllmWireArgs {
+            inference: inference.clone(),
+            model_id: resolved.id,
+            normalized_body,
+            original_body_bytes: body.len(),
+            stream: chat.stream,
+            request_id,
+            session_id: scoped_session_id,
+            session_id_for_log,
+        })
+        .await;
+    }
+
     let prompt = match build_prompt(&chat.messages, &resolved.name) {
         Ok(prompt) => prompt,
         Err(message) => {
@@ -97,10 +254,6 @@ async fn handle_chat_completion(
         }
     };
     let stops = chat.stop_sequences();
-    let is_managed_vllm = models
-        .registry()
-        .get(resolved.id)
-        .is_some_and(|model| model.device == "vllm");
 
     // A UTF-8 prompt tensor is shaped `[1, byte_len]`, matching the RAG and
     // native inference path. `[1]` only validates for a one-byte prompt.
@@ -129,31 +282,13 @@ async fn handle_chat_completion(
         }
     };
 
-    let request_id = completion_id();
     let mut metadata = chat.to_request_metadata();
     metadata.request_id = Some(request_id.clone());
 
     let mut request = InferenceRequest::new(input).with_metadata(metadata);
-    // KV affinity: an explicit session header wins, else the OpenAI end-user id.
-    // The internal key is credential-scoped because both values are controlled
-    // by the client and must not collide across authentication principals.
-    let client_session_id = session_header
-        .map(|session| session.trim().to_string())
-        .filter(|session| !session.is_empty())
-        .or_else(|| {
-            chat.user
-                .as_ref()
-                .map(|user| user.trim().to_string())
-                .filter(|user| !user.is_empty())
-        });
-    request.session_id =
-        scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
+    request.session_id = scoped_session_id;
 
     let scheduler_priority = inference.priority_for_request(&request);
-    let session_id_for_log = redact_identifier_for_logs(
-        client_session_id.as_deref().unwrap_or("-"),
-        log_sensitive_ids,
-    );
 
     let cancellation = request
         .cancellation
@@ -231,6 +366,183 @@ async fn handle_chat_completion(
             openai_error(status, error.to_string(), "server_error")
         }
     }
+}
+
+struct ManagedVllmWireArgs {
+    inference: Arc<InferenceService>,
+    model_id: u32,
+    normalized_body: serde_json::Value,
+    original_body_bytes: usize,
+    stream: bool,
+    request_id: String,
+    session_id: Option<String>,
+    session_id_for_log: String,
+}
+
+async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Response {
+    let ManagedVllmWireArgs {
+        inference,
+        model_id,
+        mut normalized_body,
+        original_body_bytes,
+        stream,
+        request_id,
+        session_id,
+        session_id_for_log,
+    } = args;
+
+    let metadata = OpenAiWireMetadata {
+        request_id: Some(request_id),
+        timeout_ms: None,
+        priority: None,
+    };
+    let priority = inference.priority_for_openai_wire_parts(original_body_bytes, Some(&metadata));
+    let generation_cap = match inference.openai_wire_generation_cap(priority) {
+        Ok(cap) => cap,
+        Err(error) => {
+            return logged_wire_error(model_id, &session_id_for_log, error, "admission");
+        }
+    };
+    if let Some(cap) = generation_cap {
+        apply_wire_generation_cap(&mut normalized_body, cap);
+    }
+
+    let serialized = match serde_json::to_vec(&normalized_body) {
+        Ok(body) => body,
+        Err(error) => {
+            return openai_error(
+                warp::http::StatusCode::BAD_REQUEST,
+                format!("Failed to normalize chat completion payload: {error}"),
+                "invalid_request_error",
+            );
+        }
+    };
+    let format = if stream {
+        OpenAiWireFormat::ServerSentEvents
+    } else {
+        OpenAiWireFormat::Json
+    };
+    let mut request =
+        OpenAiWireRequest::new(OpenAiWireEndpoint::ChatCompletions, format, serialized)
+            .with_metadata(metadata);
+    request.session_id = session_id;
+    request.cancellation = Some(kapsl_engine_api::CancellationToken::new());
+    if let Err(error) =
+        request.validate(kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+    {
+        return openai_error(
+            status_code_for_engine_error(&error),
+            error.to_string(),
+            "invalid_request_error",
+        );
+    }
+
+    if stream {
+        match inference
+            .infer_openai_wire_stream(model_id, request, priority, false)
+            .await
+        {
+            Ok(response) => wire_stream_response(response).unwrap_or_else(|error| {
+                openai_error(warp::http::StatusCode::BAD_GATEWAY, error, "server_error")
+            }),
+            Err(error) => logged_wire_error(model_id, &session_id_for_log, error, "stream start"),
+        }
+    } else {
+        match inference
+            .infer_openai_wire(model_id, request, priority, false)
+            .await
+        {
+            Ok(response) => wire_buffered_response(response).unwrap_or_else(|error| {
+                openai_error(warp::http::StatusCode::BAD_GATEWAY, error, "server_error")
+            }),
+            Err(error) => logged_wire_error(model_id, &session_id_for_log, error, "request"),
+        }
+    }
+}
+
+fn apply_wire_generation_cap(body: &mut serde_json::Value, cap: u32) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    let mut found = false;
+    for field in ["max_tokens", "max_completion_tokens"] {
+        if let Some(value) = object.get(field) {
+            found = true;
+            let value = value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .map_or(cap, |value| value.min(cap));
+            object.insert(field.to_string(), serde_json::Value::from(value));
+        }
+    }
+    if !found {
+        object.insert(
+            "max_completion_tokens".to_string(),
+            serde_json::Value::from(cap),
+        );
+    }
+}
+
+fn logged_wire_error(
+    model_id: u32,
+    session_id_for_log: &str,
+    error: EngineError,
+    stage: &str,
+) -> warp::reply::Response {
+    let status = status_code_for_engine_error(&error);
+    if status == warp::http::StatusCode::INTERNAL_SERVER_ERROR {
+        log::error!(
+            "Managed vLLM wire {stage} failed: model_id={model_id} session_id={session_id_for_log} status={} error={error}",
+            status.as_u16()
+        );
+    } else {
+        log::warn!(
+            "Managed vLLM wire {stage} rejected: model_id={model_id} session_id={session_id_for_log} status={} error={error}",
+            status.as_u16()
+        );
+    }
+    openai_error(status, error.to_string(), "server_error")
+}
+
+fn wire_response_builder(
+    head: &OpenAiWireResponseHead,
+) -> Result<warp::http::response::Builder, String> {
+    head.validate().map_err(|error| error.to_string())?;
+    let status = warp::http::StatusCode::from_u16(head.status)
+        .map_err(|error| format!("Invalid managed vLLM response status: {error}"))?;
+    let mut builder = warp::http::Response::builder().status(status);
+    for OpenAiWireHeader { name, value } in &head.headers {
+        let value = warp::http::HeaderValue::from_bytes(value).map_err(|error| {
+            format!(
+                "Invalid managed vLLM response header '{}': {error}",
+                name.as_str()
+            )
+        })?;
+        builder = builder.header(name.as_str(), value);
+    }
+    Ok(builder)
+}
+
+fn wire_buffered_response(response: OpenAiWireResponse) -> Result<warp::reply::Response, String> {
+    wire_response_builder(&response.head)?
+        .body(warp::hyper::Body::from(response.body))
+        .map_err(|error| format!("Failed to build managed vLLM response: {error}"))
+}
+
+fn wire_stream_response(
+    response: OpenAiWireStreamResponse,
+) -> Result<warp::reply::Response, String> {
+    let body = response.body.map(|item| {
+        item.map(warp::hyper::body::Bytes::from).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("managed vLLM response stream failed: {error}"),
+            )
+        })
+    });
+    wire_response_builder(&response.head)?
+        .body(warp::hyper::Body::wrap_stream(body))
+        .map_err(|error| format!("Failed to build managed vLLM stream response: {error}"))
 }
 
 struct StreamChatArgs {
@@ -523,6 +835,54 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn chat_body_filter_rejects_before_buffering_above_the_wire_limit() {
+        let body = vec![b'x'; kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES + 1];
+        let result = warp::test::request()
+            .method("POST")
+            .body(body)
+            .filter(&bounded_chat_body())
+            .await
+            .expect("body filter should return a typed result");
+        assert!(matches!(result, BoundedChatBody::TooLarge));
+    }
+
+    #[test]
+    fn pressure_cap_bounds_both_token_spellings_and_inserts_a_default() {
+        let mut both = serde_json::json!({
+            "max_tokens": 100,
+            "max_completion_tokens": 80,
+        });
+        apply_wire_generation_cap(&mut both, 12);
+        assert_eq!(both["max_tokens"], 12);
+        assert_eq!(both["max_completion_tokens"], 12);
+
+        let mut absent = serde_json::json!({"model": "test"});
+        apply_wire_generation_cap(&mut absent, 7);
+        assert_eq!(absent["max_completion_tokens"], 7);
+    }
+
+    #[tokio::test]
+    async fn buffered_wire_response_preserves_status_body_and_allowlisted_headers() {
+        let response = OpenAiWireResponse {
+            head: OpenAiWireResponseHead::new(
+                429,
+                vec![OpenAiWireHeader::new(
+                    kapsl_engine_api::OpenAiWireHeaderName::RetryAfter,
+                    b"3".to_vec(),
+                )
+                .unwrap()],
+            )
+            .unwrap(),
+            body: br#"{"error":{"message":"busy"}}"#.to_vec(),
+        };
+        let response = wire_buffered_response(response).unwrap();
+        assert_eq!(response.status(), warp::http::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "3");
+        let body = warp::hyper::body::to_bytes(response.into_body()).await;
+        assert_eq!(body.unwrap().as_ref(), br#"{"error":{"message":"busy"}}"#);
+    }
 
     #[test]
     fn prompt_tensor_shape_validates_for_a_realistic_prompt() {

@@ -6,6 +6,8 @@
 //! surface itself lives in [`super::cli`].
 
 use super::*;
+use crate::runtime::model::{BackendLoadTuning, BackendTuningProvider};
+use kapsl_backends::OnnxRuntimeTuning;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OnnxTuningProfile {
@@ -39,6 +41,16 @@ impl OnnxTuningProfile {
             merge_onnx_runtime_tuning(&self.global, model_overrides)
         } else {
             self.global.clone()
+        }
+    }
+}
+
+impl BackendTuningProvider for OnnxTuningProfile {
+    fn resolve(&self, model_id: u32, engine_kind: EngineKind) -> BackendLoadTuning {
+        if engine_kind.uses_onnx_session() {
+            BackendLoadTuning::Onnx(OnnxTuningProfile::resolve(self, model_id))
+        } else {
+            BackendLoadTuning::None
         }
     }
 }
@@ -214,4 +226,37 @@ pub(crate) fn build_onnx_tuning_profile(args: &Args) -> Result<OnnxTuningProfile
     }
 
     Ok(profile)
+}
+
+#[cfg(test)]
+mod dependency_injection_tests {
+    use super::*;
+
+    #[test]
+    fn tuning_provider_only_injects_onnx_settings() {
+        let profile = OnnxTuningProfile {
+            global: OnnxRuntimeTuning {
+                session_buckets: Some(4),
+                ..OnnxRuntimeTuning::default()
+            },
+            per_model: HashMap::from([(
+                7,
+                OnnxRuntimeTuning {
+                    session_buckets: Some(8),
+                    ..OnnxRuntimeTuning::default()
+                },
+            )]),
+        };
+
+        let BackendLoadTuning::Onnx(tuning) =
+            BackendTuningProvider::resolve(&profile, 7, EngineKind::OnnxForward)
+        else {
+            panic!("ONNX models must receive ONNX tuning");
+        };
+        assert_eq!(tuning.session_buckets, Some(8));
+        assert!(matches!(
+            BackendTuningProvider::resolve(&profile, 7, EngineKind::GgufGenerate),
+            BackendLoadTuning::None
+        ));
+    }
 }

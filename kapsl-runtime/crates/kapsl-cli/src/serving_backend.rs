@@ -856,7 +856,7 @@ mod tests {
             error.contains("unsupported framework"),
             "unexpected: {error}"
         );
-        assert!(error.contains("will not be routed to ONNX Runtime"));
+        assert!(error.contains("not ONNX models"), "unexpected: {error}");
 
         let mut mislabeled = manifest("safetensors", "causal-lm", "generate");
         mislabeled.framework = "onnx".to_string();
@@ -866,7 +866,7 @@ mod tests {
         mislabeled.model_file = "model.pth".to_string();
         let error = validate_model_contract(&mislabeled).unwrap_err();
         assert!(error.contains("PyTorch weight file"), "unexpected: {error}");
-        assert!(error.contains("Refusing to pass it to ONNX Runtime"));
+        assert!(error.contains("to ONNX Runtime"), "unexpected: {error}");
     }
 
     #[test]

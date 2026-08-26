@@ -4,6 +4,7 @@
 //! Unix connection. Policy and byte accounting live in `ExternalKvCoordinator`;
 //! framing only decodes the versioned `kapsl-kv-abi` envelopes.
 
+use super::managed_vllm::ManagedVllmKvReadinessFence;
 use super::memory::{
     MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryDomain, MemoryLease, MemoryOwner,
     MemoryPlan,
@@ -19,7 +20,7 @@ use kapsl_kv_abi::{
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -366,6 +367,18 @@ struct CoordinatorState {
     participants: HashMap<String, ParticipantRecord>,
     leases: HashMap<String, ExternalLeaseRecord>,
     sequences: HashMap<(String, KvSequenceKey), String>,
+    managed_readiness_fences: HashMap<String, Weak<ManagedVllmKvReadinessFence>>,
+}
+
+fn participant_matches_managed_base(participant_id: &str, participant_base: &str) -> bool {
+    participant_id == participant_base
+        || participant_id
+            .strip_prefix(participant_base)
+            .is_some_and(|suffix| suffix.starts_with(':'))
+}
+
+fn managed_bases_overlap(left: &str, right: &str) -> bool {
+    participant_matches_managed_base(left, right) || participant_matches_managed_base(right, left)
 }
 
 /// Parse exact adapter/backend tuples produced by the hardware conformance
@@ -621,6 +634,74 @@ impl ExternalKvCoordinator {
         count
     }
 
+    /// Bind the stable participant namespace configured for one managed vLLM
+    /// process to its lock-free readiness fence. The coordinator retains only
+    /// a weak reference so participant bookkeeping cannot extend the process
+    /// lifecycle or form a coordinator/process ownership cycle.
+    pub(crate) fn register_managed_readiness_fence(
+        &self,
+        participant_base: &str,
+        fence: Weak<ManagedVllmKvReadinessFence>,
+    ) -> Result<(), String> {
+        if participant_base.is_empty() {
+            return Err("managed participant readiness base must not be empty".to_string());
+        }
+        if fence.upgrade().is_none() {
+            return Err(format!(
+                "managed participant readiness fence for '{participant_base}' has expired"
+            ));
+        }
+
+        let mut state = self.state.lock();
+        state
+            .managed_readiness_fences
+            .retain(|_, candidate| candidate.strong_count() > 0);
+        if let Some((conflict, _)) = state.managed_readiness_fences.iter().find(|(base, _)| {
+            base.as_str() != participant_base
+                && managed_bases_overlap(base.as_str(), participant_base)
+        }) {
+            return Err(format!(
+                "managed participant readiness base '{participant_base}' overlaps registered base '{conflict}'"
+            ));
+        }
+        if let Some(current) = state.managed_readiness_fences.get(participant_base) {
+            if Weak::ptr_eq(current, &fence) {
+                return Ok(());
+            }
+            return Err(format!(
+                "managed participant readiness base '{participant_base}' already has a live owner"
+            ));
+        }
+        state
+            .managed_readiness_fences
+            .insert(participant_base.to_string(), fence);
+        Ok(())
+    }
+
+    /// Advance the matching managed process's lock-free activation epoch.
+    ///
+    /// This is deliberately called while coordinator state is held, at the
+    /// linearization point immediately before activation/backing mutation. It
+    /// must remain atomic-only: taking a process lifecycle lock here would
+    /// introduce a coordinator-state -> process-lifecycle lock edge.
+    fn fence_managed_readiness_locked(state: &mut CoordinatorState, participant_id: &str) {
+        let mut matched = 0usize;
+        state.managed_readiness_fences.retain(|base, candidate| {
+            let Some(fence) = candidate.upgrade() else {
+                return false;
+            };
+            if participant_matches_managed_base(participant_id, base) {
+                fence.advance();
+                matched += 1;
+            }
+            true
+        });
+        debug_assert!(
+            matched <= 1,
+            "managed readiness base registration must be delimiter-unambiguous"
+        );
+    }
+
     /// Retire every control-plane object owned by a participant after its
     /// backend process tree has been reaped.
     ///
@@ -645,10 +726,7 @@ impl ExternalKvCoordinator {
             .participants
             .keys()
             .filter(|participant_id| {
-                participant_id.as_str() == participant_base
-                    || participant_id
-                        .strip_prefix(participant_base)
-                        .is_some_and(|suffix| suffix.starts_with(':'))
+                participant_matches_managed_base(participant_id, participant_base)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -658,12 +736,47 @@ impl ExternalKvCoordinator {
             .count()
     }
 
+    /// Return whether the one concrete participant derived from a supervised
+    /// managed-backend base ID has completed shared-pool activation.
+    ///
+    /// A missing participant is ordinary while the child starts. More than
+    /// one live generation is a lifecycle violation and fails closed rather
+    /// than allowing an ambiguous generation to become routable.
+    pub(crate) fn managed_participant_is_active(
+        &self,
+        participant_base: &str,
+    ) -> Result<bool, String> {
+        let state = self.state.lock();
+        let mut matches = state.participants.iter().filter(|(participant_id, _)| {
+            participant_matches_managed_base(participant_id, participant_base)
+        });
+        let Some((_, participant)) = matches.next() else {
+            return Ok(false);
+        };
+        if matches.next().is_some() {
+            return Err(format!(
+                "multiple live KV participants match managed base '{participant_base}'"
+            ));
+        }
+        let activation = participant.shared_activation.as_ref().ok_or_else(|| {
+            format!(
+                "managed KV participant base '{participant_base}' registered without shared-pool activation state"
+            )
+        })?;
+        Ok(activation.active)
+    }
+
     fn retire_one_participant_after_backend_exit(&self, participant_id: &str) -> bool {
         let (participant, mut leases) = {
             let mut state = self.state.lock();
-            let Some(participant) = state.participants.remove(participant_id) else {
+            if !state.participants.contains_key(participant_id) {
                 return false;
-            };
+            }
+            Self::fence_managed_readiness_locked(&mut state, participant_id);
+            let participant = state
+                .participants
+                .remove(participant_id)
+                .expect("participant existence was checked while coordinator state was held");
             let lease_ids = state
                 .leases
                 .iter()
@@ -1358,8 +1471,8 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 "shared-pool participant '{participant_id}' cannot detach while leases are active"
             )));
         }
-        let remove_participant = {
-            let record = state.participants.get_mut(participant_id).ok_or_else(|| {
+        {
+            let record = state.participants.get(participant_id).ok_or_else(|| {
                 KvContractError::NotFound {
                     message: format!("KV participant '{participant_id}' is not registered"),
                 }
@@ -1369,7 +1482,7 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     "detach epoch does not match the registration receipt",
                 ));
             }
-            let activation = record.shared_activation.as_mut().ok_or_else(|| {
+            let activation = record.shared_activation.as_ref().ok_or_else(|| {
                 KvContractError::invalid_request(
                     "opaque participants cannot detach shared-pool bindings",
                 )
@@ -1386,6 +1499,23 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     )));
                 }
             }
+        }
+
+        // All caller-controlled detach fields have now been validated. Fence
+        // stale managed-process health publications before changing active
+        // state, removing attachments, or dropping the participant backing.
+        // The fence operation is atomic-only and never enters process
+        // lifecycle locking while coordinator state is held.
+        Self::fence_managed_readiness_locked(&mut state, participant_id);
+        let remove_participant = {
+            let record = state
+                .participants
+                .get_mut(participant_id)
+                .expect("detach participant was validated while coordinator state was held");
+            let activation = record
+                .shared_activation
+                .as_mut()
+                .expect("shared activation was validated while coordinator state was held");
             activation.active = false;
             for binding_id in &request.binding_ids {
                 activation.attachments.remove(binding_id);
@@ -2185,6 +2315,14 @@ mod tests {
         )
         .unwrap();
         let baseline_refs = Arc::strong_count(&backing);
+        let target_fence = Arc::new(ManagedVllmKvReadinessFence::new());
+        let collision_fence = Arc::new(ManagedVllmKvReadinessFence::new());
+        coordinator
+            .register_managed_readiness_fence("kapsl-model-1", Arc::downgrade(&target_fence))
+            .unwrap();
+        coordinator
+            .register_managed_readiness_fence("kapsl-model-10", Arc::downgrade(&collision_fence))
+            .unwrap();
 
         let mut target = shared_registration();
         target.participant_id = "kapsl-model-1:engine-uuid".to_string();
@@ -2204,7 +2342,131 @@ mod tests {
             .lock()
             .participants
             .contains_key("kapsl-model-10:engine-uuid"));
+        assert_eq!(target_fence.snapshot(), 1);
+        assert_eq!(collision_fence.snapshot(), 0);
         assert_eq!(Arc::strong_count(&backing), baseline_refs + 1);
+    }
+
+    #[test]
+    fn validated_detach_fences_managed_readiness_but_invalid_detach_does_not() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let fence = Arc::new(ManagedVllmKvReadinessFence::new());
+        coordinator
+            .register_managed_readiness_fence("kapsl-model-1", Arc::downgrade(&fence))
+            .unwrap();
+
+        let mut registration = shared_registration();
+        registration.participant_id = "kapsl-model-1:engine-a".to_string();
+        let receipt = coordinator.register(&registration).unwrap();
+        let attachment = shared_attachment(&receipt);
+        coordinator
+            .attach(&registration.participant_id, &attachment)
+            .unwrap();
+        coordinator
+            .activate(&registration.participant_id, receipt.participant_epoch)
+            .unwrap();
+
+        let valid = KvSharedPoolDetachRequest {
+            participant_epoch: receipt.participant_epoch,
+            binding_ids: vec![attachment.binding_id.clone()],
+            shard: attachment.shard,
+            completion: KvReleaseCompletion::BackendSynchronized,
+        };
+        let mut stale_epoch = valid.clone();
+        stale_epoch.participant_epoch += 1;
+        assert!(coordinator
+            .detach(&registration.participant_id, &stale_epoch)
+            .is_err());
+        assert_eq!(fence.snapshot(), 0);
+        assert!(coordinator
+            .managed_participant_is_active("kapsl-model-1")
+            .unwrap());
+
+        let mut unknown_binding = valid.clone();
+        unknown_binding.binding_ids = vec!["not-attached".to_string()];
+        assert!(coordinator
+            .detach(&registration.participant_id, &unknown_binding)
+            .is_err());
+        assert_eq!(fence.snapshot(), 0);
+        assert!(coordinator
+            .managed_participant_is_active("kapsl-model-1")
+            .unwrap());
+
+        coordinator
+            .detach(&registration.participant_id, &valid)
+            .unwrap();
+        assert_eq!(fence.snapshot(), 1);
+        assert_eq!(coordinator.participant_count(), 0);
+    }
+
+    #[test]
+    fn managed_readiness_registration_is_weak_and_reuses_an_expired_base() {
+        let coordinator = ExternalKvCoordinator::new(test_memory(), Duration::from_secs(30))
+            .expect("test coordinator");
+        let original = Arc::new(ManagedVllmKvReadinessFence::new());
+        coordinator
+            .register_managed_readiness_fence("kapsl-model-1", Arc::downgrade(&original))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&original), 1);
+        drop(original);
+
+        let replacement = Arc::new(ManagedVllmKvReadinessFence::new());
+        coordinator
+            .register_managed_readiness_fence("kapsl-model-1", Arc::downgrade(&replacement))
+            .unwrap();
+        assert_eq!(Arc::strong_count(&replacement), 1);
+    }
+
+    #[test]
+    fn managed_participant_readiness_requires_one_active_generation() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        assert!(!coordinator
+            .managed_participant_is_active("kapsl-model-1")
+            .unwrap());
+
+        let mut registration = shared_registration();
+        registration.participant_id = "kapsl-model-1:engine-a".to_string();
+        let receipt = coordinator.register(&registration).unwrap();
+        assert!(!coordinator
+            .managed_participant_is_active("kapsl-model-1")
+            .unwrap());
+        coordinator
+            .attach(&registration.participant_id, &shared_attachment(&receipt))
+            .unwrap();
+        coordinator
+            .activate(&registration.participant_id, receipt.participant_epoch)
+            .unwrap();
+        assert!(coordinator
+            .managed_participant_is_active("kapsl-model-1")
+            .unwrap());
+
+        let mut second = shared_registration();
+        second.participant_id = "kapsl-model-1:engine-b".to_string();
+        coordinator.register(&second).unwrap();
+        assert!(coordinator
+            .managed_participant_is_active("kapsl-model-1")
+            .unwrap_err()
+            .contains("multiple live"));
     }
 
     #[test]

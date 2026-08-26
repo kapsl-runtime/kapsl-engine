@@ -125,6 +125,7 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
 | `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. Packaged installs discover the verified lazy cache and legacy beside-binary bundle automatically. |
 | `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
+| `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge rollout mode: `wire` enables the typed byte relay; `async-translated` (the default) and `legacy` retain response translation for rollback. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -180,7 +181,7 @@ installer no longer downloads this multi-gigabyte pack by default; pass
 complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
-`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.5.0` with profile
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.6.0` with profile
 `vllm-v1-packed-cuda-ipc/flash-attn`. A missing or different bundle fails
 closed; Kapsl never falls back to ONNX Runtime, native SafeTensors, or another
 attention implementation. Source/development builds can point to the same
@@ -196,13 +197,33 @@ metadata:
     backend: vllm
     vllm:
       max_model_len: 4096
-      gpu_memory_utilization: 0.5
+      kv_cache:
+        mode: legacy_fraction
+        gpu_memory_utilization: 0.5
       startup_timeout_seconds: 300
 ```
 
-The defaults are `1024`, `0.5`, and `300` seconds respectively. Managed vLLM
-currently uses one selected CUDA device per Kapsl replica. Use
-`CUDA_VISIBLE_DEVICES` to select or isolate GPUs.
+The compatibility defaults are `1024`, a `0.5` legacy fraction, and `300`
+seconds respectively. The deprecated top-level `gpu_memory_utilization` field
+is still accepted for existing packages but conflicts with `kv_cache` when
+both are present.
+
+The manifest parser also validates the future `kv_cache.mode: auto` and
+`kv_cache.mode: fixed` shapes. This release deliberately rejects either exact
+mode before downloading a backend or starting a child: exact launch remains
+fail-closed until the certified runtime geometry provider and provisional
+`MemoryAuthority` grant handoff are installed. It never falls back to `0.5`
+after an operator requested an exact policy. Managed vLLM currently uses one
+selected CUDA device per Kapsl replica. Use `CUDA_VISIBLE_DEVICES` to select or
+isolate GPUs.
+
+`KAPSL_VLLM_BRIDGE_MODE=wire` enables the protocol-native OpenAI path after
+authentication, model resolution, pressure admission, priority selection, and
+session scoping. The route normalizes the model alias once, forwards the JSON
+body to the private managed process, and relays vLLM's status, allowlisted
+headers, JSON body, or SSE bytes without reconstructing completion events.
+Client authorization is never forwarded. Leave the variable unset to retain
+the translated bridge while canary and semantic tests are running.
 
 ### External KV participants
 
@@ -220,7 +241,7 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.5.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
+    'kapsl-vllm-connector,0.6.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four

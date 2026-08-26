@@ -8,7 +8,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::{stream, StreamExt};
 use infer_adapter::{default_request_adapter_registry, parse_inference_request_with_registry};
-use kapsl_backends::{BackendFactory, OnnxRuntimeTuning};
+use kapsl_backends::BackendFactory;
 use kapsl_core::loader::Manifest;
 use kapsl_core::{
     AutoScaler, EngineKind, ModelInfo, ModelRegistry, ModelStatus, PackageLoader, ScalingPolicy,
@@ -156,10 +156,6 @@ async fn main() -> Result<(), DynError> {
     configure_onnx_backend_packs(args.offline)
         .map_err(|error| format!("Configure lazy ONNX backend packs: {error}"))?;
     let applied_tuning = apply_performance_profile(&mut args, &matches);
-    let onnx_tuning_profile = Arc::new(
-        build_onnx_tuning_profile(&args)
-            .map_err(|e| format!("Invalid ONNX tuning configuration: {}", e))?,
-    );
     // Propagate --kv-compression-bits to the env var read by kapsl-llm engine.rs.
     // This lets the existing metadata/env override chain pick it up without
     // threading an extra parameter through every load_model call site.
@@ -275,6 +271,10 @@ async fn main() -> Result<(), DynError> {
     // 1. Hardware Probe
     log::info!("=== Hardware Detection ===");
     let device_info = Arc::new(DeviceInfo::probe());
+    let model_load_planner = Arc::new(
+        build_model_load_planner(&args, device_info.clone())
+            .map_err(|e| format!("Invalid model loading configuration: {}", e))?,
+    );
     log::info!("CPU: {} cores", device_info.cpu_cores);
     log::info!("Memory: {} MB", device_info.total_memory / 1024);
     log::info!("OS: {} ({})", device_info.os_type, device_info.os_release);
@@ -308,7 +308,9 @@ async fn main() -> Result<(), DynError> {
     args.model = expand_run_bundles(&args.model, &device_info)?;
 
     if args.worker {
-        return run_worker(&args, &device_info, onnx_tuning_profile.as_ref()).await;
+        let worker_config = build_worker_run_config(&args)
+            .map_err(|error| format!("Invalid worker configuration: {error}"))?;
+        return run_worker(worker_config, model_load_planner).await;
     }
 
     // Fail fast on common collisions (avoid slow model load, and avoid panics in background tasks).
@@ -323,8 +325,9 @@ async fn main() -> Result<(), DynError> {
         _ => {}
     }
     let registry = Arc::new(Registry::new());
-    let model_registry = Arc::new(ModelRegistry::new());
-    let models = ModelManager::new(model_registry.clone());
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+    // Create one metrics facade for every model-loading and serving path.
+    let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
 
     // Resolve and retain every startup package before choosing the immutable
     // physical GPU pool. This gives automatic sizing a host-only view of
@@ -333,21 +336,7 @@ async fn main() -> Result<(), DynError> {
     let mut startup_plans = Vec::with_capacity(args.model.len());
     for model_path in &args.model {
         let model_id = models.allocate_model_id();
-        let onnx_tuning = onnx_tuning_profile.resolve(model_id);
-        let plan = prepare_model_load(
-            model_id,
-            model_id,
-            0,
-            model_path,
-            &device_info,
-            args.batch_size,
-            args.scheduler_queue_size,
-            args.scheduler_max_micro_batch,
-            args.scheduler_queue_delay_ms,
-            &args.topology,
-            args.tp_degree,
-            &onnx_tuning,
-        )?;
+        let plan = model_load_planner.prepare(model_id, model_id, 0, model_path, None)?;
         startup_plans.push((model_path.clone(), plan));
     }
 
@@ -368,8 +357,18 @@ async fn main() -> Result<(), DynError> {
     #[cfg(not(feature = "gpu-device-pool"))]
     let resources = RuntimeResources::new(&device_info)?;
 
-    let preliminary_vllm_admission =
-        preflight_managed_vllm_admission(&startup_plans, &device_info, &resources).await?;
+    #[cfg(feature = "gpu-device-pool")]
+    resources.attach_device_memory_metrics(shared_metrics.clone());
+    let model_runtime = Arc::new(ModelRuntime::new(
+        model_load_planner.clone(),
+        resources.clone(),
+        models.clone(),
+        shared_metrics.clone(),
+    ));
+
+    let preliminary_vllm_admission = model_runtime
+        .preflight_managed_vllm_admission(&startup_plans)
+        .await?;
     let certified_vllm_source = uses_managed_vllm.then(certified_managed_vllm_source);
     if let Some(certified_vllm_source) = certified_vllm_source {
         let lazy_enabled = std::env::var("KAPSL_LAZY_BACKENDS")
@@ -478,11 +477,6 @@ async fn main() -> Result<(), DynError> {
         resources.pressure().clone(),
         latency_samples.clone(),
     );
-
-    // Create shared metrics instance ONCE for all models
-    let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
-    #[cfg(feature = "gpu-device-pool")]
-    resources.attach_device_memory_metrics(shared_metrics.clone());
 
     let runtime_samples_for_sampler = runtime_samples.clone();
     let has_cuda_for_sampler = device_info.has_cuda;
@@ -634,29 +628,13 @@ async fn main() -> Result<(), DynError> {
     }
 
     let load_results = run_with_loading_async("Loading model backends", {
-        let device_info = device_info.clone();
-        let resources = resources.clone();
-        let model_registry = model_registry.clone();
-        let shared_metrics = shared_metrics.clone();
-        let onnx_tuning_profile = onnx_tuning_profile.clone();
+        let model_runtime = model_runtime.clone();
         async move {
             let results = stream::iter(startup_plans.into_iter().map(|(model_path, plan)| {
-                let device_info = device_info.clone();
-                let resources = resources.clone();
-                let model_registry = model_registry.clone();
-                let shared_metrics = shared_metrics.clone();
+                let model_runtime = model_runtime.clone();
                 let model_id = plan.base_model_id();
-                let onnx_tuning = onnx_tuning_profile.resolve(model_id);
                 async move {
-                    let result = load_prepared_model(
-                        plan,
-                        &device_info,
-                        resources,
-                        &model_registry,
-                        &shared_metrics,
-                        onnx_tuning,
-                    )
-                    .await;
+                    let result = model_runtime.load_prepared_model(plan).await;
                     (model_id, model_path, result)
                 }
             }))
@@ -822,7 +800,6 @@ async fn main() -> Result<(), DynError> {
 
     let registry_arc = registry.clone();
     let models_for_api = models.clone();
-    let shared_metrics_clone = shared_metrics.clone();
     let metrics_port = args.metrics_port;
     let http_bind_addr_for_api = http_bind_addr;
     let api_auth_state_for_api = api_auth_state.clone();
@@ -834,7 +811,7 @@ async fn main() -> Result<(), DynError> {
     let generated_token_samples_clone = generated_token_samples.clone();
     let total_token_samples_clone = total_token_samples.clone();
     let latency_samples_clone = latency_samples.clone();
-    let onnx_tuning_profile_for_api = onnx_tuning_profile.clone();
+    let model_runtime_for_api = model_runtime.clone();
 
     let extensions_root = state_layout.extensions_root.clone();
     let extensions_config_root = state_layout.extensions_config_root.clone();
@@ -860,9 +837,8 @@ async fn main() -> Result<(), DynError> {
     let (http_ready_tx, http_ready_rx) =
         tokio::sync::oneshot::channel::<Result<std::net::SocketAddr, String>>();
 
-    // Clone before the API server spawn so the auto-scaler task can use the same state.
+    // Clone before the API server spawn; non-model routes also use the resource facade.
     let resources_for_api = resources.clone();
-    let resources_for_autoscaler = resources.clone();
 
     tokio::spawn(async move {
         let metrics_route = build_metrics_route(
@@ -873,20 +849,12 @@ async fn main() -> Result<(), DynError> {
 
         // API routes
         let model_routes = build_model_routes(ModelRoutesConfig {
-            models: models_for_api.clone(),
+            model_runtime: model_runtime_for_api.clone(),
             inference: inference_service.clone(),
-            shared_metrics: shared_metrics_clone.clone(),
             throughput_samples: throughput_samples_clone.clone(),
             generated_token_samples: generated_token_samples_clone.clone(),
             total_token_samples: total_token_samples_clone.clone(),
             latency_samples: latency_samples_clone.clone(),
-            device_info: device_info_for_api.clone(),
-            batch_size: args.batch_size,
-            scheduler_queue_size: args.scheduler_queue_size,
-            scheduler_max_micro_batch: args.scheduler_max_micro_batch,
-            scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
-            onnx_tuning_profile: onnx_tuning_profile_for_api.clone(),
-            resources: resources_for_api.clone(),
             rag_state: rag_state.clone(),
             auto_scaler: auto_scaler_api.clone(),
             log_sensitive_ids: log_sensitive_ids_for_api,
@@ -1057,17 +1025,7 @@ async fn main() -> Result<(), DynError> {
 
     spawn_auto_scaler_task(AutoScalerTaskConfig {
         auto_scaler: auto_scaler.clone(),
-        models: models.clone(),
-        device_info: device_info.clone(),
-        shared_metrics: shared_metrics.clone(),
-        resources: resources_for_autoscaler,
-        batch_size: args.batch_size,
-        scheduler_queue_size: args.scheduler_queue_size,
-        scheduler_max_micro_batch: args.scheduler_max_micro_batch,
-        scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
-        topology: args.topology.clone(),
-        tp_degree: args.tp_degree,
-        onnx_tuning_profile: onnx_tuning_profile.clone(),
+        model_runtime: model_runtime.clone(),
     });
     let http_bound_addr = match tokio::time::timeout(Duration::from_secs(10), http_ready_rx).await {
         Ok(Ok(Ok(addr))) => addr,

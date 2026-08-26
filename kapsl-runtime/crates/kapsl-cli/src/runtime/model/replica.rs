@@ -58,7 +58,6 @@ pub(super) async fn load_replica(
     device_info: &DeviceInfo,
     resources: Arc<RuntimeResources>,
     shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
-    onnx_tuning: &OnnxRuntimeTuning,
 ) -> Result<LoadedReplica, DynError> {
     log_package_plan(&plan);
 
@@ -123,7 +122,7 @@ pub(super) async fn load_replica(
         (None, None)
     };
 
-    let worker = start_isolated_worker(&plan, onnx_tuning).await?;
+    let worker = start_isolated_worker(&plan).await?;
     let mut engines = if let Some(worker) = worker {
         let engine_count = if role.is_primary() && !plan.use_pipeline_backend {
             device_mesh
@@ -198,7 +197,7 @@ pub(super) async fn load_replica(
                 provider,
                 device.id,
                 device_info,
-                onnx_tuning,
+                plan.backend_tuning.onnx(),
                 &resources,
                 plan.base_model_id,
                 plan.replica_id,
@@ -256,7 +255,7 @@ pub(super) async fn load_replica(
             &selection.logical_provider,
             device_id,
             device_info,
-            onnx_tuning,
+            plan.backend_tuning.onnx(),
             &resources,
             plan.base_model_id,
             plan.replica_id,
@@ -557,6 +556,7 @@ mod tests {
             worker_topology: "data-parallel",
             worker_tp_degree: 1,
             use_pipeline_backend: false,
+            backend_tuning: BackendLoadTuning::None,
             #[cfg(feature = "gpu-device-pool")]
             onnx_peak_concurrency: 1,
             isolate_process: false,
