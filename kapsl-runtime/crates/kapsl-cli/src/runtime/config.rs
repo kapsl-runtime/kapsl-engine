@@ -58,8 +58,8 @@ pub(crate) struct RuntimeStateLayout {
     pub(crate) auth_store_path: PathBuf,
 }
 
-pub(crate) fn resolve_runtime_state_layout(args: &Args) -> RuntimeStateLayout {
-    if let Some(state_dir) = args.state_dir.as_ref() {
+pub(crate) fn resolve_runtime_state_layout(state_dir: Option<&Path>) -> RuntimeStateLayout {
+    if let Some(state_dir) = state_dir {
         RuntimeStateLayout {
             rag_root: state_dir.join("rag-data"),
             extensions_root: state_dir.join("extensions"),

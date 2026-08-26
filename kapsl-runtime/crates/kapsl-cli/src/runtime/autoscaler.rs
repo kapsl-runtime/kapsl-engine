@@ -5,7 +5,7 @@ pub(crate) struct AutoScalerTaskConfig {
     pub(crate) model_runtime: Arc<ModelRuntime>,
 }
 
-pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
+pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::task::JoinHandle<()> {
     let AutoScalerTaskConfig {
         auto_scaler: auto_scaler_clone,
         model_runtime,
@@ -210,5 +210,5 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) {
                 }
             }
         }
-    });
+    })
 }

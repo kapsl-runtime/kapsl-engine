@@ -1,4 +1,5 @@
 use super::*;
+use sysinfo::{Pid, System};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RuntimeSamples {
@@ -189,6 +190,19 @@ impl LatencyWindow {
             .max(1.0) as usize;
         sorted[rank.min(sorted.len()) - 1]
     }
+}
+
+/// Shared model-level observations used by inference and model-status routes.
+///
+/// Keeping the related windows behind one injected object prevents callers from
+/// constructing or wiring four independent lock-protected maps. The HTTP layer
+/// still owns presentation, while inference owns latency recording.
+#[derive(Default)]
+pub(crate) struct ModelTelemetry {
+    pub(crate) throughput_samples: RwLock<HashMap<u32, ThroughputSample>>,
+    pub(crate) generated_token_samples: RwLock<HashMap<u32, ThroughputSample>>,
+    pub(crate) total_token_samples: RwLock<HashMap<u32, ThroughputSample>>,
+    pub(crate) latency_samples: RwLock<HashMap<u32, LatencyWindow>>,
 }
 
 pub(crate) fn update_throughput(
@@ -614,6 +628,179 @@ impl MemorySnapshotExporter {
             }
         }
     }
+}
+
+/// Dependencies consumed by the process-wide resource sampler.
+pub(crate) struct RuntimeMonitorConfig {
+    pub(crate) device_info: Arc<DeviceInfo>,
+    pub(crate) resources: Arc<RuntimeResources>,
+    pub(crate) models: Arc<ModelManager>,
+    pub(crate) registry: Arc<Registry>,
+}
+
+/// Running process/resource monitor and the observations it publishes.
+///
+/// The handle owns its background task so the runtime supervisor can terminate
+/// it together with the serving tasks instead of leaving detached work behind.
+pub(crate) struct RuntimeMonitor {
+    samples: Arc<RwLock<RuntimeSamples>>,
+    telemetry: Arc<ModelTelemetry>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RuntimeMonitor {
+    pub(crate) fn start(config: RuntimeMonitorConfig) -> Self {
+        let RuntimeMonitorConfig {
+            device_info,
+            resources,
+            models,
+            registry,
+        } = config;
+        let samples = Arc::new(RwLock::new(RuntimeSamples::default()));
+        let telemetry = Arc::new(ModelTelemetry::default());
+        let samples_for_task = samples.clone();
+        let has_cuda = device_info.has_cuda;
+        let pressure_config = resources.pressure().config();
+        let pressure_state = resources.pressure().state();
+        let kv = resources.kv().clone();
+        let memory = resources.memory().clone();
+        let cotenancy_guard = optional_env_var(COTENANCY_GUARD_ENV).is_some_and(|value| {
+            matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on")
+        });
+        let mut cotenancy_exporter =
+            cotenancy_guard.then(|| CotenancyCeilingExporter::new(&registry));
+        let memory_exporter = MemorySnapshotExporter::new(&registry);
+
+        let task = tokio::spawn(async move {
+            let pid = Pid::from_u32(std::process::id());
+            let mut system = System::new();
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let mut nvidia_smi_retry_after: Option<Instant> = None;
+            system.refresh_memory();
+            let total_system_memory_bytes = system_memory_bytes_from_sysinfo(system.total_memory());
+
+            loop {
+                interval.tick().await;
+
+                // Reclaim KV block quota from engines whose health changed.
+                kv.maybe_rebalance_for_health();
+                // Backend-owned allocations may change after model loading.
+                models.reconcile_memory_reports();
+
+                system.refresh_process(pid);
+                let process_memory_bytes = system
+                    .process(pid)
+                    .map(|process| process.memory() as usize)
+                    .unwrap_or(0);
+
+                let now = Instant::now();
+                let (gpu_utilization, gpu_memory_bytes, gpu_memory_total_bytes) = if has_cuda {
+                    if nvidia_smi_retry_after.is_some_and(|retry_after| now < retry_after) {
+                        (0.0, None, None)
+                    } else {
+                        match sample_nvidia_smi() {
+                            Some((utilization, used_bytes, total_bytes)) => {
+                                nvidia_smi_retry_after = None;
+                                (utilization, Some(used_bytes), Some(total_bytes))
+                            }
+                            None => {
+                                nvidia_smi_retry_after = Some(now + Duration::from_secs(30));
+                                (0.0, None, None)
+                            }
+                        }
+                    }
+                } else {
+                    (0.0, None, None)
+                };
+
+                let foreign_gpu_memory_bytes = if cotenancy_guard
+                    && has_cuda
+                    && nvidia_smi_retry_after.is_none_or(|retry_after| now >= retry_after)
+                {
+                    let foreign = sample_foreign_vram();
+                    let ceilings = memory.reconcile_external_device_memory(&foreign);
+                    if ceilings
+                        .iter()
+                        .any(|sample| sample.smoothed_bytes != sample.previous_bytes)
+                    {
+                        kv.rebalance_kv_caps();
+                    }
+                    if let Some(exporter) = cotenancy_exporter.as_mut() {
+                        exporter.observe(&ceilings);
+                    }
+                    Some(foreign.values().sum::<usize>())
+                } else {
+                    None
+                };
+
+                let snapshot = RuntimeSamples {
+                    process_memory_bytes,
+                    total_system_memory_bytes,
+                    gpu_utilization,
+                    gpu_memory_bytes,
+                    gpu_memory_total_bytes,
+                    foreign_gpu_memory_bytes,
+                    collected_at_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                };
+                *samples_for_task.write() = snapshot.clone();
+
+                memory.observe_process_memory(process_memory_bytes);
+                if let Some(gpu_bytes) = gpu_memory_bytes {
+                    memory.observe_cuda_memory_total(
+                        gpu_bytes.saturating_sub(foreign_gpu_memory_bytes.unwrap_or(0)),
+                    );
+                }
+                let memory_snapshot = memory.snapshot();
+                memory_exporter.observe(&memory_snapshot);
+                let next_state = evaluate_authority_pressure_state(
+                    &memory_snapshot,
+                    snapshot.gpu_utilization,
+                    &pressure_config,
+                );
+                let previous_raw = pressure_state.swap(next_state as u8, Ordering::Relaxed);
+                let previous = RuntimePressureState::from_u8(previous_raw);
+                if previous != next_state {
+                    log::warn!(
+                        "Runtime pressure state changed: {} -> {} (rss={}B total_mem={}B gpu_util={:.2} gpu_mem={:?}/{:?} foreign_gpu_mem={:?})",
+                        previous.as_str(),
+                        next_state.as_str(),
+                        snapshot.process_memory_bytes,
+                        snapshot.total_system_memory_bytes.unwrap_or(0),
+                        snapshot.gpu_utilization,
+                        snapshot.gpu_memory_bytes,
+                        snapshot.gpu_memory_total_bytes,
+                        snapshot.foreign_gpu_memory_bytes
+                    );
+                }
+            }
+        });
+
+        Self {
+            samples,
+            telemetry,
+            task,
+        }
+    }
+
+    pub(crate) fn samples(&self) -> Arc<RwLock<RuntimeSamples>> {
+        self.samples.clone()
+    }
+
+    pub(crate) fn telemetry(&self) -> Arc<ModelTelemetry> {
+        self.telemetry.clone()
+    }
+
+    pub(crate) fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+pub(crate) fn system_memory_bytes_from_sysinfo(bytes: u64) -> Option<usize> {
+    // sysinfo 0.30 reports memory in bytes. Older releases used KiB.
+    usize::try_from(bytes).ok()
 }
 
 #[cfg(test)]
