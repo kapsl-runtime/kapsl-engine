@@ -300,6 +300,7 @@ jobs:
       CUDA_PATH: /usr/local/cuda
       KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
       LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
     steps:
       - name: Install CUDA build dependencies
@@ -312,12 +313,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate certified vLLM SDK commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Protected KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit." >&2
+            exit 1
+          fi
+
       - name: Checkout certified vLLM connector
         uses: actions/checkout@v4
         with:
           repository: kapsl-runtime/kapsl-sdk
-          ref: 3a4e626f919e11287e0a19bb720c547ec9216f7f
+          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
           path: sdk-vllm
+
+      - name: Verify certified vLLM SDK checkout
+        shell: bash
+        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
 
       - name: Checkout certified llama.cpp shared-pool SDK
         if: ${{ vars.KAPSL_LLAMA_SDK_REF != '' }}
@@ -366,7 +380,6 @@ jobs:
         shell: bash
         env:
           KAPSL_VLLM_SDK_DIR: sdk-vllm
-          KAPSL_VLLM_SDK_REF: 3a4e626f919e11287e0a19bb720c547ec9216f7f
         run: .github/scripts/package-linux-vllm-backend.sh
 
       - name: Generate signed backend index

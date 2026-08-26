@@ -6,7 +6,10 @@ bootstrap=".github/scripts/bootstrap-vllm-backend.sh"
 packager=".github/scripts/package-linux-vllm-backend.sh"
 index_generator=".github/scripts/generate-backend-index.py"
 runtime="kapsl-runtime/crates/kapsl-cli/src/runtime/managed_vllm.rs"
-sdk_ref="3a4e626f919e11287e0a19bb720c547ec9216f7f"
+sdk_verifier=".github/scripts/verify-managed-vllm-sdk-checkout.sh"
+wheel_verifier=".github/scripts/verify-managed-vllm-connector-wheel.py"
+connector_version="0.6.0"
+planner_schema_version="1"
 
 require_literal() {
   local file="$1"
@@ -22,7 +25,7 @@ for pin in \
   'torchvision==0.28.0+cu130' \
   'torchaudio==2.11.0+cu130' \
   'vllm==0.26.1rc1.dev1130+g2ec6f0d71' \
-  'kapsl-vllm-connector==0.5.0'; do
+  "kapsl-vllm-connector==$connector_version"; do
   require_literal "$lock_file" "$pin"
   require_literal "$bootstrap" "$pin"
 done
@@ -31,11 +34,26 @@ require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_TORCH_VERSION: &str = 
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_TORCHVISION_VERSION: &str = "0.28.0+cu130";'
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_TORCHAUDIO_VERSION: &str = "2.11.0+cu130";'
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_CUDA_RUNTIME_VERSION: &str = "13.0";'
+require_literal "$runtime" "pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = \"$connector_version\";"
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";'
+require_literal "$runtime" "planner_schema_version: $planner_schema_version,"
 require_literal "$packager" '--constraint "$requirements_lock"'
 require_literal "$bootstrap" '--constraint "$requirements_lock"'
+require_literal "$packager" ': "${KAPSL_VLLM_SDK_REF:?'
+require_literal "$packager" 'verify-managed-vllm-sdk-checkout.sh "$sdk_dir" "$sdk_ref"'
+require_literal "$packager" 'verify-managed-vllm-connector-wheel.py'
+require_literal "$packager" "connector_version=\"$connector_version\""
+require_literal "$packager" "planner_schema_version=\"$planner_schema_version\""
+require_literal "$packager" '"connector_distribution": "$connector_version"'
+require_literal "$packager" '"sdk_ref": "$sdk_ref"'
+require_literal "$bootstrap" "\"connector_distribution\": \"$connector_version\""
+require_literal "$bootstrap" "\"planner_schema_version\": $planner_schema_version"
 require_literal "$packager" '"profile": "cu130-flash-attn"'
 require_literal "$packager" '"runtime_abi": 1'
+require_literal "$sdk_verifier" '^[0-9a-f]{40}$'
+require_literal "$sdk_verifier" '--untracked-files=all'
+require_literal "$sdk_verifier" '--ignored=matching'
+require_literal "$wheel_verifier" '"planner_entry_point": "kapsl_vllm_connector.plan:main"'
 require_literal "$index_generator" 'kapsl-backend-index-v1\0'
 require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
 
@@ -43,12 +61,24 @@ for workflow in \
   .github/workflows/release-runtime-installers.yml \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/vllm-shared-pool-conformance.yml; do
-  require_literal "$workflow" "$sdk_ref"
+  require_literal "$workflow" 'KAPSL_VLLM_SDK_REF'
+  require_literal "$workflow" 'verify-managed-vllm-sdk-checkout.sh'
   if [ "$workflow" != ".github/workflows/vllm-shared-pool-conformance.yml" ]; then
+    require_literal "$workflow" '${{ vars.KAPSL_VLLM_SDK_REF }}'
     require_literal "$workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
+  else
+    require_literal "$workflow" "EXPECTED_CONNECTOR_VERSION: \"$connector_version\""
+    require_literal "$workflow" "EXPECTED_PLANNER_SCHEMA_VERSION: \"$planner_schema_version\""
   fi
 done
-require_literal "$packager" "$sdk_ref"
+
+if grep -Eq 'KAPSL_VLLM_SDK_REF:-|sdk_ref:.*default:' "$packager" \
+  .github/workflows/release-runtime-installers.yml \
+  .github/workflows/beta-runtime-installers.yml \
+  .github/workflows/vllm-shared-pool-conformance.yml; then
+  echo "Managed-vLLM release paths must not carry a fallback SDK ref." >&2
+  exit 1
+fi
 
 awk -F '==' '
   /^[[:space:]]*($|#)/ { next }
