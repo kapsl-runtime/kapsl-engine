@@ -1311,12 +1311,12 @@ impl BackendManager {
                     pack.artifact
                 )));
             }
-            let agent = crate::features::packaging::http_agent_for_transfer();
+            let agent = crate::features::http_client::http_agent_for_transfer();
             let mut response = agent.get(&pack.artifact).call().map_err(|error| {
                 BackendManagerError::new(format!(
                     "download backend artifact {}: {}",
                     pack.artifact,
-                    crate::features::packaging::format_remote_http_error(error)
+                    crate::features::http_client::format_remote_http_error(error)
                 ))
             })?;
             let file = File::create(destination)?;
@@ -1961,11 +1961,11 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path, limit: u64) -> M
 }
 
 fn download_bytes(url: &str, limit: u64) -> ManagerResult<Vec<u8>> {
-    let agent = crate::features::packaging::http_agent_for_transfer();
+    let agent = crate::features::http_client::http_agent_for_transfer();
     let mut response = agent.get(url).call().map_err(|error| {
         BackendManagerError::new(format!(
             "download {url}: {}",
-            crate::features::packaging::format_remote_http_error(error)
+            crate::features::http_client::format_remote_http_error(error)
         ))
     })?;
     let mut bytes = Vec::new();

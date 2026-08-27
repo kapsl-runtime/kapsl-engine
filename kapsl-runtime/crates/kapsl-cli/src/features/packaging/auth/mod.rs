@@ -1,4 +1,48 @@
+//! Remote registry authentication used by package push, pull, and login.
+
 use super::*;
+use crate::features::http_client::{format_remote_http_error, native_tls_http_agent};
+
+mod callback;
+mod token_store;
+
+use callback::{open_browser, percent_encode_query_component, wait_for_login_callback_token};
+use token_store::read_last_remote_url_from_store;
+pub(crate) use token_store::{resolved_remote_token, store_remote_token_for_remote};
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LoginResponse {
+    pub(crate) status: String,
+    pub(crate) remote_url: String,
+    pub(crate) auth_base_url: String,
+    pub(crate) provider: String,
+    pub(crate) login_method: String,
+    pub(crate) callback_url: String,
+    pub(crate) token_store_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verification_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) user_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodeStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: Option<String>,
+    expires_in: Option<u64>,
+    interval: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceCodePollResponse {
+    status: String,
+    token: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+    interval: Option<u64>,
+}
 
 /// The remote URL sources both resolvers share, in precedence order: an
 /// explicit non-blank argument, then `REMOTE_URL_ENV`.
@@ -307,14 +351,6 @@ pub(crate) fn perform_device_code_login_flow(
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct RemoteHttpRequestError {
-    pub(crate) status_code: Option<u16>,
-    pub(crate) message: String,
-}
-
-impl RemoteHttpRequestError {}
-
 pub(crate) fn looks_like_auth_transport_failure(http_error: &RemoteHttpRequestError) -> bool {
     if http_error.status_code.is_some() {
         return false;
@@ -365,243 +401,4 @@ pub(crate) fn is_likely_headless_session() -> bool {
     std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_CLIENT").is_some()
         || std::env::var_os("SSH_TTY").is_some()
-}
-
-pub(crate) fn remote_token_store_key(remote_url: &str) -> String {
-    auth_base_url_from_remote_url(remote_url).unwrap_or_else(|_| remote_url.trim().to_string())
-}
-
-pub(crate) fn resolve_remote_token_store_path() -> PathBuf {
-    if let Some(path) = optional_env_var(REMOTE_TOKEN_STORE_PATH_ENV) {
-        return PathBuf::from(path);
-    }
-
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".kapsl").join("remote-token-store.json")
-}
-
-pub(crate) fn load_remote_token_store(path: &Path) -> RemoteTokenStoreFile {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return RemoteTokenStoreFile::default();
-    };
-
-    serde_json::from_str::<RemoteTokenStoreFile>(&raw).unwrap_or_default()
-}
-
-pub(crate) fn save_remote_token_store(
-    path: &Path,
-    store: &RemoteTokenStoreFile,
-) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| {
-        format!(
-            "Invalid token store path (missing parent directory): {}",
-            path.display()
-        )
-    })?;
-    fs::create_dir_all(parent).map_err(|e| {
-        format!(
-            "Failed to create token store directory {}: {}",
-            parent.display(),
-            e
-        )
-    })?;
-
-    let raw = serde_json::to_string_pretty(store)
-        .map_err(|e| format!("Failed to serialize token store: {}", e))?;
-    fs::write(path, raw)
-        .map_err(|e| format!("Failed to write token store {}: {}", path.display(), e))
-}
-
-pub(crate) fn read_stored_remote_token_for_remote(remote_url: &str) -> Option<String> {
-    let path = resolve_remote_token_store_path();
-    let store = load_remote_token_store(&path);
-    let key = remote_token_store_key(remote_url);
-    store.tokens_by_remote.get(&key).cloned()
-}
-
-pub(crate) fn read_last_remote_url_from_store() -> Option<String> {
-    let path = resolve_remote_token_store_path();
-    let store = load_remote_token_store(&path);
-    store
-        .last_remote_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-pub(crate) fn store_remote_token_for_remote(
-    remote_url: &str,
-    token: &str,
-) -> Result<PathBuf, String> {
-    let path = resolve_remote_token_store_path();
-    let mut store = load_remote_token_store(&path);
-    let trimmed_remote_url = remote_url.trim();
-    if !trimmed_remote_url.is_empty() {
-        store.last_remote_url = Some(trimmed_remote_url.to_string());
-    }
-    store
-        .tokens_by_remote
-        .insert(remote_token_store_key(remote_url), token.trim().to_string());
-    save_remote_token_store(&path, &store)?;
-    Ok(path)
-}
-
-pub(crate) fn resolved_remote_token(
-    remote_url: &str,
-    custom_token: Option<&str>,
-) -> Option<String> {
-    if let Some(explicit) = format_authorization_header(custom_token) {
-        return Some(explicit);
-    }
-
-    let env_token = optional_env_var(REMOTE_TOKEN_ENV);
-    if let Some(env_header) = format_authorization_header(env_token.as_deref()) {
-        return Some(env_header);
-    }
-
-    format_authorization_header(read_stored_remote_token_for_remote(remote_url).as_deref())
-}
-
-pub(crate) fn percent_encode_query_component(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        let ch = byte as char;
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
-            encoded.push(ch);
-        } else {
-            encoded.push('%');
-            encoded.push_str(&format!("{:02X}", byte));
-        }
-    }
-    encoded
-}
-
-pub(crate) fn open_browser(url: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("open").arg(url).status().is_ok()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .status()
-            .is_ok()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        Command::new("xdg-open").arg(url).status().is_ok()
-    }
-}
-
-pub(crate) fn wait_for_login_callback_token(
-    listener: TcpListener,
-    timeout: Duration,
-) -> Result<String, String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match listener.accept() {
-            Ok((mut stream, _peer)) => {
-                return handle_login_callback_stream(&mut stream);
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err("timed out waiting for login callback".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(err) => {
-                return Err(format!("failed to accept callback connection: {}", err));
-            }
-        }
-    }
-}
-
-pub(crate) fn handle_login_callback_stream(stream: &mut TcpStream) -> Result<String, String> {
-    let mut buffer = [0u8; 8192];
-    let bytes_read = stream
-        .read(&mut buffer)
-        .map_err(|e| format!("failed to read callback request: {}", e))?;
-    if bytes_read == 0 {
-        return Err("empty callback request".to_string());
-    }
-
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let request_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| "missing callback request line".to_string())?;
-    let path = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| "malformed callback request line".to_string())?;
-
-    let token = extract_query_value_from_path(path, "token");
-    if let Some(raw_token) = token {
-        let trimmed = raw_token.trim();
-        if !trimmed.is_empty() {
-            let body =
-                "<html><body><h3>Login complete</h3><p>You can close this tab.</p></body></html>";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = stream.write_all(response.as_bytes());
-            return Ok(trimmed.to_string());
-        }
-    }
-
-    let body = "<html><body><h3>Login failed</h3><p>Token not found in callback.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes());
-    Err("callback did not include token".to_string())
-}
-
-pub(crate) fn extract_query_value_from_path(path: &str, key: &str) -> Option<String> {
-    let (_, query) = path.split_once('?')?;
-    for pair in query.split('&') {
-        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-        if raw_key == key {
-            return Some(percent_decode(raw_value));
-        }
-    }
-    None
-}
-
-pub(crate) fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = &value[i + 1..i + 3];
-                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                    out.push(decoded);
-                    i += 3;
-                    continue;
-                }
-                out.push(bytes[i]);
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            ch => {
-                out.push(ch);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
 }
