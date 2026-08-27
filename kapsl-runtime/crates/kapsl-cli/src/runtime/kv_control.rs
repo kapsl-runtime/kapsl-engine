@@ -7,17 +7,22 @@
 use super::managed_vllm::ManagedVllmKvReadinessFence;
 use super::memory::{
     MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryDomain, MemoryLease, MemoryOwner,
-    MemoryPlan,
+    MemoryPlan, MemorySnapshot,
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use kapsl_kv_abi::{
     dispatch_control_request, KvAdapterProfile, KvBlockHandle, KvCacheOwnership, KvCommitRequest,
     KvContractError, KvControlRequestEnvelope, KvControlResponse, KvControlResponseEnvelope,
     KvFeature, KvGroupLease, KvGroupReservation, KvIntegrationTier, KvLease, KvMemoryDomain,
-    KvMetadataMode, KvParticipantRegistration, KvRegistrationReceipt, KvReleaseCompletion,
-    KvReserveRequest, KvSequenceKey, KvSharedPoolAllocationMode, KvSharedPoolAttachment,
-    KvSharedPoolDescriptor, KvSharedPoolDetachRequest, KAPSL_KV_ABI_VERSION,
+    KvMetadataMode, KvParticipantRegistration, KvProvisioningGrant, KvRegistrationReceipt,
+    KvReleaseCompletion, KvReserveRequest, KvSequenceKey, KvSharedPoolAllocationMode,
+    KvSharedPoolAttachment, KvSharedPoolDescriptor, KvSharedPoolDetachRequest,
+    KAPSL_KV_ABI_VERSION,
 };
 use parking_lot::Mutex;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -40,6 +45,10 @@ pub(crate) trait SharedPoolBacking: Send + Sync {
 pub(crate) struct ProvisionedSharedPools {
     pub(crate) descriptors: Vec<KvSharedPoolDescriptor>,
     pub(crate) backing: Arc<dyn SharedPoolBacking>,
+    /// Exact authority charge retained alongside the physical backing. A
+    /// provisional grant moves its existing lease here without release or
+    /// reacquisition; legacy registrations create it inside the provisioner.
+    pub(crate) memory_lease: Option<MemoryLease>,
 }
 
 /// Transport-specific provider boundary. A CUDA IPC implementation must
@@ -54,6 +63,7 @@ pub(crate) trait SharedPoolProvisioner: Send + Sync {
         registration: &KvParticipantRegistration,
         owner: MemoryOwner,
         participant_epoch: u64,
+        precharged: Option<MemoryLease>,
     ) -> Result<ProvisionedSharedPools, KvContractError>;
 }
 
@@ -79,13 +89,14 @@ struct SharedPoolSet {
     allocation_modes: HashMap<String, KvSharedPoolAllocationMode>,
     state: Mutex<SharedPoolAllocatorState>,
     backing: Arc<dyn SharedPoolBacking>,
+    _memory_lease: Option<Mutex<MemoryLease>>,
 }
 
 impl SharedPoolSet {
     fn new(
         registration: &KvParticipantRegistration,
         receipt: &KvRegistrationReceipt,
-        provisioned: ProvisionedSharedPools,
+        mut provisioned: ProvisionedSharedPools,
     ) -> Result<Arc<Self>, KvContractError> {
         receipt.validate_for(registration)?;
         if provisioned.descriptors != receipt.shared_pools {
@@ -155,6 +166,10 @@ impl SharedPoolSet {
             quarantined_by_pool.insert(capacity_pool_id.clone(), BTreeSet::new());
         }
 
+        let memory_lease = provisioned.memory_lease.take().map(|mut lease| {
+            lease.commit_capacity();
+            Mutex::new(lease)
+        });
         Ok(Arc::new(Self {
             groups,
             bindings_by_pool,
@@ -164,6 +179,7 @@ impl SharedPoolSet {
                 quarantined_by_pool,
             }),
             backing: provisioned.backing,
+            _memory_lease: memory_lease,
         }))
     }
 
@@ -362,12 +378,222 @@ struct ExternalLeaseRecord {
     shared_allocation: Option<SharedPoolLeaseAllocation>,
 }
 
+/// One whole-block exact KV candidate, ordered from preferred to hard minimum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProvisionalKvCandidate {
+    pub(crate) block_count: u64,
+    pub(crate) bytes_per_block: u64,
+    pub(crate) effective_target_concurrency: u64,
+}
+
+/// Certified scope used to precharge one managed external KV backing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProvisionalKvGrantRequest {
+    pub(crate) participant_base: String,
+    pub(crate) model_fingerprint: String,
+    pub(crate) geometry_digest: String,
+    pub(crate) adapter_profile: KvAdapterProfile,
+    pub(crate) capacity_pool_id: String,
+    pub(crate) group_ids: BTreeSet<String>,
+    pub(crate) memory_domains: BTreeSet<KvMemoryDomain>,
+    pub(crate) candidates: Vec<ProvisionalKvCandidate>,
+    pub(crate) ttl: Duration,
+}
+
+/// Result of one atomic exact-KV selection and MemoryAuthority reservation.
+pub(crate) struct ProvisionalKvGrant {
+    pub(crate) proof: KvProvisioningGrant,
+    pub(crate) selected_candidate: ProvisionalKvCandidate,
+    pub(crate) selected_candidate_index: usize,
+    pub(crate) authority_snapshot: MemorySnapshot,
+}
+
+struct ProvisionalKvGrantRecord {
+    proof: KvProvisioningGrant,
+    participant_base: String,
+    model_fingerprint: String,
+    adapter_profile: KvAdapterProfile,
+    capacity_pool_id: String,
+    group_ids: BTreeSet<String>,
+    memory_domains: BTreeSet<KvMemoryDomain>,
+    candidate: ProvisionalKvCandidate,
+    owner: MemoryOwner,
+    lease: Option<MemoryLease>,
+    expires_at: Instant,
+}
+
+impl ProvisionalKvGrantRecord {
+    fn validate_registration(
+        &self,
+        registration: &KvParticipantRegistration,
+        proof: &KvProvisioningGrant,
+        now: Instant,
+    ) -> Result<(), KvContractError> {
+        if now >= self.expires_at {
+            return Err(KvContractError::invalid_request(
+                "provisioning grant expired before participant registration",
+            ));
+        }
+        if proof != &self.proof {
+            return Err(KvContractError::invalid_request(
+                "provisioning grant proof does not match the authority record",
+            ));
+        }
+        let suffix = registration
+            .participant_id
+            .strip_prefix(&self.participant_base)
+            .filter(|suffix| suffix.starts_with(':') && suffix.len() > 1);
+        if suffix.is_none() {
+            return Err(KvContractError::invalid_request(
+                "participant identity is outside the provisioning grant namespace",
+            ));
+        }
+        if registration.backend != "vllm"
+            || registration.model_fingerprint != self.model_fingerprint
+            || registration.adapter_profile.as_ref() != Some(&self.adapter_profile)
+        {
+            return Err(KvContractError::invalid_request(
+                "participant model/backend/profile does not match the provisioning grant",
+            ));
+        }
+
+        let capacity_group_ids = registration
+            .capacity_model
+            .groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<BTreeSet<_>>();
+        if capacity_group_ids != self.group_ids
+            || registration.capacity_model.groups.iter().any(|group| {
+                group.pool_id != self.capacity_pool_id
+                    || group.bytes_per_allocation != self.candidate.bytes_per_block
+                    || group.max_allocations != Some(self.candidate.block_count)
+                    || group
+                        .memory_domains
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        != self.memory_domains
+            })
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "participant capacity geometry does not exactly match the provisioning grant",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_provisional_grant_request(request: &ProvisionalKvGrantRequest) -> Result<(), String> {
+    if request.participant_base.trim().is_empty() || request.participant_base.contains(':') {
+        return Err(
+            "provisional KV participant base must be non-empty and cannot contain ':'".to_string(),
+        );
+    }
+    if request.model_fingerprint.trim().is_empty()
+        || request.capacity_pool_id.trim().is_empty()
+        || request.group_ids.is_empty()
+        || request
+            .group_ids
+            .iter()
+            .any(|group| group.trim().is_empty())
+        || request.memory_domains.is_empty()
+    {
+        return Err(
+            "provisional KV grant requires model, pool, group, and memory-domain identity"
+                .to_string(),
+        );
+    }
+    request
+        .adapter_profile
+        .validate()
+        .map_err(|error| format!("invalid provisional KV adapter profile: {error}"))?;
+    KvProvisioningGrant {
+        token: "validation".to_string(),
+        geometry_digest: request.geometry_digest.clone(),
+        authority_generation: 1,
+        expires_at_unix_ms: 1,
+    }
+    .validate()
+    .map_err(|error| format!("invalid provisional KV geometry digest: {error}"))?;
+    if request.ttl < Duration::from_secs(1) || request.ttl > Duration::from_secs(3600) {
+        return Err("provisional KV grant TTL must be between 1 and 3600 seconds".to_string());
+    }
+    if request.candidates.is_empty() {
+        return Err("provisional KV grant requires at least one sizing candidate".to_string());
+    }
+    let bytes_per_block = request.candidates[0].bytes_per_block;
+    let mut previous: Option<(u64, u64)> = None;
+    for candidate in &request.candidates {
+        if candidate.block_count == 0
+            || candidate.bytes_per_block == 0
+            || candidate.effective_target_concurrency == 0
+            || candidate.bytes_per_block != bytes_per_block
+            || previous.is_some_and(|(blocks, concurrency)| {
+                candidate.block_count >= blocks
+                    || candidate.effective_target_concurrency > concurrency
+            })
+            || candidate
+                .block_count
+                .checked_mul(candidate.bytes_per_block)
+                .is_none()
+        {
+            return Err(
+                "provisional KV candidates must be positive, overflow-safe, share one stride, and strictly decrease by whole block count"
+                    .to_string(),
+            );
+        }
+        previous = Some((
+            candidate.block_count,
+            candidate.effective_target_concurrency,
+        ));
+    }
+    for domain in &request.memory_domains {
+        runtime_memory_domain(domain)
+            .map_err(|error| format!("invalid provisional KV memory domain: {error}"))?;
+    }
+    Ok(())
+}
+
+fn provisional_memory_plan(
+    request: &ProvisionalKvGrantRequest,
+    candidate: &ProvisionalKvCandidate,
+    owner: MemoryOwner,
+    token: &str,
+) -> Result<MemoryPlan, String> {
+    let bytes = candidate
+        .block_count
+        .checked_mul(candidate.bytes_per_block)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| "provisional KV candidate byte size exceeds this runtime".to_string())?;
+    let mut plan = MemoryPlan::new();
+    for (index, domain) in request.memory_domains.iter().enumerate() {
+        let domain = runtime_memory_domain(domain)
+            .map_err(|error| format!("invalid provisional KV memory domain: {error}"))?;
+        plan.push(MemoryClaim::external(
+            domain,
+            owner,
+            MemoryAllocationClass::KvCache,
+            format!("provisional:{token}:{}:{index}", request.capacity_pool_id),
+            bytes,
+        ));
+    }
+    Ok(plan)
+}
+
+fn new_provisioning_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("kvg1_{}", BASE64_URL_SAFE_NO_PAD.encode(bytes))
+}
+
 #[derive(Default)]
 struct CoordinatorState {
     participants: HashMap<String, ParticipantRecord>,
     leases: HashMap<String, ExternalLeaseRecord>,
     sequences: HashMap<(String, KvSequenceKey), String>,
     managed_readiness_fences: HashMap<String, Weak<ManagedVllmKvReadinessFence>>,
+    provisional_grants: HashMap<String, ProvisionalKvGrantRecord>,
 }
 
 fn participant_matches_managed_base(participant_id: &str, participant_base: &str) -> bool {
@@ -555,6 +781,7 @@ pub(crate) struct ExternalKvCoordinator {
     state: Mutex<CoordinatorState>,
     next_participant_slot: AtomicU32,
     next_participant_epoch: AtomicU64,
+    next_provisioning_generation: AtomicU64,
     next_lease_id: AtomicU64,
     maximum_lease_ttl: Duration,
     shared_pool_provisioner: Option<Arc<dyn SharedPoolProvisioner>>,
@@ -583,6 +810,7 @@ impl ExternalKvCoordinator {
             state: Mutex::new(CoordinatorState::default()),
             next_participant_slot: AtomicU32::new(0),
             next_participant_epoch: AtomicU64::new(1),
+            next_provisioning_generation: AtomicU64::new(1),
             next_lease_id: AtomicU64::new(1),
             maximum_lease_ttl,
             shared_pool_provisioner,
@@ -590,7 +818,132 @@ impl ExternalKvCoordinator {
         }))
     }
 
+    /// Atomically select and reserve one exact external KV candidate before
+    /// the managed backend process is allowed to start.
+    pub(crate) fn reserve_provisional_kv_grant(
+        &self,
+        request: &ProvisionalKvGrantRequest,
+    ) -> Result<ProvisionalKvGrant, String> {
+        validate_provisional_grant_request(request)?;
+        self.expire_provisional_grants();
+
+        let slot = self.next_participant_slot.fetch_add(1, Ordering::Relaxed);
+        let owner = MemoryOwner::external_kv(slot)
+            .ok_or_else(|| "external KV participant owner space exhausted".to_string())?;
+        let generation = self
+            .next_provisioning_generation
+            .fetch_add(1, Ordering::Relaxed);
+        if generation == 0 {
+            return Err("KV provisioning generation space exhausted".to_string());
+        }
+        let proof = KvProvisioningGrant {
+            token: new_provisioning_token(),
+            geometry_digest: request.geometry_digest.clone(),
+            authority_generation: generation,
+            expires_at_unix_ms: unix_ms_after(request.ttl),
+        };
+        proof
+            .validate()
+            .map_err(|error| format!("invalid generated KV provisioning proof: {error}"))?;
+
+        let candidates = request
+            .candidates
+            .iter()
+            .map(|candidate| provisional_memory_plan(request, candidate, owner, &proof.token))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Coordinator state serializes participant/grant namespaces while
+        // MemoryAuthority serializes the snapshot, candidate decision, and
+        // physical adapter reservations. No child can register between them.
+        let mut state = self.state.lock();
+        if state.participants.keys().any(|participant_id| {
+            participant_matches_managed_base(participant_id, &request.participant_base)
+        }) || state
+            .provisional_grants
+            .values()
+            .any(|grant| managed_bases_overlap(&grant.participant_base, &request.participant_base))
+        {
+            return Err(format!(
+                "managed participant base '{}' already has a live participant or provisional grant",
+                request.participant_base
+            ));
+        }
+        if state.provisional_grants.contains_key(&proof.token) {
+            return Err("cryptographic KV provisioning token collision".to_string());
+        }
+        let (lease, selected_candidate_index, authority_snapshot) =
+            self.memory.admit_first_fitting(&candidates)?;
+        let selected_candidate = request.candidates[selected_candidate_index].clone();
+        state.provisional_grants.insert(
+            proof.token.clone(),
+            ProvisionalKvGrantRecord {
+                proof: proof.clone(),
+                participant_base: request.participant_base.clone(),
+                model_fingerprint: request.model_fingerprint.clone(),
+                adapter_profile: request.adapter_profile.clone(),
+                capacity_pool_id: request.capacity_pool_id.clone(),
+                group_ids: request.group_ids.clone(),
+                memory_domains: request.memory_domains.clone(),
+                candidate: selected_candidate.clone(),
+                owner,
+                lease: Some(lease),
+                expires_at: Instant::now() + request.ttl,
+            },
+        );
+        Ok(ProvisionalKvGrant {
+            proof,
+            selected_candidate,
+            selected_candidate_index,
+            authority_snapshot,
+        })
+    }
+
+    /// Release every unused provisional charge for one supervised namespace.
+    pub(crate) fn cancel_provisional_kv_grants(&self, participant_base: &str) -> usize {
+        let grants = {
+            let mut state = self.state.lock();
+            let tokens = state
+                .provisional_grants
+                .iter()
+                .filter_map(|(token, grant)| {
+                    managed_bases_overlap(&grant.participant_base, participant_base)
+                        .then_some(token.clone())
+                })
+                .collect::<Vec<_>>();
+            tokens
+                .into_iter()
+                .filter_map(|token| state.provisional_grants.remove(&token))
+                .collect::<Vec<_>>()
+        };
+        let count = grants.len();
+        drop(grants);
+        count
+    }
+
+    fn expire_provisional_grants(&self) -> usize {
+        let now = Instant::now();
+        let grants = {
+            let mut state = self.state.lock();
+            let tokens = state
+                .provisional_grants
+                .iter()
+                .filter_map(|(token, grant)| (grant.expires_at <= now).then_some(token.clone()))
+                .collect::<Vec<_>>();
+            tokens
+                .into_iter()
+                .filter_map(|token| state.provisional_grants.remove(&token))
+                .collect::<Vec<_>>()
+        };
+        let count = grants.len();
+        if count != 0 {
+            log::warn!("[kv-control] expired {count} unused KV provisioning grant(s)");
+        }
+        drop(grants);
+        count
+    }
+
     pub(crate) fn expire_stale(&self) -> usize {
+        self.expire_provisional_grants();
         let now = Instant::now();
         let mut expired = {
             let mut state = self.state.lock();
@@ -720,6 +1073,7 @@ impl ExternalKvCoordinator {
     /// the final registration key. The delimiter check prevents one model's
     /// base (for example `model-1`) from matching an unrelated `model-10`.
     pub(crate) fn retire_participants_after_backend_exit(&self, participant_base: &str) -> usize {
+        let cancelled_grants = self.cancel_provisional_kv_grants(participant_base);
         let participant_ids = self
             .state
             .lock()
@@ -730,10 +1084,16 @@ impl ExternalKvCoordinator {
             })
             .cloned()
             .collect::<Vec<_>>();
-        participant_ids
+        let retired = participant_ids
             .iter()
             .filter(|participant_id| self.retire_one_participant_after_backend_exit(participant_id))
-            .count()
+            .count();
+        if cancelled_grants != 0 {
+            log::info!(
+                "[kv-control] cancelled {cancelled_grants} unused KV provisioning grant(s) for managed base '{participant_base}'"
+            );
+        }
+        retired
     }
 
     /// Return whether the one concrete participant derived from a supervised
@@ -816,6 +1176,11 @@ impl ExternalKvCoordinator {
     #[cfg(test)]
     fn participant_count(&self) -> usize {
         self.state.lock().participants.len()
+    }
+
+    #[cfg(test)]
+    fn provisional_grant_count(&self) -> usize {
+        self.state.lock().provisional_grants.len()
     }
 
     #[cfg(test)]
@@ -965,10 +1330,32 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
             return Ok(receipt);
         }
 
-        let slot = self.next_participant_slot.fetch_add(1, Ordering::Relaxed);
-        let owner = MemoryOwner::external_kv(slot).ok_or_else(|| KvContractError::Internal {
-            message: "external KV participant owner space exhausted".to_string(),
-        })?;
+        let (owner, precharged) = if let Some(proof) = registration.provisioning_grant.as_ref() {
+            let record = state.provisional_grants.get(&proof.token).ok_or_else(|| {
+                KvContractError::invalid_request(
+                    "provisioning grant is unknown, expired, or already consumed",
+                )
+            })?;
+            record.validate_registration(registration, proof, Instant::now())?;
+            let mut record = state
+                .provisional_grants
+                .remove(&proof.token)
+                .expect("validated provisioning grant remained under coordinator state");
+            let lease = record
+                .lease
+                .take()
+                .ok_or_else(|| KvContractError::Internal {
+                    message: "validated provisioning grant has no authority lease".to_string(),
+                })?;
+            (record.owner, Some(lease))
+        } else {
+            let slot = self.next_participant_slot.fetch_add(1, Ordering::Relaxed);
+            let owner =
+                MemoryOwner::external_kv(slot).ok_or_else(|| KvContractError::Internal {
+                    message: "external KV participant owner space exhausted".to_string(),
+                })?;
+            (owner, None)
+        };
         let participant_epoch = self.next_participant_epoch.fetch_add(1, Ordering::Relaxed);
         let (receipt, shared_pools) = if is_shared {
             let provisioner = self.shared_pool_provisioner.as_ref().ok_or_else(|| {
@@ -976,7 +1363,8 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     "shared_pool was requested but no isolated data-plane provisioner is configured",
                 )
             })?;
-            let provisioned = provisioner.provision(registration, owner, participant_epoch)?;
+            let provisioned =
+                provisioner.provision(registration, owner, participant_epoch, precharged)?;
             let receipt = KvRegistrationReceipt {
                 participant_id: registration.participant_id.clone(),
                 participant_epoch,
@@ -1889,6 +2277,7 @@ mod tests {
             registration: &KvParticipantRegistration,
             _owner: MemoryOwner,
             participant_epoch: u64,
+            precharged: Option<MemoryLease>,
         ) -> Result<ProvisionedSharedPools, KvContractError> {
             let group = registration
                 .capacity_model
@@ -1919,6 +2308,7 @@ mod tests {
                     descriptor: "test-shared-backing".to_string(),
                 }],
                 backing: self.backing.clone(),
+                memory_lease: precharged,
             })
         }
     }
@@ -1971,6 +2361,7 @@ mod tests {
             },
             adapter_profile: None,
             topology: None,
+            provisioning_grant: None,
         }
     }
 
@@ -2022,6 +2413,7 @@ mod tests {
                     policy: KvCachePolicy::FullAttention,
                 }],
             }),
+            provisioning_grant: None,
         }
     }
 
@@ -2071,6 +2463,216 @@ mod tests {
             backend_version: "test-backend-1".to_string(),
             profile_id: "test-direct-v1".to_string(),
         }])
+    }
+
+    fn provisional_request(candidates: Vec<ProvisionalKvCandidate>) -> ProvisionalKvGrantRequest {
+        ProvisionalKvGrantRequest {
+            participant_base: "vllm".to_string(),
+            model_fingerprint: "sha256:test".to_string(),
+            geometry_digest: format!("sha256:{}", "ab".repeat(32)),
+            adapter_profile: allowed_test_profiles()
+                .into_iter()
+                .next()
+                .expect("test profile"),
+            capacity_pool_id: "vllm.pool.0".to_string(),
+            group_ids: BTreeSet::from(["vllm.group.0".to_string()]),
+            memory_domains: BTreeSet::from([KvMemoryDomain::Host]),
+            candidates,
+            ttl: Duration::from_secs(30),
+        }
+    }
+
+    fn registration_with_grant(proof: KvProvisioningGrant) -> KvParticipantRegistration {
+        let mut registration = shared_registration();
+        registration.participant_id = "vllm:engine-1".to_string();
+        registration.provisioning_grant = Some(proof);
+        registration
+            .capabilities
+            .features
+            .insert(KvFeature::ProvisioningGrant);
+        registration
+    }
+
+    fn kv_snapshot_bytes(memory: &MemoryAuthority) -> (usize, usize) {
+        memory
+            .snapshot()
+            .rows
+            .iter()
+            .filter(|row| row.class == MemoryAllocationClass::KvCache)
+            .fold((0, 0), |current, row| {
+                (
+                    current.0 + row.reserved_bytes,
+                    current.1 + row.committed_bytes,
+                )
+            })
+    }
+
+    #[test]
+    fn provisional_grant_transfers_without_release_reacquire_or_double_charge() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let memory = test_memory();
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            memory.clone(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let grant = coordinator
+            .reserve_provisional_kv_grant(&provisional_request(vec![
+                ProvisionalKvCandidate {
+                    block_count: 4,
+                    bytes_per_block: 4096,
+                    effective_target_concurrency: 2,
+                },
+                ProvisionalKvCandidate {
+                    block_count: 2,
+                    bytes_per_block: 4096,
+                    effective_target_concurrency: 1,
+                },
+            ]))
+            .unwrap();
+        assert_eq!(grant.selected_candidate_index, 0);
+        assert_eq!(grant.selected_candidate.block_count, 4);
+        assert_eq!(coordinator.provisional_grant_count(), 1);
+        assert_eq!(kv_snapshot_bytes(&memory), (4 * 4096, 0));
+
+        let registration = registration_with_grant(grant.proof.clone());
+        let receipt = coordinator.register(&registration).unwrap();
+        assert_eq!(receipt.shared_pools[0].block_count, 4);
+        assert_eq!(coordinator.provisional_grant_count(), 0);
+        assert_eq!(kv_snapshot_bytes(&memory), (4 * 4096, 4 * 4096));
+
+        // Repeated scheduler/worker registration is idempotent and does not
+        // consume or create another authority charge.
+        assert_eq!(coordinator.register(&registration).unwrap(), receipt);
+        assert_eq!(kv_snapshot_bytes(&memory), (4 * 4096, 4 * 4096));
+
+        let mut replay = registration;
+        replay.participant_id = "vllm:engine-2".to_string();
+        assert!(matches!(
+            coordinator.register(&replay),
+            Err(KvContractError::InvalidRequest { .. })
+        ));
+        assert_eq!(kv_snapshot_bytes(&memory), (4 * 4096, 4 * 4096));
+    }
+
+    #[test]
+    fn provisional_grant_falls_back_to_the_first_whole_block_candidate_that_fits() {
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let request = provisional_request(vec![
+            ProvisionalKvCandidate {
+                block_count: 1_000_000_000_000,
+                bytes_per_block: 4096,
+                effective_target_concurrency: 16,
+            },
+            ProvisionalKvCandidate {
+                block_count: 4,
+                bytes_per_block: 4096,
+                effective_target_concurrency: 1,
+            },
+        ]);
+
+        let grant = coordinator.reserve_provisional_kv_grant(&request).unwrap();
+
+        assert_eq!(grant.selected_candidate_index, 1);
+        assert_eq!(grant.selected_candidate.block_count, 4);
+        assert_eq!(grant.selected_candidate.effective_target_concurrency, 1);
+    }
+
+    #[test]
+    fn provisional_candidate_validation_allows_the_full_u64_block_count_shape() {
+        let request = provisional_request(vec![ProvisionalKvCandidate {
+            block_count: u64::MAX,
+            bytes_per_block: 1,
+            effective_target_concurrency: 1,
+        }]);
+
+        validate_provisional_grant_request(&request).unwrap();
+    }
+
+    #[test]
+    fn mismatched_registration_does_not_consume_provisional_grant() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let grant = coordinator
+            .reserve_provisional_kv_grant(&provisional_request(vec![ProvisionalKvCandidate {
+                block_count: 4,
+                bytes_per_block: 4096,
+                effective_target_concurrency: 2,
+            }]))
+            .unwrap();
+        let mut mismatched = registration_with_grant(grant.proof.clone());
+        mismatched.capacity_model.groups[0].max_allocations = Some(3);
+        assert!(matches!(
+            coordinator.register(&mismatched),
+            Err(KvContractError::InvalidCapabilities { .. })
+        ));
+        assert_eq!(coordinator.provisional_grant_count(), 1);
+
+        coordinator
+            .register(&registration_with_grant(grant.proof))
+            .expect("the intended registration still consumes the grant");
+        assert_eq!(coordinator.provisional_grant_count(), 0);
+    }
+
+    #[test]
+    fn provisional_grant_expiry_and_supervised_cancel_release_authority() {
+        let memory = test_memory();
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            memory.clone(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let request = provisional_request(vec![ProvisionalKvCandidate {
+            block_count: 4,
+            bytes_per_block: 4096,
+            effective_target_concurrency: 1,
+        }]);
+        let first = coordinator.reserve_provisional_kv_grant(&request).unwrap();
+        {
+            let mut state = coordinator.state.lock();
+            state
+                .provisional_grants
+                .get_mut(&first.proof.token)
+                .expect("provisional record")
+                .expires_at = Instant::now() - Duration::from_millis(1);
+        }
+        assert_eq!(coordinator.expire_provisional_grants(), 1);
+        assert_eq!(kv_snapshot_bytes(&memory), (0, 0));
+
+        coordinator.reserve_provisional_kv_grant(&request).unwrap();
+        assert_eq!(kv_snapshot_bytes(&memory), (4 * 4096, 0));
+        assert_eq!(
+            coordinator.retire_participants_after_backend_exit("vllm"),
+            0
+        );
+        assert_eq!(coordinator.provisional_grant_count(), 0);
+        assert_eq!(kv_snapshot_bytes(&memory), (0, 0));
     }
 
     #[test]

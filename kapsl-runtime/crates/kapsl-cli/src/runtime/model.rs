@@ -46,6 +46,33 @@ pub(crate) struct ModelRuntime {
     shared_metrics: kapsl_monitor::metrics::KapslMetrics,
 }
 
+fn select_managed_vllm_device_ids(
+    devices: &[kapsl_hal::device::Device],
+    tensor_parallel_size: usize,
+    replica_id: u32,
+) -> Result<Vec<usize>, String> {
+    if tensor_parallel_size == 0 {
+        return Err("managed vLLM tensor-parallel size must be positive".to_string());
+    }
+    let cuda = devices
+        .iter()
+        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+        .map(|device| device.id)
+        .collect::<Vec<_>>();
+    if cuda.len() < tensor_parallel_size {
+        return Err(format!(
+            "managed vLLM tensor parallelism requires {tensor_parallel_size} CUDA devices, but selection produced {}",
+            cuda.len()
+        ));
+    }
+    let disjoint_groups = cuda.len() / tensor_parallel_size;
+    let group = usize::try_from(replica_id).unwrap_or(usize::MAX) % disjoint_groups;
+    let start = group
+        .checked_mul(tensor_parallel_size)
+        .ok_or_else(|| "managed vLLM replica device-group index overflowed".to_string())?;
+    Ok(cuda[start..start + tensor_parallel_size].to_vec())
+}
+
 impl ModelRuntime {
     pub(crate) fn new(
         load_planner: Arc<ModelLoadPlanner>,
@@ -167,11 +194,8 @@ impl ModelRuntime {
         let mut domains = Vec::new();
         for (_, plan) in plans.iter().filter(|(_, plan)| plan.uses_managed_vllm()) {
             validate_managed_vllm_launch_policy(&plan.loader.manifest)?;
-            if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
-                return Err(
-                    "managed vLLM currently supports one CUDA device per Kapsl replica; keep --tp-degree=1"
-                        .into(),
-                );
+            if plan.use_pipeline_backend {
+                return Err("managed vLLM does not support pipeline topology".into());
             }
             let selection = select_mesh_devices(
                 &plan.loader.manifest.hardware_requirements,
@@ -183,22 +207,23 @@ impl ModelRuntime {
                     plan.base_model_id
                 )
             })?;
-            let device_id = selection
-                .devices
-                .iter()
-                .find(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
-                .map(|device| device.id)
-                .ok_or("managed vLLM preliminary admission selected no CUDA device")?;
+            let device_ids = select_managed_vllm_device_ids(
+                &selection.devices,
+                plan.worker_tp_degree,
+                plan.replica_id,
+            )?;
             let model_report = managed_vllm_memory_report(
                 &plan.model_file_path,
-                &[device_id],
+                &device_ids,
                 plan.base_model_id,
                 plan.replica_id,
             )?;
             report.allocations.extend(model_report.allocations);
-            let domain = MemoryDomain::Cuda { device_id };
-            if !domains.contains(&domain) {
-                domains.push(domain);
+            for device_id in device_ids {
+                let domain = MemoryDomain::Cuda { device_id };
+                if !domains.contains(&domain) {
+                    domains.push(domain);
+                }
             }
         }
         if report.allocations.is_empty() {
@@ -285,4 +310,50 @@ pub(crate) async fn run_worker(
     );
     server.run().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod managed_vllm_device_tests {
+    use super::*;
+    use kapsl_hal::device::{Device, DeviceBackend};
+
+    fn cuda(id: usize) -> Device {
+        Device {
+            id,
+            name: format!("cuda-{id}"),
+            backend: DeviceBackend::Cuda,
+            memory_mb: 24_000,
+            compute_units: 1,
+            pci_bus_id: None,
+            partition_id: None,
+            driver_version: None,
+            cuda_version: None,
+            compute_capability: None,
+            utilization_gpu_pct: None,
+            temperature_c: None,
+            supports_fp16: true,
+            supports_int8: true,
+        }
+    }
+
+    #[test]
+    fn managed_vllm_tp_replicas_use_disjoint_device_groups_before_wrapping() {
+        let devices = vec![cuda(0), cuda(1), cuda(2), cuda(3)];
+
+        assert_eq!(
+            select_managed_vllm_device_ids(&devices, 2, 0).unwrap(),
+            [0, 1]
+        );
+        assert_eq!(
+            select_managed_vllm_device_ids(&devices, 2, 1).unwrap(),
+            [2, 3]
+        );
+        assert_eq!(
+            select_managed_vllm_device_ids(&devices, 2, 2).unwrap(),
+            [0, 1]
+        );
+        assert!(select_managed_vllm_device_ids(&devices, 5, 0)
+            .unwrap_err()
+            .contains("requires 5 CUDA devices"));
+    }
 }

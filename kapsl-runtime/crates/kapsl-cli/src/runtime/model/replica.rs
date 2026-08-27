@@ -330,11 +330,8 @@ async fn load_managed_vllm_replica(
             plan.base_model_id
         );
     }
-    if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
-        return Err(
-            "managed vLLM currently supports one CUDA device per Kapsl replica; use CUDA_VISIBLE_DEVICES to select the device and keep --tp-degree=1"
-                .into(),
-        );
+    if plan.use_pipeline_backend {
+        return Err("managed vLLM does not support pipeline topology".into());
     }
     let deployment = resources.managed_vllm().ok_or_else(|| {
         "managed vLLM was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
@@ -348,40 +345,34 @@ async fn load_managed_vllm_replica(
             error
         )
     })?;
-    let cuda_device_ids = selection
-        .devices
+    let device_ids =
+        select_managed_vllm_device_ids(&selection.devices, plan.worker_tp_degree, plan.replica_id)?;
+    let memory_domains = device_ids
         .iter()
-        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
-        .map(|device| device.id)
+        .map(|device_id| MemoryDomain::Cuda {
+            device_id: *device_id,
+        })
         .collect::<Vec<_>>();
-    if cuda_device_ids.is_empty() {
-        return Err("managed vLLM device selection produced no CUDA device".into());
-    }
-    let device_index = if role.is_primary() {
-        0
-    } else {
-        plan.replica_id as usize % cuda_device_ids.len()
-    };
-    let device_id = cuda_device_ids[device_index];
     let backend = ManagedVllmEngine::create(
         deployment,
         &plan.loader.manifest,
         &plan.model_file_path,
         plan.base_model_id,
         plan.replica_id,
-        vec![device_id],
-        1,
+        device_ids.clone(),
+        plan.worker_tp_degree,
+        plan.batch_size.max(1),
     )?;
     let backend = load_runtime_backend(
         backend,
         &plan.model_file_path,
-        &[MemoryDomain::Cuda { device_id }],
+        &memory_domains,
         &resources,
         plan.base_model_id,
         plan.replica_id,
         EngineKind::Native,
         plan.priority_weight,
-        &role.load_context(&plan, Some(device_id)),
+        &role.load_context(&plan, device_ids.first().copied()),
     )
     .await?;
     let engine = monitor_runtime_backend(

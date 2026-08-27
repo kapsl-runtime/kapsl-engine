@@ -258,9 +258,6 @@ impl Drop for CudaIpcAllocation {
 
 struct CudaIpcSharedPoolBacking {
     allocations: HashMap<String, CudaIpcAllocation>,
-    // The memory authority lease must outlive every physical allocation. The
-    // mutex provides Sync without exposing mutation after construction.
-    _memory_lease: Mutex<MemoryLease>,
 }
 
 impl SharedPoolBacking for CudaIpcSharedPoolBacking {
@@ -288,27 +285,33 @@ impl SharedPoolProvisioner for CudaIpcSharedPoolProvisioner {
         registration: &KvParticipantRegistration,
         owner: MemoryOwner,
         participant_epoch: u64,
+        precharged: Option<MemoryLease>,
     ) -> Result<ProvisionedSharedPools, KvContractError> {
         let planned = plan_bindings(registration, participant_epoch)?;
-        let mut memory_plan = MemoryPlan::new();
-        for binding in &planned {
-            // `external` means outside the general CUDA suballocator here; the
-            // runtime still owns and frees the physical allocation below.
-            memory_plan.push(MemoryClaim::external(
-                MemoryDomain::Cuda {
-                    device_id: binding.device_id,
-                },
-                owner,
-                MemoryAllocationClass::KvCache,
-                binding.descriptor.binding_id.clone(),
-                binding.allocation_bytes,
-            ));
-        }
-        let mut memory_lease = self.memory.admit(&memory_plan).map_err(|message| {
-            KvContractError::CapacityExhausted {
-                message: format!("CUDA IPC shared-pool admission failed: {message}"),
+        let memory_lease = if let Some(lease) = precharged {
+            validate_precharged_lease(&planned, owner, &lease)?;
+            lease
+        } else {
+            let mut memory_plan = MemoryPlan::new();
+            for binding in &planned {
+                // `external` means outside the general CUDA suballocator here;
+                // the runtime still owns and frees the allocation below.
+                memory_plan.push(MemoryClaim::external(
+                    MemoryDomain::Cuda {
+                        device_id: binding.device_id,
+                    },
+                    owner,
+                    MemoryAllocationClass::KvCache,
+                    binding.descriptor.binding_id.clone(),
+                    binding.allocation_bytes,
+                ));
             }
-        })?;
+            self.memory.admit(&memory_plan).map_err(|message| {
+                KvContractError::CapacityExhausted {
+                    message: format!("CUDA IPC shared-pool admission failed: {message}"),
+                }
+            })?
+        };
 
         let mut descriptors = Vec::with_capacity(planned.len());
         let mut allocations = HashMap::with_capacity(planned.len());
@@ -323,7 +326,6 @@ impl SharedPoolProvisioner for CudaIpcSharedPoolProvisioner {
             allocations.insert(descriptor.binding_id.clone(), allocation);
             descriptors.push(descriptor);
         }
-        memory_lease.commit_capacity();
         log::info!(
             "[kv-control] provisioned {} isolated CUDA IPC KV binding(s) for participant '{}' epoch={}",
             descriptors.len(),
@@ -332,12 +334,57 @@ impl SharedPoolProvisioner for CudaIpcSharedPoolProvisioner {
         );
         Ok(ProvisionedSharedPools {
             descriptors,
-            backing: Arc::new(CudaIpcSharedPoolBacking {
-                allocations,
-                _memory_lease: Mutex::new(memory_lease),
-            }),
+            backing: Arc::new(CudaIpcSharedPoolBacking { allocations }),
+            memory_lease: Some(memory_lease),
         })
     }
+}
+
+fn validate_precharged_lease(
+    planned: &[PlannedBinding],
+    owner: MemoryOwner,
+    lease: &MemoryLease,
+) -> Result<(), KvContractError> {
+    let mut expected = HashMap::<MemoryDomain, usize>::new();
+    for binding in planned {
+        let bytes = expected
+            .entry(MemoryDomain::Cuda {
+                device_id: binding.device_id,
+            })
+            .or_default();
+        *bytes = bytes.checked_add(binding.allocation_bytes).ok_or_else(|| {
+            KvContractError::Internal {
+                message: "precharged CUDA IPC binding bytes overflowed".to_string(),
+            }
+        })?;
+    }
+    let mut actual = HashMap::<MemoryDomain, usize>::new();
+    for claim in lease.claims() {
+        if claim.owner != owner
+            || claim.class != MemoryAllocationClass::KvCache
+            || !matches!(
+                claim.source,
+                super::memory::MemoryClaimSource::External { .. }
+            )
+            || !matches!(claim.domain, MemoryDomain::Cuda { .. })
+        {
+            return Err(KvContractError::invalid_capabilities(
+                "precharged CUDA IPC lease contains a claim outside its exact KV scope",
+            ));
+        }
+        let bytes = actual.entry(claim.domain.clone()).or_default();
+        *bytes = bytes
+            .checked_add(claim.bytes)
+            .ok_or_else(|| KvContractError::Internal {
+                message: "precharged CUDA IPC lease bytes overflowed".to_string(),
+            })?;
+    }
+    if actual != expected {
+        return Err(KvContractError::invalid_capabilities(
+            "precharged CUDA IPC lease does not exactly match planned bindings",
+        ));
+    }
+    Ok(())
 }
 
 fn cuda_internal(

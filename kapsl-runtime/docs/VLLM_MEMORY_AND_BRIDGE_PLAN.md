@@ -412,7 +412,7 @@ Launch the pinned vLLM build with its exact-byte cache option, shown by the
 current build as:
 
 ```text
---kv-cache-memory <granted-bytes>
+--kv-cache-memory-bytes <granted-bytes>
 ```
 
 Remove the implicit `--gpu-memory-utilization 0.5` from the auto path. Before
@@ -713,7 +713,7 @@ fixtures.
 - Add `kv_cache` manifest policy and legacy migration parsing.
 - Add checked block/byte planning.
 - Add transactional provisional external-KV reservations.
-- Pass exact `--kv-cache-memory` bytes.
+- Pass exact `--kv-cache-memory-bytes` bytes.
 - Transfer the reservation during connector registration.
 - Make attachment, activation, and scheduler publication one readiness path.
 - Re-plan restarts and scale-ups.

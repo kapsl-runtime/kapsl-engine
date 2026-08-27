@@ -10,6 +10,7 @@ use kapsl_engine_api::{
     OpenAiWireStream, OpenAiWireStreamResponse,
 };
 use serde::Deserialize;
+use std::collections::BTreeSet;
 use std::fs::{OpenOptions, Permissions};
 use std::net::TcpListener as StdTcpListener;
 #[cfg(unix)]
@@ -193,6 +194,20 @@ impl ManagedVllmDeployment {
         }
         *installed = Some(coordinator);
         Ok(())
+    }
+
+    fn coordinator(&self) -> Result<Arc<ExternalKvCoordinator>, String> {
+        #[cfg(unix)]
+        {
+            self.coordinator
+                .read()
+                .clone()
+                .ok_or_else(|| "managed vLLM control coordinator is not installed".to_string())
+        }
+        #[cfg(not(unix))]
+        {
+            Err("managed vLLM control coordinator requires Unix".to_string())
+        }
     }
 
     fn retire_participants_after_backend_exit(
@@ -582,10 +597,9 @@ enum ManagedVllmKvCachePolicy {
 
 #[derive(Clone, Debug)]
 struct ManagedVllmSettings {
-    /// Compatibility value used by the process command until the certified
-    /// geometry planner and provisional reservation handoff are wired. The
-    /// parsed policy is retained separately so enabling exact sizing does not
-    /// require another manifest migration.
+    /// Compatibility value retained only for explicit legacy-fraction
+    /// manifests. Exact auto/fixed launches are driven exclusively by the
+    /// certified planner and authority grant.
     gpu_memory_utilization: f64,
     kv_cache_policy: ManagedVllmKvCachePolicy,
     legacy_top_level_fraction_authored: bool,
@@ -593,12 +607,159 @@ struct ManagedVllmSettings {
     startup_timeout: Duration,
 }
 
+const MANAGED_VLLM_PLANNER_SCHEMA_VERSION: u64 = 1;
+
+#[derive(Clone, Debug)]
+struct ManagedVllmPlannerInvocation {
+    model_root: PathBuf,
+    model_fingerprint: String,
+    participant_base: String,
+    device_ids: Vec<usize>,
+    tensor_parallel_size: usize,
+    max_model_len: usize,
+    resolved_target_concurrency: usize,
+    policy: ManagedVllmKvCachePolicy,
+    timeout: Duration,
+    cuda_visible_devices: String,
+    output_path: PathBuf,
+    log_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedVllmExactPlanTemplate {
+    grant_request: ProvisionalKvGrantRequest,
+    requested_bytes_per_rank: u64,
+    minimum_bytes_per_rank: u64,
+    target_concurrency: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerEnvelope {
+    schema_version: u64,
+    status: String,
+    supported: bool,
+    geometry_digest: String,
+    geometry: serde_json::Value,
+    policy: ManagedVllmPlannerPolicy,
+    sizing: ManagedVllmPlannerSizing,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerPolicy {
+    target_concurrency: u64,
+    headroom_percent: u64,
+    prefix_blocks: u64,
+    alignment_blocks: u64,
+    #[serde(default)]
+    min_bytes: Option<u64>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    strict_concurrency: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerSizing {
+    ranks: Vec<ManagedVllmPlannerRankSizing>,
+    total_desired_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerRankSizing {
+    rank: u64,
+    device_id: u64,
+    bytes_per_block: u64,
+    sequence_blocks: u64,
+    minimum_blocks: u64,
+    minimum_bytes: u64,
+    base_blocks: u64,
+    headroom_blocks: u64,
+    desired_blocks: u64,
+    desired_bytes: u64,
+    effective_target_concurrency: u64,
+    concurrency_reduced: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerGeometry {
+    identity: ManagedVllmPlannerIdentity,
+    model_fingerprint: String,
+    max_model_len: u64,
+    tensor_parallel_size: u64,
+    attention_backend: String,
+    layout_id: String,
+    total_pool_bytes_per_block: u64,
+    ranks: Vec<ManagedVllmPlannerRankGeometry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerIdentity {
+    adapter_id: String,
+    adapter_version: String,
+    backend_version: String,
+    profile_id: String,
+    layout_version: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerRankGeometry {
+    rank: u64,
+    device_id: u64,
+    pool_bytes_per_block: u64,
+    fixed_overhead_blocks: u64,
+    required_blocks_per_sequence: u64,
+    cache_groups: Vec<ManagedVllmPlannerCacheGroup>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerCacheGroup {
+    group_id: String,
+    layers: Vec<String>,
+    block_size_tokens: u64,
+    bytes_per_group_block: u64,
+    required_blocks_per_sequence: u64,
+    kv_heads: u64,
+    key_head_dim: u64,
+    value_head_dim: u64,
+    element_type: ManagedVllmPlannerElementType,
+    policy: ManagedVllmPlannerCachePolicy,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerElementType {
+    name: String,
+    bits: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerCachePolicy {
+    kind: String,
+    #[serde(default)]
+    window_tokens: Option<u64>,
+    #[serde(default)]
+    extra_retained_tokens: Option<u64>,
+}
+
 impl ManagedVllmSettings {
     fn from_manifest(manifest: &Manifest) -> Result<Self, String> {
         let mut settings = Self {
             gpu_memory_utilization: DEFAULT_LEGACY_GPU_MEMORY_UTILIZATION,
-            kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
-                gpu_memory_utilization: DEFAULT_LEGACY_GPU_MEMORY_UTILIZATION,
+            kv_cache_policy: ManagedVllmKvCachePolicy::Auto {
+                target_concurrency: None,
+                headroom_percent: DEFAULT_KV_HEADROOM_PERCENT,
+                min_bytes: None,
+                max_bytes: None,
+                strict: false,
             },
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
@@ -670,13 +831,7 @@ impl ManagedVllmSettings {
     }
 
     fn validate_launch_policy(&self) -> Result<(), String> {
-        match self.kv_cache_policy {
-            ManagedVllmKvCachePolicy::LegacyFraction { .. } => Ok(()),
-            ManagedVllmKvCachePolicy::Auto { .. } | ManagedVllmKvCachePolicy::Fixed { .. } => Err(
-                "managed vLLM exact KV policy is not launchable until the certified runtime planner and provisional MemoryAuthority grant handoff are installed; use kv_cache.mode: legacy_fraction during this compatibility release"
-                    .to_string(),
-            ),
-        }
+        Ok(())
     }
 }
 
@@ -810,6 +965,719 @@ fn parse_positive_usize(raw: &serde_yaml::Value, path: &str) -> Result<usize, St
         return Err(format!("{path} must be a positive integer"));
     }
     Ok(value)
+}
+
+fn planner_policy_for_invocation(
+    policy: &ManagedVllmKvCachePolicy,
+    resolved_target_concurrency: usize,
+) -> Result<ManagedVllmPlannerPolicy, String> {
+    let to_u64 = |value: usize, field: &str| {
+        u64::try_from(value).map_err(|_| format!("managed vLLM {field} exceeds uint64"))
+    };
+    match policy {
+        ManagedVllmKvCachePolicy::LegacyFraction { .. } => {
+            Err("legacy_fraction does not invoke the exact managed vLLM planner".to_string())
+        }
+        ManagedVllmKvCachePolicy::Fixed { bytes } => {
+            let bytes = to_u64(*bytes, "fixed KV bytes")?;
+            Ok(ManagedVllmPlannerPolicy {
+                target_concurrency: 1,
+                headroom_percent: 0,
+                prefix_blocks: 0,
+                alignment_blocks: 1,
+                min_bytes: Some(bytes),
+                max_bytes: Some(bytes),
+                strict_concurrency: true,
+            })
+        }
+        ManagedVllmKvCachePolicy::Auto {
+            target_concurrency,
+            headroom_percent,
+            min_bytes,
+            max_bytes,
+            strict,
+        } => Ok(ManagedVllmPlannerPolicy {
+            target_concurrency: to_u64(
+                target_concurrency.unwrap_or(resolved_target_concurrency),
+                "target concurrency",
+            )?,
+            headroom_percent: to_u64(*headroom_percent, "KV headroom percent")?,
+            prefix_blocks: 0,
+            alignment_blocks: 1,
+            min_bytes: min_bytes
+                .map(|value| to_u64(value, "minimum KV bytes"))
+                .transpose()?,
+            max_bytes: max_bytes
+                .map(|value| to_u64(value, "maximum KV bytes"))
+                .transpose()?,
+            strict_concurrency: *strict,
+        }),
+    }
+}
+
+fn parse_managed_vllm_planner_output(
+    encoded: &str,
+    invocation: &ManagedVllmPlannerInvocation,
+) -> Result<ManagedVllmExactPlanTemplate, String> {
+    let envelope: ManagedVllmPlannerEnvelope = serde_json::from_str(encoded)
+        .map_err(|error| format!("managed vLLM planner emitted invalid JSON: {error}"))?;
+    if envelope.schema_version != MANAGED_VLLM_PLANNER_SCHEMA_VERSION
+        || envelope.status != "planned"
+        || !envelope.supported
+    {
+        return Err(format!(
+            "managed vLLM planner did not emit supported schema {} output",
+            MANAGED_VLLM_PLANNER_SCHEMA_VERSION
+        ));
+    }
+    let expected_digest = managed_vllm_geometry_digest(&envelope.geometry)?;
+    if envelope.geometry_digest != expected_digest {
+        return Err("managed vLLM planner geometry digest does not match its payload".to_string());
+    }
+    let geometry: ManagedVllmPlannerGeometry = serde_json::from_value(envelope.geometry)
+        .map_err(|error| format!("managed vLLM planner geometry is malformed: {error}"))?;
+    let expected_policy =
+        planner_policy_for_invocation(&invocation.policy, invocation.resolved_target_concurrency)?;
+    if envelope.policy != expected_policy {
+        return Err(format!(
+            "managed vLLM planner policy drifted from the requested policy: {:?} != {:?}",
+            envelope.policy, expected_policy
+        ));
+    }
+    validate_managed_vllm_planner_geometry(
+        &geometry,
+        &envelope.sizing,
+        invocation,
+        &envelope.policy,
+    )?;
+    let candidates = managed_vllm_grant_candidates(
+        &geometry.ranks[0],
+        &envelope.sizing.ranks[0],
+        &envelope.policy,
+    )?;
+    let memory_domains = invocation
+        .device_ids
+        .iter()
+        .map(|device_id| {
+            u32::try_from(*device_id)
+                .map(|device_id| kapsl_kv_abi::KvMemoryDomain::Cuda { device_id })
+                .map_err(|_| format!("managed vLLM CUDA device {device_id} exceeds uint32"))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let group_ids = geometry.ranks[0]
+        .cache_groups
+        .iter()
+        .map(|group| group.group_id.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(ManagedVllmExactPlanTemplate {
+        grant_request: ProvisionalKvGrantRequest {
+            participant_base: invocation.participant_base.clone(),
+            model_fingerprint: invocation.model_fingerprint.clone(),
+            geometry_digest: envelope.geometry_digest,
+            adapter_profile: kapsl_kv_abi::KvAdapterProfile {
+                adapter_id: MANAGED_VLLM_ADAPTER_ID.to_string(),
+                adapter_version: MANAGED_VLLM_ADAPTER_VERSION.to_string(),
+                backend_version: MANAGED_VLLM_BACKEND_VERSION.to_string(),
+                profile_id: MANAGED_VLLM_PROFILE_ID.to_string(),
+            },
+            capacity_pool_id: "vllm.pool.0".to_string(),
+            group_ids,
+            memory_domains,
+            candidates,
+            ttl: invocation.timeout,
+        },
+        requested_bytes_per_rank: envelope.sizing.ranks[0].desired_bytes,
+        minimum_bytes_per_rank: envelope.sizing.ranks[0].minimum_bytes,
+        target_concurrency: envelope.policy.target_concurrency,
+    })
+}
+
+fn validate_managed_vllm_planner_geometry(
+    geometry: &ManagedVllmPlannerGeometry,
+    sizing: &ManagedVllmPlannerSizing,
+    invocation: &ManagedVllmPlannerInvocation,
+    policy: &ManagedVllmPlannerPolicy,
+) -> Result<(), String> {
+    let expected_tp = u64::try_from(invocation.tensor_parallel_size)
+        .map_err(|_| "managed vLLM tensor parallel size exceeds uint64".to_string())?;
+    let expected_max_len = u64::try_from(invocation.max_model_len)
+        .map_err(|_| "managed vLLM max_model_len exceeds uint64".to_string())?;
+    if geometry.identity
+        != (ManagedVllmPlannerIdentity {
+            adapter_id: MANAGED_VLLM_ADAPTER_ID.to_string(),
+            adapter_version: MANAGED_VLLM_ADAPTER_VERSION.to_string(),
+            backend_version: MANAGED_VLLM_BACKEND_VERSION.to_string(),
+            profile_id: MANAGED_VLLM_PROFILE_ID.to_string(),
+            layout_version: 1,
+        })
+        || geometry.model_fingerprint != invocation.model_fingerprint
+        || geometry.max_model_len != expected_max_len
+        || geometry.tensor_parallel_size != expected_tp
+        || geometry.attention_backend != "FLASH_ATTN"
+        || geometry.layout_id.trim().is_empty()
+        || geometry.ranks.len() != invocation.tensor_parallel_size
+        || sizing.ranks.len() != invocation.tensor_parallel_size
+    {
+        return Err(
+            "managed vLLM planner identity/model/profile/world does not match the launch"
+                .to_string(),
+        );
+    }
+    let mut total_stride = 0_u64;
+    let mut total_desired = 0_u64;
+    let first_rank = geometry
+        .ranks
+        .first()
+        .ok_or_else(|| "managed vLLM planner returned no rank geometry".to_string())?;
+    for (index, (rank, rank_sizing)) in geometry.ranks.iter().zip(&sizing.ranks).enumerate() {
+        let expected_device = u64::try_from(invocation.device_ids[index])
+            .map_err(|_| "managed vLLM device ID exceeds uint64".to_string())?;
+        if rank.rank != index as u64
+            || rank.device_id != expected_device
+            || rank_sizing.rank != index as u64
+            || rank_sizing.device_id != expected_device
+            || rank.pool_bytes_per_block == 0
+            || rank.fixed_overhead_blocks == 0
+            || rank.required_blocks_per_sequence == 0
+            || rank.cache_groups.is_empty()
+            || rank_sizing.bytes_per_block != rank.pool_bytes_per_block
+            || rank_sizing.sequence_blocks != rank.required_blocks_per_sequence
+            || rank_sizing.desired_bytes
+                != checked_u64_mul(
+                    rank_sizing.desired_blocks,
+                    rank.pool_bytes_per_block,
+                    "planner desired bytes",
+                )?
+            || rank_sizing.minimum_bytes
+                != checked_u64_mul(
+                    rank_sizing.minimum_blocks,
+                    rank.pool_bytes_per_block,
+                    "planner minimum bytes",
+                )?
+        {
+            return Err(format!(
+                "managed vLLM planner rank {index} has inconsistent placement or sizing"
+            ));
+        }
+        validate_managed_vllm_rank_sizing(rank, rank_sizing, policy)?;
+        let mut group_ids = HashSet::new();
+        let mut layers = HashSet::new();
+        let mut required_blocks = 0_u64;
+        let mut maximum_group_stride = 0_u64;
+        for (group_index, group) in rank.cache_groups.iter().enumerate() {
+            if group.group_id != format!("vllm.group.{group_index}")
+                || !group_ids.insert(group.group_id.as_str())
+                || group.layers.is_empty()
+                || group
+                    .layers
+                    .iter()
+                    .any(|layer| layer.trim().is_empty() || !layers.insert(layer.as_str()))
+                || group.block_size_tokens == 0
+                || group.bytes_per_group_block == 0
+                || group.bytes_per_group_block > rank.pool_bytes_per_block
+                || group.required_blocks_per_sequence == 0
+                || group.kv_heads == 0
+                || group.key_head_dim == 0
+                || group.value_head_dim == 0
+                || group.element_type.name.trim().is_empty()
+                || group.element_type.bits == 0
+                || group.element_type.bytes == 0
+                || group.element_type.bits != group.element_type.bytes.saturating_mul(8)
+                || !matches!(
+                    group.policy.kind.as_str(),
+                    "full_attention" | "sliding_window"
+                )
+                || (group.policy.kind == "full_attention"
+                    && (group.policy.window_tokens.is_some()
+                        || group.policy.extra_retained_tokens.is_some()))
+                || (group.policy.kind == "sliding_window"
+                    && (group.policy.window_tokens.is_none_or(|window| window == 0)
+                        || group.policy.extra_retained_tokens.is_none()))
+            {
+                return Err(format!(
+                    "managed vLLM planner cache group {group_index} is not a certified packed geometry"
+                ));
+            }
+            required_blocks = checked_u64_add(
+                required_blocks,
+                group.required_blocks_per_sequence,
+                "planner per-sequence group blocks",
+            )?;
+            maximum_group_stride = maximum_group_stride.max(group.bytes_per_group_block);
+        }
+        if required_blocks != rank.required_blocks_per_sequence
+            || maximum_group_stride != rank.pool_bytes_per_block
+        {
+            return Err(format!(
+                "managed vLLM planner rank {index} group accounting does not match the packed pool"
+            ));
+        }
+        if index != 0
+            && (rank.pool_bytes_per_block != first_rank.pool_bytes_per_block
+                || rank.fixed_overhead_blocks != first_rank.fixed_overhead_blocks
+                || rank.required_blocks_per_sequence != first_rank.required_blocks_per_sequence
+                || rank.cache_groups != first_rank.cache_groups
+                || rank_sizing.desired_blocks != sizing.ranks[0].desired_blocks
+                || rank_sizing.minimum_blocks != sizing.ranks[0].minimum_blocks)
+        {
+            return Err(
+                "managed vLLM planner tensor-parallel ranks have divergent cache geometry"
+                    .to_string(),
+            );
+        }
+        total_stride = checked_u64_add(
+            total_stride,
+            rank.pool_bytes_per_block,
+            "planner total block stride",
+        )?;
+        total_desired = checked_u64_add(
+            total_desired,
+            rank_sizing.desired_bytes,
+            "planner total desired bytes",
+        )?;
+    }
+    if geometry.total_pool_bytes_per_block != total_stride
+        || sizing.total_desired_bytes != total_desired
+    {
+        return Err("managed vLLM planner aggregate bytes are inconsistent".to_string());
+    }
+    Ok(())
+}
+
+fn validate_managed_vllm_rank_sizing(
+    rank: &ManagedVllmPlannerRankGeometry,
+    sizing: &ManagedVllmPlannerRankSizing,
+    policy: &ManagedVllmPlannerPolicy,
+) -> Result<(), String> {
+    if policy.target_concurrency == 0
+        || policy.alignment_blocks == 0
+        || policy.headroom_percent > 100
+    {
+        return Err("managed vLLM planner policy contains invalid bounds".to_string());
+    }
+    let minimum = checked_u64_round_up(
+        checked_u64_add(
+            rank.fixed_overhead_blocks,
+            rank.required_blocks_per_sequence,
+            "planner minimum blocks",
+        )?,
+        policy.alignment_blocks,
+        "planner minimum alignment",
+    )?;
+    let workload = checked_u64_mul(
+        rank.required_blocks_per_sequence,
+        policy.target_concurrency,
+        "planner workload blocks",
+    )?;
+    let workload_with_prefix =
+        checked_u64_add(workload, policy.prefix_blocks, "planner prefix blocks")?;
+    let headroom = checked_u64_ceil_div(
+        checked_u64_mul(
+            workload_with_prefix,
+            policy.headroom_percent,
+            "planner headroom",
+        )?,
+        100,
+        "planner headroom",
+    )?;
+    let base = checked_u64_add(
+        rank.fixed_overhead_blocks,
+        workload_with_prefix,
+        "planner base blocks",
+    )?;
+    let mut desired = checked_u64_round_up(
+        checked_u64_add(base, headroom, "planner desired blocks")?,
+        policy.alignment_blocks,
+        "planner desired alignment",
+    )?;
+    let floor = policy
+        .min_bytes
+        .map(|bytes| {
+            checked_u64_round_up(
+                checked_u64_ceil_div(bytes, rank.pool_bytes_per_block, "planner min bytes")?,
+                policy.alignment_blocks,
+                "planner min byte alignment",
+            )
+        })
+        .transpose()?;
+    if let Some(floor) = floor {
+        desired = desired.max(floor);
+    }
+    if let Some(max_bytes) = policy.max_bytes {
+        let cap = (max_bytes / rank.pool_bytes_per_block / policy.alignment_blocks)
+            * policy.alignment_blocks;
+        if cap < minimum || floor.is_some_and(|floor| cap < floor) {
+            return Err("managed vLLM planner byte cap violates its minimum".to_string());
+        }
+        desired = desired.min(cap);
+    }
+    let effective = policy.target_concurrency.min(
+        desired.saturating_sub(rank.fixed_overhead_blocks) / rank.required_blocks_per_sequence,
+    );
+    if sizing.minimum_blocks != minimum
+        || sizing.base_blocks != base
+        || sizing.headroom_blocks != headroom
+        || sizing.desired_blocks != desired
+        || sizing.effective_target_concurrency != effective
+        || sizing.concurrency_reduced != (effective < policy.target_concurrency)
+        || effective == 0
+        || (policy.strict_concurrency && effective < policy.target_concurrency)
+    {
+        return Err("managed vLLM planner rank arithmetic failed the Rust cross-check".to_string());
+    }
+    Ok(())
+}
+
+fn managed_vllm_grant_candidates(
+    rank: &ManagedVllmPlannerRankGeometry,
+    sizing: &ManagedVllmPlannerRankSizing,
+    policy: &ManagedVllmPlannerPolicy,
+) -> Result<Vec<ProvisionalKvCandidate>, String> {
+    let mut candidates = std::collections::BTreeMap::<u64, u64>::new();
+    let mut add_candidate = |blocks: u64| -> Result<(), String> {
+        if blocks < sizing.minimum_blocks
+            || blocks > sizing.desired_blocks
+            || !blocks.is_multiple_of(policy.alignment_blocks)
+        {
+            return Ok(());
+        }
+        let effective = policy.target_concurrency.min(
+            blocks.saturating_sub(rank.fixed_overhead_blocks) / rank.required_blocks_per_sequence,
+        );
+        if effective == 0 || (policy.strict_concurrency && effective < policy.target_concurrency) {
+            return Ok(());
+        }
+        candidates
+            .entry(blocks)
+            .and_modify(|current| *current = (*current).max(effective))
+            .or_insert(effective);
+        Ok(())
+    };
+    add_candidate(sizing.desired_blocks)?;
+    let floor = policy
+        .min_bytes
+        .map(|bytes| {
+            checked_u64_round_up(
+                checked_u64_ceil_div(bytes, rank.pool_bytes_per_block, "candidate min bytes")?,
+                policy.alignment_blocks,
+                "candidate min alignment",
+            )
+        })
+        .transpose()?
+        .unwrap_or(sizing.minimum_blocks);
+    let start = if policy.strict_concurrency {
+        policy.target_concurrency
+    } else {
+        sizing.effective_target_concurrency
+    };
+    for concurrency in (1..=start).rev() {
+        let workload = checked_u64_mul(
+            rank.required_blocks_per_sequence,
+            concurrency,
+            "candidate workload blocks",
+        )?;
+        let bare = checked_u64_round_up(
+            checked_u64_add(
+                rank.fixed_overhead_blocks,
+                workload,
+                "candidate bare blocks",
+            )?,
+            policy.alignment_blocks,
+            "candidate bare alignment",
+        )?
+        .max(floor);
+        let optional_base = checked_u64_add(workload, policy.prefix_blocks, "candidate prefix")?;
+        let optional_headroom = checked_u64_ceil_div(
+            checked_u64_mul(optional_base, policy.headroom_percent, "candidate headroom")?,
+            100,
+            "candidate headroom",
+        )?;
+        let full = checked_u64_round_up(
+            checked_u64_add(
+                checked_u64_add(rank.fixed_overhead_blocks, optional_base, "candidate base")?,
+                optional_headroom,
+                "candidate full blocks",
+            )?,
+            policy.alignment_blocks,
+            "candidate full alignment",
+        )?
+        .max(floor)
+        .min(sizing.desired_blocks);
+        add_candidate(full)?;
+        add_candidate(bare)?;
+    }
+    let candidates = candidates
+        .into_iter()
+        .rev()
+        .map(
+            |(block_count, effective_target_concurrency)| ProvisionalKvCandidate {
+                block_count,
+                bytes_per_block: rank.pool_bytes_per_block,
+                effective_target_concurrency,
+            },
+        )
+        .collect::<Vec<_>>();
+    if candidates.is_empty()
+        || candidates[0].block_count != sizing.desired_blocks
+        || candidates
+            .last()
+            .is_none_or(|candidate| candidate.effective_target_concurrency == 0)
+    {
+        return Err("managed vLLM planner produced no valid exact grant candidates".to_string());
+    }
+    Ok(candidates)
+}
+
+fn checked_u64_add(left: u64, right: u64, context: &str) -> Result<u64, String> {
+    left.checked_add(right)
+        .ok_or_else(|| format!("{context} overflowed uint64"))
+}
+
+fn checked_u64_mul(left: u64, right: u64, context: &str) -> Result<u64, String> {
+    left.checked_mul(right)
+        .ok_or_else(|| format!("{context} overflowed uint64"))
+}
+
+fn checked_u64_ceil_div(value: u64, divisor: u64, context: &str) -> Result<u64, String> {
+    if divisor == 0 {
+        return Err(format!("{context} has a zero divisor"));
+    }
+    (value / divisor)
+        .checked_add(u64::from(!value.is_multiple_of(divisor)))
+        .ok_or_else(|| format!("{context} overflowed uint64"))
+}
+
+fn checked_u64_round_up(value: u64, alignment: u64, context: &str) -> Result<u64, String> {
+    checked_u64_mul(
+        checked_u64_ceil_div(value, alignment, context)?,
+        alignment,
+        context,
+    )
+}
+
+fn managed_vllm_geometry_digest(geometry: &serde_json::Value) -> Result<String, String> {
+    let payload = serde_json::json!({
+        "schema_version": MANAGED_VLLM_PLANNER_SCHEMA_VERSION,
+        "geometry": geometry,
+    });
+    let mut canonical = String::new();
+    write_canonical_json(&payload, &mut canonical)?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> Result<(), String> {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => output.push_str(
+            &serde_json::to_string(value)
+                .map_err(|error| format!("canonicalize planner string: {error}"))?,
+        ),
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                output.push_str(
+                    &serde_json::to_string(key)
+                        .map_err(|error| format!("canonicalize planner key: {error}"))?,
+                );
+                output.push(':');
+                write_canonical_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn run_managed_vllm_planner(
+    python: &Path,
+    invocation: &ManagedVllmPlannerInvocation,
+) -> Result<ManagedVllmExactPlanTemplate, String> {
+    let expected_policy =
+        planner_policy_for_invocation(&invocation.policy, invocation.resolved_target_concurrency)?;
+    let output_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&invocation.output_path)
+        .map_err(|error| {
+            format!(
+                "create managed vLLM planner output {}: {error}",
+                invocation.output_path.display()
+            )
+        })?;
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&invocation.log_path)
+        .map_err(|error| {
+            format!(
+                "open managed vLLM planner log {}: {error}",
+                invocation.log_path.display()
+            )
+        })?;
+    let mut command = Command::new(python);
+    command
+        .arg("-m")
+        .arg("kapsl_vllm_connector.plan")
+        .args(["--model", invocation.model_root.to_string_lossy().as_ref()])
+        .args(["--model-fingerprint", &invocation.model_fingerprint])
+        .args(["--max-model-len", &invocation.max_model_len.to_string()])
+        .args([
+            "--tensor-parallel-size",
+            &invocation.tensor_parallel_size.to_string(),
+        ])
+        .args(["--attention-backend", "FLASH_ATTN"])
+        .args([
+            "--devices",
+            &invocation
+                .device_ids
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ])
+        .args([
+            "--target-concurrency",
+            &expected_policy.target_concurrency.to_string(),
+        ])
+        .args([
+            "--headroom-percent",
+            &expected_policy.headroom_percent.to_string(),
+        ])
+        .args([
+            "--prefix-blocks",
+            &expected_policy.prefix_blocks.to_string(),
+        ])
+        .args([
+            "--alignment-blocks",
+            &expected_policy.alignment_blocks.to_string(),
+        ])
+        .env("CUDA_VISIBLE_DEVICES", &invocation.cuda_visible_devices)
+        .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        .stdout(Stdio::from(output_file))
+        .stderr(Stdio::from(log_file));
+    if let Some(bytes) = expected_policy.min_bytes {
+        command.args(["--min-bytes", &bytes.to_string()]);
+    }
+    if let Some(bytes) = expected_policy.max_bytes {
+        command.args(["--max-bytes", &bytes.to_string()]);
+    }
+    if expected_policy.strict_concurrency {
+        command.arg("--strict-concurrency");
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "start managed vLLM geometry planner with {}: {error}",
+            python.display()
+        )
+    })?;
+    #[cfg(unix)]
+    let process_group = i32::try_from(child.id()).unwrap_or(i32::MAX);
+    let deadline = Instant::now() + invocation.timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                stop_managed_vllm_planner(&mut child);
+                return Err(format!(
+                    "managed vLLM geometry planner exceeded {}s; log: {}",
+                    invocation.timeout.as_secs(),
+                    invocation.log_path.display()
+                ));
+            }
+            Err(error) => {
+                stop_managed_vllm_planner(&mut child);
+                return Err(format!("inspect managed vLLM geometry planner: {error}"));
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!(
+            "managed vLLM geometry planner exited with {status}; log: {}",
+            invocation.log_path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let descendants_deadline = Instant::now() + Duration::from_secs(3);
+        while process_group_alive(process_group) && Instant::now() < descendants_deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if process_group_alive(process_group) {
+            stop_managed_vllm_planner(&mut child);
+            return Err(
+                "managed vLLM planner parent exited but its process group remained alive; refusing to start the serving generation"
+                    .to_string(),
+            );
+        }
+    }
+    let output = std::fs::read_to_string(&invocation.output_path).map_err(|error| {
+        format!(
+            "read managed vLLM planner output {}: {error}",
+            invocation.output_path.display()
+        )
+    })?;
+    let template = parse_managed_vllm_planner_output(&output, invocation)?;
+    log::info!(
+        "[vllm-memory] certified plan model={} desired_per_rank={} minimum_per_rank={} target_concurrency={} candidates={} geometry={} output={}",
+        invocation.model_fingerprint,
+        template.requested_bytes_per_rank,
+        template.minimum_bytes_per_rank,
+        template.target_concurrency,
+        template.grant_request.candidates.len(),
+        template.grant_request.geometry_digest,
+        invocation.output_path.display(),
+    );
+    Ok(template)
+}
+
+fn stop_managed_vllm_planner(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let process_group = i32::try_from(child.id()).unwrap_or(i32::MAX);
+        unsafe {
+            libc::kill(-process_group, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let _ = child.try_wait();
+            if !process_group_alive(process_group) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// One standard, non-hybrid cache group used only by the Rust diagnostic
@@ -1261,15 +2129,30 @@ struct ManagedVllmProcessSpec {
     served_model_name: String,
     endpoint: String,
     port: u16,
-    kv_transfer_config: String,
     log_path: PathBuf,
     settings: ManagedVllmSettings,
     tensor_parallel_size: usize,
     cuda_visible_devices: String,
+    planner_invocation: Option<ManagedVllmPlannerInvocation>,
+}
+
+#[derive(Clone, Debug)]
+enum ManagedVllmMemoryArgument {
+    LegacyFraction(f64),
+    ExactBytes(u64),
+}
+
+#[derive(Clone, Debug)]
+struct ManagedVllmLaunchSpec {
+    kv_transfer_config: String,
+    memory_argument: ManagedVllmMemoryArgument,
 }
 
 struct ManagedVllmProcess {
     spec: ManagedVllmProcessSpec,
+    launch: Mutex<ManagedVllmLaunchSpec>,
+    exact_plan: Mutex<Option<ManagedVllmExactPlanTemplate>>,
+    launch_preparation: tokio::sync::Mutex<()>,
     bridge: ManagedVllmHttpBridge,
     lifecycle: Mutex<()>,
     child: Mutex<Option<Child>>,
@@ -1283,11 +2166,14 @@ struct ManagedVllmProcess {
 }
 
 impl ManagedVllmProcess {
-    fn new(spec: ManagedVllmProcessSpec) -> Self {
+    fn new(spec: ManagedVllmProcessSpec, launch: ManagedVllmLaunchSpec) -> Self {
         let bridge = ManagedVllmHttpBridge::new(&spec.endpoint)
             .expect("managed vLLM process specs always use a private HTTP origin");
         Self {
             spec,
+            launch: Mutex::new(launch),
+            exact_plan: Mutex::new(None),
+            launch_preparation: tokio::sync::Mutex::new(()),
             bridge,
             lifecycle: Mutex::new(()),
             child: Mutex::new(None),
@@ -1319,6 +2205,12 @@ impl ManagedVllmProcess {
             ))
         })?;
 
+        let launch = self.launch.lock().clone();
+        if launch.kv_transfer_config.trim().is_empty() {
+            return Err(EngineError::backend(
+                "managed vLLM launch has no provisioned KV transfer configuration".to_string(),
+            ));
+        }
         let mut command = Command::new(&self.spec.python);
         command
             .arg("-m")
@@ -1330,19 +2222,28 @@ impl ManagedVllmProcess {
             .args(["--port", &self.spec.port.to_string()])
             .args(["--attention-backend", "FLASH_ATTN"])
             .args([
-                "--gpu-memory-utilization",
-                &self.spec.settings.gpu_memory_utilization.to_string(),
-            ])
-            .args([
                 "--max-model-len",
                 &self.spec.settings.max_model_len.to_string(),
             ])
             .arg("--enforce-eager")
-            .args(["--kv-transfer-config", &self.spec.kv_transfer_config])
+            .args(["--kv-transfer-config", &launch.kv_transfer_config])
             .env("CUDA_VISIBLE_DEVICES", &self.spec.cuda_visible_devices)
             .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(stderr));
+        match launch.memory_argument {
+            ManagedVllmMemoryArgument::LegacyFraction(utilization) => {
+                command.args(["--gpu-memory-utilization", &utilization.to_string()]);
+            }
+            ManagedVllmMemoryArgument::ExactBytes(bytes) => {
+                if bytes == 0 {
+                    return Err(EngineError::backend(
+                        "managed vLLM exact launch has a zero-byte KV grant".to_string(),
+                    ));
+                }
+                command.args(["--kv-cache-memory-bytes", &bytes.to_string()]);
+            }
+        }
         if self.spec.tensor_parallel_size > 1 {
             command.args([
                 "--tensor-parallel-size",
@@ -1367,6 +2268,103 @@ impl ManagedVllmProcess {
         #[cfg(unix)]
         command.process_group(0);
         Ok(command)
+    }
+
+    fn install_exact_launch(&self, kv_transfer_config: String, bytes: u64) {
+        *self.launch.lock() = ManagedVllmLaunchSpec {
+            kv_transfer_config,
+            memory_argument: ManagedVllmMemoryArgument::ExactBytes(bytes),
+        };
+    }
+
+    async fn prepare_exact_launch(
+        &self,
+        deployment: &Arc<ManagedVllmDeployment>,
+        participant_base: &str,
+    ) -> Result<(), EngineError> {
+        let Some(invocation) = self.spec.planner_invocation.clone() else {
+            return Ok(());
+        };
+        let _preparation = self.launch_preparation.lock().await;
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EngineError::backend(
+                "managed vLLM was shut down before exact KV preparation".to_string(),
+            ));
+        }
+        let cached_template = { self.exact_plan.lock().clone() };
+        let template = if let Some(template) = cached_template {
+            template
+        } else {
+            let python = self.spec.python.clone();
+            let invocation_for_task = invocation.clone();
+            let template = tokio::task::spawn_blocking(move || {
+                run_managed_vllm_planner(&python, &invocation_for_task)
+            })
+            .await
+            .map_err(|error| {
+                EngineError::backend(format!(
+                    "managed vLLM planner task failed before completion: {error}"
+                ))
+            })?
+            .map_err(EngineError::backend)?;
+            *self.exact_plan.lock() = Some(template.clone());
+            template
+        };
+        let grant_request = template.grant_request.clone();
+        let coordinator = deployment.coordinator().map_err(EngineError::backend)?;
+        let grant = tokio::task::spawn_blocking(move || {
+            coordinator.reserve_provisional_kv_grant(&grant_request)
+        })
+        .await
+        .map_err(|error| {
+            EngineError::backend(format!(
+                "managed vLLM KV grant task failed before completion: {error}"
+            ))
+        })?
+        .map_err(|error| EngineError::backend(format!("managed vLLM KV grant: {error}")))?;
+        let granted_bytes = grant
+            .selected_candidate
+            .block_count
+            .checked_mul(grant.selected_candidate.bytes_per_block)
+            .ok_or_else(|| EngineError::backend("managed vLLM KV grant bytes overflowed"))?;
+        let config = build_kv_transfer_config(
+            &deployment.control_endpoint,
+            participant_base,
+            &invocation.model_fingerprint,
+            &invocation.device_ids,
+            deployment.lease_ttl_ms,
+            Some(&grant.proof),
+        )
+        .map_err(EngineError::backend)?;
+        self.install_exact_launch(config, granted_bytes);
+        let available = grant
+            .authority_snapshot
+            .domains
+            .iter()
+            .filter_map(|domain| {
+                invocation.device_ids.iter().find_map(|device_id| {
+                    (domain.domain
+                        == super::memory::MemoryDomain::Cuda {
+                            device_id: *device_id,
+                        })
+                    .then_some(format!("{}:{}", device_id, domain.available_bytes))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        log::info!(
+            "[vllm-memory] grant model={} desired_per_rank={} granted_per_rank={} minimum_per_rank={} target_concurrency={} effective_concurrency={} candidate={} generation={} authority_available=[{}]",
+            invocation.model_fingerprint,
+            template.requested_bytes_per_rank,
+            granted_bytes,
+            template.minimum_bytes_per_rank,
+            template.target_concurrency,
+            grant.selected_candidate.effective_target_concurrency,
+            grant.selected_candidate_index,
+            grant.proof.authority_generation,
+            available,
+        );
+        Ok(())
     }
 
     fn spawn_child(&self) -> Result<(), EngineError> {
@@ -1990,6 +2988,17 @@ fn start_managed_vllm_supervisor(
             if process.shutdown.load(Ordering::Acquire) {
                 break;
             }
+            if let Err(error) = process
+                .prepare_exact_launch(&deployment, &participant_id)
+                .await
+            {
+                log::error!(
+                    "[vllm-supervisor] model {} could not obtain a fresh exact KV grant: {}",
+                    process.spec.served_model_name,
+                    error,
+                );
+                continue;
+            }
             match process.spawn_child() {
                 Ok(()) => match process.wait_ready(&deployment, &participant_id).await {
                     Ok(()) => {
@@ -2077,6 +3086,7 @@ impl ManagedVllmEngine {
         replica_id: u32,
         device_ids: Vec<usize>,
         tensor_parallel_size: usize,
+        resolved_target_concurrency: usize,
     ) -> Result<Box<dyn Engine>, String> {
         if device_ids.is_empty() {
             return Err("managed vLLM requires at least one CUDA device".to_string());
@@ -2102,9 +3112,12 @@ impl ManagedVllmEngine {
 
         let settings = ManagedVllmSettings::from_manifest(manifest)?;
         settings.validate_launch_policy()?;
-        if settings.legacy_top_level_fraction_authored {
+        if matches!(
+            settings.kv_cache_policy,
+            ManagedVllmKvCachePolicy::LegacyFraction { .. }
+        ) {
             log::warn!(
-                "metadata.serving.vllm.gpu_memory_utilization is deprecated; use kv_cache.mode: legacy_fraction during this compatibility release. An exact-byte recommendation is unavailable until the certified runtime geometry provider is installed"
+                "managed vLLM legacy_fraction memory sizing is deprecated; use kv_cache.mode: auto. Legacy fractions remain available only for compatibility and rollback"
             );
         }
         let port = reserve_loopback_port()?;
@@ -2116,13 +3129,6 @@ impl ManagedVllmEngine {
             model_id,
             replica_id
         );
-        let kv_transfer_config = build_kv_transfer_config(
-            &deployment.control_endpoint,
-            &participant_id,
-            &fingerprint,
-            &device_ids,
-            deployment.lease_ttl_ms,
-        )?;
         let model_root_log = deployment
             .runtime_root
             .join(format!("model-{model_id}-replica-{replica_id}"));
@@ -2133,18 +3139,62 @@ impl ManagedVllmEngine {
             )
         })?;
         let log_path = model_root_log.join("vllm.log");
-        let process = Arc::new(ManagedVllmProcess::new(ManagedVllmProcessSpec {
-            python: deployment.python.clone(),
-            model_root: model_root.clone(),
-            served_model_name: manifest.project_name.clone(),
-            endpoint,
-            port,
-            kv_transfer_config,
-            log_path,
-            settings,
-            tensor_parallel_size,
-            cuda_visible_devices: child_cuda_visibility(&device_ids)?,
-        }));
+        let cuda_visible_devices = child_cuda_visibility(&device_ids)?;
+        let (launch, planner_invocation) = match &settings.kv_cache_policy {
+            ManagedVllmKvCachePolicy::LegacyFraction {
+                gpu_memory_utilization,
+            } => (
+                ManagedVllmLaunchSpec {
+                    kv_transfer_config: build_kv_transfer_config(
+                        &deployment.control_endpoint,
+                        &participant_id,
+                        &fingerprint,
+                        &device_ids,
+                        deployment.lease_ttl_ms,
+                        None,
+                    )?,
+                    memory_argument: ManagedVllmMemoryArgument::LegacyFraction(
+                        *gpu_memory_utilization,
+                    ),
+                },
+                None,
+            ),
+            ManagedVllmKvCachePolicy::Auto { .. } | ManagedVllmKvCachePolicy::Fixed { .. } => (
+                ManagedVllmLaunchSpec {
+                    kv_transfer_config: String::new(),
+                    memory_argument: ManagedVllmMemoryArgument::ExactBytes(0),
+                },
+                Some(ManagedVllmPlannerInvocation {
+                    model_root: model_root.clone(),
+                    model_fingerprint: fingerprint.clone(),
+                    participant_base: participant_id.clone(),
+                    device_ids: device_ids.clone(),
+                    tensor_parallel_size,
+                    max_model_len: settings.max_model_len,
+                    resolved_target_concurrency,
+                    policy: settings.kv_cache_policy.clone(),
+                    timeout: settings.startup_timeout,
+                    cuda_visible_devices: cuda_visible_devices.clone(),
+                    output_path: model_root_log.join("kv-plan.json"),
+                    log_path: model_root_log.join("kv-planner.log"),
+                }),
+            ),
+        };
+        let process = Arc::new(ManagedVllmProcess::new(
+            ManagedVllmProcessSpec {
+                python: deployment.python.clone(),
+                model_root: model_root.clone(),
+                served_model_name: manifest.project_name.clone(),
+                endpoint,
+                port,
+                log_path,
+                settings,
+                tensor_parallel_size,
+                cuda_visible_devices,
+                planner_invocation,
+            },
+            launch,
+        ));
         let memory_report =
             managed_vllm_memory_report(&model_root, &device_ids, model_id, replica_id)?;
         deployment.register_participant_readiness_fence(&participant_id, &process)?;
@@ -2338,6 +3388,9 @@ impl Engine for ManagedVllmEngine {
     }
 
     async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+        self.process
+            .prepare_exact_launch(&self.deployment, &self.runtime.participant_id)
+            .await?;
         self.process.spawn_child()?;
         if let Err(error) = self
             .process
@@ -2665,6 +3718,7 @@ fn build_kv_transfer_config(
     model_fingerprint: &str,
     device_ids: &[usize],
     lease_ttl_ms: u64,
+    provisioning_grant: Option<&kapsl_kv_abi::KvProvisioningGrant>,
 ) -> Result<String, String> {
     let memory_domains = device_ids
         .iter()
@@ -2675,19 +3729,24 @@ fn build_kv_transfer_config(
         .enumerate()
         .map(|(rank, device_id)| (rank.to_string(), serde_json::json!(device_id)))
         .collect::<serde_json::Map<_, _>>();
+    let mut extra = serde_json::json!({
+        "kapsl_control_endpoint": control_endpoint,
+        "kapsl_participant_id": participant_id,
+        "kapsl_model_fingerprint": model_fingerprint,
+        "kapsl_kv_mode": "shared_pool",
+        "kapsl_memory_domains": memory_domains,
+        "kapsl_rank_device_map": rank_device_map,
+        "kapsl_lease_ttl_ms": lease_ttl_ms,
+    });
+    if let Some(grant) = provisioning_grant {
+        extra["kapsl_provisioning_grant"] = serde_json::to_value(grant)
+            .map_err(|error| format!("serialize managed vLLM provisioning grant: {error}"))?;
+    }
     serde_json::to_string(&serde_json::json!({
         "kv_connector": "KapslConnectorV1",
         "kv_role": "kv_both",
         "kv_connector_module_path": "kapsl_vllm_connector",
-        "kv_connector_extra_config": {
-            "kapsl_control_endpoint": control_endpoint,
-            "kapsl_participant_id": participant_id,
-            "kapsl_model_fingerprint": model_fingerprint,
-            "kapsl_kv_mode": "shared_pool",
-            "kapsl_memory_domains": memory_domains,
-            "kapsl_rank_device_map": rank_device_map,
-            "kapsl_lease_ttl_ms": lease_ttl_ms,
-        }
+        "kv_connector_extra_config": extra,
     }))
     .map_err(|error| format!("serialize managed vLLM KV transfer config: {error}"))
 }
@@ -2807,6 +3866,11 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
+    // Frozen output emitted by kapsl_vllm_connector.planning 0.6.0. Keeping
+    // one exact cross-language fixture catches JSON/digest/arithmetic drift
+    // before the executor-backed planner is exercised on a GPU host.
+    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.6.0","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:e4a791621a5d33c536a63e8c6c69b60ca75d1eadebaae852ccb034da2e85ef5b","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416},"status":"planned","supported":true}"#;
+
     fn settings_from_metadata(metadata: &str) -> Result<ManagedVllmSettings, String> {
         let metadata = serde_yaml::from_str(metadata).expect("test metadata YAML");
         ManagedVllmSettings::from_manifest(&Manifest {
@@ -2824,6 +3888,29 @@ mod tests {
         })
     }
 
+    fn synthetic_planner_invocation(root: &Path) -> ManagedVllmPlannerInvocation {
+        ManagedVllmPlannerInvocation {
+            model_root: root.to_path_buf(),
+            model_fingerprint: "sha256:model".to_string(),
+            participant_base: "kapsl-test-1-0".to_string(),
+            device_ids: vec![0],
+            tensor_parallel_size: 1,
+            max_model_len: 1024,
+            resolved_target_concurrency: 4,
+            policy: ManagedVllmKvCachePolicy::Auto {
+                target_concurrency: Some(4),
+                headroom_percent: 20,
+                min_bytes: None,
+                max_bytes: None,
+                strict: false,
+            },
+            timeout: Duration::from_secs(300),
+            cuda_visible_devices: "0".to_string(),
+            output_path: root.join("kv-plan.json"),
+            log_path: root.join("kv-planner.log"),
+        }
+    }
+
     fn simple_kv_geometry() -> ManagedVllmKvCacheGeometry {
         ManagedVllmKvCacheGeometry {
             groups: vec![ManagedVllmKvCacheGroupGeometry {
@@ -2839,26 +3926,32 @@ mod tests {
     }
 
     fn test_managed_process() -> Arc<ManagedVllmProcess> {
-        Arc::new(ManagedVllmProcess::new(ManagedVllmProcessSpec {
-            python: PathBuf::from("python"),
-            model_root: PathBuf::from("model"),
-            served_model_name: "test-model".to_string(),
-            endpoint: "http://127.0.0.1:12345".to_string(),
-            port: 12345,
-            kv_transfer_config: "{}".to_string(),
-            log_path: PathBuf::from("vllm-test.log"),
-            settings: ManagedVllmSettings {
-                gpu_memory_utilization: 0.25,
-                kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
+        Arc::new(ManagedVllmProcess::new(
+            ManagedVllmProcessSpec {
+                python: PathBuf::from("python"),
+                model_root: PathBuf::from("model"),
+                served_model_name: "test-model".to_string(),
+                endpoint: "http://127.0.0.1:12345".to_string(),
+                port: 12345,
+                log_path: PathBuf::from("vllm-test.log"),
+                settings: ManagedVllmSettings {
                     gpu_memory_utilization: 0.25,
+                    kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
+                        gpu_memory_utilization: 0.25,
+                    },
+                    legacy_top_level_fraction_authored: false,
+                    max_model_len: 512,
+                    startup_timeout: Duration::from_secs(30),
                 },
-                legacy_top_level_fraction_authored: false,
-                max_model_len: 512,
-                startup_timeout: Duration::from_secs(30),
+                tensor_parallel_size: 1,
+                cuda_visible_devices: "0".to_string(),
+                planner_invocation: None,
             },
-            tensor_parallel_size: 1,
-            cuda_visible_devices: "0".to_string(),
-        }))
+            ManagedVllmLaunchSpec {
+                kv_transfer_config: "{}".to_string(),
+                memory_argument: ManagedVllmMemoryArgument::LegacyFraction(0.25),
+            },
+        ))
     }
 
     #[test]
@@ -2870,15 +3963,106 @@ mod tests {
     }
 
     #[test]
-    fn kv_policy_defaults_to_the_legacy_runtime_fraction_until_exact_wiring_exists() {
+    fn kv_policy_defaults_to_exact_auto_sizing() {
         let settings = settings_from_metadata("{}\n").unwrap();
 
-        assert_eq!(settings.gpu_memory_utilization, 0.5);
         assert_eq!(
             settings.kv_cache_policy,
-            ManagedVllmKvCachePolicy::LegacyFraction {
-                gpu_memory_utilization: 0.5,
+            ManagedVllmKvCachePolicy::Auto {
+                target_concurrency: None,
+                headroom_percent: 20,
+                min_bytes: None,
+                max_bytes: None,
+                strict: false,
             }
+        );
+        assert!(settings.validate_launch_policy().is_ok());
+    }
+
+    #[test]
+    fn python_planner_fixture_has_matching_digest_arithmetic_and_grant_ladder() {
+        let directory = tempfile::tempdir().unwrap();
+        let invocation = synthetic_planner_invocation(directory.path());
+
+        let template =
+            parse_managed_vllm_planner_output(SYNTHETIC_PLANNER_OUTPUT, &invocation).unwrap();
+
+        assert_eq!(template.requested_bytes_per_rank, 316_416);
+        assert_eq!(template.minimum_bytes_per_rank, 66_560);
+        assert_eq!(template.target_concurrency, 4);
+        assert_eq!(
+            template
+                .grant_request
+                .candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.block_count,
+                    candidate.effective_target_concurrency,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (309, 4),
+                (257, 4),
+                (232, 3),
+                (193, 3),
+                (155, 2),
+                (129, 2),
+                (78, 1),
+                (65, 1),
+            ]
+        );
+        assert_eq!(template.grant_request.candidates[0].bytes_per_block, 1024);
+        assert_eq!(
+            template.grant_request.geometry_digest,
+            "sha256:e4a791621a5d33c536a63e8c6c69b60ca75d1eadebaae852ccb034da2e85ef5b"
+        );
+    }
+
+    #[test]
+    fn planner_output_rejects_digest_identity_arithmetic_and_packed_stride_drift() {
+        let directory = tempfile::tempdir().unwrap();
+        let invocation = synthetic_planner_invocation(directory.path());
+        let baseline: serde_json::Value = serde_json::from_str(SYNTHETIC_PLANNER_OUTPUT).unwrap();
+
+        let mut bad_digest = baseline.clone();
+        bad_digest["geometry_digest"] = serde_json::json!(format!("sha256:{}", "0".repeat(64)));
+        assert!(
+            parse_managed_vllm_planner_output(&bad_digest.to_string(), &invocation)
+                .unwrap_err()
+                .contains("digest")
+        );
+
+        let mut bad_identity = baseline.clone();
+        bad_identity["geometry"]["identity"]["backend_version"] = serde_json::json!("other");
+        let digest = managed_vllm_geometry_digest(&bad_identity["geometry"]).unwrap();
+        bad_identity["geometry_digest"] = serde_json::json!(digest);
+        assert!(
+            parse_managed_vllm_planner_output(&bad_identity.to_string(), &invocation)
+                .unwrap_err()
+                .contains("identity")
+        );
+
+        let mut bad_arithmetic = baseline.clone();
+        bad_arithmetic["sizing"]["ranks"][0]["desired_blocks"] = serde_json::json!(308);
+        assert!(
+            parse_managed_vllm_planner_output(&bad_arithmetic.to_string(), &invocation)
+                .unwrap_err()
+                .contains("sizing")
+        );
+
+        let mut bad_stride = baseline;
+        bad_stride["geometry"]["ranks"][0]["pool_bytes_per_block"] = serde_json::json!(2048);
+        bad_stride["geometry"]["total_pool_bytes_per_block"] = serde_json::json!(2048);
+        bad_stride["sizing"]["ranks"][0]["bytes_per_block"] = serde_json::json!(2048);
+        bad_stride["sizing"]["ranks"][0]["desired_bytes"] = serde_json::json!(632832);
+        bad_stride["sizing"]["ranks"][0]["minimum_bytes"] = serde_json::json!(133120);
+        bad_stride["sizing"]["total_desired_bytes"] = serde_json::json!(632832);
+        let digest = managed_vllm_geometry_digest(&bad_stride["geometry"]).unwrap();
+        bad_stride["geometry_digest"] = serde_json::json!(digest);
+        assert!(
+            parse_managed_vllm_planner_output(&bad_stride.to_string(), &invocation)
+                .unwrap_err()
+                .contains("packed pool")
         );
     }
 
@@ -2908,11 +4092,7 @@ serving:
                 strict: true,
             }
         );
-        assert_eq!(
-            auto.gpu_memory_utilization, DEFAULT_LEGACY_GPU_MEMORY_UTILIZATION,
-            "the command compatibility fallback must not change yet"
-        );
-        assert!(auto.validate_launch_policy().is_err());
+        assert!(auto.validate_launch_policy().is_ok());
 
         let fixed = settings_from_metadata(
             r#"
@@ -2928,7 +4108,7 @@ serving:
             fixed.kv_cache_policy,
             ManagedVllmKvCachePolicy::Fixed { bytes: 536_870_912 }
         );
-        assert!(fixed.validate_launch_policy().is_err());
+        assert!(fixed.validate_launch_policy().is_ok());
 
         let explicit_legacy = settings_from_metadata(
             r#"
@@ -3429,6 +4609,7 @@ serving:
             "sha256:model",
             &[0, 2],
             30_000,
+            None,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -3438,6 +4619,31 @@ serving:
         assert_eq!(extra["kapsl_rank_device_map"]["0"], 0);
         assert_eq!(extra["kapsl_rank_device_map"]["1"], 2);
         assert_eq!(extra["kapsl_kv_mode"], "shared_pool");
+    }
+
+    #[test]
+    fn exact_kv_config_carries_the_single_use_authority_proof() {
+        let proof = kapsl_kv_abi::KvProvisioningGrant {
+            token: "opaque-token".to_string(),
+            geometry_digest: format!("sha256:{}", "a".repeat(64)),
+            authority_generation: 7,
+            expires_at_unix_ms: 42,
+        };
+        let encoded = build_kv_transfer_config(
+            "unix:///tmp/kapsl.sock",
+            "worker",
+            "sha256:model",
+            &[0],
+            30_000,
+            Some(&proof),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            value["kv_connector_extra_config"]["kapsl_provisioning_grant"],
+            serde_json::to_value(proof).unwrap()
+        );
     }
 
     #[test]
@@ -3472,26 +4678,32 @@ serving:
         let directory = tempfile::tempdir().unwrap();
         let model_root = directory.path().join("model");
         std::fs::create_dir(&model_root).unwrap();
-        let process = ManagedVllmProcess::new(ManagedVllmProcessSpec {
-            python: PathBuf::from("python"),
-            model_root: model_root.clone(),
-            served_model_name: "test-model".to_string(),
-            endpoint: "http://127.0.0.1:12345".to_string(),
-            port: 12345,
-            kv_transfer_config: "{}".to_string(),
-            log_path: directory.path().join("vllm.log"),
-            settings: ManagedVllmSettings {
-                gpu_memory_utilization: 0.25,
-                kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
+        let process = ManagedVllmProcess::new(
+            ManagedVllmProcessSpec {
+                python: PathBuf::from("python"),
+                model_root: model_root.clone(),
+                served_model_name: "test-model".to_string(),
+                endpoint: "http://127.0.0.1:12345".to_string(),
+                port: 12345,
+                log_path: directory.path().join("vllm.log"),
+                settings: ManagedVllmSettings {
                     gpu_memory_utilization: 0.25,
+                    kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
+                        gpu_memory_utilization: 0.25,
+                    },
+                    legacy_top_level_fraction_authored: false,
+                    max_model_len: 512,
+                    startup_timeout: Duration::from_secs(30),
                 },
-                legacy_top_level_fraction_authored: false,
-                max_model_len: 512,
-                startup_timeout: Duration::from_secs(30),
+                tensor_parallel_size: 1,
+                cuda_visible_devices: "0".to_string(),
+                planner_invocation: None,
             },
-            tensor_parallel_size: 1,
-            cuda_visible_devices: "0".to_string(),
-        });
+            ManagedVllmLaunchSpec {
+                kv_transfer_config: "{}".to_string(),
+                memory_argument: ManagedVllmMemoryArgument::LegacyFraction(0.25),
+            },
+        );
 
         let command = process.build_command().unwrap();
         let arguments = command
@@ -3501,6 +4713,31 @@ serving:
         assert!(arguments
             .windows(2)
             .any(|pair| { pair[0] == "--model" && pair[1] == model_root.as_os_str() }));
+    }
+
+    #[test]
+    fn exact_process_uses_the_pinned_byte_flag_and_never_the_fraction() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("model");
+        std::fs::create_dir(&model_root).unwrap();
+        let mut process = test_managed_process();
+        let process = Arc::get_mut(&mut process).expect("test owns the process");
+        process.spec.model_root = model_root;
+        process.spec.log_path = directory.path().join("vllm.log");
+        process.install_exact_launch("{\"exact\":true}".to_string(), 316_416);
+
+        let command = process.build_command().unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--kv-cache-memory-bytes", "316416"]));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--gpu-memory-utilization"));
     }
 
     #[test]
