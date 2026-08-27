@@ -20,9 +20,10 @@ use std::os::unix::process::CommandExt;
 use std::process::{ExitStatus, Stdio};
 
 pub(crate) const MANAGED_VLLM_ADAPTER_ID: &str = "kapsl-vllm-connector";
-pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.6.0";
+pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.0";
 pub(crate) const MANAGED_VLLM_BACKEND_VERSION: &str = "0.26.1rc1.dev1130+g2ec6f0d71";
 pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";
+pub(crate) const MANAGED_VLLM_ELASTIC_PROFILE_ID: &str = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc";
 pub(crate) const MANAGED_VLLM_PYTHON_VERSION: &str = "3.12.3";
 pub(crate) const MANAGED_VLLM_TORCH_VERSION: &str = "2.13.0+cu130";
 pub(crate) const MANAGED_VLLM_TORCHVISION_VERSION: &str = "0.28.0+cu130";
@@ -43,6 +44,9 @@ const MAX_CONSECUTIVE_HEALTH_FAILURES: u8 = 15;
 const DEFAULT_LEGACY_GPU_MEMORY_UTILIZATION: f64 = 0.5;
 const DEFAULT_KV_HEADROOM_PERCENT: usize = 20;
 const MAX_KV_HEADROOM_PERCENT: usize = 100;
+const DEFAULT_KV_GROW_UTILIZATION_PERCENT: usize = 80;
+const DEFAULT_KV_SHRINK_UTILIZATION_PERCENT: usize = 25;
+const DEFAULT_KV_SHRINK_IDLE_SECONDS: u64 = 60;
 const BRIDGE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const BRIDGE_IDLE_BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_OPENAI_WIRE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -103,6 +107,12 @@ pub(crate) fn certified_vllm_profile() -> String {
     )
 }
 
+pub(crate) fn certified_vllm_elastic_profile() -> String {
+    format!(
+        "{MANAGED_VLLM_ADAPTER_ID},{MANAGED_VLLM_ADAPTER_VERSION},{MANAGED_VLLM_BACKEND_VERSION},{MANAGED_VLLM_ELASTIC_PROFILE_ID}"
+    )
+}
+
 pub(crate) struct ManagedVllmDeployment {
     python: PathBuf,
     control_endpoint: String,
@@ -117,7 +127,7 @@ pub(crate) struct ManagedVllmDeployment {
 pub(crate) struct PreparedManagedVllmDeployment {
     pub(crate) deployment: Arc<ManagedVllmDeployment>,
     pub(crate) control_socket: PathBuf,
-    pub(crate) shared_pool_profile: String,
+    pub(crate) shared_pool_profiles: Vec<String>,
 }
 
 impl ManagedVllmDeployment {
@@ -154,15 +164,16 @@ impl ManagedVllmDeployment {
             Some(path) => absolute_path(path)?,
             None => runtime_root.join("kv-control.sock"),
         };
-        let shared_pool_profile = certified_vllm_profile();
+        let shared_pool_profiles = vec![certified_vllm_profile(), certified_vllm_elastic_profile()];
 
         let python = discover_certified_vllm_python()?;
         log::info!(
-            "Managed vLLM bundle: {} (vLLM {}, connector {}, profile {})",
+            "Managed vLLM bundle: {} (vLLM {}, connector {}, profiles [{}, {}])",
             python.display(),
             MANAGED_VLLM_BACKEND_VERSION,
             MANAGED_VLLM_ADAPTER_VERSION,
-            MANAGED_VLLM_PROFILE_ID
+            MANAGED_VLLM_PROFILE_ID,
+            MANAGED_VLLM_ELASTIC_PROFILE_ID,
         );
 
         let deployment = Arc::new(Self {
@@ -177,7 +188,7 @@ impl ManagedVllmDeployment {
         Ok(PreparedManagedVllmDeployment {
             deployment,
             control_socket: socket_path,
-            shared_pool_profile,
+            shared_pool_profiles,
         })
     }
 
@@ -221,7 +232,7 @@ impl ManagedVllmDeployment {
                 self.coordinator.read().clone().ok_or_else(|| {
                     "managed vLLM control coordinator is not installed".to_string()
                 })?;
-            Ok(coordinator.retire_participants_after_backend_exit(participant_base))
+            coordinator.retire_participants_after_backend_exit(participant_base)
         }
         #[cfg(not(unix))]
         {
@@ -274,6 +285,39 @@ impl ManagedVllmDeployment {
         let model_runtimes = runtimes.entry(model_id).or_default();
         model_runtimes.retain(|candidate| candidate.strong_count() > 0);
         model_runtimes.push(Arc::downgrade(runtime));
+    }
+
+    pub(crate) fn model_has_live_resize_headroom(&self, model_id: u32) -> bool {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .get(&model_id)
+            .cloned()
+            .unwrap_or_default();
+        if runtimes.is_empty() {
+            return false;
+        }
+        let coordinator = match self.coordinator() {
+            Ok(coordinator) => coordinator,
+            Err(_) => return true,
+        };
+        runtimes
+            .into_iter()
+            .filter_map(|runtime| runtime.upgrade())
+            .any(|runtime| {
+                if runtime.process.spec.settings.live_resize.is_none() {
+                    return false;
+                }
+                coordinator
+                    .managed_vllm_resize_snapshot(&runtime.participant_id)
+                    .map_or(true, |snapshot| {
+                        snapshot.is_none_or(|snapshot| {
+                            snapshot.failure.is_none()
+                                && (snapshot.pending_generation.is_some()
+                                    || snapshot.current_block_count < snapshot.maximum_block_count)
+                        })
+                    })
+            })
     }
 
     /// Stop all managed replicas for a logical model at the lifecycle
@@ -360,6 +404,9 @@ struct ManagedVllmEnvironment {
     connector_distribution: String,
     connector: String,
     profile: String,
+    elastic_profile: String,
+    kv_abi_major: u64,
+    kv_abi_minor: u64,
     cuda_runtime: String,
     cuda_available: bool,
     planner_schema_version: u64,
@@ -496,7 +543,8 @@ import importlib.metadata as md
 import json
 import platform
 import torch
-from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
+from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION, ELASTIC_ADAPTER_PROFILE_ID
+from kapsl_vllm_connector.contract import ABI_VERSION
 from kapsl_vllm_connector.planning import PLANNER_SCHEMA_VERSION, planner_json_schema
 from vllm.engine.arg_utils import EngineArgs
 parser = argparse.ArgumentParser(add_help=False)
@@ -515,6 +563,9 @@ print(json.dumps({
     "connector_distribution": md.version("kapsl-vllm-connector"),
     "connector": ADAPTER_VERSION,
     "profile": ADAPTER_PROFILE_ID,
+    "elastic_profile": ELASTIC_ADAPTER_PROFILE_ID,
+    "kv_abi_major": ABI_VERSION["major"],
+    "kv_abi_minor": ABI_VERSION["minor"],
     "cuda_runtime": str(torch.version.cuda),
     "cuda_available": bool(torch.cuda.is_available()),
     "planner_schema_version": PLANNER_SCHEMA_VERSION,
@@ -566,6 +617,9 @@ print(json.dumps({
         connector_distribution: MANAGED_VLLM_ADAPTER_VERSION.to_string(),
         connector: MANAGED_VLLM_ADAPTER_VERSION.to_string(),
         profile: MANAGED_VLLM_PROFILE_ID.to_string(),
+        elastic_profile: MANAGED_VLLM_ELASTIC_PROFILE_ID.to_string(),
+        kv_abi_major: MANAGED_VLLM_KV_ABI_MAJOR,
+        kv_abi_minor: MANAGED_VLLM_KV_ABI_MINOR,
         cuda_runtime: MANAGED_VLLM_CUDA_RUNTIME_VERSION.to_string(),
         cuda_available: true,
         planner_schema_version: 1,
@@ -596,6 +650,14 @@ enum ManagedVllmKvCachePolicy {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManagedVllmLiveResizeSettings {
+    maximum_concurrency: usize,
+    grow_utilization_percent: usize,
+    shrink_utilization_percent: usize,
+    shrink_idle: Duration,
+}
+
 #[derive(Clone, Debug)]
 struct ManagedVllmSettings {
     /// Compatibility value retained only for explicit legacy-fraction
@@ -603,12 +665,15 @@ struct ManagedVllmSettings {
     /// certified planner and authority grant.
     gpu_memory_utilization: f64,
     kv_cache_policy: ManagedVllmKvCachePolicy,
+    live_resize: Option<ManagedVllmLiveResizeSettings>,
     legacy_top_level_fraction_authored: bool,
     max_model_len: usize,
     startup_timeout: Duration,
 }
 
 const MANAGED_VLLM_PLANNER_SCHEMA_VERSION: u64 = 1;
+pub(crate) const MANAGED_VLLM_KV_ABI_MAJOR: u64 = 1;
+pub(crate) const MANAGED_VLLM_KV_ABI_MINOR: u64 = 5;
 
 #[derive(Clone, Debug)]
 struct ManagedVllmPlannerInvocation {
@@ -620,6 +685,7 @@ struct ManagedVllmPlannerInvocation {
     max_model_len: usize,
     resolved_target_concurrency: usize,
     policy: ManagedVllmKvCachePolicy,
+    live_resize: Option<ManagedVllmLiveResizeSettings>,
     timeout: Duration,
     cuda_visible_devices: String,
     output_path: PathBuf,
@@ -632,6 +698,14 @@ struct ManagedVllmExactPlanTemplate {
     requested_bytes_per_rank: u64,
     minimum_bytes_per_rank: u64,
     target_concurrency: u64,
+    maximum_bytes_per_rank: u64,
+    maximum_block_count: u64,
+    live_resize: bool,
+    fixed_overhead_blocks: u64,
+    sequence_blocks: u64,
+    maximum_concurrency: Option<u64>,
+    maximum_byte_cap: Option<u64>,
+    strict_concurrency: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -650,6 +724,8 @@ struct ManagedVllmPlannerEnvelope {
 #[serde(deny_unknown_fields)]
 struct ManagedVllmPlannerPolicy {
     target_concurrency: u64,
+    #[serde(default)]
+    maximum_concurrency: Option<u64>,
     headroom_percent: u64,
     prefix_blocks: u64,
     alignment_blocks: u64,
@@ -665,6 +741,7 @@ struct ManagedVllmPlannerPolicy {
 struct ManagedVllmPlannerSizing {
     ranks: Vec<ManagedVllmPlannerRankSizing>,
     total_desired_bytes: u64,
+    total_maximum_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -680,6 +757,8 @@ struct ManagedVllmPlannerRankSizing {
     headroom_blocks: u64,
     desired_blocks: u64,
     desired_bytes: u64,
+    maximum_blocks: u64,
+    maximum_bytes: u64,
     effective_target_concurrency: u64,
     concurrency_reduced: bool,
 }
@@ -762,6 +841,7 @@ impl ManagedVllmSettings {
                 max_bytes: None,
                 strict: false,
             },
+            live_resize: None,
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
@@ -799,8 +879,9 @@ impl ManagedVllmSettings {
             };
             settings.legacy_top_level_fraction_authored = true;
         } else if let Some(raw) = kv_cache {
-            let (policy, compatibility_fraction) = parse_kv_cache_policy(raw)?;
+            let (policy, compatibility_fraction, live_resize) = parse_kv_cache_policy(raw)?;
             settings.kv_cache_policy = policy;
+            settings.live_resize = live_resize;
             if let Some(utilization) = compatibility_fraction {
                 settings.gpu_memory_utilization = utilization;
             }
@@ -867,6 +948,23 @@ impl ManagedVllmSettings {
     }
 
     fn validate_launch_policy(&self) -> Result<(), String> {
+        if let Some(live_resize) = &self.live_resize {
+            let ManagedVllmKvCachePolicy::Auto {
+                target_concurrency, ..
+            } = &self.kv_cache_policy
+            else {
+                return Err(
+                    "managed vLLM live_resize is supported only with kv_cache.mode: auto"
+                        .to_string(),
+                );
+            };
+            if target_concurrency.is_some_and(|target| live_resize.maximum_concurrency < target) {
+                return Err(
+                    "managed vLLM live_resize.maximum_concurrency cannot be below target_concurrency"
+                        .to_string(),
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -887,7 +985,14 @@ fn parse_gpu_memory_utilization(raw: &serde_yaml::Value, path: &str) -> Result<f
 
 fn parse_kv_cache_policy(
     raw: &serde_yaml::Value,
-) -> Result<(ManagedVllmKvCachePolicy, Option<f64>), String> {
+) -> Result<
+    (
+        ManagedVllmKvCachePolicy,
+        Option<f64>,
+        Option<ManagedVllmLiveResizeSettings>,
+    ),
+    String,
+> {
     const PATH: &str = "metadata.serving.vllm.kv_cache";
     let object = raw
         .as_mapping()
@@ -905,6 +1010,7 @@ fn parse_kv_cache_policy(
             "min_bytes",
             "max_bytes",
             "strict",
+            "live_resize",
         ][..],
         "fixed" => &["mode", "bytes"][..],
         "legacy_fraction" => &["mode", "gpu_memory_utilization"][..],
@@ -953,6 +1059,10 @@ fn parse_kv_cache_policy(
                 })
                 .transpose()?
                 .unwrap_or(false);
+            let live_resize = value("live_resize")
+                .map(parse_live_resize_settings)
+                .transpose()?
+                .flatten();
             Ok((
                 ManagedVllmKvCachePolicy::Auto {
                     target_concurrency,
@@ -962,13 +1072,14 @@ fn parse_kv_cache_policy(
                     strict,
                 },
                 None,
+                live_resize,
             ))
         }
         "fixed" => {
             let bytes = value("bytes")
                 .ok_or_else(|| format!("{PATH}.bytes is required when mode is fixed"))
                 .and_then(|raw| parse_positive_usize(raw, &format!("{PATH}.bytes")))?;
-            Ok((ManagedVllmKvCachePolicy::Fixed { bytes }, None))
+            Ok((ManagedVllmKvCachePolicy::Fixed { bytes }, None, None))
         }
         "legacy_fraction" => {
             let utilization = value("gpu_memory_utilization")
@@ -982,10 +1093,80 @@ fn parse_kv_cache_policy(
                     gpu_memory_utilization: utilization,
                 },
                 Some(utilization),
+                None,
             ))
         }
         _ => unreachable!("mode was validated above"),
     }
+}
+
+fn parse_live_resize_settings(
+    raw: &serde_yaml::Value,
+) -> Result<Option<ManagedVllmLiveResizeSettings>, String> {
+    const PATH: &str = "metadata.serving.vllm.kv_cache.live_resize";
+    let object = raw
+        .as_mapping()
+        .ok_or_else(|| format!("{PATH} must be an object"))?;
+    let value = |name: &str| object.get(serde_yaml::Value::String(name.to_string()));
+    let allowed = [
+        "enabled",
+        "maximum_concurrency",
+        "grow_utilization_percent",
+        "shrink_utilization_percent",
+        "shrink_idle_seconds",
+    ];
+    for key in object.keys() {
+        let key = key
+            .as_str()
+            .ok_or_else(|| format!("{PATH} field names must be strings"))?;
+        if !allowed.contains(&key) {
+            return Err(format!("{PATH}.{key} is not supported"));
+        }
+    }
+    let enabled = value("enabled")
+        .map(|raw| {
+            raw.as_bool()
+                .ok_or_else(|| format!("{PATH}.enabled must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    if !enabled {
+        if object.len() != usize::from(value("enabled").is_some()) {
+            return Err(format!(
+                "{PATH} cannot configure resize thresholds when enabled is false"
+            ));
+        }
+        return Ok(None);
+    }
+    let maximum_concurrency = value("maximum_concurrency")
+        .ok_or_else(|| format!("{PATH}.maximum_concurrency is required when enabled"))
+        .and_then(|raw| parse_positive_usize(raw, &format!("{PATH}.maximum_concurrency")))?;
+    let grow_utilization_percent = value("grow_utilization_percent")
+        .map(|raw| parse_positive_usize(raw, &format!("{PATH}.grow_utilization_percent")))
+        .transpose()?
+        .unwrap_or(DEFAULT_KV_GROW_UTILIZATION_PERCENT);
+    let shrink_utilization_percent = value("shrink_utilization_percent")
+        .map(|raw| parse_usize(raw, &format!("{PATH}.shrink_utilization_percent")))
+        .transpose()?
+        .unwrap_or(DEFAULT_KV_SHRINK_UTILIZATION_PERCENT);
+    if grow_utilization_percent > 100 || shrink_utilization_percent >= grow_utilization_percent {
+        return Err(format!(
+            "{PATH} requires 0 <= shrink_utilization_percent < grow_utilization_percent <= 100"
+        ));
+    }
+    let shrink_idle_seconds = value("shrink_idle_seconds")
+        .map(|raw| parse_positive_usize(raw, &format!("{PATH}.shrink_idle_seconds")))
+        .transpose()?
+        .unwrap_or(DEFAULT_KV_SHRINK_IDLE_SECONDS as usize);
+    if shrink_idle_seconds > 3600 {
+        return Err(format!("{PATH}.shrink_idle_seconds must not exceed 3600"));
+    }
+    Ok(Some(ManagedVllmLiveResizeSettings {
+        maximum_concurrency,
+        grow_utilization_percent,
+        shrink_utilization_percent,
+        shrink_idle: Duration::from_secs(shrink_idle_seconds as u64),
+    }))
 }
 
 fn parse_usize(raw: &serde_yaml::Value, path: &str) -> Result<usize, String> {
@@ -1006,6 +1187,7 @@ fn parse_positive_usize(raw: &serde_yaml::Value, path: &str) -> Result<usize, St
 fn planner_policy_for_invocation(
     policy: &ManagedVllmKvCachePolicy,
     resolved_target_concurrency: usize,
+    live_resize: Option<&ManagedVllmLiveResizeSettings>,
 ) -> Result<ManagedVllmPlannerPolicy, String> {
     let to_u64 = |value: usize, field: &str| {
         u64::try_from(value).map_err(|_| format!("managed vLLM {field} exceeds uint64"))
@@ -1018,6 +1200,7 @@ fn planner_policy_for_invocation(
             let bytes = to_u64(*bytes, "fixed KV bytes")?;
             Ok(ManagedVllmPlannerPolicy {
                 target_concurrency: 1,
+                maximum_concurrency: None,
                 headroom_percent: 0,
                 prefix_blocks: 0,
                 alignment_blocks: 1,
@@ -1037,6 +1220,9 @@ fn planner_policy_for_invocation(
                 target_concurrency.unwrap_or(resolved_target_concurrency),
                 "target concurrency",
             )?,
+            maximum_concurrency: live_resize
+                .map(|settings| to_u64(settings.maximum_concurrency, "maximum live KV concurrency"))
+                .transpose()?,
             headroom_percent: to_u64(*headroom_percent, "KV headroom percent")?,
             prefix_blocks: 0,
             alignment_blocks: 1,
@@ -1072,8 +1258,11 @@ fn parse_managed_vllm_planner_output(
     }
     let geometry: ManagedVllmPlannerGeometry = serde_json::from_value(envelope.geometry)
         .map_err(|error| format!("managed vLLM planner geometry is malformed: {error}"))?;
-    let expected_policy =
-        planner_policy_for_invocation(&invocation.policy, invocation.resolved_target_concurrency)?;
+    let expected_policy = planner_policy_for_invocation(
+        &invocation.policy,
+        invocation.resolved_target_concurrency,
+        invocation.live_resize.as_ref(),
+    )?;
     if envelope.policy != expected_policy {
         return Err(format!(
             "managed vLLM planner policy drifted from the requested policy: {:?} != {:?}",
@@ -1105,6 +1294,9 @@ fn parse_managed_vllm_planner_output(
         .iter()
         .map(|group| group.group_id.clone())
         .collect::<BTreeSet<_>>();
+    let live_resize = invocation.live_resize.is_some();
+    let maximum_block_count = envelope.sizing.ranks[0].maximum_blocks;
+    let maximum_bytes_per_rank = envelope.sizing.ranks[0].maximum_bytes;
     Ok(ManagedVllmExactPlanTemplate {
         grant_request: ProvisionalKvGrantRequest {
             participant_base: invocation.participant_base.clone(),
@@ -1114,18 +1306,148 @@ fn parse_managed_vllm_planner_output(
                 adapter_id: MANAGED_VLLM_ADAPTER_ID.to_string(),
                 adapter_version: MANAGED_VLLM_ADAPTER_VERSION.to_string(),
                 backend_version: MANAGED_VLLM_BACKEND_VERSION.to_string(),
-                profile_id: MANAGED_VLLM_PROFILE_ID.to_string(),
+                profile_id: if live_resize {
+                    MANAGED_VLLM_ELASTIC_PROFILE_ID
+                } else {
+                    MANAGED_VLLM_PROFILE_ID
+                }
+                .to_string(),
             },
             capacity_pool_id: "vllm.pool.0".to_string(),
             group_ids,
             memory_domains,
             candidates,
+            maximum_block_count: live_resize.then_some(maximum_block_count),
             ttl: invocation.timeout,
         },
         requested_bytes_per_rank: envelope.sizing.ranks[0].desired_bytes,
         minimum_bytes_per_rank: envelope.sizing.ranks[0].minimum_bytes,
         target_concurrency: envelope.policy.target_concurrency,
+        maximum_bytes_per_rank,
+        maximum_block_count,
+        live_resize,
+        fixed_overhead_blocks: geometry.ranks[0].fixed_overhead_blocks,
+        sequence_blocks: geometry.ranks[0].required_blocks_per_sequence,
+        maximum_concurrency: envelope.policy.maximum_concurrency,
+        maximum_byte_cap: envelope.policy.max_bytes,
+        strict_concurrency: envelope.policy.strict_concurrency,
     })
+}
+
+fn align_managed_vllm_elastic_plan(
+    template: &mut ManagedVllmExactPlanTemplate,
+    alignment_blocks: u64,
+) -> Result<(), String> {
+    if !template.live_resize || alignment_blocks == 0 {
+        return Err(
+            "managed vLLM elastic alignment requires a live plan and non-zero alignment"
+                .to_string(),
+        );
+    }
+    let bytes_per_block = template
+        .grant_request
+        .candidates
+        .first()
+        .map(|candidate| candidate.bytes_per_block)
+        .filter(|stride| *stride > 0)
+        .ok_or_else(|| "managed vLLM elastic plan has no block stride".to_string())?;
+    let minimum_blocks = checked_u64_round_up(
+        checked_u64_ceil_div(
+            template.minimum_bytes_per_rank,
+            bytes_per_block,
+            "elastic minimum blocks",
+        )?,
+        alignment_blocks,
+        "elastic minimum alignment",
+    )?;
+    let cap_blocks = template
+        .maximum_byte_cap
+        .map(|cap| (cap / bytes_per_block / alignment_blocks).saturating_mul(alignment_blocks));
+    if cap_blocks.is_some_and(|cap| cap < minimum_blocks) {
+        return Err(
+            "managed vLLM max_bytes cannot satisfy CUDA VMM allocation granularity".to_string(),
+        );
+    }
+
+    let mut aligned = Vec::new();
+    for candidate in &template.grant_request.candidates {
+        let rounded_up = checked_u64_round_up(
+            candidate.block_count,
+            alignment_blocks,
+            "elastic grant alignment",
+        )?;
+        let block_count = cap_blocks
+            .filter(|cap| rounded_up > *cap)
+            .unwrap_or(rounded_up);
+        if block_count < minimum_blocks
+            || aligned
+                .last()
+                .is_some_and(|previous: &ProvisionalKvCandidate| {
+                    previous.block_count == block_count
+                })
+        {
+            continue;
+        }
+        let effective = template.target_concurrency.min(
+            block_count.saturating_sub(template.fixed_overhead_blocks) / template.sequence_blocks,
+        );
+        if effective == 0 {
+            continue;
+        }
+        aligned.push(ProvisionalKvCandidate {
+            block_count,
+            bytes_per_block,
+            effective_target_concurrency: effective,
+        });
+    }
+    let preferred = aligned.first().ok_or_else(|| {
+        "managed vLLM CUDA VMM alignment removed every valid grant candidate".to_string()
+    })?;
+    if template.strict_concurrency
+        && preferred.effective_target_concurrency < template.target_concurrency
+    {
+        return Err(format!(
+            "managed vLLM CUDA VMM alignment reduces strict target concurrency from {} to {}",
+            template.target_concurrency, preferred.effective_target_concurrency
+        ));
+    }
+
+    let mut maximum_blocks = checked_u64_round_up(
+        template.maximum_block_count,
+        alignment_blocks,
+        "elastic virtual maximum alignment",
+    )?;
+    if let Some(cap) = cap_blocks {
+        maximum_blocks = maximum_blocks.min(cap);
+    }
+    if maximum_blocks < preferred.block_count {
+        return Err(
+            "managed vLLM aligned virtual maximum is below initial physical capacity".to_string(),
+        );
+    }
+    if let Some(maximum_concurrency) = template.maximum_concurrency {
+        let effective_maximum = maximum_blocks.saturating_sub(template.fixed_overhead_blocks)
+            / template.sequence_blocks;
+        if effective_maximum < maximum_concurrency {
+            return Err(format!(
+                "managed vLLM aligned maximum can hold {effective_maximum} full sequences, below configured maximum_concurrency {maximum_concurrency}"
+            ));
+        }
+    }
+    template.requested_bytes_per_rank = preferred
+        .block_count
+        .checked_mul(bytes_per_block)
+        .ok_or_else(|| "managed vLLM aligned desired bytes overflowed".to_string())?;
+    template.minimum_bytes_per_rank = minimum_blocks
+        .checked_mul(bytes_per_block)
+        .ok_or_else(|| "managed vLLM aligned minimum bytes overflowed".to_string())?;
+    template.maximum_block_count = maximum_blocks;
+    template.maximum_bytes_per_rank = maximum_blocks
+        .checked_mul(bytes_per_block)
+        .ok_or_else(|| "managed vLLM aligned maximum bytes overflowed".to_string())?;
+    template.grant_request.maximum_block_count = Some(maximum_blocks);
+    template.grant_request.candidates = aligned;
+    Ok(())
 }
 
 fn validate_managed_vllm_planner_geometry(
@@ -1138,12 +1460,17 @@ fn validate_managed_vllm_planner_geometry(
         .map_err(|_| "managed vLLM tensor parallel size exceeds uint64".to_string())?;
     let expected_max_len = u64::try_from(invocation.max_model_len)
         .map_err(|_| "managed vLLM max_model_len exceeds uint64".to_string())?;
+    let expected_profile = if invocation.live_resize.is_some() {
+        MANAGED_VLLM_ELASTIC_PROFILE_ID
+    } else {
+        MANAGED_VLLM_PROFILE_ID
+    };
     if geometry.identity
         != (ManagedVllmPlannerIdentity {
             adapter_id: MANAGED_VLLM_ADAPTER_ID.to_string(),
             adapter_version: MANAGED_VLLM_ADAPTER_VERSION.to_string(),
             backend_version: MANAGED_VLLM_BACKEND_VERSION.to_string(),
-            profile_id: MANAGED_VLLM_PROFILE_ID.to_string(),
+            profile_id: expected_profile.to_string(),
             layout_version: 1,
         })
         || geometry.model_fingerprint != invocation.model_fingerprint
@@ -1151,6 +1478,7 @@ fn validate_managed_vllm_planner_geometry(
         || geometry.tensor_parallel_size != expected_tp
         || geometry.attention_backend != "FLASH_ATTN"
         || geometry.layout_id.trim().is_empty()
+        || (invocation.live_resize.is_some() && !geometry.layout_id.eq_ignore_ascii_case("BLNHC"))
         || geometry.ranks.len() != invocation.tensor_parallel_size
         || sizing.ranks.len() != invocation.tensor_parallel_size
     {
@@ -1161,6 +1489,7 @@ fn validate_managed_vllm_planner_geometry(
     }
     let mut total_stride = 0_u64;
     let mut total_desired = 0_u64;
+    let mut total_maximum = 0_u64;
     let first_rank = geometry
         .ranks
         .first()
@@ -1190,6 +1519,13 @@ fn validate_managed_vllm_planner_geometry(
                     rank.pool_bytes_per_block,
                     "planner minimum bytes",
                 )?
+            || rank_sizing.maximum_bytes
+                != checked_u64_mul(
+                    rank_sizing.maximum_blocks,
+                    rank.pool_bytes_per_block,
+                    "planner maximum bytes",
+                )?
+            || rank_sizing.maximum_blocks < rank_sizing.desired_blocks
         {
             return Err(format!(
                 "managed vLLM planner rank {index} has inconsistent placement or sizing"
@@ -1254,7 +1590,8 @@ fn validate_managed_vllm_planner_geometry(
                 || rank.required_blocks_per_sequence != first_rank.required_blocks_per_sequence
                 || rank.cache_groups != first_rank.cache_groups
                 || rank_sizing.desired_blocks != sizing.ranks[0].desired_blocks
-                || rank_sizing.minimum_blocks != sizing.ranks[0].minimum_blocks)
+                || rank_sizing.minimum_blocks != sizing.ranks[0].minimum_blocks
+                || rank_sizing.maximum_blocks != sizing.ranks[0].maximum_blocks)
         {
             return Err(
                 "managed vLLM planner tensor-parallel ranks have divergent cache geometry"
@@ -1271,9 +1608,15 @@ fn validate_managed_vllm_planner_geometry(
             rank_sizing.desired_bytes,
             "planner total desired bytes",
         )?;
+        total_maximum = checked_u64_add(
+            total_maximum,
+            rank_sizing.maximum_bytes,
+            "planner total maximum bytes",
+        )?;
     }
     if geometry.total_pool_bytes_per_block != total_stride
         || sizing.total_desired_bytes != total_desired
+        || sizing.total_maximum_bytes != total_maximum
     {
         return Err("managed vLLM planner aggregate bytes are inconsistent".to_string());
     }
@@ -1347,6 +1690,51 @@ fn validate_managed_vllm_rank_sizing(
         }
         desired = desired.min(cap);
     }
+    let mut maximum = desired;
+    if let Some(maximum_concurrency) = policy.maximum_concurrency {
+        let maximum_workload = checked_u64_add(
+            checked_u64_mul(
+                rank.required_blocks_per_sequence,
+                maximum_concurrency,
+                "planner maximum workload",
+            )?,
+            policy.prefix_blocks,
+            "planner maximum prefix blocks",
+        )?;
+        let maximum_headroom = checked_u64_ceil_div(
+            checked_u64_mul(
+                maximum_workload,
+                policy.headroom_percent,
+                "planner maximum headroom",
+            )?,
+            100,
+            "planner maximum headroom",
+        )?;
+        maximum = checked_u64_round_up(
+            checked_u64_add(
+                checked_u64_add(
+                    rank.fixed_overhead_blocks,
+                    maximum_workload,
+                    "planner maximum blocks",
+                )?,
+                maximum_headroom,
+                "planner maximum blocks",
+            )?,
+            policy.alignment_blocks,
+            "planner maximum alignment",
+        )?;
+        if let Some(max_bytes) = policy.max_bytes {
+            let cap = (max_bytes / rank.pool_bytes_per_block / policy.alignment_blocks)
+                * policy.alignment_blocks;
+            maximum = maximum.min(cap);
+        }
+        if maximum < desired {
+            return Err(
+                "managed vLLM planner maximum concurrency cannot contain initial capacity"
+                    .to_string(),
+            );
+        }
+    }
     let effective = policy.target_concurrency.min(
         desired.saturating_sub(rank.fixed_overhead_blocks) / rank.required_blocks_per_sequence,
     );
@@ -1354,6 +1742,7 @@ fn validate_managed_vllm_rank_sizing(
         || sizing.base_blocks != base
         || sizing.headroom_blocks != headroom
         || sizing.desired_blocks != desired
+        || sizing.maximum_blocks != maximum
         || sizing.effective_target_concurrency != effective
         || sizing.concurrency_reduced != (effective < policy.target_concurrency)
         || effective == 0
@@ -1547,8 +1936,11 @@ fn run_managed_vllm_planner(
     python: &Path,
     invocation: &ManagedVllmPlannerInvocation,
 ) -> Result<ManagedVllmExactPlanTemplate, String> {
-    let expected_policy =
-        planner_policy_for_invocation(&invocation.policy, invocation.resolved_target_concurrency)?;
+    let expected_policy = planner_policy_for_invocation(
+        &invocation.policy,
+        invocation.resolved_target_concurrency,
+        invocation.live_resize.as_ref(),
+    )?;
     let output_file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -1616,6 +2008,12 @@ fn run_managed_vllm_planner(
     }
     if let Some(bytes) = expected_policy.max_bytes {
         command.args(["--max-bytes", &bytes.to_string()]);
+    }
+    if let Some(maximum_concurrency) = expected_policy.maximum_concurrency {
+        command.args(["--maximum-concurrency", &maximum_concurrency.to_string()]);
+    }
+    if invocation.live_resize.is_some() {
+        command.arg("--live-resize");
     }
     if expected_policy.strict_concurrency {
         command.arg("--strict-concurrency");
@@ -2455,6 +2853,7 @@ struct ManagedVllmProcess {
     kv_readiness_fence: Arc<ManagedVllmKvReadinessFence>,
     published_kv_readiness_epoch: AtomicU64,
     generation: AtomicU64,
+    initial_kv_blocks: AtomicU64,
     telemetry: Option<Arc<ManagedVllmTelemetry>>,
 }
 
@@ -2491,6 +2890,7 @@ impl ManagedVllmProcess {
             kv_readiness_fence: Arc::new(ManagedVllmKvReadinessFence::new()),
             published_kv_readiness_epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            initial_kv_blocks: AtomicU64::new(0),
             telemetry,
         }
     }
@@ -2534,6 +2934,7 @@ impl ManagedVllmProcess {
                 &self.spec.settings.max_model_len.to_string(),
             ])
             .arg("--enforce-eager")
+            .arg("--enable-prefix-caching")
             .args(["--kv-transfer-config", &launch.kv_transfer_config])
             .env("CUDA_VISIBLE_DEVICES", &self.spec.cuda_visible_devices)
             .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -2578,11 +2979,13 @@ impl ManagedVllmProcess {
         Ok(command)
     }
 
-    fn install_exact_launch(&self, kv_transfer_config: String, bytes: u64) {
+    fn install_exact_launch(&self, kv_transfer_config: String, bytes: u64, initial_kv_blocks: u64) {
         *self.launch.lock() = ManagedVllmLaunchSpec {
             kv_transfer_config,
             memory_argument: ManagedVllmMemoryArgument::ExactBytes(bytes),
         };
+        self.initial_kv_blocks
+            .store(initial_kv_blocks, Ordering::Release);
     }
 
     async fn prepare_exact_launch(
@@ -2599,6 +3002,7 @@ impl ManagedVllmProcess {
                 "managed vLLM was shut down before exact KV preparation".to_string(),
             ));
         }
+        let coordinator = deployment.coordinator().map_err(EngineError::backend)?;
         let cached_template = { self.exact_plan.lock().clone() };
         let template = if let Some(template) = cached_template {
             template
@@ -2615,7 +3019,7 @@ impl ManagedVllmProcess {
                 ))
             })
             .and_then(|result| result.map_err(EngineError::backend));
-            let template = match planned {
+            let mut template = match planned {
                 Ok(template) => template,
                 Err(error) => {
                     if let Some(telemetry) = &self.telemetry {
@@ -2624,13 +3028,40 @@ impl ManagedVllmProcess {
                     return Err(error);
                 }
             };
+            if template.live_resize {
+                let alignment_coordinator = coordinator.clone();
+                let domains = template.grant_request.memory_domains.clone();
+                let bytes_per_block = template
+                    .grant_request
+                    .candidates
+                    .first()
+                    .map(|candidate| candidate.bytes_per_block)
+                    .ok_or_else(|| {
+                        EngineError::backend(
+                            "managed vLLM elastic planner returned no grant candidates",
+                        )
+                    })?;
+                let alignment = tokio::task::spawn_blocking(move || {
+                    alignment_coordinator
+                        .managed_vllm_live_resize_alignment_blocks(&domains, bytes_per_block)
+                })
+                .await
+                .map_err(|error| {
+                    EngineError::backend(format!(
+                        "managed vLLM CUDA VMM alignment task failed: {error}"
+                    ))
+                })?
+                .map_err(EngineError::backend)?;
+                align_managed_vllm_elastic_plan(&mut template, alignment)
+                    .map_err(EngineError::backend)?;
+            }
             *self.exact_plan.lock() = Some(template.clone());
             template
         };
         let grant_request = template.grant_request.clone();
-        let coordinator = deployment.coordinator().map_err(EngineError::backend)?;
+        let grant_coordinator = coordinator.clone();
         let grant = tokio::task::spawn_blocking(move || {
-            coordinator.reserve_provisional_kv_grant(&grant_request)
+            grant_coordinator.reserve_provisional_kv_grant(&grant_request)
         })
         .await
         .map_err(|error| {
@@ -2653,21 +3084,40 @@ impl ManagedVllmProcess {
         if let Some(telemetry) = &self.telemetry {
             telemetry.observe_grant(&template, &grant);
         }
-        let granted_bytes = grant
+        let granted_bytes = match grant
             .selected_candidate
             .block_count
             .checked_mul(grant.selected_candidate.bytes_per_block)
-            .ok_or_else(|| EngineError::backend("managed vLLM KV grant bytes overflowed"))?;
-        let config = build_kv_transfer_config(
+        {
+            Some(bytes) => bytes,
+            None => {
+                coordinator.cancel_provisional_kv_grants(participant_base);
+                return Err(EngineError::backend(
+                    "managed vLLM KV grant bytes overflowed",
+                ));
+            }
+        };
+        let config = match build_kv_transfer_config(
             &deployment.control_endpoint,
             participant_base,
             &invocation.model_fingerprint,
             &invocation.device_ids,
             deployment.lease_ttl_ms,
             Some(&grant.proof),
-        )
-        .map_err(EngineError::backend)?;
-        self.install_exact_launch(config, granted_bytes);
+            template.live_resize,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                coordinator.cancel_provisional_kv_grants(participant_base);
+                return Err(EngineError::backend(error));
+            }
+        };
+        let launch_bytes = if template.live_resize {
+            template.maximum_bytes_per_rank
+        } else {
+            granted_bytes
+        };
+        self.install_exact_launch(config, launch_bytes, grant.selected_candidate.block_count);
         let available = grant
             .authority_snapshot
             .domains
@@ -2684,15 +3134,17 @@ impl ManagedVllmProcess {
             .collect::<Vec<_>>()
             .join(",");
         log::info!(
-            "[vllm-memory] grant model={} desired_per_rank={} granted_per_rank={} minimum_per_rank={} target_concurrency={} effective_concurrency={} candidate={} generation={} authority_available=[{}]",
+            "[vllm-memory] grant model={} desired_per_rank={} granted_per_rank={} virtual_maximum_per_rank={} minimum_per_rank={} target_concurrency={} effective_concurrency={} candidate={} generation={} live_resize={} authority_available=[{}]",
             invocation.model_fingerprint,
             template.requested_bytes_per_rank,
             granted_bytes,
+            template.maximum_bytes_per_rank,
             template.minimum_bytes_per_rank,
             template.target_concurrency,
             grant.selected_candidate.effective_target_concurrency,
             grant.selected_candidate_index,
             grant.proof.authority_generation,
+            template.live_resize,
             available,
         );
         Ok(())
@@ -3231,6 +3683,7 @@ fn start_managed_vllm_supervisor(
 ) {
     tokio::spawn(async move {
         let mut consecutive_health_failures = 0u8;
+        let mut low_kv_utilization_since = None;
         loop {
             tokio::time::sleep(SUPERVISOR_INTERVAL).await;
             if process.shutdown.load(Ordering::Acquire) {
@@ -3248,9 +3701,29 @@ fn start_managed_vllm_supervisor(
                 if process.probe_health().await.is_ok()
                     && matches!(deployment.participant_is_active(&participant_id), Ok(true))
                 {
-                    consecutive_health_failures = 0;
-                    process.mark_routable(generation, readiness_epoch, kv_readiness_epoch);
-                    continue;
+                    match supervise_managed_vllm_live_resize(
+                        &process,
+                        &deployment,
+                        &participant_id,
+                        &mut low_kv_utilization_since,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            consecutive_health_failures = 0;
+                            process.mark_routable(generation, readiness_epoch, kv_readiness_epoch);
+                            continue;
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "[vllm-supervisor] live KV resize policy failed for model {}: {}",
+                                process.spec.served_model_name,
+                                error,
+                            );
+                            process.mark_suspect();
+                            consecutive_health_failures = MAX_CONSECUTIVE_HEALTH_FAILURES;
+                        }
+                    }
                 }
                 process.mark_suspect();
                 consecutive_health_failures = consecutive_health_failures.saturating_add(1);
@@ -3351,14 +3824,133 @@ fn start_managed_vllm_supervisor(
                         error
                     ),
                 },
-                Err(error) => log::error!(
-                    "[vllm-supervisor] failed to restart model {}: {}",
-                    process.spec.served_model_name,
-                    error
-                ),
+                Err(error) => {
+                    log::error!(
+                        "[vllm-supervisor] failed to restart model {}: {}",
+                        process.spec.served_model_name,
+                        error
+                    );
+                    if let Err(retire_error) =
+                        deployment.retire_participants_after_backend_exit(&participant_id)
+                    {
+                        log::error!(
+                            "[vllm-supervisor] failed to cancel the unstarted generation for model {}: {}",
+                            process.spec.served_model_name,
+                            retire_error,
+                        );
+                        break;
+                    }
+                }
             }
         }
     });
+}
+
+async fn supervise_managed_vllm_live_resize(
+    process: &Arc<ManagedVllmProcess>,
+    deployment: &Arc<ManagedVllmDeployment>,
+    participant_base: &str,
+    low_utilization_since: &mut Option<Instant>,
+) -> Result<(), String> {
+    let Some(policy) = process.spec.settings.live_resize.as_ref() else {
+        return Ok(());
+    };
+    let coordinator = deployment.coordinator()?;
+    let Some(resize) = coordinator.managed_vllm_resize_snapshot(participant_base)? else {
+        return Ok(());
+    };
+    if let Some(failure) = resize.failure {
+        return Err(format!("coordinator fenced the pending resize: {failure}"));
+    }
+    if resize.pending_generation.is_some() {
+        *low_utilization_since = None;
+        return Ok(());
+    }
+    let devices = coordinator.managed_vllm_kv_snapshot(participant_base)?;
+    if devices.is_empty() || devices.iter().any(|device| device.allocated_blocks == 0) {
+        return Ok(());
+    }
+    let utilization_percent = devices
+        .iter()
+        .map(|device| {
+            device
+                .active_blocks
+                .saturating_mul(100)
+                .div_ceil(device.allocated_blocks)
+        })
+        .max()
+        .unwrap_or_default();
+    let template = process
+        .exact_plan
+        .lock()
+        .clone()
+        .ok_or_else(|| "live KV resize has no certified exact plan".to_string())?;
+    let step = template
+        .sequence_blocks
+        .checked_mul(template.target_concurrency)
+        .ok_or_else(|| "live KV resize step overflowed".to_string())?
+        .max(resize.resize_alignment_blocks);
+    let aligned_up = |value: u64| {
+        value
+            .checked_add(resize.resize_alignment_blocks - 1)
+            .map(|value| value / resize.resize_alignment_blocks * resize.resize_alignment_blocks)
+            .ok_or_else(|| "live KV resize target overflowed".to_string())
+    };
+
+    let target = if utilization_percent >= policy.grow_utilization_percent as u64
+        && resize.current_block_count < resize.maximum_block_count
+    {
+        *low_utilization_since = None;
+        Some(
+            aligned_up(resize.current_block_count.saturating_add(step))?
+                .min(resize.maximum_block_count),
+        )
+    } else if utilization_percent <= policy.shrink_utilization_percent as u64 {
+        let since = low_utilization_since.get_or_insert_with(Instant::now);
+        let floor = resize.minimum_block_count;
+        if since.elapsed() >= policy.shrink_idle && resize.current_block_count > floor {
+            let raw = resize.current_block_count.saturating_sub(step).max(floor);
+            let aligned = raw / resize.resize_alignment_blocks * resize.resize_alignment_blocks;
+            *low_utilization_since = None;
+            Some(aligned.max(floor))
+        } else {
+            None
+        }
+    } else {
+        *low_utilization_since = None;
+        None
+    };
+    let Some(target) = target.filter(|target| *target != resize.current_block_count) else {
+        return Ok(());
+    };
+    let resize_coordinator = coordinator.clone();
+    let participant_base = participant_base.to_string();
+    let requested = tokio::task::spawn_blocking(move || {
+        resize_coordinator.request_managed_vllm_resize(&participant_base, target)
+    })
+    .await
+    .map_err(|error| format!("live KV resize task failed: {error}"))?;
+    let generation = match requested {
+        Ok(generation) => generation,
+        Err(error) if error.contains("resize was not admitted") => {
+            log::debug!(
+                "[vllm-supervisor] deferred live KV resize model={} target_blocks={}: {}",
+                process.spec.served_model_name,
+                target,
+                error,
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    log::info!(
+        "[vllm-supervisor] requested live KV resize model={} generation={} target_blocks={} utilization_percent={}",
+        process.spec.served_model_name,
+        generation,
+        target,
+        utilization_percent,
+    );
+    Ok(())
 }
 
 struct ManagedVllmRuntime {
@@ -3493,6 +4085,7 @@ impl ManagedVllmEngine {
                         &device_ids,
                         deployment.lease_ttl_ms,
                         None,
+                        false,
                     )?,
                     memory_argument: ManagedVllmMemoryArgument::LegacyFraction(
                         *gpu_memory_utilization,
@@ -3514,6 +4107,7 @@ impl ManagedVllmEngine {
                     max_model_len: settings.max_model_len,
                     resolved_target_concurrency,
                     policy: settings.kv_cache_policy.clone(),
+                    live_resize: settings.live_resize.clone(),
                     timeout: settings.startup_timeout,
                     cuda_visible_devices: cuda_visible_devices.clone(),
                     output_path: model_root_log.join("kv-plan.json"),
@@ -3740,7 +4334,10 @@ impl Engine for ManagedVllmEngine {
         self.process
             .prepare_exact_launch(&self.deployment, &self.runtime.participant_id)
             .await?;
-        self.process.spawn_child()?;
+        if let Err(error) = self.process.spawn_child() {
+            self.shutdown_managed_backend();
+            return Err(error);
+        }
         if let Err(error) = self
             .process
             .wait_ready(&self.deployment, &self.runtime.participant_id)
@@ -3885,9 +4482,18 @@ impl Engine for ManagedVllmEngine {
         let mut policy = BatchingPolicy::delegated();
         policy.max_requests = self
             .process
-            .telemetry
+            .spec
+            .settings
+            .live_resize
             .as_ref()
-            .map_or(1, |telemetry| telemetry.target_concurrency());
+            .map(|settings| settings.maximum_concurrency)
+            .or_else(|| {
+                self.process
+                    .telemetry
+                    .as_ref()
+                    .map(|telemetry| telemetry.target_concurrency())
+            })
+            .unwrap_or(1);
         policy.with_priority_support()
     }
 
@@ -3985,6 +4591,20 @@ impl Engine for ManagedVllmEngine {
             .fold(0_usize, usize::saturating_add);
         EngineMetrics {
             memory_usage: planned_memory.saturating_add(metric_usize(kv_cache_bytes_capacity)),
+            batch_size: self
+                .process
+                .spec
+                .settings
+                .live_resize
+                .as_ref()
+                .map(|settings| settings.maximum_concurrency)
+                .or_else(|| {
+                    self.process
+                        .telemetry
+                        .as_ref()
+                        .map(|telemetry| telemetry.target_concurrency())
+                })
+                .unwrap_or(1),
             error_rate: if requests == 0 {
                 0.0
             } else {
@@ -4114,6 +4734,7 @@ fn build_kv_transfer_config(
     device_ids: &[usize],
     lease_ttl_ms: u64,
     provisioning_grant: Option<&kapsl_kv_abi::KvProvisioningGrant>,
+    live_resize: bool,
 ) -> Result<String, String> {
     let memory_domains = device_ids
         .iter()
@@ -4132,6 +4753,7 @@ fn build_kv_transfer_config(
         "kapsl_memory_domains": memory_domains,
         "kapsl_rank_device_map": rank_device_map,
         "kapsl_lease_ttl_ms": lease_ttl_ms,
+        "kapsl_live_resize": live_resize,
     });
     if let Some(grant) = provisioning_grant {
         extra["kapsl_provisioning_grant"] = serde_json::to_value(grant)
@@ -4261,10 +4883,10 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    // Frozen output emitted by kapsl_vllm_connector.planning 0.6.0. Keeping
+    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.0. Keeping
     // one exact cross-language fixture catches JSON/digest/arithmetic drift
     // before the executor-backed planner is exercised on a GPU host.
-    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.6.0","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:e4a791621a5d33c536a63e8c6c69b60ca75d1eadebaae852ccb034da2e85ef5b","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416},"status":"planned","supported":true}"#;
+    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.0","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
 
     fn settings_from_metadata(metadata: &str) -> Result<ManagedVllmSettings, String> {
         let metadata = serde_yaml::from_str(metadata).expect("test metadata YAML");
@@ -4299,6 +4921,7 @@ mod tests {
                 max_bytes: None,
                 strict: false,
             },
+            live_resize: None,
             timeout: Duration::from_secs(300),
             cuda_visible_devices: "0".to_string(),
             output_path: root.join("kv-plan.json"),
@@ -4334,6 +4957,7 @@ mod tests {
                     kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
                         gpu_memory_utilization: 0.25,
                     },
+                    live_resize: None,
                     legacy_top_level_fraction_authored: false,
                     max_model_len: 512,
                     startup_timeout: Duration::from_secs(30),
@@ -4354,7 +4978,11 @@ mod tests {
     fn certified_profile_matches_certified_tuple() {
         assert_eq!(
             certified_vllm_profile(),
-            "kapsl-vllm-connector,0.6.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
+            "kapsl-vllm-connector,0.7.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
+        );
+        assert_eq!(
+            certified_vllm_elastic_profile(),
+            "kapsl-vllm-connector,0.7.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
         );
     }
 
@@ -4386,6 +5014,7 @@ mod tests {
                 max_bytes: None,
                 strict: false,
             },
+            live_resize: None,
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
             startup_timeout: Duration::from_secs(300),
@@ -4440,8 +5069,49 @@ mod tests {
         assert_eq!(template.grant_request.candidates[0].bytes_per_block, 1024);
         assert_eq!(
             template.grant_request.geometry_digest,
-            "sha256:e4a791621a5d33c536a63e8c6c69b60ca75d1eadebaae852ccb034da2e85ef5b"
+            "sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697"
         );
+    }
+
+    #[test]
+    fn elastic_planner_fixture_separates_initial_physical_and_virtual_maximum() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut invocation = synthetic_planner_invocation(directory.path());
+        invocation.live_resize = Some(ManagedVllmLiveResizeSettings {
+            maximum_concurrency: 8,
+            grow_utilization_percent: 80,
+            shrink_utilization_percent: 25,
+            shrink_idle: Duration::from_secs(60),
+        });
+        let mut value: serde_json::Value = serde_json::from_str(SYNTHETIC_PLANNER_OUTPUT).unwrap();
+        value["geometry"]["identity"]["profile_id"] =
+            serde_json::json!(MANAGED_VLLM_ELASTIC_PROFILE_ID);
+        value["geometry"]["layout_id"] = serde_json::json!("BLNHC");
+        value["policy"]["maximum_concurrency"] = serde_json::json!(8);
+        value["sizing"]["ranks"][0]["maximum_blocks"] = serde_json::json!(616);
+        value["sizing"]["ranks"][0]["maximum_bytes"] = serde_json::json!(630_784);
+        value["sizing"]["total_maximum_bytes"] = serde_json::json!(630_784);
+        value["geometry_digest"] =
+            serde_json::json!(managed_vllm_geometry_digest(&value["geometry"]).unwrap());
+
+        let mut template =
+            parse_managed_vllm_planner_output(&value.to_string(), &invocation).unwrap();
+
+        assert!(template.live_resize);
+        assert_eq!(template.requested_bytes_per_rank, 316_416);
+        assert_eq!(template.maximum_bytes_per_rank, 630_784);
+        assert_eq!(template.grant_request.maximum_block_count, Some(616));
+        align_managed_vllm_elastic_plan(&mut template, 64).unwrap();
+        assert_eq!(template.minimum_bytes_per_rank, 128 * 1024);
+        assert_eq!(template.requested_bytes_per_rank, 320 * 1024);
+        assert_eq!(template.maximum_block_count, 640);
+        assert_eq!(template.maximum_bytes_per_rank, 640 * 1024);
+        assert_eq!(template.grant_request.maximum_block_count, Some(640));
+        assert!(template
+            .grant_request
+            .candidates
+            .iter()
+            .all(|candidate| candidate.block_count.is_multiple_of(64)));
     }
 
     #[test]
@@ -4482,7 +5152,9 @@ mod tests {
         bad_stride["sizing"]["ranks"][0]["bytes_per_block"] = serde_json::json!(2048);
         bad_stride["sizing"]["ranks"][0]["desired_bytes"] = serde_json::json!(632832);
         bad_stride["sizing"]["ranks"][0]["minimum_bytes"] = serde_json::json!(133120);
+        bad_stride["sizing"]["ranks"][0]["maximum_bytes"] = serde_json::json!(632832);
         bad_stride["sizing"]["total_desired_bytes"] = serde_json::json!(632832);
+        bad_stride["sizing"]["total_maximum_bytes"] = serde_json::json!(632832);
         let digest = managed_vllm_geometry_digest(&bad_stride["geometry"]).unwrap();
         bad_stride["geometry_digest"] = serde_json::json!(digest);
         assert!(
@@ -4572,6 +5244,93 @@ serving:
                 gpu_memory_utilization: 0.3,
             }
         );
+    }
+
+    #[test]
+    fn live_resize_policy_parses_bounded_thresholds_and_requires_auto_mode() {
+        let settings = settings_from_metadata(
+            r#"
+serving:
+  vllm:
+    kv_cache:
+      mode: auto
+      target_concurrency: 4
+      live_resize:
+        maximum_concurrency: 16
+        grow_utilization_percent: 75
+        shrink_utilization_percent: 20
+        shrink_idle_seconds: 45
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.live_resize,
+            Some(ManagedVllmLiveResizeSettings {
+                maximum_concurrency: 16,
+                grow_utilization_percent: 75,
+                shrink_utilization_percent: 20,
+                shrink_idle: Duration::from_secs(45),
+            })
+        );
+        settings.validate_launch_policy().unwrap();
+
+        let disabled = settings_from_metadata(
+            r#"
+serving:
+  vllm:
+    kv_cache:
+      mode: auto
+      live_resize:
+        enabled: false
+"#,
+        )
+        .unwrap();
+        assert!(disabled.live_resize.is_none());
+
+        for metadata in [
+            r#"
+serving:
+  vllm:
+    kv_cache:
+      mode: auto
+      live_resize: {}
+"#,
+            r#"
+serving:
+  vllm:
+    kv_cache:
+      mode: auto
+      target_concurrency: 8
+      live_resize:
+        maximum_concurrency: 4
+"#,
+            r#"
+serving:
+  vllm:
+    kv_cache:
+      mode: auto
+      live_resize:
+        maximum_concurrency: 8
+        grow_utilization_percent: 25
+        shrink_utilization_percent: 25
+"#,
+            r#"
+serving:
+  vllm:
+    kv_cache:
+      mode: auto
+      live_resize:
+        enabled: false
+        maximum_concurrency: 8
+"#,
+        ] {
+            let result = settings_from_metadata(metadata)
+                .and_then(|settings| settings.validate_launch_policy().map(|_| settings));
+            assert!(
+                result.is_err(),
+                "live resize metadata should fail: {metadata}"
+            );
+        }
     }
 
     #[test]
@@ -5036,6 +5795,7 @@ serving:
             &[0, 2],
             30_000,
             None,
+            false,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -5062,6 +5822,7 @@ serving:
             &[0],
             30_000,
             Some(&proof),
+            false,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -5069,6 +5830,22 @@ serving:
         assert_eq!(
             value["kv_connector_extra_config"]["kapsl_provisioning_grant"],
             serde_json::to_value(proof).unwrap()
+        );
+
+        let live_encoded = build_kv_transfer_config(
+            "unix:///tmp/kapsl.sock",
+            "worker",
+            "sha256:model",
+            &[0],
+            30_000,
+            None,
+            true,
+        )
+        .unwrap();
+        let live_value: serde_json::Value = serde_json::from_str(&live_encoded).unwrap();
+        assert_eq!(
+            live_value["kv_connector_extra_config"]["kapsl_live_resize"],
+            true
         );
     }
 
@@ -5117,6 +5894,7 @@ serving:
                     kv_cache_policy: ManagedVllmKvCachePolicy::LegacyFraction {
                         gpu_memory_utilization: 0.25,
                     },
+                    live_resize: None,
                     legacy_top_level_fraction_authored: false,
                     max_model_len: 512,
                     startup_timeout: Duration::from_secs(30),
@@ -5151,7 +5929,7 @@ serving:
         let process = Arc::get_mut(&mut process).expect("test owns the process");
         process.spec.model_root = model_root;
         process.spec.log_path = directory.path().join("vllm.log");
-        process.install_exact_launch("{\"exact\":true}".to_string(), 316_416);
+        process.install_exact_launch("{\"exact\":true}".to_string(), 316_416, 309);
 
         let command = process.build_command().unwrap();
         let arguments = command
@@ -5165,6 +5943,115 @@ serving:
         assert!(!arguments
             .iter()
             .any(|argument| argument == "--gpu-memory-utilization"));
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--enable-prefix-caching"));
+    }
+
+    #[cfg(all(unix, feature = "gpu-device-pool"))]
+    #[tokio::test]
+    async fn failed_child_spawn_releases_exact_grant_and_participant_namespace() {
+        use kapsl_hal::device::{Device, DeviceBackend, DeviceInfo};
+
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("model");
+        std::fs::create_dir(&model_root).unwrap();
+        let invocation = synthetic_planner_invocation(directory.path());
+        let mut template =
+            parse_managed_vllm_planner_output(SYNTHETIC_PLANNER_OUTPUT, &invocation).unwrap();
+        // The host test exercises lifecycle cleanup without opening CUDA. The
+        // production planner binds this same claim to CUDA domains.
+        template.grant_request.memory_domains =
+            BTreeSet::from([kapsl_kv_abi::KvMemoryDomain::Host]);
+        let authority = MemoryAuthority::new_accounting_only_for_test(&DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 1024 * 1024 * 1024,
+            os_type: "test".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: true,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: vec![Device {
+                id: 0,
+                name: "synthetic-cuda".to_string(),
+                backend: DeviceBackend::Cuda,
+                memory_mb: 1024,
+                compute_units: 1,
+                pci_bus_id: None,
+                partition_id: None,
+                driver_version: None,
+                cuda_version: None,
+                compute_capability: None,
+                utilization_gpu_pct: None,
+                temperature_c: None,
+                supports_fp16: true,
+                supports_int8: true,
+            }],
+        })
+        .unwrap();
+        let coordinator =
+            ExternalKvCoordinator::new(authority.clone(), Duration::from_secs(30)).unwrap();
+        let port = reserve_loopback_port().unwrap();
+        let deployment = Arc::new(ManagedVllmDeployment {
+            python: directory.path().join("missing-python"),
+            control_endpoint: format!("unix://{}", directory.path().join("kv.sock").display()),
+            runtime_root: directory.path().to_path_buf(),
+            lease_ttl_ms: 30_000,
+            runtimes: parking_lot::Mutex::new(HashMap::new()),
+            coordinator: parking_lot::RwLock::new(Some(coordinator.clone())),
+        });
+        let process = Arc::new(ManagedVllmProcess::new(
+            ManagedVllmProcessSpec {
+                python: directory.path().join("missing-python"),
+                model_root,
+                served_model_name: "test-model".to_string(),
+                endpoint: format!("http://127.0.0.1:{port}"),
+                port,
+                log_path: directory.path().join("vllm.log"),
+                settings: ManagedVllmSettings {
+                    gpu_memory_utilization: 0.5,
+                    kv_cache_policy: invocation.policy.clone(),
+                    live_resize: None,
+                    legacy_top_level_fraction_authored: false,
+                    max_model_len: invocation.max_model_len,
+                    startup_timeout: invocation.timeout,
+                },
+                tensor_parallel_size: 1,
+                cuda_visible_devices: "0".to_string(),
+                planner_invocation: Some(invocation.clone()),
+            },
+            ManagedVllmLaunchSpec {
+                kv_transfer_config: String::new(),
+                memory_argument: ManagedVllmMemoryArgument::ExactBytes(0),
+            },
+            None,
+        ));
+        *process.exact_plan.lock() = Some(template);
+
+        process
+            .prepare_exact_launch(&deployment, &invocation.participant_base)
+            .await
+            .unwrap();
+        assert!(!authority.snapshot().rows.is_empty());
+        assert!(process.spawn_child().is_err());
+        assert!(process.child.lock().is_none());
+
+        let runtime = ManagedVllmRuntime {
+            process: process.clone(),
+            participant_id: invocation.participant_base.clone(),
+            participant_retired: parking_lot::Mutex::new(false),
+        };
+        assert!(runtime.shutdown(&deployment));
+        assert!(authority.snapshot().rows.is_empty());
+        assert_eq!(
+            coordinator.cancel_provisional_kv_grants(&invocation.participant_base),
+            0
+        );
+        assert!(!coordinator
+            .managed_participant_is_active(&invocation.participant_base)
+            .unwrap());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
 
     #[test]

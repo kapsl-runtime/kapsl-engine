@@ -12,13 +12,14 @@ pub(crate) struct KvControlConfig {
 impl KvControlConfig {
     pub(crate) fn apply_managed_defaults(&mut self, prepared: &PreparedManagedVllmDeployment) {
         self.socket_path = Some(prepared.control_socket.clone());
-        if !self
-            .shared_pool_profiles
-            .iter()
-            .any(|candidate| candidate == &prepared.shared_pool_profile)
-        {
-            self.shared_pool_profiles
-                .push(prepared.shared_pool_profile.clone());
+        for profile in &prepared.shared_pool_profiles {
+            if !self
+                .shared_pool_profiles
+                .iter()
+                .any(|candidate| candidate == profile)
+            {
+                self.shared_pool_profiles.push(profile.clone());
+            }
         }
     }
 
@@ -54,7 +55,7 @@ impl KvControlConfig {
             return Ok(None);
         };
 
-        #[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+        #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
         let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
             resources.memory().clone(),
             Duration::from_millis(self.lease_ttl_ms),
@@ -63,7 +64,7 @@ impl KvControlConfig {
             )),
             parse_shared_pool_profiles(&self.shared_pool_profiles)?,
         )?;
-        #[cfg(not(all(feature = "gpu-device-pool", target_os = "linux")))]
+        #[cfg(not(all(feature = "gpu-device-pool", any(target_os = "linux", test))))]
         let coordinator = ExternalKvCoordinator::new(
             resources.memory().clone(),
             Duration::from_millis(self.lease_ttl_ms),

@@ -75,30 +75,43 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
                 let metrics_available = pool_metrics.is_some();
 
                 // Check for scale-up
-                let should_scale_up = auto_scaler_clone.write().should_scale_up(
-                    base_model_id,
-                    current_replicas,
-                    healthy_replicas,
-                    total_queue_depth,
-                    elapsed,
-                    metrics_available,
-                );
+                let (should_scale_up, scale_up_enforces_minimum) = {
+                    let mut auto_scaler = auto_scaler_clone.write();
+                    let minimum_replicas = auto_scaler.get_policy(base_model_id).min_replicas;
+                    let decision = auto_scaler.should_scale_up(
+                        base_model_id,
+                        current_replicas,
+                        healthy_replicas,
+                        total_queue_depth,
+                        elapsed,
+                        metrics_available,
+                    );
+                    let enforces_minimum = current_replicas >= 1
+                        && current_replicas < minimum_replicas
+                        && decision.is_some_and(|target| target >= minimum_replicas);
+                    (decision, enforces_minimum)
+                };
 
                 if let Some(target_replicas) = should_scale_up {
+                    let live_resize_headroom =
+                        model_runtime.managed_vllm_has_live_resize_headroom(base_model_id);
                     if healthy_replicas == current_replicas
-                        && managed_vllm_has_internal_batching_headroom(
+                        && should_defer_managed_vllm_replication(
                             &model_info,
                             pool_metrics.as_ref(),
+                            live_resize_headroom,
+                            scale_up_enforces_minimum,
                         )
                     {
                         let (active, target) = pool_metrics.as_ref().map_or((0, 0), |metrics| {
                             (metrics.kv_cache_sequences, metrics.batch_size)
                         });
                         log::info!(
-                            "Auto-scaler: deferring managed vLLM model {} process replication; internal continuous batching has {}/{} active sequences",
+                            "Auto-scaler: deferring managed vLLM model {} process replication; internal continuous batching has {}/{} active sequences (live_resize_headroom={})",
                             base_model_id,
                             active,
                             target,
+                            live_resize_headroom,
                         );
                         continue;
                     }
@@ -244,6 +257,16 @@ fn managed_vllm_has_internal_batching_headroom(
     metrics.batch_size == 0 || metrics.kv_cache_sequences < metrics.batch_size
 }
 
+fn should_defer_managed_vllm_replication(
+    model: &ModelInfo,
+    metrics: Option<&EngineMetrics>,
+    live_resize_headroom: bool,
+    scale_up_enforces_minimum: bool,
+) -> bool {
+    !scale_up_enforces_minimum
+        && (live_resize_headroom || managed_vllm_has_internal_batching_headroom(model, metrics))
+}
+
 #[cfg(test)]
 mod managed_vllm_autoscaling_tests {
     use super::*;
@@ -283,6 +306,28 @@ mod managed_vllm_autoscaling_tests {
         assert!(!managed_vllm_has_internal_batching_headroom(
             &model("CUDAExecutionProvider"),
             Some(&EngineMetrics::default())
+        ));
+    }
+
+    #[test]
+    fn configured_minimum_replica_floor_is_never_deferred() {
+        let managed = model("vllm");
+        let idle = EngineMetrics {
+            batch_size: 16,
+            kv_cache_sequences: 0,
+            ..Default::default()
+        };
+        assert!(should_defer_managed_vllm_replication(
+            &managed,
+            Some(&idle),
+            true,
+            false,
+        ));
+        assert!(!should_defer_managed_vllm_replication(
+            &managed,
+            Some(&idle),
+            true,
+            true,
         ));
     }
 }

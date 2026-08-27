@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 
 pub(crate) mod autoscaler;
 pub(crate) mod config;
-#[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
 pub(crate) mod cuda_ipc;
 #[cfg(any(feature = "gpu-device-pool", test))]
 mod device_budget;
@@ -35,7 +35,7 @@ pub(crate) mod worker;
 
 pub(crate) use autoscaler::*;
 pub(crate) use config::*;
-#[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
 pub(crate) use cuda_ipc::*;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use device_memory::*;

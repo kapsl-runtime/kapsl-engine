@@ -96,6 +96,12 @@ impl ModelRuntime {
         self.resources.memory().snapshot()
     }
 
+    pub(crate) fn managed_vllm_has_live_resize_headroom(&self, model_id: u32) -> bool {
+        self.resources
+            .managed_vllm()
+            .is_some_and(|deployment| deployment.model_has_live_resize_headroom(model_id))
+    }
+
     pub(crate) fn models(&self) -> &Arc<ModelManager> {
         &self.models
     }
