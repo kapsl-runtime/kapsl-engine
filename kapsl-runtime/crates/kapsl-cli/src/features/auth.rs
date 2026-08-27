@@ -16,16 +16,7 @@ pub(crate) struct ApiLocalOnly;
 impl warp::reject::Reject for ApiLocalOnly {}
 
 pub(crate) fn format_authorization_header(token: Option<&str>) -> Option<String> {
-    let raw = token?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some((scheme, _)) = raw.split_once(' ') {
-        if scheme.eq_ignore_ascii_case("bearer") {
-            return Some(raw.to_string());
-        }
-    }
-    Some(format!("Bearer {}", raw))
+    parse_authorization_token(token).map(|token| format!("Bearer {token}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,50 +63,22 @@ impl ApiRoleTokenConfig {
         }
     }
 
-    pub(crate) fn auth_enabled(&self) -> bool {
+    pub(crate) fn has_configured_tokens(&self) -> bool {
         self.reader_token.is_some() || self.writer_token.is_some() || self.admin_token.is_some()
     }
 
-    pub(crate) fn role_for_token(&self, presented_token: &str) -> Option<ApiRole> {
-        if self
-            .admin_token
-            .as_deref()
-            .is_some_and(|token| authorization_matches_token(Some(presented_token), token))
-        {
-            return Some(ApiRole::Admin);
-        }
-        if self
-            .writer_token
-            .as_deref()
-            .is_some_and(|token| authorization_matches_token(Some(presented_token), token))
-        {
-            return Some(ApiRole::Writer);
-        }
-        if self
-            .reader_token
-            .as_deref()
-            .is_some_and(|token| authorization_matches_token(Some(presented_token), token))
-        {
-            return Some(ApiRole::Reader);
-        }
-        None
-    }
-
-    pub(crate) fn role_from_authorization_header(
-        &self,
-        authorization: Option<&str>,
-    ) -> Option<ApiRole> {
-        let raw_header = authorization?;
-        let trimmed = raw_header.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if let Some((scheme, token)) = trimmed.split_once(' ') {
-            if scheme.eq_ignore_ascii_case("bearer") {
-                return self.role_for_token(token.trim());
-            }
-        }
-        self.role_for_token(trimmed)
+    fn role_for_token(&self, presented_token: &str) -> Option<ApiRole> {
+        [
+            (ApiRole::Admin, self.admin_token.as_deref()),
+            (ApiRole::Writer, self.writer_token.as_deref()),
+            (ApiRole::Reader, self.reader_token.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(role, expected_token)| {
+            expected_token
+                .is_some_and(|expected| constant_time_eq(presented_token, expected))
+                .then_some(role)
+        })
     }
 
     pub(crate) fn update_from_payload(
@@ -125,7 +88,7 @@ impl ApiRoleTokenConfig {
         self.reader_token = normalize_optional_text(payload.reader_token);
         self.writer_token = normalize_optional_text(payload.writer_token);
         self.admin_token = normalize_optional_text(payload.admin_token);
-        if self.auth_enabled() && self.admin_token.is_none() {
+        if self.has_configured_tokens() && self.admin_token.is_none() {
             return Err("admin_token is required when role auth is enabled".to_string());
         }
         Ok(())
@@ -444,47 +407,35 @@ impl ApiAuthState {
     }
 
     pub(crate) fn auth_enabled(&self) -> bool {
-        self.role_tokens.auth_enabled() || self.active_key_count() > 0
+        self.role_tokens.has_configured_tokens() || self.active_key_count() > 0
     }
 
     pub(crate) fn active_key_count(&self) -> usize {
-        let now = now_unix_seconds();
-        self.store
-            .api_keys
-            .iter()
-            .filter(|key| {
-                self.user_by_id(&key.user_id)
-                    .is_some_and(|user| Self::is_key_active_for_user(key, user, now))
-            })
-            .count()
+        self.active_key_count_matching(|_, _| true)
     }
 
     pub(crate) fn active_admin_key_count(&self) -> usize {
-        let now = now_unix_seconds();
-        self.store
-            .api_keys
-            .iter()
-            .filter(|key| {
-                self.user_by_id(&key.user_id).is_some_and(|user| {
-                    user.role == ApiRole::Admin && Self::is_key_active_for_user(key, user, now)
-                })
-            })
-            .count()
+        self.active_key_count_matching(|_, user| user.role == ApiRole::Admin)
     }
 
     pub(crate) fn active_key_count_for_user(&self, user_id: &str) -> usize {
-        let now = now_unix_seconds();
-        self.store
-            .api_keys
-            .iter()
-            .filter(|key| {
-                if key.user_id != user_id {
-                    return false;
-                }
-                self.user_by_id(&key.user_id)
-                    .is_some_and(|user| Self::is_key_active_for_user(key, user, now))
-            })
+        self.active_key_count_matching(|key, _| key.user_id == user_id)
+    }
+
+    fn active_key_count_matching(
+        &self,
+        predicate: impl Fn(&ApiAuthKey, &ApiAuthUser) -> bool,
+    ) -> usize {
+        self.active_keys_at(now_unix_seconds())
+            .filter(|(key, user)| predicate(key, user))
             .count()
+    }
+
+    fn active_keys_at(&self, now: u64) -> impl Iterator<Item = (&ApiAuthKey, &ApiAuthUser)> {
+        self.store.api_keys.iter().filter_map(move |key| {
+            let user = self.user_by_id(&key.user_id)?;
+            Self::is_key_active_for_user(key, user, now).then_some((key, user))
+        })
     }
 
     pub(crate) fn is_key_active_for_user(key: &ApiAuthKey, user: &ApiAuthUser, now: u64) -> bool {
@@ -513,20 +464,11 @@ impl ApiAuthState {
             });
         }
         self.role_tokens
-            .role_from_authorization_header(authorization)
+            .role_for_token(presented)
             .map(|role| ApiAuthGrantMatch {
                 grant: ApiAuthGrant { role, scopes: None },
                 matched_key_index: None,
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn role_from_authorization_header(
-        &mut self,
-        authorization: Option<&str>,
-    ) -> Option<ApiRole> {
-        self.grant_from_authorization_header_read(authorization)
-            .map(|matched| matched.grant.role)
     }
 
     pub(crate) fn grant_for_api_key_token_read(
@@ -574,7 +516,7 @@ impl ApiAuthState {
     pub(crate) fn status_response(&self) -> ApiAuthStatusResponse {
         ApiAuthStatusResponse {
             auth_enabled: self.auth_enabled(),
-            role_token_auth_enabled: self.role_tokens.auth_enabled(),
+            role_token_auth_enabled: self.role_tokens.has_configured_tokens(),
             store_path: self.store_path.to_string_lossy().to_string(),
             user_count: self.store.users.len(),
             key_count: self.store.api_keys.len(),
@@ -584,6 +526,7 @@ impl ApiAuthState {
     }
 
     pub(crate) fn role_summaries(&self) -> Vec<ApiRoleSummary> {
+        let now = now_unix_seconds();
         [ApiRole::Admin, ApiRole::Writer, ApiRole::Reader]
             .iter()
             .copied()
@@ -594,16 +537,9 @@ impl ApiAuthState {
                     .iter()
                     .filter(|user| user.role == role)
                     .count();
-                let now = now_unix_seconds();
                 let active_key_count = self
-                    .store
-                    .api_keys
-                    .iter()
-                    .filter(|key| {
-                        self.user_by_id(&key.user_id).is_some_and(|user| {
-                            user.role == role && Self::is_key_active_for_user(key, user, now)
-                        })
-                    })
+                    .active_keys_at(now)
+                    .filter(|(_, user)| user.role == role)
                     .count();
                 ApiRoleSummary {
                     role,
@@ -736,11 +672,12 @@ impl ApiAuthState {
             updated_user.display_name = normalize_optional_text(display_name);
         }
         if let Some(new_role) = request.role {
+            let active_user_key_count = self.active_key_count_for_user(&updated_user.id);
             if updated_user.role == ApiRole::Admin
                 && new_role != ApiRole::Admin
-                && self.active_key_count_for_user(&updated_user.id) > 0
-                && self.active_admin_key_count() <= self.active_key_count_for_user(&updated_user.id)
-                && self.active_key_count() > self.active_key_count_for_user(&updated_user.id)
+                && active_user_key_count > 0
+                && self.active_admin_key_count() <= active_user_key_count
+                && self.active_key_count() > active_user_key_count
             {
                 return Err(
                     "cannot remove admin role from the last admin with active API keys".to_string(),
@@ -887,20 +824,21 @@ pub(crate) fn resolve_auth_store_path() -> PathBuf {
 }
 
 pub(crate) fn parse_authorization_token(header_value: Option<&str>) -> Option<&str> {
-    let raw_header = header_value?;
-    let trimmed = raw_header.trim();
+    let trimmed = header_value?.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Some((scheme, token)) = trimmed.split_once(' ') {
+
+    if let Some(separator) = trimmed.find(char::is_whitespace) {
+        let (scheme, token) = trimmed.split_at(separator);
         if scheme.eq_ignore_ascii_case("bearer") {
             let parsed = token.trim();
-            if parsed.is_empty() {
-                return None;
-            }
-            return Some(parsed);
+            return (!parsed.is_empty()).then_some(parsed);
         }
+    } else if trimmed.eq_ignore_ascii_case("bearer") {
+        return None;
     }
+
     Some(trimmed)
 }
 
@@ -986,14 +924,21 @@ pub(crate) fn is_loopback_remote(remote: Option<std::net::SocketAddr>) -> bool {
     remote.is_some_and(|addr| addr.ip().is_loopback())
 }
 
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(HEX_DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 pub(crate) fn generate_random_id(prefix: &str) -> String {
     let mut bytes = [0u8; 8];
     OsRng.fill_bytes(&mut bytes);
-    let mut suffix = String::with_capacity(16);
-    for byte in bytes {
-        suffix.push_str(&format!("{:02x}", byte));
-    }
-    format!("{}_{}", prefix, suffix)
+    format!("{}_{}", prefix, encode_lower_hex(&bytes))
 }
 
 pub(crate) fn generate_api_key() -> String {
@@ -1005,11 +950,7 @@ pub(crate) fn generate_api_key() -> String {
 
 pub(crate) fn sha256_hex(input: &str) -> String {
     let digest = Sha256::digest(input.as_bytes());
-    let mut output = String::with_capacity(64);
-    for byte in digest {
-        output.push_str(&format!("{:02x}", byte));
-    }
-    output
+    encode_lower_hex(&digest)
 }
 
 /// Converts a client-controlled session id into an internal KV-cache key scoped
@@ -1046,25 +987,6 @@ pub(crate) fn constant_time_eq(left: &str, right: &str) -> bool {
         diff |= lhs ^ rhs;
     }
     diff == 0
-}
-
-pub(crate) fn authorization_matches_token(
-    header_value: Option<&str>,
-    expected_token: &str,
-) -> bool {
-    let Some(raw_header) = header_value else {
-        return false;
-    };
-    let trimmed = raw_header.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if let Some((scheme, token)) = trimmed.split_once(' ') {
-        if scheme.eq_ignore_ascii_case("bearer") {
-            return constant_time_eq(token.trim(), expected_token);
-        }
-    }
-    constant_time_eq(trimmed, expected_token)
 }
 
 pub(crate) fn api_auth_filter(

@@ -1,6 +1,4 @@
-use base64::engine::general_purpose::{
-    STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
-};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use clap::{ArgGroup, ArgMatches, FromArgMatches, Parser};
 use flate2::read::GzDecoder;
@@ -25,19 +23,14 @@ use kapsl_ipc::{IpcServer, TcpServer};
 use kapsl_llm::block_manager::{new_shared_allocator, SharedBlockAllocator};
 use kapsl_llm::global_scheduler::{EngineHandle as KvEngineHandle, GlobalKvScheduler};
 use kapsl_llm::llm_backend::LLMBackend;
-use kapsl_llm::rag::{
-    build_rag_prompt, CitationStyle, RagChunk, RagPromptConfig, WhitespaceTokenCounter,
-};
 use kapsl_monitor::middleware::MonitoringMiddleware;
 use kapsl_rag::extension::{
     ConnectorRuntimeHandle, ExtensionManager, ExtensionRegistry, InstalledExtension,
 };
 use kapsl_rag::vector::SqliteVectorStore;
-use kapsl_rag::{
-    AccessControl, ConnectorClient, DocStore, EmbeddedChunk, FsDocStore, VectorQuery, VectorStore,
-};
+use kapsl_rag::{ConnectorClient, FsDocStore};
 use kapsl_rag_sdk::protocol::{ConnectorRequestKind, ConnectorResponseKind, ConnectorResult};
-use kapsl_rag_sdk::types::{DeltaOp, DocumentDelta, DocumentPayload, SourceDescriptor};
+use kapsl_rag_sdk::types::{DeltaOp, DocumentDelta};
 use kapsl_scheduler::{
     determine_priority, PoolStrategy, ReplicaPool, ReplicaScheduler,
     RequestMetadata as SchedulerRequestMetadata, Scheduler,
@@ -53,7 +46,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::future::Future;
-use std::io::{BufRead, BufWriter, Cursor, Read, Write};
+use std::io::{BufRead, BufWriter, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};

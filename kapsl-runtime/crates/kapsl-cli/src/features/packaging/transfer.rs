@@ -24,17 +24,28 @@ pub(crate) fn format_remote_http_error(error: ureq::Error) -> String {
     }
 }
 
+fn build_native_tls_http_agent(timeout: Option<std::time::Duration>) -> ureq::Agent {
+    let mut config = ureq::Agent::config_builder().tls_config(
+        ureq::tls::TlsConfig::builder()
+            .provider(ureq::tls::TlsProvider::NativeTls)
+            // Ureq's WebPki default disables Schannel's trusted roots on Windows.
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build(),
+    );
+    if let Some(timeout) = timeout {
+        config = config
+            .timeout_global(Some(timeout))
+            .timeout_per_call(Some(timeout));
+    }
+    config.build().into()
+}
+
 pub(crate) fn native_tls_http_agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .provider(ureq::tls::TlsProvider::NativeTls)
-                // Ureq's WebPki default disables Schannel's trusted roots on Windows.
-                .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-                .build(),
-        )
-        .build()
-        .into()
+    build_native_tls_http_agent(None)
+}
+
+pub(crate) fn native_tls_http_agent_with_timeout(timeout: std::time::Duration) -> ureq::Agent {
+    build_native_tls_http_agent(Some(timeout))
 }
 
 /// Agent with no global timeout, suitable for large file uploads/downloads.

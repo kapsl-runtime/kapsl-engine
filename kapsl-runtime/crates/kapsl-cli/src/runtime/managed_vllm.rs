@@ -1620,9 +1620,9 @@ mod tests {
             .get_args()
             .map(std::ffi::OsStr::to_os_string)
             .collect::<Vec<_>>();
-        assert!(arguments.windows(2).any(|pair| {
-            pair[0] == std::ffi::OsString::from("--model") && pair[1] == model_root.as_os_str()
-        }));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair[0] == "--model" && pair[1] == model_root.as_os_str()));
     }
 
     #[test]

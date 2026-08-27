@@ -26,7 +26,7 @@ impl ModelLoadingConfig {
                 scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
                 placement: ModelLoadPlacement::new(args.topology.clone(), args.tp_degree),
             },
-            tuning_provider: Arc::new(build_onnx_tuning_profile(args)?),
+            tuning_provider: Arc::new(build_onnx_session_config_profile(args)?),
         })
     }
 

@@ -5,7 +5,7 @@ pub(crate) struct ModelInferStreamRouteConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
-    pub(crate) rag_state: RagRuntimeState,
+    pub(crate) rag: RagService,
 }
 
 /// `POST /api/models/:id/infer/stream` — Server-Sent Events token streaming.
@@ -23,7 +23,7 @@ pub(crate) fn build_model_infer_stream_route(
         models,
         inference,
         log_sensitive_ids,
-        rag_state,
+        rag,
     } = config;
 
     let request_adapters = Arc::new(default_request_adapter_registry());
@@ -36,7 +36,7 @@ pub(crate) fn build_model_infer_stream_route(
             let models = models.clone();
             let inference = inference.clone();
             let request_adapters = request_adapters.clone();
-            let rag_state = rag_state.clone();
+            let rag = rag.clone();
             async move {
                 use warp::http::StatusCode;
 
@@ -141,7 +141,8 @@ pub(crate) fn build_model_infer_stream_route(
                     };
 
                 if let Some(rag_options) = rag_options {
-                    match augment_inference_request_with_rag(&mut request, &rag_options, &rag_state)
+                    match rag
+                        .augment_inference_request(&mut request, &rag_options)
                         .await
                     {
                         Ok(_) => {}

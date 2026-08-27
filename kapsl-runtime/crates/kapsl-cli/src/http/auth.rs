@@ -76,14 +76,7 @@ pub(crate) fn build_auth_routes(api_auth_state_for_api: Arc<RwLock<ApiAuthState>
                 );
             }
 
-            let token_from_body = payload.token.and_then(|token| {
-                let trimmed = token.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                }
-            });
+            let token_from_body = normalize_optional_text(payload.token);
             let normalized_authorization = authorization
                 .as_deref()
                 .map(str::trim)
