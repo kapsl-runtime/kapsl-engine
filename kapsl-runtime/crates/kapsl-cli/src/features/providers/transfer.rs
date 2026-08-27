@@ -1,4 +1,4 @@
-use crate::features::packaging::{
+use crate::features::http_client::{
     format_remote_http_error, http_agent_for_transfer, native_tls_http_agent,
 };
 use crate::DynError;

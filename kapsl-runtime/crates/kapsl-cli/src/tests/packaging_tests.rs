@@ -70,19 +70,8 @@ fn test_context_build_creates_source_metadata_when_missing() {
     let context_dir = temp_dir.path();
     fs::write(context_dir.join("model.onnx"), b"dummy model").expect("model file");
 
-    let response = create_kapsl_package_from_context(
-        context_dir,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        AxisOverrides::default(),
-        false,
-    )
-    .expect("context package");
+    let response = create_kapsl_package_from_context(ContextPackageRequest::new(context_dir))
+        .expect("context package");
 
     let metadata_path = context_dir.join("metadata.json");
     let response_metadata_path = PathBuf::from(
@@ -124,19 +113,8 @@ fn test_context_build_does_not_overwrite_existing_source_metadata() {
     let metadata_path = context_dir.join("metadata.json");
     fs::write(&metadata_path, existing_metadata).expect("metadata file");
 
-    let response = create_kapsl_package_from_context(
-        context_dir,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        AxisOverrides::default(),
-        false,
-    )
-    .expect("context package");
+    let response = create_kapsl_package_from_context(ContextPackageRequest::new(context_dir))
+        .expect("context package");
 
     assert_eq!(response.metadata_path, None);
     assert_eq!(
@@ -165,22 +143,15 @@ fn test_context_build_embeds_serving_backend_without_overwriting_source_manifest
     let metadata_path = context_dir.join("metadata.json");
     fs::write(&metadata_path, existing_metadata).expect("metadata file");
 
-    let response = create_kapsl_package_from_context(
-        context_dir,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(ServingBackendPolicy::LlamaCpp),
-        AxisOverrides {
+    let response = create_kapsl_package_from_context(ContextPackageRequest {
+        serving_backend_override: Some(ServingBackendPolicy::LlamaCpp),
+        axes: AxisOverrides {
             format: Some("gguf"),
             model_type: Some("causal-lm"),
             task: Some("generate"),
         },
-        false,
-    )
+        ..ContextPackageRequest::new(context_dir)
+    })
     .expect("context package");
 
     assert_eq!(
@@ -220,19 +191,8 @@ fn test_context_build_preserves_axes_required_by_vllm_policy() {
     )
     .expect("metadata file");
 
-    let response = create_kapsl_package_from_context(
-        context_dir,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        AxisOverrides::default(),
-        false,
-    )
-    .expect("context package");
+    let response = create_kapsl_package_from_context(ContextPackageRequest::new(context_dir))
+        .expect("context package");
     let manifest = inspect_serving_manifest(Path::new(&response.kapsl_path))
         .expect("manifest-only backend inspection");
     assert_eq!(manifest.format.as_deref(), Some("safetensors"));

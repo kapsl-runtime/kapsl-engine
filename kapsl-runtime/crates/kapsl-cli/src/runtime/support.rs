@@ -1,4 +1,5 @@
 use super::*;
+use crate::features::http_client::format_remote_http_error;
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct ListedModel {

@@ -4,7 +4,7 @@ use crate::app::{
     ExtensionSubcommand,
 };
 use crate::features::auth::format_authorization_header;
-use crate::features::packaging::{format_remote_http_error, native_tls_http_agent_with_timeout};
+use crate::features::http_client::{format_remote_http_error, native_tls_http_agent_with_timeout};
 use crate::DynError;
 use std::time::Duration;
 

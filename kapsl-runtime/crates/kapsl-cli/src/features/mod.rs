@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod auth;
 pub(crate) mod extensions;
+pub(crate) mod http_client;
 pub(crate) mod infer_adapter;
 pub(crate) mod packaging;
 pub(crate) mod providers;

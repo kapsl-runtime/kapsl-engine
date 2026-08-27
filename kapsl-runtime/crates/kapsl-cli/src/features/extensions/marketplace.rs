@@ -1,5 +1,5 @@
 use crate::app::{EXTENSION_MARKETPLACE_URL, EXTENSION_MARKETPLACE_URL_ENV};
-use crate::features::packaging::{format_remote_http_error, native_tls_http_agent};
+use crate::features::http_client::{format_remote_http_error, native_tls_http_agent};
 use crate::runtime::optional_env_var;
 
 struct ExtensionMarketplaceClient {
