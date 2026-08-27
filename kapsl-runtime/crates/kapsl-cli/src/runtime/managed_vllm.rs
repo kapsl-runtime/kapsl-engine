@@ -3500,7 +3500,7 @@ serving:
             .collect::<Vec<_>>();
         assert!(arguments
             .windows(2)
-            .any(|pair| { pair[0] == "--model" && pair[1] == model_root.as_os_str() }));
+            .any(|pair| pair[0] == "--model" && pair[1] == model_root.as_os_str()));
     }
 
     #[test]

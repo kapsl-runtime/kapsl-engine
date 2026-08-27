@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Cursor;
 
 fn file_build_request(model_path: &Path, output_path: &Path) -> PackageKapslRequest {
     PackageKapslRequest {

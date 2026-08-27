@@ -534,10 +534,7 @@ fn wire_stream_response(
 ) -> Result<warp::reply::Response, String> {
     let body = response.body.map(|item| {
         item.map(warp::hyper::body::Bytes::from).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("managed vLLM response stream failed: {error}"),
-            )
+            std::io::Error::other(format!("managed vLLM response stream failed: {error}"))
         })
     });
     wire_response_builder(&response.head)?
