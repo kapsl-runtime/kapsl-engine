@@ -6,7 +6,6 @@ use clap::{ArgGroup, ArgMatches, FromArgMatches, Parser};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-#[cfg(test)]
 use futures::StreamExt;
 use infer_adapter::{default_request_adapter_registry, parse_inference_request_with_registry};
 use kapsl_backends::BackendFactory;
