@@ -23,6 +23,7 @@ pub(crate) mod kv_control;
 pub(crate) mod kv_runtime;
 pub(crate) mod load_policy;
 pub(crate) mod managed_vllm;
+pub(crate) mod managed_vllm_bridge;
 pub(crate) mod memory;
 pub(crate) mod model;
 pub(crate) mod model_manager;

@@ -55,6 +55,38 @@ ln -sfn python3.12 "$staging_root/bin/python3"
 ln -sfn python3.12 "$staging_root/bin/python"
 
 staging_python="$staging_root/bin/python"
+"$staging_python" - "$installed_manifest" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "schema_version": 1,
+    "python": "3.12.3",
+    "torch": "2.13.0+cu130",
+    "torchvision": "0.28.0+cu130",
+    "torchaudio": "2.11.0+cu130",
+    "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
+    "connector_distribution": "0.6.0",
+    "connector": "0.6.0",
+    "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
+    "cuda_runtime": "13.0",
+    "planner_schema_version": 1,
+}
+actual = {key: manifest.get(key) for key in expected}
+if actual != expected:
+    raise SystemExit(
+        f"managed-vLLM installed manifest mismatch: {actual!r} != {expected!r}"
+    )
+sdk_ref = manifest.get("sdk_ref")
+if not isinstance(sdk_ref, str) or re.fullmatch(r"[0-9a-f]{40}", sdk_ref) is None:
+    raise SystemExit(
+        "managed-vLLM installed manifest sdk_ref must be an exact lowercase "
+        f"40-hex commit, got {sdk_ref!r}"
+    )
+PY
 "$staging_python" -m pip install \
   --disable-pip-version-check \
   --no-cache-dir \
@@ -65,7 +97,7 @@ staging_python="$staging_root/bin/python"
   "torchvision==0.28.0+cu130" \
   "torchaudio==2.11.0+cu130" \
   "vllm==0.26.1rc1.dev1130+g2ec6f0d71" \
-  "kapsl-vllm-connector==0.5.0"
+  "kapsl-vllm-connector==0.6.0"
 "$staging_python" -m pip check
 
 "$staging_python" <<'PY'
@@ -74,6 +106,7 @@ import json
 import platform
 import torch
 from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
+from kapsl_vllm_connector.planning import PLANNER_SCHEMA_VERSION
 
 actual = {
     "python": platform.python_version(),
@@ -85,6 +118,7 @@ actual = {
     "connector": ADAPTER_VERSION,
     "profile": ADAPTER_PROFILE_ID,
     "cuda_runtime": str(torch.version.cuda),
+    "planner_schema_version": PLANNER_SCHEMA_VERSION,
 }
 expected = {
     "python": "3.12.3",
@@ -92,10 +126,11 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.5.0",
-    "connector": "0.5.0",
+    "connector_distribution": "0.6.0",
+    "connector": "0.6.0",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
     "cuda_runtime": "13.0",
+    "planner_schema_version": 1,
 }
 if actual != expected:
     raise SystemExit(f"managed-vLLM bundle mismatch: {actual!r} != {expected!r}")

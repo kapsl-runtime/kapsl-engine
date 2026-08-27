@@ -1,10 +1,11 @@
 //! OpenAI-compatible HTTP surface.
 //!
 //! These routes exist so an existing OpenAI client can be pointed at a Kapsl
-//! runtime by changing its base URL and nothing else. They are a thin
-//! translation layer: every request ends up on the same `ReplicaPool` paths as
-//! `/api/models/:id/infer`, with the same admission, runtime-pressure shedding
-//! and cancellation behaviour.
+//! runtime by changing its base URL and nothing else. Every request ends up on
+//! the same `ReplicaPool` paths as `/api/models/:id/infer`, with the same
+//! admission, runtime-pressure shedding, and cancellation behaviour. Managed
+//! vLLM may use a typed byte-relay path after those policies have run; other
+//! engines retain the tensor translation path.
 
 use super::*;
 

@@ -72,10 +72,14 @@ jobs:
           bash -n .github/scripts/package-linux-vllm-backend.sh
           bash -n .github/scripts/test-bootstrap-vllm-backend.sh
           bash -n .github/scripts/test-managed-vllm-release-contract.sh
+          bash -n .github/scripts/verify-managed-vllm-sdk-checkout.sh
+          bash -n .github/scripts/test-verify-managed-vllm-sdk-checkout.sh
+          bash -n .github/scripts/test-verify-managed-vllm-connector-wheel.sh
           bash -n .github/scripts/test-generate-backend-index.sh
           bash -n .github/scripts/verify-public-backend-release.sh
           python3 -m py_compile .github/scripts/generate-backend-index.py
           python3 -m py_compile .github/scripts/benchmark-llama-cpp-backend-pack.py
+          python3 -m py_compile .github/scripts/verify-managed-vllm-connector-wheel.py
 
       - name: Test llama.cpp performance threshold math
         run: .github/scripts/benchmark-llama-cpp-backend-pack.py self-test
@@ -103,6 +107,12 @@ jobs:
 
       - name: Test managed-vLLM release pins
         run: .github/scripts/test-managed-vllm-release-contract.sh
+
+      - name: Test managed-vLLM SDK checkout verification
+        run: .github/scripts/test-verify-managed-vllm-sdk-checkout.sh
+
+      - name: Test managed-vLLM connector wheel verification
+        run: .github/scripts/test-verify-managed-vllm-connector-wheel.sh
 
       - name: Test signed backend-index generation
         run: .github/scripts/test-generate-backend-index.sh

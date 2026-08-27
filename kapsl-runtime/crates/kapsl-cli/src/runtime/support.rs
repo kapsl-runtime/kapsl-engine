@@ -452,6 +452,21 @@ pub(crate) fn scheduler_priority_for_request(
     determine_priority(&scheduler_metadata)
 }
 
+pub(crate) fn scheduler_priority_for_openai_wire_parts(
+    body_bytes: usize,
+    metadata: Option<&kapsl_engine_api::OpenAiWireMetadata>,
+) -> kapsl_scheduler::Priority {
+    let scheduler_metadata = SchedulerRequestMetadata {
+        priority: metadata.and_then(|metadata| metadata.priority).unwrap_or(1),
+        sla_deadline: metadata.and_then(|metadata| metadata.timeout_ms),
+        batch_size: 1,
+        input_size_bytes: Some(body_bytes),
+        estimated_flops: None,
+    };
+
+    determine_priority(&scheduler_metadata)
+}
+
 #[cfg(test)]
 mod command_tests {
     use super::*;

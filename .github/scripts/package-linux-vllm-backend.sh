@@ -2,6 +2,7 @@
 set -euo pipefail
 
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
+: "${KAPSL_VLLM_SDK_REF:?KAPSL_VLLM_SDK_REF is required and must be an exact 40-hex commit}"
 
 if [ "${RUNNER_OS:-}" != "Linux" ] || [ "${RUNNER_ARCH:-}" != "X64" ]; then
   echo "The managed-vLLM backend bundle is supported only on Linux x86_64." >&2
@@ -9,9 +10,13 @@ if [ "${RUNNER_OS:-}" != "Linux" ] || [ "${RUNNER_ARCH:-}" != "X64" ]; then
 fi
 
 sdk_dir="${KAPSL_VLLM_SDK_DIR:-sdk-vllm}"
-sdk_ref="${KAPSL_VLLM_SDK_REF:-3a4e626f919e11287e0a19bb720c547ec9216f7f}"
+sdk_ref="$KAPSL_VLLM_SDK_REF"
+connector_version="0.6.0"
+connector_profile="vllm-v1-packed-cuda-ipc/flash-attn"
+planner_schema_version="1"
 connector_root="$sdk_dir/integrations/vllm"
 requirements_lock=".github/scripts/managed-vllm-cu130.lock"
+.github/scripts/verify-managed-vllm-sdk-checkout.sh "$sdk_dir" "$sdk_ref"
 if [ ! -f "$connector_root/pyproject.toml" ]; then
   echo "Missing kapsl-vLLM connector checkout at $connector_root" >&2
   exit 1
@@ -20,12 +25,6 @@ if [ ! -f "$requirements_lock" ]; then
   echo "Missing managed-vLLM dependency lock at $requirements_lock" >&2
   exit 1
 fi
-actual_sdk_ref="$(git -C "$sdk_dir" rev-parse HEAD)"
-if [ "$actual_sdk_ref" != "$sdk_ref" ]; then
-  echo "kapsl-sdk checkout is $actual_sdk_ref, expected $sdk_ref" >&2
-  exit 1
-fi
-
 python_archive_name="cpython-3.12.3+20240415-x86_64-unknown-linux-gnu-install_only.tar.gz"
 python_archive_url="https://github.com/astral-sh/python-build-standalone/releases/download/20240415/cpython-3.12.3%2B20240415-x86_64-unknown-linux-gnu-install_only.tar.gz"
 python_archive_sha256="a73ba777b5d55ca89edef709e6b8521e3f3d4289581f174c8699adfb608d09d6"
@@ -80,6 +79,20 @@ printf '%s  %s\n' "$vllm_wheel_sha256" "$vllm_wheel" | sha256sum --check -
   --wheel-dir "$payload/wheels" \
   "$connector_root"
 
+shopt -s nullglob
+connector_wheels=("$payload/wheels/kapsl_vllm_connector-${connector_version}-"*.whl)
+shopt -u nullglob
+if [ "${#connector_wheels[@]}" -ne 1 ]; then
+  echo "Expected exactly one kapsl-vLLM connector $connector_version wheel, found ${#connector_wheels[@]}" >&2
+  exit 1
+fi
+connector_wheel="${connector_wheels[0]}"
+.github/scripts/verify-managed-vllm-connector-wheel.py \
+  --wheel "$connector_wheel" \
+  --connector-version "$connector_version" \
+  --profile "$connector_profile" \
+  --planner-schema "$planner_schema_version"
+
 "$bootstrap_python" -m pip download \
   --disable-pip-version-check \
   --no-cache-dir \
@@ -93,7 +106,7 @@ printf '%s  %s\n' "$vllm_wheel_sha256" "$vllm_wheel" | sha256sum --check -
   "torchaudio==2.11.0+cu130"
 
 for required_glob in \
-  'kapsl_vllm_connector-0.5.0-*.whl' \
+  "kapsl_vllm_connector-${connector_version}-*.whl" \
   'torch-2.13.0+cu130-*.whl' \
   'torchvision-0.28.0+cu130-*.whl' \
   'torchaudio-2.11.0+cu130-*.whl' \
@@ -113,17 +126,20 @@ cp .github/scripts/bootstrap-vllm-backend.sh "$payload/bootstrap.sh"
 cp "$requirements_lock" "$payload/requirements.lock"
 chmod 755 "$payload/bootstrap.sh"
 requirements_lock_sha256="$(sha256sum "$requirements_lock" | awk '{ print $1 }')"
-cat > "$payload/installed-manifest.json" <<'EOF'
+cat > "$payload/installed-manifest.json" <<EOF
 {
   "schema_version": 1,
+  "sdk_ref": "$sdk_ref",
   "python": "3.12.3",
   "torch": "2.13.0+cu130",
   "torchvision": "0.28.0+cu130",
   "torchaudio": "2.11.0+cu130",
   "cuda_runtime": "13.0",
   "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-  "connector": "0.5.0",
-  "profile": "vllm-v1-packed-cuda-ipc/flash-attn"
+  "connector_distribution": "$connector_version",
+  "connector": "$connector_version",
+  "profile": "$connector_profile",
+  "planner_schema_version": $planner_schema_version
 }
 EOF
 (cd "$payload" && {
@@ -145,8 +161,10 @@ cat > "$payload/manifest.json" <<EOF
   "cuda_runtime": "13.0",
   "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
   "vllm_wheel_sha256": "$vllm_wheel_sha256",
-  "connector": "0.5.0",
-  "profile": "vllm-v1-packed-cuda-ipc/flash-attn"
+  "connector_distribution": "$connector_version",
+  "connector": "$connector_version",
+  "profile": "$connector_profile",
+  "planner_schema_version": $planner_schema_version
 }
 EOF
 

@@ -1,5 +1,6 @@
 use super::*;
 use futures::StreamExt;
+use kapsl_engine_api::{OpenAiWireRequest, OpenAiWireResponse, OpenAiWireStreamResponse};
 use kapsl_scheduler::Priority;
 use std::pin::Pin;
 
@@ -30,6 +31,24 @@ impl InferenceService {
 
     pub(crate) fn priority_for_request(&self, request: &InferenceRequest) -> Priority {
         scheduler_priority_for_request(request)
+    }
+
+    pub(crate) fn priority_for_openai_wire_parts(
+        &self,
+        body_bytes: usize,
+        metadata: Option<&kapsl_engine_api::OpenAiWireMetadata>,
+    ) -> Priority {
+        scheduler_priority_for_openai_wire_parts(body_bytes, metadata)
+    }
+
+    /// Resolve the current generation cap before the OpenAI route serializes
+    /// its normalized upstream body. This keeps pressure policy in front of
+    /// the wire fast path without forcing a second JSON decode/encode cycle.
+    pub(crate) fn openai_wire_generation_cap(
+        &self,
+        priority: Priority,
+    ) -> Result<Option<u32>, EngineError> {
+        self.enforce_openai_wire_pressure(priority)
     }
 
     pub(crate) async fn infer(
@@ -112,6 +131,91 @@ impl InferenceService {
         })))
     }
 
+    pub(crate) async fn infer_openai_wire(
+        &self,
+        model_id: u32,
+        mut request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        let pool = self.ready_pool(model_id)?;
+        if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
+            validate_openai_wire_generation_cap(&request, cap)?;
+        }
+        let cancellation = request
+            .cancellation
+            .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
+            .clone();
+        let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+        let timeout_ms = openai_wire_timeout_ms(&request);
+        let started = Instant::now();
+        let infer = pool.infer_openai_wire(request, priority, force_cpu);
+        let result = if let Some(timeout_ms) = timeout_ms {
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), infer).await {
+                Ok(result) => result,
+                Err(_) => {
+                    cancellation.cancel();
+                    Err(EngineError::timeout(format!(
+                        "OpenAI inference timed out after {timeout_ms}ms"
+                    )))
+                }
+            }
+        } else {
+            infer.await
+        };
+
+        if result.is_ok() {
+            self.telemetry
+                .latency_samples
+                .write()
+                .entry(model_id)
+                .or_default()
+                .record(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        result
+    }
+
+    pub(crate) async fn infer_openai_wire_stream(
+        &self,
+        model_id: u32,
+        mut request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        let pool = self.ready_pool(model_id)?;
+        if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
+            validate_openai_wire_generation_cap(&request, cap)?;
+        }
+        let cancellation = request
+            .cancellation
+            .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
+            .clone();
+        let guard = CancelOnDrop(cancellation.clone());
+        let timeout_ms = openai_wire_timeout_ms(&request);
+        let start = pool.infer_openai_wire_stream(request, priority, force_cpu);
+        let response = if let Some(timeout_ms) = timeout_ms {
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), start).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    cancellation.cancel();
+                    return Err(EngineError::timeout(format!(
+                        "OpenAI inference stream did not start within {timeout_ms}ms"
+                    )));
+                }
+            }
+        } else {
+            start.await?
+        };
+
+        Ok(OpenAiWireStreamResponse {
+            head: response.head,
+            body: Box::pin(response.body.map(move |item| {
+                let _hold = &guard;
+                item
+            })),
+        })
+    }
+
     /// Dynamic adapter used by socket/TCP/SHM. The returned scheduler applies
     /// this service's policy and re-resolves the live pool at execution time.
     pub(crate) fn scheduler_for_transport(
@@ -178,6 +282,20 @@ impl InferenceService {
         }
         Ok(())
     }
+
+    fn enforce_openai_wire_pressure(&self, priority: Priority) -> Result<Option<u32>, EngineError> {
+        let pressure_state =
+            RuntimePressureState::from_u8(self.pressure.state().load(Ordering::Relaxed));
+        if pressure_state == RuntimePressureState::Emergency
+            && matches!(priority, Priority::Throughput)
+        {
+            return Err(EngineError::resource_exhausted(format!(
+                "runtime pressure {}: throughput requests are temporarily rejected",
+                pressure_state.as_str()
+            )));
+        }
+        Ok(self.pressure.config().max_new_tokens_cap(pressure_state))
+    }
 }
 
 struct CancelOnDrop(kapsl_engine_api::CancellationToken);
@@ -194,6 +312,51 @@ fn request_timeout_ms(request: &InferenceRequest) -> Option<u64> {
         .as_ref()
         .and_then(|metadata| metadata.timeout_ms)
         .filter(|timeout_ms| *timeout_ms > 0)
+}
+
+fn openai_wire_timeout_ms(request: &OpenAiWireRequest) -> Option<u64> {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.timeout_ms)
+        .filter(|timeout_ms| *timeout_ms > 0)
+}
+
+fn validate_openai_wire_generation_cap(
+    request: &OpenAiWireRequest,
+    cap: u32,
+) -> Result<(), EngineError> {
+    let body: serde_json::Value = serde_json::from_slice(&request.body).map_err(|error| {
+        EngineError::invalid_input(format!(
+            "OpenAI wire request body is not valid JSON while applying runtime pressure policy: {error}"
+        ))
+    })?;
+    let object = body.as_object().ok_or_else(|| {
+        EngineError::invalid_input("OpenAI wire request body must be a JSON object")
+    })?;
+    let mut bounded = false;
+    for field in ["max_tokens", "max_completion_tokens"] {
+        let Some(value) = object.get(field) else {
+            continue;
+        };
+        let value = value.as_u64().ok_or_else(|| {
+            EngineError::invalid_input(format!(
+                "OpenAI wire field '{field}' must be an unsigned integer under runtime pressure"
+            ))
+        })?;
+        if value > u64::from(cap) {
+            return Err(EngineError::resource_exhausted(format!(
+                "OpenAI wire field '{field}' requests {value} tokens, above the current runtime pressure cap of {cap}"
+            )));
+        }
+        bounded = true;
+    }
+    if !bounded {
+        return Err(EngineError::resource_exhausted(format!(
+            "OpenAI wire request does not carry a generation limit under the current runtime pressure cap of {cap}"
+        )));
+    }
+    Ok(())
 }
 
 fn effective_force_cpu(request: &InferenceRequest, adapter_force_cpu: bool) -> bool {
@@ -253,6 +416,28 @@ impl ReplicaScheduler for InferenceServiceScheduler {
             .await
     }
 
+    async fn infer_openai_wire(
+        &self,
+        request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        self.service
+            .infer_openai_wire(self.model_id, request, priority, force_cpu)
+            .await
+    }
+
+    async fn infer_openai_wire_stream(
+        &self,
+        request: OpenAiWireRequest,
+        priority: Priority,
+        force_cpu: bool,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        self.service
+            .infer_openai_wire_stream(self.model_id, request, priority, force_cpu)
+            .await
+    }
+
     async fn infer_stream(
         &self,
         request: InferenceRequest,
@@ -268,11 +453,40 @@ impl ReplicaScheduler for InferenceServiceScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kapsl_engine_api::{OpenAiWireEndpoint, OpenAiWireFormat};
 
     const MODEL_ID: u32 = 7;
 
+    #[test]
+    fn wire_pressure_validation_requires_every_authored_limit_to_fit() {
+        let request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            br#"{"max_tokens":8,"max_completion_tokens":8}"#.to_vec(),
+        );
+        validate_openai_wire_generation_cap(&request, 8).unwrap();
+
+        let oversized = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            br#"{"max_tokens":8,"max_completion_tokens":9}"#.to_vec(),
+        );
+        assert!(validate_openai_wire_generation_cap(&oversized, 8).is_err());
+
+        let unbounded = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            br#"{"model":"test"}"#.to_vec(),
+        );
+        assert!(validate_openai_wire_generation_cap(&unbounded, 8).is_err());
+    }
+
     struct RecordingEngine {
         max_new_tokens: Arc<Mutex<Option<u32>>>,
+    }
+
+    struct PendingWireEngine {
+        entered: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
@@ -294,6 +508,44 @@ mod tests {
                 let packet = request.input.clone();
                 async move { Ok(packet) }
             }))
+        }
+
+        fn unload(&mut self) {}
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        fn health_check(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Engine for PendingWireEngine {
+        async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+            Ok(request.input.clone())
+        }
+
+        fn infer_stream(&self, request: &InferenceRequest) -> kapsl_engine_api::EngineStream {
+            let packet = request.input.clone();
+            Box::pin(futures::stream::once(async move { Ok(packet) }))
+        }
+
+        fn supports_openai_wire(&self) -> bool {
+            true
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            _request: &OpenAiWireRequest,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            self.entered.notify_one();
+            std::future::pending().await
         }
 
         fn unload(&mut self) {}
@@ -338,6 +590,54 @@ mod tests {
         let pressure = ResourcePressure::new(state, pressure_config());
         let service = InferenceService::new(models, pressure, Arc::new(ModelTelemetry::default()));
         (service, seen_cap)
+    }
+
+    #[tokio::test]
+    async fn dropping_wire_stream_start_cancels_before_upstream_headers() {
+        let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let engine: EngineHandle = Arc::new(PendingWireEngine {
+            entered: entered.clone(),
+        });
+        let scheduler = Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+        let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+        pool.add_replica(0, scheduler);
+        models.install_loaded(
+            MODEL_ID,
+            PathBuf::from("/test/wire-model"),
+            Arc::new(pool),
+            vec![],
+        );
+        let pressure = ResourcePressure::new(
+            Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+            pressure_config(),
+        );
+        let service = InferenceService::new(models, pressure, Arc::new(ModelTelemetry::default()));
+        let cancellation = kapsl_engine_api::CancellationToken::new();
+        let mut request = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            br#"{"max_completion_tokens":8}"#.to_vec(),
+        );
+        request.cancellation = Some(cancellation.clone());
+
+        let operation = tokio::spawn({
+            let service = service.clone();
+            async move {
+                service
+                    .infer_openai_wire_stream(MODEL_ID, request, Priority::LatencyCritical, false)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("wire engine should start waiting for headers");
+        operation.abort();
+        let _ = operation.await;
+        assert!(
+            cancellation.is_cancelled(),
+            "dropping stream start must cancel queued/upstream work"
+        );
     }
 
     fn request(max_new_tokens: u32) -> InferenceRequest {
