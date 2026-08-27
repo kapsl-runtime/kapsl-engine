@@ -3,13 +3,25 @@ name: GPU Device Pool Integration
 on:
   workflow_dispatch:
     inputs:
+      suite:
+        description: GPU conformance suite to execute
+        required: true
+        default: device-pool
+        type: choice
+        options:
+          - device-pool
+          - vllm-shared-pool
+      sdk_ref:
+        description: Exact kapsl-sdk commit for the managed-vLLM suite
+        required: false
+        type: string
       ort_model_path:
         description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
-        required: true
+        required: false
         type: string
       gguf_model_path:
         description: Absolute path to a uniform-KV causal GGUF/AIMOD artifact on the GPU runner
-        required: true
+        required: false
         type: string
       ort_request_path:
         description: Optional absolute path to a model-specific ONNX inference JSON request
@@ -30,11 +42,25 @@ permissions:
 
 jobs:
   ort-gguf-sharing:
+    if: inputs.suite == 'device-pool'
     # The runner must have a CUDA developer toolkit, ORT CUDA dependencies,
     # nvidia-smi, curl, jq, and both model artifacts at the input paths.
     runs-on: [self-hosted, linux, x64, gpu]
     timeout-minutes: 90
     steps:
+      - name: Validate device-pool model inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "${{ inputs.ort_model_path }}" || {
+            echo "ort_model_path is required for the device-pool suite" >&2
+            exit 1
+          }
+          test -n "${{ inputs.gguf_model_path }}" || {
+            echo "gguf_model_path is required for the device-pool suite" >&2
+            exit 1
+          }
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
@@ -67,3 +93,10 @@ jobs:
           name: gpu-device-pool-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kapsl-gpu-pool-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
+
+  vllm-shared-pool:
+    if: inputs.suite == 'vllm-shared-pool'
+    uses: ./.github/workflows/vllm-shared-pool-conformance.yml
+    with:
+      sdk_ref: ${{ inputs.sdk_ref }}
+      cuda_visible_devices: ${{ inputs.cuda_visible_devices }}

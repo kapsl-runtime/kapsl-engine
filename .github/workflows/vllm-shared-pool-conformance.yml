@@ -12,6 +12,16 @@ on:
         required: true
         default: "0"
         type: string
+  workflow_call:
+    inputs:
+      sdk_ref:
+        description: Exact lowercase 40-hex kapsl-sdk commit containing the adapter
+        required: true
+        type: string
+      cuda_visible_devices:
+        description: Physical GPU ordinals/UUIDs exposed to the probe
+        required: true
+        type: string
 
 permissions:
   contents: read
