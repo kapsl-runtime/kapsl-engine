@@ -182,8 +182,10 @@ installer no longer downloads this multi-gigabyte pack by default; pass
 complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
-`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.6.0` with profile
-`vllm-v1-packed-cuda-ipc/flash-attn`. A missing or different bundle fails
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.0` with KV ABI
+`1.5`. Fixed pools use profile
+`vllm-v1-packed-cuda-ipc/flash-attn`; live-resizable pools use
+`vllm-v1-packed-cuda-vmm/flash-attn-blnhc`. A missing or different bundle fails
 closed; Kapsl never falls back to ONNX Runtime, native SafeTensors, or another
 attention implementation. Source/development builds can point to the same
 certified environment with `KAPSL_VLLM_PYTHON=/path/to/venv/bin/python`.
@@ -203,6 +205,12 @@ metadata:
         target_concurrency: 16
         headroom_percent: 20
         max_bytes: 2147483648
+        strict: true
+        live_resize:
+          maximum_concurrency: 32
+          grow_utilization_percent: 80
+          shrink_utilization_percent: 25
+          shrink_idle_seconds: 60
       startup_timeout_seconds: 300
 ```
 
@@ -217,6 +225,23 @@ then reduces concurrency to the largest whole-sequence capacity that fits;
 exact limits, and `mode: fixed` accepts one exact `bytes` value. Every exact
 grant must remain block-aligned and large enough for one full maximum-length
 sequence on every tensor-parallel rank.
+
+`live_resize` is optional and valid only with `mode: auto`. It reserves a
+certified BLNHC virtual address range sized for `maximum_concurrency`, while
+initially mapping only the exact admitted physical prefix. At or above the grow
+threshold Kapsl admits and maps aligned, zeroed CUDA VMM segments before
+publishing new native vLLM blocks. Below the shrink threshold for the idle
+interval, vLLM first retires a free physical tail and workers then unmap it
+before Kapsl lowers the authority charge. The stable tensor address,
+one-sequence physical minimum, native block-table ownership, and per-rank
+geometry do not change.
+
+The defaults are 80% grow utilization, 25% shrink utilization, and 60 seconds
+of low utilization before shrink. `maximum_concurrency` is required and cannot
+be below the initial target. Set `live_resize.enabled: false` alone to retain a
+fixed exact pool. A live block, incomplete acknowledgement, timeout, CUDA
+release failure, or ambiguous detach fences the replica and retains or
+quarantines the affected charge; it is never reassigned speculatively.
 
 The deprecated top-level `gpu_memory_utilization` field and
 `kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
@@ -252,7 +277,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.6.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
+    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+  --kv-shared-pool-profile \
+    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four
@@ -281,14 +308,15 @@ is rejected before backend allocation when the domain budget is unavailable or
 exhausted. CUDA domains require a build with the CUDA memory authority
 (`gpu-device-pool`) enabled.
 
-ABI 1.2 defines two provisioned, runtime-owned `shared_pool` allocation modes.
+ABI 1.5 retains two provisioned, runtime-owned `shared_pool` allocation modes.
 `runtime_leased` publishes epoch/generation-checked block handles, zeros blocks
 before assignment, requires synchronized release, and quarantines an unfenced
 expiry. `participant_managed` exports the whole isolated backing while leaving
 block-index selection to the backend; Kapsl still grants aggregate request
 capacity, but those leases contain no physical block handles.
 
-ABI 1.3 adds a fail-closed activation lifecycle. Registration only provisions
+The fail-closed activation lifecycle first introduced in ABI 1.3 remains
+mandatory. Registration only provisions
 the isolated bindings. Every backend worker must then report its exact
 epoch-bound binding, shard, adapter profile, imported byte size, and bounded
 cache-layer views. The runtime accepts those attachments only when their exact
@@ -298,13 +326,29 @@ request reservations are rejected before that point. Detach requires no live
 leases plus backend-synchronized completion, and the backing is released only
 after the coordinator lock is dropped.
 
+ABI 1.4 adds the single-use, generation-bound provisioning grant. The serving
+child must register the exact participant/model/profile, rank/device map,
+geometry digest, and bytes selected during the pre-start authority transaction.
+Registration atomically adopts that precharged lease; it never releases and
+re-admits or creates a second charge. Expired, replayed, or mismatched grants
+are rejected before physical allocation.
+
+ABI 1.5 adds synchronized live-pool resize operations and CUDA VMM segment
+descriptors. Growth maps workers before increasing the scheduler block count.
+Shrink retires a native free tail before workers unmap it and before physical
+segments or authority bytes are released. Actor, shard, generation, stage,
+block count, VMM alignment, and transferred file descriptors are validated at
+every acknowledgement. A timeout advances the readiness fence and retains the
+ambiguous backing.
+
 On Linux builds with `gpu-device-pool`, enabling the control socket
 automatically installs the CUDA IPC provisioner. It synchronously allocates and
 zeros a dedicated exportable region for each participant/pool/device, charges
 that physical region once through `MemoryAuthority`, and never exports the
-runtime's general CUDA allocator slab. Other builds retain opaque support and
-reject external `shared_pool` registration rather than accepting an
-unprovisioned data plane.
+runtime's general CUDA allocator slab. The elastic allowlisted profile instead
+reserves one stable CUDA virtual range and maps individually owned physical
+segments behind it. Other builds retain opaque support and reject external
+`shared_pool` registration rather than accepting an unprovisioned data plane.
 
 Participants heartbeat active leases. A requested TTL may be shorter than the
 runtime maximum but never longer. When heartbeats stop, an opaque lease returns
@@ -322,6 +366,15 @@ and immediately allocatable bytes use the same prefix plus an `owner` label
 (`onnx`, `gguf_kv:<model-id>`, or `native_kv:<model-id>`). Unloaded owner rows
 are removed on the next scrape. `kapsl_device_memory_pooled_bytes` remains the
 fixed backing capacity, not current usage.
+
+Managed-vLLM series separately expose requested, granted, minimum, physical,
+logical, active, idle, and quarantined capacity; provisional reservation
+state/age; effective concurrency; planning reductions/rejections; and restart
+generation. Bridge histograms and counters distinguish scheduler queue,
+upstream dispatch/headers/first byte, relayed bytes/chunks, active streams,
+connections, cancellations, upstream errors, and wire versus compatibility
+mode. Device-wide NVML usage remains separate: an idle mapped block is reusable
+by its participant but is not device-free.
 
 ### Observability
 

@@ -65,7 +65,7 @@ jiter==0.16.0
 jmespath==1.1.0
 jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
-kapsl-vllm-connector==0.6.0
+kapsl-vllm-connector==0.7.0
 lark==1.2.2
 llguidance==1.7.6
 llvmlite==0.47.0

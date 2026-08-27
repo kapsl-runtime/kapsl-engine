@@ -24,7 +24,7 @@ jobs:
     container:
       image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
       options: --gpus all
-    timeout-minutes: 90
+    timeout-minutes: 240
     env:
       CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
       CUDA_LAUNCH_BLOCKING: "1"
@@ -35,9 +35,12 @@ jobs:
       EXPECTED_TORCHVISION_VERSION: "0.28.0+cu130"
       EXPECTED_TORCHAUDIO_VERSION: "2.11.0+cu130"
       EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
-      EXPECTED_CONNECTOR_VERSION: "0.6.0"
+      EXPECTED_CONNECTOR_VERSION: "0.7.0"
       EXPECTED_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-ipc/flash-attn"
+      EXPECTED_ELASTIC_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
       EXPECTED_PLANNER_SCHEMA_VERSION: "1"
+      EXPECTED_KV_ABI_MAJOR: "1"
+      EXPECTED_KV_ABI_MINOR: "5"
       KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
       PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
@@ -93,12 +96,31 @@ jobs:
         with:
           workspaces: engine/kapsl-runtime
 
-      - name: Build CUDA IPC runtime against the checked-out ABI
+      - name: Build CUDA shared-pool runtime against the checked-out SDK
         working-directory: engine
         shell: bash
         run: |
           set -Eeuo pipefail
-          cargo_patch="patch.crates-io.kapsl-kv-abi.path='$GITHUB_WORKSPACE/sdk/crates/kapsl-kv-abi'"
+          cargo_patch="$RUNNER_TEMP/kapsl-sdk-patches.toml"
+          python3 - "$cargo_patch" "$GITHUB_WORKSPACE/sdk/crates" <<'PY'
+          import sys
+          from pathlib import Path
+
+          destination = Path(sys.argv[1])
+          crates = Path(sys.argv[2])
+          names = [
+              "kapsl-backends", "kapsl-core", "kapsl-engine-api", "kapsl-hal",
+              "kapsl-ipc", "kapsl-kernels", "kapsl-kv-abi", "kapsl-llm",
+              "kapsl-loader", "kapsl-monitor", "kapsl-quantization", "kapsl-rag",
+              "kapsl-rag-sdk", "kapsl-scheduler", "kapsl-shm", "kapsl-transport",
+          ]
+          lines = ["[patch.crates-io]"]
+          lines.extend(
+              f'{name} = {{ path = "{(crates / name).as_posix()}" }}'
+              for name in names
+          )
+          destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
           metadata_path="$RUNNER_TEMP/kapsl-cargo-metadata.json"
           cargo metadata --manifest-path kapsl-runtime/Cargo.toml \
             --locked --format-version 1 --config "$cargo_patch" > "$metadata_path"
@@ -109,25 +131,27 @@ jobs:
           from pathlib import Path
 
           metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = (
-              Path(os.environ["GITHUB_WORKSPACE"])
-              / "sdk"
-              / "crates"
-              / "kapsl-kv-abi"
-              / "Cargo.toml"
-          ).resolve()
-          resolved = [
-              Path(package["manifest_path"]).resolve()
+          sdk_crates = Path(os.environ["GITHUB_WORKSPACE"]) / "sdk" / "crates"
+          patched = {
+              package["name"]: Path(package["manifest_path"]).resolve()
               for package in metadata["packages"]
-              if package["name"] == "kapsl-kv-abi"
-          ]
-          if resolved != [expected]:
+              if package["name"].startswith("kapsl-")
+              and package["name"] != "kapsl-pyo3"
+              and str(Path(package["manifest_path"]).resolve()).startswith(
+                  str(sdk_crates.resolve())
+              )
+          }
+          required = {
+              "kapsl-engine-api", "kapsl-hal", "kapsl-kv-abi", "kapsl-llm",
+              "kapsl-monitor", "kapsl-scheduler", "kapsl-transport",
+          }
+          if not required.issubset(patched):
               raise SystemExit(
-                  f"runtime resolved kapsl-kv-abi from {resolved}, expected {[expected]}"
+                  f"runtime did not resolve the checked-out SDK contract: {patched}"
               )
           PY
           cargo build --manifest-path kapsl-runtime/Cargo.toml --locked \
-            --release -p kapsl --no-default-features --features gpu-device-pool \
+            --release -p kapsl --no-default-features --features cuda \
             --config "$cargo_patch"
 
       - name: Install pinned adapter and backend artifacts
@@ -164,7 +188,12 @@ jobs:
           import platform
 
           import torch
-          from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
+          from kapsl_vllm_connector import (
+              ADAPTER_PROFILE_ID,
+              ADAPTER_VERSION,
+              ELASTIC_ADAPTER_PROFILE_ID,
+          )
+          from kapsl_vllm_connector.contract import ABI_VERSION
           from kapsl_vllm_connector.planning import PLANNER_SCHEMA_VERSION
 
           actual = {
@@ -178,6 +207,8 @@ jobs:
               ),
               "connector": ADAPTER_VERSION,
               "connector_profile": ADAPTER_PROFILE_ID,
+              "elastic_connector_profile": ELASTIC_ADAPTER_PROFILE_ID,
+              "kv_abi": ABI_VERSION,
               "planner_schema_version": PLANNER_SCHEMA_VERSION,
               "cuda_runtime": torch.version.cuda,
           }
@@ -190,6 +221,13 @@ jobs:
               "connector_distribution": os.environ["EXPECTED_CONNECTOR_VERSION"],
               "connector": os.environ["EXPECTED_CONNECTOR_VERSION"],
               "connector_profile": os.environ["EXPECTED_CONNECTOR_PROFILE"],
+              "elastic_connector_profile": os.environ[
+                  "EXPECTED_ELASTIC_CONNECTOR_PROFILE"
+              ],
+              "kv_abi": {
+                  "major": int(os.environ["EXPECTED_KV_ABI_MAJOR"]),
+                  "minor": int(os.environ["EXPECTED_KV_ABI_MINOR"]),
+              },
               "planner_schema_version": int(
                   os.environ["EXPECTED_PLANNER_SCHEMA_VERSION"]
               ),
@@ -206,6 +244,54 @@ jobs:
         working-directory: sdk/integrations/vllm
         run: $VENV_DIR/bin/python -m unittest discover -s tests -v
 
+      - name: Verify pinned vLLM refuses retirement of a live tail block
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          "$VENV_DIR/bin/python" - "$OUTPUT_DIR/native-block-pool-resize.json" <<'PY'
+          import json
+          import sys
+
+          from kapsl_vllm_connector.shared_pool import (
+              SharedPoolImportError,
+              VllmElasticBlockPool,
+          )
+          from vllm.v1.core.block_pool import BlockPool
+
+          pool = BlockPool(
+              num_gpu_blocks=8,
+              enable_caching=True,
+              hash_block_size=16,
+          )
+          elastic = VllmElasticBlockPool(initial_blocks=4, maximum_blocks=8)
+          elastic.bind(pool)
+          elastic.apply(8)
+          pool.blocks[7].ref_cnt = 1
+          rejected = False
+          try:
+              elastic.apply(4)
+          except SharedPoolImportError as error:
+              rejected = "live or null" in str(error)
+          if not rejected or elastic.current_blocks != 8 or pool.num_gpu_blocks != 8:
+              raise SystemExit("pinned vLLM live-tail retirement did not fail closed")
+          pool.blocks[7].ref_cnt = 0
+          elastic.apply(4)
+          if elastic.current_blocks != 4 or pool.num_gpu_blocks != 4:
+              raise SystemExit("pinned vLLM free-tail retirement did not commit")
+          with open(sys.argv[1], "w", encoding="utf-8") as output:
+              json.dump(
+                  {
+                      "status": "passed",
+                      "live_tail_rejected": True,
+                      "free_tail_retired": True,
+                  },
+                  output,
+                  indent=2,
+                  sort_keys=True,
+              )
+              output.write("\n")
+          PY
+
       - name: Resolve exact profile and artifact digests
         shell: bash
         run: |
@@ -216,10 +302,12 @@ jobs:
           backend_version=$("$VENV_DIR/bin/python" -c 'import importlib.metadata; print(importlib.metadata.version("vllm"))')
           adapter_version=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ADAPTER_VERSION; print(ADAPTER_VERSION)')
           profile_id=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ADAPTER_PROFILE_ID; print(ADAPTER_PROFILE_ID)')
+          elastic_profile_id=$("$VENV_DIR/bin/python" -c 'from kapsl_vllm_connector import ELASTIC_ADAPTER_PROFILE_ID; print(ELASTIC_ADAPTER_PROFILE_ID)')
           adapter_digest="sha256:$(sha256sum "$adapter_wheel" | awk '{print $1}')"
           backend_digest="sha256:$(sha256sum "$VLLM_WHEEL_PATH" | awk '{print $1}')"
           runtime_digest="sha256:$(sha256sum "$runtime_binary" | awk '{print $1}')"
           provisional_profile="kapsl-vllm-connector,$adapter_version,$backend_version,$profile_id"
+          elastic_provisional_profile="kapsl-vllm-connector,$adapter_version,$backend_version,$elastic_profile_id"
           visible_count=$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")
           logical_devices=$(seq 0 $((visible_count - 1)) | paste -sd, -)
           {
@@ -228,7 +316,9 @@ jobs:
             echo "BACKEND_DIGEST=$backend_digest"
             echo "RUNTIME_DIGEST=$runtime_digest"
             echo "PROVISIONAL_PROFILE=$provisional_profile"
+            echo "ELASTIC_PROVISIONAL_PROFILE=$elastic_provisional_profile"
             echo "LOGICAL_DEVICES=$logical_devices"
+            echo "TP_SIZE=$visible_count"
           } >> "$GITHUB_ENV"
 
       - name: Start isolated certification runtime
@@ -246,6 +336,7 @@ jobs:
             --kv-control-socket "$kv_socket" \
             --kv-control-lease-ttl-ms 30000 \
             --kv-shared-pool-profile "$PROVISIONAL_PROFILE" \
+            --kv-shared-pool-profile "$ELASTIC_PROVISIONAL_PROFILE" \
             >"$OUTPUT_DIR/runtime.log" 2>&1 &
           runtime_pid=$!
           echo "RUNTIME_PID=$runtime_pid" >> "$GITHUB_ENV"
@@ -276,6 +367,607 @@ jobs:
           if [[ -n "${RUNTIME_PID:-}" ]] && kill -0 "$RUNTIME_PID" 2>/dev/null; then
             kill "$RUNTIME_PID"
             wait "$RUNTIME_PID" || true
+          fi
+
+      - name: Download the pinned managed-vLLM conformance model
+        shell: bash
+        env:
+          MODEL_REVISION: 7ae557604adf67be50417f59c2c2f167def9a775
+        run: |
+          set -Eeuo pipefail
+          model_dir="$OUTPUT_DIR/qwen2.5-0.5b-instruct"
+          "$VENV_DIR/bin/python" - "$model_dir" "$MODEL_REVISION" <<'PY'
+          import sys
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id="Qwen/Qwen2.5-0.5B-Instruct",
+              revision=sys.argv[2],
+              local_dir=sys.argv[1],
+              allow_patterns=[
+                  "config.json",
+                  "generation_config.json",
+                  "merges.txt",
+                  "model.safetensors",
+                  "tokenizer.json",
+                  "tokenizer_config.json",
+                  "vocab.json",
+              ],
+          )
+          PY
+          test -s "$model_dir/model.safetensors"
+          test -s "$model_dir/config.json"
+          test -s "$model_dir/tokenizer.json"
+          sha256sum "$model_dir"/* > "$OUTPUT_DIR/model-files.sha256"
+          printf '%s\n' "$MODEL_REVISION" > "$OUTPUT_DIR/model-revision.txt"
+          {
+            echo "MODEL_DIR=$model_dir"
+            echo "MODEL_REVISION=$MODEL_REVISION"
+          } >> "$GITHUB_ENV"
+
+      - name: Download the pinned llama.cpp co-residency model
+        shell: bash
+        env:
+          GGUF_MODEL_REVISION: df5bf01389a39c743ab467d734bf501681e041c5
+          GGUF_MODEL_NAME: qwen2.5-0.5b-instruct-q4_k_m.gguf
+        run: |
+          set -Eeuo pipefail
+          gguf_dir="$OUTPUT_DIR/qwen2.5-0.5b-instruct-gguf"
+          "$VENV_DIR/bin/python" - "$gguf_dir" "$GGUF_MODEL_REVISION" "$GGUF_MODEL_NAME" <<'PY'
+          import sys
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id="Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+              revision=sys.argv[2],
+              local_dir=sys.argv[1],
+              allow_patterns=[sys.argv[3]],
+          )
+          PY
+          gguf_file="$gguf_dir/$GGUF_MODEL_NAME"
+          test -s "$gguf_file"
+          sha256sum "$gguf_file" > "$OUTPUT_DIR/gguf-model.sha256"
+          printf '%s\n' "$GGUF_MODEL_REVISION" > "$OUTPUT_DIR/gguf-model-revision.txt"
+          {
+            echo "GGUF_MODEL_FILE=$gguf_file"
+            echo "GGUF_MODEL_REVISION=$GGUF_MODEL_REVISION"
+          } >> "$GITHUB_ENV"
+
+      - name: Build an exact elastic managed-vLLM package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          package="$OUTPUT_DIR/qwen-vllm-elastic.aimod"
+          "$RUNTIME_BINARY" build "$MODEL_DIR" \
+            --model model.safetensors \
+            --output "$package" \
+            --project-name qwen2.5-0.5b-vllm-elastic \
+            --format safetensors \
+            --model-type causal-lm \
+            --task generate \
+            --serving-backend vllm \
+            --metadata-json '{"serving":{"vllm":{"max_model_len":1024,"kv_cache":{"mode":"auto","target_concurrency":1,"headroom_percent":20,"strict":true,"live_resize":{"maximum_concurrency":4,"grow_utilization_percent":50,"shrink_utilization_percent":10,"shrink_idle_seconds":2}},"startup_timeout_seconds":900}}}'
+          test -s "$package"
+          "$RUNTIME_BINARY" backend-plan "$package" --cuda true \
+            > "$OUTPUT_DIR/elastic-backend-plan.json"
+          grep -q 'vllm' "$OUTPUT_DIR/elastic-backend-plan.json"
+          sha256sum "$package" > "$OUTPUT_DIR/elastic-package.sha256"
+          echo "ELASTIC_PACKAGE=$package" >> "$GITHUB_ENV"
+
+      - name: Build fixed exact managed-vLLM and llama.cpp packages
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          fixed_package="$OUTPUT_DIR/qwen-vllm-fixed.aimod"
+          llama_package="$OUTPUT_DIR/qwen-llama.aimod"
+          "$RUNTIME_BINARY" build "$MODEL_DIR" \
+            --model model.safetensors \
+            --output "$fixed_package" \
+            --project-name qwen2.5-0.5b-vllm-fixed \
+            --format safetensors \
+            --model-type causal-lm \
+            --task generate \
+            --serving-backend vllm \
+            --metadata-json '{"serving":{"vllm":{"max_model_len":1024,"kv_cache":{"mode":"auto","target_concurrency":16,"headroom_percent":20,"strict":true},"startup_timeout_seconds":900}}}'
+          "$RUNTIME_BINARY" build "$GGUF_MODEL_FILE" \
+            --output "$llama_package" \
+            --project-name qwen2.5-0.5b-llama \
+            --format gguf \
+            --model-type causal-lm \
+            --task generate \
+            --serving-backend llama_cpp
+          test -s "$fixed_package"
+          test -s "$llama_package"
+          "$RUNTIME_BINARY" backend-plan "$fixed_package" --cuda true \
+            > "$OUTPUT_DIR/fixed-backend-plan.json"
+          "$RUNTIME_BINARY" backend-plan "$llama_package" --cuda true \
+            > "$OUTPUT_DIR/llama-backend-plan.json"
+          grep -q 'vllm' "$OUTPUT_DIR/fixed-backend-plan.json"
+          grep -q 'llama' "$OUTPUT_DIR/llama-backend-plan.json"
+          sha256sum "$fixed_package" "$llama_package" \
+            > "$OUTPUT_DIR/fixed-and-llama-packages.sha256"
+          {
+            echo "FIXED_PACKAGE=$fixed_package"
+            echo "LLAMA_PACKAGE=$llama_package"
+          } >> "$GITHUB_ENV"
+
+      - name: Start the exact elastic managed-vLLM runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          live_dir="$RUNNER_TEMP/kapsl-vllm-live-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 0700 "$live_dir"
+          http_port=$(python3 - <<'PY'
+          import socket
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          )
+          IFS=, read -ra physical_devices <<< "$CUDA_VISIBLE_DEVICES"
+          : > "$OUTPUT_DIR/nvml-before-live.txt"
+          for device in "${physical_devices[@]}"; do
+            used=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+            printf '%s %s\n' "$device" "$used" >> "$OUTPUT_DIR/nvml-before-live.txt"
+          done
+          KAPSL_VLLM_PYTHON="$VENV_DIR/bin/python" \
+          KAPSL_VLLM_MEMORY_MODE=exact \
+          KAPSL_VLLM_BRIDGE_MODE=wire \
+          KAPSL_VLLM_VMM_CONFORMANCE=1 \
+          "$RUNTIME_BINARY" run "$ELASTIC_PACKAGE" \
+            --transport socket \
+            --socket "$live_dir/inference.sock" \
+            --state-dir "$live_dir/state" \
+            --metrics-port "$http_port" \
+            --http-bind 127.0.0.1 \
+            --topology tensor-parallel \
+            --tp-degree "${#physical_devices[@]}" \
+            > "$OUTPUT_DIR/elastic-runtime.log" 2>&1 &
+          live_pid=$!
+          {
+            echo "LIVE_RUNTIME_PID=$live_pid"
+            echo "LIVE_HTTP_BASE=http://127.0.0.1:$http_port"
+            echo "LIVE_RUNTIME_LOG=$OUTPUT_DIR/elastic-runtime.log"
+            echo "LIVE_DIR=$live_dir"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 900); do
+            if curl --fail --silent "http://127.0.0.1:$http_port/api/health" \
+              | grep -q '"healthy_models":[1-9]'; then
+              exit 0
+            fi
+            kill -0 "$live_pid" 2>/dev/null || break
+            sleep 1
+          done
+          sed -n '1,320p' "$OUTPUT_DIR/elastic-runtime.log" >&2
+          exit 1
+
+      - name: Run exact-memory, live-resize, wire, cancellation, and restart gates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          "$VENV_DIR/bin/python" engine/.github/scripts/managed_vllm_gpu_conformance.py \
+            --base-url "$LIVE_HTTP_BASE" \
+            --metrics-url "$LIVE_HTTP_BASE/metrics" \
+            --model qwen2.5-0.5b-vllm-elastic \
+            --model-dir "$MODEL_DIR" \
+            --runtime-pid "$LIVE_RUNTIME_PID" \
+            --runtime-log "$LIVE_RUNTIME_LOG" \
+            --vllm-log-root "$LIVE_DIR/state" \
+            --output "$OUTPUT_DIR/elastic-conformance.json" \
+            --allowlist-output "$OUTPUT_DIR/elastic-allowlist-profile.txt" \
+            --profile "$ELASTIC_PROVISIONAL_PROFILE" \
+            --adapter-build-id "$ADAPTER_DIGEST" \
+            --backend-build-id "$BACKEND_DIGEST" \
+            --runtime-build-id "$RUNTIME_DIGEST"
+
+      - name: Stop elastic runtime and prove clean device release
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -n "${LIVE_RUNTIME_PID:-}" ]] && kill -0 "$LIVE_RUNTIME_PID" 2>/dev/null; then
+            kill "$LIVE_RUNTIME_PID"
+            for _ in $(seq 1 100); do
+              kill -0 "$LIVE_RUNTIME_PID" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "$LIVE_RUNTIME_PID" 2>/dev/null; then
+              kill -KILL "$LIVE_RUNTIME_PID"
+            fi
+            wait "$LIVE_RUNTIME_PID" || true
+          fi
+          if [[ -f "$OUTPUT_DIR/nvml-before-live.txt" ]]; then
+            : > "$OUTPUT_DIR/nvml-after-live.txt"
+            while read -r device before; do
+              after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+              printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-live.txt"
+              if (( after > before + 128 )); then
+                echo "GPU $device retained $((after - before)) MiB after clean managed-vLLM shutdown" >&2
+                exit 1
+              fi
+            done < "$OUTPUT_DIR/nvml-before-live.txt"
+          fi
+
+      - name: Start one fixed exact managed-vLLM replica
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          fixed_dir="$RUNNER_TEMP/kapsl-vllm-fixed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 0700 "$fixed_dir"
+          http_port=$(python3 - <<'PY'
+          import socket
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          )
+          IFS=, read -ra physical_devices <<< "$CUDA_VISIBLE_DEVICES"
+          : > "$OUTPUT_DIR/nvml-before-fixed.txt"
+          for device in "${physical_devices[@]}"; do
+            used=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+            printf '%s %s\n' "$device" "$used" >> "$OUTPUT_DIR/nvml-before-fixed.txt"
+          done
+          KAPSL_VLLM_PYTHON="$VENV_DIR/bin/python" \
+          KAPSL_VLLM_MEMORY_MODE=exact \
+          KAPSL_VLLM_BRIDGE_MODE=wire \
+          "$RUNTIME_BINARY" run "$FIXED_PACKAGE" \
+            --transport socket \
+            --socket "$fixed_dir/inference.sock" \
+            --state-dir "$fixed_dir/state" \
+            --metrics-port "$http_port" \
+            --http-bind 127.0.0.1 \
+            --topology tensor-parallel \
+            --tp-degree "$TP_SIZE" \
+            > "$OUTPUT_DIR/fixed-runtime.log" 2>&1 &
+          fixed_pid=$!
+          {
+            echo "FIXED_RUNTIME_PID=$fixed_pid"
+            echo "FIXED_HTTP_BASE=http://127.0.0.1:$http_port"
+            echo "FIXED_DIR=$fixed_dir"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 900); do
+            if curl --fail --silent "http://127.0.0.1:$http_port/api/health" \
+              | grep -q '"healthy_models":[1-9]'; then
+              exit 0
+            fi
+            kill -0 "$fixed_pid" 2>/dev/null || break
+            sleep 1
+          done
+          sed -n '1,320p' "$OUTPUT_DIR/fixed-runtime.log" >&2
+          exit 1
+
+      - name: Freeze one replica and measure the Kapsl wire path
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - "$FIXED_HTTP_BASE" qwen2.5-0.5b-vllm-fixed \
+            "$OUTPUT_DIR/fixed-scaling-policy.json" <<'PY'
+          import json
+          import sys
+          import urllib.request
+
+          base, model, output = sys.argv[1:]
+          with urllib.request.urlopen(base + "/api/models", timeout=30) as response:
+              rows = json.load(response)
+          primary = [
+              row for row in rows
+              if row.get("name") == model and row.get("replica_id") == 0
+          ]
+          if len(primary) != 1:
+              raise SystemExit(f"expected one primary model row, found {primary!r}")
+          model_id = int(primary[0]["base_model_id"])
+          policy = {
+              "min_replicas": 1,
+              "max_replicas": 1,
+              "target_queue_depth": 1,
+              "scale_down_threshold": 0,
+              "cooldown_seconds": 1,
+          }
+          request = urllib.request.Request(
+              f"{base}/api/models/{model_id}/scaling",
+              data=json.dumps(policy, separators=(",", ":")).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              result = json.load(response)
+          with open(output, "w", encoding="utf-8") as stream:
+              json.dump(
+                  {"model_id": model_id, "policy": policy, "response": result},
+                  stream,
+                  indent=2,
+                  sort_keys=True,
+              )
+              stream.write("\n")
+          PY
+          direct_kv_bytes=$(python3 - "$FIXED_HTTP_BASE/metrics" \
+            qwen2.5-0.5b-vllm-fixed "$OUTPUT_DIR/fixed-memory.json" <<'PY'
+          import json
+          import sys
+          import time
+          import urllib.request
+
+          sys.path.insert(0, "engine/.github/scripts")
+          from managed_vllm_scaling_conformance import active_kv_rows, validate_exact_rows
+
+          metrics_url, model, output = sys.argv[1:]
+          deadline = time.monotonic() + 60
+          last_error = None
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(metrics_url, timeout=10) as response:
+                      rows = active_kv_rows(response.read().decode(), model)
+                  validate_exact_rows(rows, 1)
+                  grants = {row.granted_bytes for row in rows}
+                  if len(grants) != 1:
+                      raise RuntimeError(f"tensor-parallel grants diverged: {grants}")
+                  with open(output, "w", encoding="utf-8") as stream:
+                      json.dump([row.__dict__ for row in rows], stream, indent=2, sort_keys=True)
+                      stream.write("\n")
+                  print(next(iter(grants)))
+                  break
+              except Exception as error:
+                  last_error = error
+                  time.sleep(1)
+          else:
+              raise SystemExit(f"fixed exact metrics did not converge: {last_error}")
+          PY
+          )
+          echo "DIRECT_KV_BYTES=$direct_kv_bytes" >> "$GITHUB_ENV"
+          python3 engine/.github/scripts/managed_vllm_bridge_benchmark.py run \
+            --base-url "$FIXED_HTTP_BASE" \
+            --model qwen2.5-0.5b-vllm-fixed \
+            --target kapsl \
+            --output "$OUTPUT_DIR/bridge-kapsl.json" \
+            --vllm-version "$EXPECTED_VLLM_VERSION" \
+            --vllm-build-id "$BACKEND_DIGEST" \
+            --model-revision "$MODEL_REVISION" \
+            --kv-cache-memory-bytes "$direct_kv_bytes" \
+            --tensor-parallel-size "$TP_SIZE" \
+            --runtime-build-id "$RUNTIME_DIGEST" \
+            --adapter-build-id "$ADAPTER_DIGEST"
+
+      - name: Exercise exact 1 to 2 to 1 managed-vLLM scaling
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 engine/.github/scripts/managed_vllm_scaling_conformance.py \
+            --base-url "$FIXED_HTTP_BASE" \
+            --metrics-url "$FIXED_HTTP_BASE/metrics" \
+            --model qwen2.5-0.5b-vllm-fixed \
+            --output "$OUTPUT_DIR/scaling-conformance.json"
+
+      - name: Stop fixed Kapsl benchmark runtime
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -n "${FIXED_RUNTIME_PID:-}" ]] && kill -0 "$FIXED_RUNTIME_PID" 2>/dev/null; then
+            kill "$FIXED_RUNTIME_PID"
+            for _ in $(seq 1 100); do
+              kill -0 "$FIXED_RUNTIME_PID" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "$FIXED_RUNTIME_PID" 2>/dev/null; then
+              kill -KILL "$FIXED_RUNTIME_PID"
+            fi
+            wait "$FIXED_RUNTIME_PID" || true
+          fi
+          if [[ -f "$OUTPUT_DIR/nvml-before-fixed.txt" ]]; then
+            : > "$OUTPUT_DIR/nvml-after-fixed.txt"
+            while read -r device before; do
+              after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+              printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-fixed.txt"
+              if (( after > before + 128 )); then
+                echo "GPU $device retained $((after - before)) MiB after fixed runtime shutdown" >&2
+                exit 1
+              fi
+            done < "$OUTPUT_DIR/nvml-before-fixed.txt"
+          fi
+
+      - name: Start direct vLLM with the identical exact engine settings
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          direct_port=$(python3 - <<'PY'
+          import socket
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          )
+          CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+          VLLM_WORKER_MULTIPROC_METHOD=spawn \
+          "$VENV_DIR/bin/python" -m vllm.entrypoints.openai.api_server \
+            --model "$MODEL_DIR" \
+            --served-model-name qwen2.5-0.5b-vllm-fixed \
+            --host 127.0.0.1 \
+            --port "$direct_port" \
+            --attention-backend FLASH_ATTN \
+            --max-model-len 1024 \
+            --enforce-eager \
+            --enable-prefix-caching \
+            --kv-cache-memory-bytes "$DIRECT_KV_BYTES" \
+            --tensor-parallel-size "$TP_SIZE" \
+            > "$OUTPUT_DIR/direct-vllm.log" 2>&1 &
+          direct_pid=$!
+          {
+            echo "DIRECT_VLLM_PID=$direct_pid"
+            echo "DIRECT_HTTP_BASE=http://127.0.0.1:$direct_port"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 900); do
+            if curl --fail --silent "http://127.0.0.1:$direct_port/health" >/dev/null; then
+              exit 0
+            fi
+            kill -0 "$direct_pid" 2>/dev/null || break
+            sleep 1
+          done
+          sed -n '1,320p' "$OUTPUT_DIR/direct-vllm.log" >&2
+          exit 1
+
+      - name: Measure direct vLLM and enforce bridge performance gates
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 engine/.github/scripts/managed_vllm_bridge_benchmark.py run \
+            --base-url "$DIRECT_HTTP_BASE" \
+            --model qwen2.5-0.5b-vllm-fixed \
+            --target direct \
+            --output "$OUTPUT_DIR/bridge-direct.json" \
+            --vllm-version "$EXPECTED_VLLM_VERSION" \
+            --vllm-build-id "$BACKEND_DIGEST" \
+            --model-revision "$MODEL_REVISION" \
+            --kv-cache-memory-bytes "$DIRECT_KV_BYTES" \
+            --tensor-parallel-size "$TP_SIZE"
+          python3 engine/.github/scripts/managed_vllm_bridge_benchmark.py compare \
+            --direct "$OUTPUT_DIR/bridge-direct.json" \
+            --kapsl "$OUTPUT_DIR/bridge-kapsl.json" \
+            --output "$OUTPUT_DIR/bridge-comparison.json"
+
+      - name: Stop direct vLLM
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${DIRECT_VLLM_PID:-}" ]] && kill -0 "$DIRECT_VLLM_PID" 2>/dev/null; then
+            kill "$DIRECT_VLLM_PID"
+            for _ in $(seq 1 100); do
+              kill -0 "$DIRECT_VLLM_PID" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "$DIRECT_VLLM_PID" 2>/dev/null; then
+              kill -KILL "$DIRECT_VLLM_PID"
+            fi
+            wait "$DIRECT_VLLM_PID" || true
+          fi
+
+      - name: Start fixed vLLM for llama.cpp co-residency
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mixed_dir="$RUNNER_TEMP/kapsl-vllm-mixed-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -m 0700 "$mixed_dir"
+          mixed_port=$(python3 - <<'PY'
+          import socket
+          with socket.socket() as sock:
+              sock.bind(("127.0.0.1", 0))
+              print(sock.getsockname()[1])
+          PY
+          )
+          IFS=, read -ra physical_devices <<< "$CUDA_VISIBLE_DEVICES"
+          : > "$OUTPUT_DIR/nvml-before-mixed.txt"
+          for device in "${physical_devices[@]}"; do
+            used=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+            printf '%s %s\n' "$device" "$used" >> "$OUTPUT_DIR/nvml-before-mixed.txt"
+          done
+          KAPSL_VLLM_PYTHON="$VENV_DIR/bin/python" \
+          KAPSL_VLLM_MEMORY_MODE=exact \
+          KAPSL_VLLM_BRIDGE_MODE=wire \
+          KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=0 \
+          KAPSL_GGUF_DISABLE_SHARED_KV=0 \
+          KAPSL_GPU_DEVICE_POOL_MODE=auto \
+          "$RUNTIME_BINARY" run "$FIXED_PACKAGE" \
+            --transport socket \
+            --socket "$mixed_dir/inference.sock" \
+            --state-dir "$mixed_dir/state" \
+            --metrics-port "$mixed_port" \
+            --http-bind 127.0.0.1 \
+            --topology tensor-parallel \
+            --tp-degree "$TP_SIZE" \
+            > "$OUTPUT_DIR/mixed-runtime.log" 2>&1 &
+          mixed_pid=$!
+          {
+            echo "MIXED_RUNTIME_PID=$mixed_pid"
+            echo "MIXED_HTTP_BASE=http://127.0.0.1:$mixed_port"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 900); do
+            if curl --fail --silent "http://127.0.0.1:$mixed_port/api/health" \
+              | grep -q '"healthy_models":[1-9]'; then
+              exit 0
+            fi
+            kill -0 "$mixed_pid" 2>/dev/null || break
+            sleep 1
+          done
+          sed -n '1,320p' "$OUTPUT_DIR/mixed-runtime.log" >&2
+          exit 1
+
+      - name: Add llama.cpp and certify concurrent mixed-backend service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - "$MIXED_HTTP_BASE" "$LLAMA_PACKAGE" \
+            "$OUTPUT_DIR/llama-start-response.json" <<'PY'
+          import json
+          import sys
+          import time
+          import urllib.request
+
+          base, package, output = sys.argv[1:]
+          request = urllib.request.Request(
+              base + "/api/models/start",
+              data=json.dumps(
+                  {"model_path": package, "topology": "data-parallel", "tp_degree": 1},
+                  separators=(",", ":"),
+              ).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(request, timeout=900) as response:
+              result = json.load(response)
+          with open(output, "w", encoding="utf-8") as stream:
+              json.dump(result, stream, indent=2, sort_keys=True)
+              stream.write("\n")
+          deadline = time.monotonic() + 900
+          while time.monotonic() < deadline:
+              with urllib.request.urlopen(base + "/api/models", timeout=30) as response:
+                  rows = json.load(response)
+              active = {
+                  row.get("name") for row in rows
+                  if row.get("status") == "active" and row.get("replica_id") == 0
+              }
+              if {
+                  "qwen2.5-0.5b-vllm-fixed",
+                  "qwen2.5-0.5b-llama",
+              }.issubset(active):
+                  break
+              time.sleep(1)
+          else:
+              raise SystemExit(f"mixed models did not become active: {rows!r}")
+          PY
+          python3 engine/.github/scripts/certify-mixed-backend-concurrency.py \
+            --base-url "$MIXED_HTTP_BASE" \
+            --metrics-url "$MIXED_HTTP_BASE/metrics" \
+            --llama-model qwen2.5-0.5b-llama \
+            --vllm-model qwen2.5-0.5b-vllm-fixed \
+            --output "$OUTPUT_DIR/mixed-backend-conformance.json"
+          grep -Fq 'kv_path=shared-kv' "$OUTPUT_DIR/mixed-runtime.log"
+          ! grep -Fq 'kv_path=native' "$OUTPUT_DIR/mixed-runtime.log"
+
+      - name: Stop mixed runtime and prove clean co-resident release
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -n "${MIXED_RUNTIME_PID:-}" ]] && kill -0 "$MIXED_RUNTIME_PID" 2>/dev/null; then
+            kill "$MIXED_RUNTIME_PID"
+            for _ in $(seq 1 100); do
+              kill -0 "$MIXED_RUNTIME_PID" 2>/dev/null || break
+              sleep 0.1
+            done
+            if kill -0 "$MIXED_RUNTIME_PID" 2>/dev/null; then
+              kill -KILL "$MIXED_RUNTIME_PID"
+            fi
+            wait "$MIXED_RUNTIME_PID" || true
+          fi
+          if [[ -f "$OUTPUT_DIR/nvml-before-mixed.txt" ]]; then
+            : > "$OUTPUT_DIR/nvml-after-mixed.txt"
+            while read -r device before; do
+              after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+              printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-mixed.txt"
+              if (( after > before + 128 )); then
+                echo "GPU $device retained $((after - before)) MiB after mixed shutdown" >&2
+                exit 1
+              fi
+            done < "$OUTPUT_DIR/nvml-before-mixed.txt"
           fi
 
       - name: Upload conformance evidence

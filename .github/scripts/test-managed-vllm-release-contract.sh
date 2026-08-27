@@ -8,8 +8,10 @@ index_generator=".github/scripts/generate-backend-index.py"
 runtime="kapsl-runtime/crates/kapsl-cli/src/runtime/managed_vllm.rs"
 sdk_verifier=".github/scripts/verify-managed-vllm-sdk-checkout.sh"
 wheel_verifier=".github/scripts/verify-managed-vllm-connector-wheel.py"
-connector_version="0.6.0"
+connector_version="0.7.0"
 planner_schema_version="1"
+kv_abi_major="1"
+kv_abi_minor="5"
 
 require_literal() {
   local file="$1"
@@ -36,6 +38,9 @@ require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_TORCHAUDIO_VERSION: &s
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_CUDA_RUNTIME_VERSION: &str = "13.0";'
 require_literal "$runtime" "pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = \"$connector_version\";"
 require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";'
+require_literal "$runtime" 'pub(crate) const MANAGED_VLLM_ELASTIC_PROFILE_ID: &str = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc";'
+require_literal "$runtime" "pub(crate) const MANAGED_VLLM_KV_ABI_MAJOR: u64 = $kv_abi_major;"
+require_literal "$runtime" "pub(crate) const MANAGED_VLLM_KV_ABI_MINOR: u64 = $kv_abi_minor;"
 require_literal "$runtime" "planner_schema_version: $planner_schema_version,"
 require_literal "$packager" '--constraint "$requirements_lock"'
 require_literal "$bootstrap" '--constraint "$requirements_lock"'
@@ -44,10 +49,16 @@ require_literal "$packager" 'verify-managed-vllm-sdk-checkout.sh "$sdk_dir" "$sd
 require_literal "$packager" 'verify-managed-vllm-connector-wheel.py'
 require_literal "$packager" "connector_version=\"$connector_version\""
 require_literal "$packager" "planner_schema_version=\"$planner_schema_version\""
+require_literal "$packager" "kv_abi_major=\"$kv_abi_major\""
+require_literal "$packager" "kv_abi_minor=\"$kv_abi_minor\""
 require_literal "$packager" '"connector_distribution": "$connector_version"'
+require_literal "$packager" '"elastic_profile": "$connector_elastic_profile"'
+require_literal "$packager" '"kv_abi": {"major": $kv_abi_major, "minor": $kv_abi_minor}'
 require_literal "$packager" '"sdk_ref": "$sdk_ref"'
 require_literal "$bootstrap" "\"connector_distribution\": \"$connector_version\""
 require_literal "$bootstrap" "\"planner_schema_version\": $planner_schema_version"
+require_literal "$bootstrap" '"elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"'
+require_literal "$bootstrap" "\"kv_abi\": {\"major\": $kv_abi_major, \"minor\": $kv_abi_minor}"
 require_literal "$packager" '"profile": "cu130-flash-attn"'
 require_literal "$packager" '"runtime_abi": 1'
 require_literal "$sdk_verifier" '^[0-9a-f]{40}$'
@@ -69,6 +80,9 @@ for workflow in \
   else
     require_literal "$workflow" "EXPECTED_CONNECTOR_VERSION: \"$connector_version\""
     require_literal "$workflow" "EXPECTED_PLANNER_SCHEMA_VERSION: \"$planner_schema_version\""
+    require_literal "$workflow" 'EXPECTED_ELASTIC_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"'
+    require_literal "$workflow" "EXPECTED_KV_ABI_MAJOR: \"$kv_abi_major\""
+    require_literal "$workflow" "EXPECTED_KV_ABI_MINOR: \"$kv_abi_minor\""
   fi
 done
 
