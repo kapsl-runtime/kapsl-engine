@@ -1579,6 +1579,17 @@ impl MemoryAuthority {
 
     fn register_lease(&self, claims: &[MemoryClaim]) -> u64 {
         let _operation = self.operations.lock();
+        self.register_lease_locked(claims)
+    }
+
+    /// Register one lease while the caller holds [`Self::operations`].
+    ///
+    /// Startup reservations sometimes need to choose among several whole,
+    /// geometry-aligned candidates and reserve the selected candidate in the
+    /// same authority transaction. Splitting registration from the locked
+    /// form would either deadlock on the non-reentrant operation mutex or
+    /// reopen the admission race between selection and reservation.
+    fn register_lease_locked(&self, claims: &[MemoryClaim]) -> u64 {
         let lease_id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
         let mut rows = HashMap::<MemoryRowKey, MemoryAccountingBytes>::new();
         for claim in claims {
@@ -1757,10 +1768,18 @@ impl MemoryAuthority {
     /// to pressure and autoscaling policy. Callers hold `operations`, making
     /// this check and the following adapter reservations one transaction.
     fn preflight_growth_locked(&self, plan: &MemoryPlan) -> Result<(), String> {
+        let snapshot = self.snapshot_unlocked();
+        self.preflight_growth_against_snapshot_locked(plan, &snapshot)
+    }
+
+    fn preflight_growth_against_snapshot_locked(
+        &self,
+        plan: &MemoryPlan,
+        snapshot: &MemorySnapshot,
+    ) -> Result<(), String> {
         if plan.claims().iter().all(|claim| claim.bytes == 0) {
             return Ok(());
         }
-        let snapshot = self.snapshot_unlocked();
         let mut additions_by_domain = HashMap::<MemoryDomain, usize>::new();
         for claim in plan.claims() {
             let bytes = additions_by_domain.entry(claim.domain.clone()).or_default();
@@ -2178,6 +2197,65 @@ impl MemoryAuthority {
         Ok(lease)
     }
 
+    /// Admit the first candidate that fits, preserving caller order.
+    ///
+    /// All candidates are evaluated and the winner is reserved while holding
+    /// the same authority operation lock. This is intended for plans such as
+    /// an exact external KV cache where capacity may be reduced only in whole,
+    /// precomputed geometry units; callers provide candidates from most to
+    /// least preferred and include their hard minimum as the final entry.
+    /// Returning the snapshot used for the decision makes the grant auditable.
+    #[allow(dead_code)]
+    pub(crate) fn admit_first_fitting(
+        self: &Arc<Self>,
+        candidates: &[MemoryPlan],
+    ) -> Result<(MemoryLease, usize, MemorySnapshot), String> {
+        if candidates.is_empty() {
+            return Err("memory admission requires at least one candidate".to_string());
+        }
+
+        let _operation = self.operations.lock();
+        // Candidate order is part of one auditable decision. Observed-domain
+        // samplers do not all participate in `operations`, so freeze their
+        // point-in-time values once instead of allowing a later fallback to
+        // be judged against a different snapshot from the preferred plan.
+        let decision_snapshot = self.snapshot_unlocked();
+        let mut failures = Vec::with_capacity(candidates.len());
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            if candidate.claims().iter().all(|claim| claim.bytes == 0) {
+                failures.push(format!(
+                    "candidate {index}: memory admission candidate has no positive-byte claims"
+                ));
+                continue;
+            }
+            if let Err(error) =
+                self.preflight_growth_against_snapshot_locked(candidate, &decision_snapshot)
+            {
+                failures.push(format!("candidate {index}: {error}"));
+                continue;
+            }
+
+            let mut lease = MemoryLease::new_locked(Arc::clone(self), Vec::new());
+            match lease.grow_pre_admitted_locked(candidate) {
+                Ok(()) => return Ok((lease, index, decision_snapshot.clone())),
+                Err(error) => {
+                    // `grow_impl_locked` stages physical adapter leases and
+                    // publishes claims only after every reservation succeeds,
+                    // so a failed candidate leaves this registered lease empty.
+                    self.unregister_lease_locked(lease.lease_id);
+                    lease.released = true;
+                    failures.push(format!("candidate {index}: {error}"));
+                }
+            }
+        }
+
+        Err(format!(
+            "memory authority rejected every candidate: {}",
+            failures.join("; ")
+        ))
+    }
+
     /// Begin a model-load transaction. Host and provider claims are reserved
     /// first; CUDA adapters then serialize load sampling per device.
     pub(crate) async fn begin_load(
@@ -2448,6 +2526,20 @@ pub(crate) struct MemoryLease {
 impl MemoryLease {
     fn new(authority: Arc<MemoryAuthority>, claims: Vec<MemoryClaim>) -> Self {
         let lease_id = authority.register_lease(&claims);
+        Self::from_registered(authority, lease_id, claims)
+    }
+
+    #[allow(dead_code)]
+    fn new_locked(authority: Arc<MemoryAuthority>, claims: Vec<MemoryClaim>) -> Self {
+        let lease_id = authority.register_lease_locked(&claims);
+        Self::from_registered(authority, lease_id, claims)
+    }
+
+    fn from_registered(
+        authority: Arc<MemoryAuthority>,
+        lease_id: u64,
+        claims: Vec<MemoryClaim>,
+    ) -> Self {
         let planned = aggregate_claim_rows(&claims);
         Self {
             authority,
@@ -3306,6 +3398,165 @@ mod tests {
             domain_budgets,
             live_ceiling: Mutex::new(HashMap::new()),
         })
+    }
+
+    #[test]
+    fn first_fitting_admission_selects_and_reserves_under_one_snapshot() {
+        let domain = MemoryDomain::Provider {
+            provider: "metal".to_string(),
+            device_id: Some(0),
+        };
+        let authority = authority_with_provider_budget(domain.clone(), 100);
+        let owner = MemoryOwner::new(71, 2);
+        let candidate = |bytes: usize| {
+            let mut plan = MemoryPlan::new();
+            plan.push(MemoryClaim::external(
+                domain.clone(),
+                owner,
+                MemoryAllocationClass::KvCache,
+                "managed-vllm-provisional",
+                bytes,
+            ));
+            plan
+        };
+        let candidates = vec![candidate(120), candidate(80), candidate(40)];
+
+        let (mut lease, selected, decision) = authority
+            .admit_first_fitting(&candidates)
+            .expect("the second whole candidate should fit");
+        assert_eq!(selected, 1);
+        assert_eq!(decision.domain(&domain).unwrap().available_bytes, 100);
+        assert_eq!(
+            authority
+                .snapshot()
+                .domain(&domain)
+                .unwrap()
+                .available_bytes,
+            20
+        );
+        assert_eq!(
+            lease.reserved_bytes_for_class(MemoryAllocationClass::KvCache),
+            80
+        );
+
+        lease.commit_capacity();
+        drop(lease);
+        assert_eq!(
+            authority
+                .snapshot()
+                .domain(&domain)
+                .unwrap()
+                .available_bytes,
+            100
+        );
+    }
+
+    #[test]
+    fn first_fitting_admission_rejects_all_without_leaking_a_lease() {
+        let domain = MemoryDomain::Provider {
+            provider: "directml".to_string(),
+            device_id: Some(4),
+        };
+        let authority = authority_with_provider_budget(domain.clone(), 64);
+        let owner = MemoryOwner::new(72, 0);
+        let candidates = [80usize, 65].map(|bytes| {
+            let mut plan = MemoryPlan::new();
+            plan.push(MemoryClaim::external(
+                domain.clone(),
+                owner,
+                MemoryAllocationClass::KvCache,
+                "managed-vllm-provisional",
+                bytes,
+            ));
+            plan
+        });
+
+        let error = match authority.admit_first_fitting(&candidates) {
+            Ok(_) => panic!("every candidate exceeds the hard budget"),
+            Err(error) => error,
+        };
+        assert!(error.contains("rejected every candidate"));
+        assert!(authority.snapshot().rows.is_empty());
+        assert_eq!(
+            authority
+                .snapshot()
+                .domain(&domain)
+                .unwrap()
+                .available_bytes,
+            64
+        );
+    }
+
+    #[test]
+    fn first_fitting_admission_rejects_empty_and_zero_candidates() {
+        let domain = MemoryDomain::Provider {
+            provider: "metal".to_string(),
+            device_id: Some(0),
+        };
+        let authority = authority_with_provider_budget(domain.clone(), 64);
+        let owner = MemoryOwner::new(73, 0);
+        let mut zero = MemoryPlan::new();
+        zero.push(MemoryClaim::external(
+            domain,
+            owner,
+            MemoryAllocationClass::KvCache,
+            "managed-vllm-provisional",
+            0,
+        ));
+
+        assert!(authority.admit_first_fitting(&[]).is_err());
+        let error = match authority.admit_first_fitting(&[MemoryPlan::new(), zero]) {
+            Ok(_) => panic!("zero-byte candidates cannot satisfy a hard minimum"),
+            Err(error) => error,
+        };
+        assert!(error.contains("no positive-byte claims"));
+        assert!(authority.snapshot().rows.is_empty());
+    }
+
+    #[test]
+    fn concurrent_first_fitting_admissions_have_one_winner() {
+        let domain = MemoryDomain::Provider {
+            provider: "metal".to_string(),
+            device_id: Some(0),
+        };
+        let authority = authority_with_provider_budget(domain.clone(), 100);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for replica_id in 0..2 {
+            let authority = authority.clone();
+            let domain = domain.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut plan = MemoryPlan::new();
+                plan.push(MemoryClaim::external(
+                    domain,
+                    MemoryOwner::new(74, replica_id),
+                    MemoryAllocationClass::KvCache,
+                    "managed-vllm-provisional",
+                    80,
+                ));
+                barrier.wait();
+                let admission = authority.admit_first_fitting(&[plan]);
+                barrier.wait();
+                admission.is_ok()
+            }));
+        }
+        barrier.wait();
+        barrier.wait();
+        let winners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+        assert_eq!(
+            authority
+                .snapshot()
+                .domain(&domain)
+                .unwrap()
+                .available_bytes,
+            100
+        );
     }
 
     #[test]

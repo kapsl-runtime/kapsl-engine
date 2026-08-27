@@ -1,7 +1,8 @@
 use super::*;
 use kapsl_backends::OnnxRuntimeTuning;
 use kapsl_engine_api::{
-    EngineStream, ExternalDeviceMemoryReport, MemoryReport, RequestMemoryAdmission,
+    EngineStream, ExternalDeviceMemoryReport, MemoryReport, OpenAiWireRequest, OpenAiWireResponse,
+    OpenAiWireStreamResponse, RequestMemoryAdmission,
 };
 
 struct MemoryTrackedEngine {
@@ -102,6 +103,19 @@ impl MemoryTrackedEngine {
         RequestMemoryAdmission::new(move || Self::acquire_request_plan(&resources, &plan))
     }
 
+    fn openai_wire_request_plan(&self, request: &OpenAiWireRequest) -> MemoryPlan {
+        MemoryPlan::request_from_backend_report(
+            self.owner,
+            &self.inner.planned_openai_wire_request_memory(request),
+        )
+    }
+
+    fn openai_wire_request_admission(&self, request: &OpenAiWireRequest) -> RequestMemoryAdmission {
+        let resources = Arc::clone(&self.resources);
+        let plan = self.openai_wire_request_plan(request);
+        RequestMemoryAdmission::new(move || Self::acquire_request_plan(&resources, &plan))
+    }
+
     fn reconcile_actual_report(&self, report: &MemoryReport) {
         let result = self
             .lease
@@ -180,6 +194,34 @@ impl kapsl_engine_api::Engine for MemoryTrackedEngine {
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
         self.inner
             .infer_with_memory_admission(request, self.request_admission(request))
+    }
+    fn supports_openai_wire(&self) -> bool {
+        self.inner.supports_openai_wire()
+    }
+    fn planned_openai_wire_request_memory(&self, request: &OpenAiWireRequest) -> MemoryReport {
+        self.inner.planned_openai_wire_request_memory(request)
+    }
+    async fn infer_openai_wire(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireResponse, EngineError> {
+        self.inner
+            .infer_openai_wire_with_memory_admission(
+                request,
+                self.openai_wire_request_admission(request),
+            )
+            .await
+    }
+    async fn infer_openai_wire_stream(
+        &self,
+        request: &OpenAiWireRequest,
+    ) -> Result<OpenAiWireStreamResponse, EngineError> {
+        self.inner
+            .infer_openai_wire_stream_with_memory_admission(
+                request,
+                self.openai_wire_request_admission(request),
+            )
+            .await
     }
     fn infer_batch(
         &self,
@@ -512,7 +554,8 @@ mod tests {
     use futures::stream;
     use kapsl_engine_api::{
         MemoryAllocation, MemoryAllocationClass as EngineMemoryClass, MemoryAllocationSource,
-        MemoryDomain as EngineMemoryDomain,
+        MemoryDomain as EngineMemoryDomain, OpenAiWireEndpoint, OpenAiWireFormat,
+        OpenAiWireResponseHead,
     };
 
     const MIB: usize = 1024 * 1024;
@@ -526,6 +569,8 @@ mod tests {
         acquired: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
+
+    struct WireStreamEngine;
 
     #[cfg(feature = "gpu-device-pool")]
     struct PeakThenSettledSwapEngine {
@@ -638,6 +683,68 @@ mod tests {
                 drop(guard);
                 Ok(packet)
             }))
+        }
+
+        fn unload(&mut self) {}
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        fn health_check(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl kapsl_engine_api::Engine for WireStreamEngine {
+        async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+            Ok(request.input.clone())
+        }
+
+        fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+            let result = Ok(request.input.clone());
+            Box::pin(stream::once(async move { result }))
+        }
+
+        fn supports_openai_wire(&self) -> bool {
+            true
+        }
+
+        fn planned_openai_wire_request_memory(&self, _request: &OpenAiWireRequest) -> MemoryReport {
+            MemoryReport {
+                allocations: vec![MemoryAllocation {
+                    allocation_id: "wire:request".to_string(),
+                    domain: EngineMemoryDomain::Host,
+                    class: EngineMemoryClass::RequestTransient,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: MIB,
+                }],
+            }
+        }
+
+        async fn infer_openai_wire(
+            &self,
+            request: &OpenAiWireRequest,
+        ) -> Result<OpenAiWireResponse, EngineError> {
+            Ok(OpenAiWireResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: request.body.clone(),
+            })
+        }
+
+        async fn infer_openai_wire_stream(
+            &self,
+            _request: &OpenAiWireRequest,
+        ) -> Result<OpenAiWireStreamResponse, EngineError> {
+            Ok(OpenAiWireStreamResponse {
+                head: OpenAiWireResponseHead::new(200, Vec::new())?,
+                body: Box::pin(stream::pending()),
+            })
         }
 
         fn unload(&mut self) {}
@@ -837,6 +944,67 @@ mod tests {
         release.notify_one();
         let result = response_task.await.unwrap().unwrap().unwrap();
         assert_eq!(result.data, vec![1]);
+        assert!(resources
+            .memory()
+            .snapshot()
+            .rows
+            .iter()
+            .all(|row| row.owner != owner || row.class != MemoryAllocationClass::RequestTransient));
+    }
+
+    #[tokio::test]
+    async fn openai_wire_delegation_holds_request_lease_until_stream_drop() {
+        let resources = RuntimeResources::new(&device_info()).unwrap();
+        let owner = MemoryOwner::new(44, 0);
+        let lease = resources
+            .memory()
+            .admit(&MemoryPlan::new())
+            .expect("empty model lease");
+        let priority = resources
+            .priority()
+            .register(owner, 1, [MemoryDomain::Host]);
+        let engine = MemoryTrackedEngine::new(
+            Box::new(WireStreamEngine),
+            lease,
+            resources.clone(),
+            owner,
+            EngineKind::OnnxGenerate,
+            priority,
+        );
+
+        assert!(engine.supports_openai_wire());
+        let unary = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::Json,
+            b"wire".to_vec(),
+        );
+        assert_eq!(
+            engine.infer_openai_wire(&unary).await.unwrap().body,
+            b"wire"
+        );
+
+        let streaming = OpenAiWireRequest::new(
+            OpenAiWireEndpoint::ChatCompletions,
+            OpenAiWireFormat::ServerSentEvents,
+            b"stream".to_vec(),
+        );
+        assert_eq!(
+            engine
+                .planned_openai_wire_request_memory(&streaming)
+                .bytes_for_domain(&EngineMemoryDomain::Host),
+            MIB
+        );
+        let response = engine.infer_openai_wire_stream(&streaming).await.unwrap();
+        let active_row = resources
+            .memory()
+            .snapshot()
+            .rows
+            .into_iter()
+            .find(|row| row.owner == owner && row.class == MemoryAllocationClass::RequestTransient)
+            .expect("wire stream should retain its request admission lease");
+        assert_eq!(active_row.reserved_bytes, MIB);
+
+        drop(response);
         assert!(resources
             .memory()
             .snapshot()

@@ -27,8 +27,8 @@ cuda12-shared-pool = [
 [dependencies]
 futures = "0.3"
 kapsl-backend-abi = { path = "../kapsl-backend-abi" }
-kapsl-engine-api = "0.1.3"
-kapsl-llm = { version = "0.1.3", default-features = false, features = ["gguf"] }
+kapsl-engine-api = "0.2.0"
+kapsl-llm = { version = "0.2.0", default-features = false, features = ["gguf"] }
 llama-cpp-sys-2 = { package = "kapsl-llama-cpp-sys-2", version = "=0.1.146-kapsl.1", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

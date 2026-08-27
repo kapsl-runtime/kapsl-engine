@@ -166,6 +166,7 @@ impl ModelRuntime {
         let mut report = MemoryReport::default();
         let mut domains = Vec::new();
         for (_, plan) in plans.iter().filter(|(_, plan)| plan.uses_managed_vllm()) {
+            validate_managed_vllm_launch_policy(&plan.loader.manifest)?;
             if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
                 return Err(
                     "managed vLLM currently supports one CUDA device per Kapsl replica; keep --tp-degree=1"

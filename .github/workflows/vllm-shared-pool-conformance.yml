@@ -4,9 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       sdk_ref:
-        description: Exact kapsl-sdk branch, tag, or commit containing the adapter
+        description: Exact lowercase 40-hex kapsl-sdk commit containing the adapter
         required: true
-        default: 3a4e626f919e11287e0a19bb720c547ec9216f7f
         type: string
       cuda_visible_devices:
         description: Physical GPU ordinals/UUIDs exposed to the probe (for example 0 or 0,2)
@@ -36,6 +35,10 @@ jobs:
       EXPECTED_TORCHVISION_VERSION: "0.28.0+cu130"
       EXPECTED_TORCHAUDIO_VERSION: "2.11.0+cu130"
       EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
+      EXPECTED_CONNECTOR_VERSION: "0.6.0"
+      EXPECTED_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-ipc/flash-attn"
+      EXPECTED_PLANNER_SCHEMA_VERSION: "1"
+      KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
       PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
       VLLM_WHEEL_URL: https://wheels.vllm.ai/2ec6f0d71ea3b350952630e310efcda1c744ff4d/vllm-0.26.1rc1.dev1130%2Bg2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl
@@ -63,11 +66,24 @@ jobs:
         with:
           path: engine
 
+      - name: Validate certified vLLM SDK commit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sdk_ref must be an exact lowercase 40-hex kapsl-sdk commit." >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ inputs.sdk_ref }}
+          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
           path: sdk
+
+      - name: Verify certified vLLM SDK checkout
+        shell: bash
+        run: engine/.github/scripts/verify-managed-vllm-sdk-checkout.sh sdk "$KAPSL_VLLM_SDK_REF"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -148,6 +164,8 @@ jobs:
           import platform
 
           import torch
+          from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
+          from kapsl_vllm_connector.planning import PLANNER_SCHEMA_VERSION
 
           actual = {
               "python": platform.python_version(),
@@ -155,6 +173,12 @@ jobs:
               "torchvision": importlib.metadata.version("torchvision"),
               "torchaudio": importlib.metadata.version("torchaudio"),
               "vllm": importlib.metadata.version("vllm"),
+              "connector_distribution": importlib.metadata.version(
+                  "kapsl-vllm-connector"
+              ),
+              "connector": ADAPTER_VERSION,
+              "connector_profile": ADAPTER_PROFILE_ID,
+              "planner_schema_version": PLANNER_SCHEMA_VERSION,
               "cuda_runtime": torch.version.cuda,
           }
           expected = {
@@ -163,6 +187,12 @@ jobs:
               "torchvision": os.environ["EXPECTED_TORCHVISION_VERSION"],
               "torchaudio": os.environ["EXPECTED_TORCHAUDIO_VERSION"],
               "vllm": os.environ["EXPECTED_VLLM_VERSION"],
+              "connector_distribution": os.environ["EXPECTED_CONNECTOR_VERSION"],
+              "connector": os.environ["EXPECTED_CONNECTOR_VERSION"],
+              "connector_profile": os.environ["EXPECTED_CONNECTOR_PROFILE"],
+              "planner_schema_version": int(
+                  os.environ["EXPECTED_PLANNER_SCHEMA_VERSION"]
+              ),
               "cuda_runtime": os.environ["EXPECTED_CUDA_RUNTIME_VERSION"],
           }
           if actual != expected:
