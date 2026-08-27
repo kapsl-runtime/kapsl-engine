@@ -37,7 +37,7 @@ fn test_inference_service(models: Arc<ModelManager>) -> Arc<InferenceService> {
             Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
             test_pressure_config(),
         ),
-        Arc::new(RwLock::new(HashMap::new())),
+        Arc::new(ModelTelemetry::default()),
     )
 }
 

@@ -37,7 +37,7 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         kv_compression_bits: Some(3_u8),
     };
 
-    let layout = resolve_runtime_state_layout(&args);
+    let layout = resolve_runtime_state_layout(args.state_dir.as_deref());
     assert_eq!(layout.rag_root, state_dir.join("rag-data"));
     assert_eq!(layout.extensions_root, state_dir.join("extensions"));
     assert_eq!(

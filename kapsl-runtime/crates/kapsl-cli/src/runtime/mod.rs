@@ -17,6 +17,7 @@ mod host_memory;
 pub(crate) mod inference_service;
 #[cfg(unix)]
 pub(crate) mod kv_control;
+pub(crate) mod kv_runtime;
 pub(crate) mod managed_vllm;
 pub(crate) mod managed_vllm_bridge;
 pub(crate) mod memory;
@@ -26,7 +27,9 @@ pub(crate) mod monitor;
 pub(crate) mod priority_arbiter;
 pub(crate) mod resources;
 pub(crate) mod shared_kv;
+pub(crate) mod supervisor;
 pub(crate) mod support;
+pub(crate) mod transport;
 pub(crate) mod tuning;
 pub(crate) mod worker;
 
@@ -39,6 +42,7 @@ pub(crate) use device_memory::*;
 pub(crate) use inference_service::*;
 #[cfg(unix)]
 pub(crate) use kv_control::*;
+pub(crate) use kv_runtime::*;
 pub(crate) use managed_vllm::*;
 pub(crate) use memory::*;
 #[cfg(feature = "gpu-device-pool")]
@@ -49,6 +53,8 @@ pub(crate) use monitor::*;
 pub(crate) use priority_arbiter::*;
 pub(crate) use resources::*;
 pub(crate) use shared_kv::*;
+pub(crate) use supervisor::*;
 pub(crate) use support::*;
+pub(crate) use transport::*;
 pub(crate) use tuning::*;
 pub(crate) use worker::*;

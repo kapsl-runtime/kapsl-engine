@@ -6,36 +6,35 @@
 
 use super::*;
 use crate::runtime::model::{
-    ModelLoadDefaults, ModelLoadPlacement, ModelLoadPlanner, WorkerRunConfig,
+    BackendTuningProvider, ModelLoadDefaults, ModelLoadPlacement, ModelLoadPlanner,
 };
 
-pub(crate) fn build_model_load_planner(
-    args: &Args,
-    device_info: Arc<DeviceInfo>,
-) -> Result<ModelLoadPlanner, String> {
-    let tuning_provider = Arc::new(build_onnx_tuning_profile(args)?);
-    let defaults = ModelLoadDefaults {
-        batch_size: args.batch_size,
-        scheduler_queue_size: args.scheduler_queue_size,
-        scheduler_max_micro_batch: args.scheduler_max_micro_batch,
-        scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
-        placement: ModelLoadPlacement::new(args.topology.clone(), args.tp_degree),
-    };
-
-    Ok(ModelLoadPlanner::new(
-        device_info,
-        defaults,
-        tuning_provider,
-    ))
+/// Model-loading policy resolved from CLI input before hardware is probed.
+#[derive(Clone)]
+pub(crate) struct ModelLoadingConfig {
+    defaults: ModelLoadDefaults,
+    tuning_provider: Arc<dyn BackendTuningProvider>,
 }
 
-pub(crate) fn build_worker_run_config(args: &Args) -> Result<WorkerRunConfig, String> {
-    let [model_path] = args.model.as_slice() else {
-        return Err("worker mode expects exactly one --model".to_string());
-    };
-    Ok(WorkerRunConfig::new(
-        args.worker_model_id.unwrap_or(0),
-        model_path.clone(),
-        args.socket.clone(),
-    ))
+impl ModelLoadingConfig {
+    pub(crate) fn from_args(args: &Args) -> Result<Self, String> {
+        Ok(Self {
+            defaults: ModelLoadDefaults {
+                batch_size: args.batch_size,
+                scheduler_queue_size: args.scheduler_queue_size,
+                scheduler_max_micro_batch: args.scheduler_max_micro_batch,
+                scheduler_queue_delay_ms: args.scheduler_queue_delay_ms,
+                placement: ModelLoadPlacement::new(args.topology.clone(), args.tp_degree),
+            },
+            tuning_provider: Arc::new(build_onnx_tuning_profile(args)?),
+        })
+    }
+
+    pub(crate) fn planner(&self, device_info: Arc<DeviceInfo>) -> ModelLoadPlanner {
+        ModelLoadPlanner::new(
+            device_info,
+            self.defaults.clone(),
+            self.tuning_provider.clone(),
+        )
+    }
 }
