@@ -7,10 +7,10 @@
 //! participate in ownership and lifetime now, without pretending that the
 //! runtime physically allocates their memory.
 
-use super::host_memory::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
-use super::tuning::{
+use super::device_limits::{
     device_vram_cap_bytes, effective_ceiling_bytes, parse_cuda_memory_limit, smooth_ceiling_bytes,
 };
+use super::host_memory::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
 use crate::app::constants::PROVIDER_MEMORY_LIMITS_ENV;
 use kapsl_core::EngineKind;
 #[cfg(any(feature = "gpu-device-pool", test))]

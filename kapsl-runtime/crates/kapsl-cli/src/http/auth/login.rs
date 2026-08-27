@@ -48,14 +48,7 @@ pub(super) fn build_login_route(
                     );
                 }
 
-                let token_from_body = payload.token.and_then(|token| {
-                    let trimmed = token.trim();
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_string())
-                    }
-                });
+                let token_from_body = normalize_optional_text(payload.token);
                 let normalized_authorization = authorization
                     .as_deref()
                     .map(str::trim)

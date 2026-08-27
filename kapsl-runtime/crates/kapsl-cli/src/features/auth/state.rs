@@ -114,47 +114,35 @@ impl ApiAuthState {
     }
 
     pub(crate) fn auth_enabled(&self) -> bool {
-        self.role_tokens.auth_enabled() || self.active_key_count() > 0
+        self.role_tokens.has_configured_tokens() || self.active_key_count() > 0
     }
 
     pub(crate) fn active_key_count(&self) -> usize {
-        let now = now_unix_seconds();
-        self.store
-            .api_keys
-            .iter()
-            .filter(|key| {
-                self.user_by_id(&key.user_id)
-                    .is_some_and(|user| Self::is_key_active_for_user(key, user, now))
-            })
-            .count()
+        self.active_key_count_matching(|_, _| true)
     }
 
     pub(crate) fn active_admin_key_count(&self) -> usize {
-        let now = now_unix_seconds();
-        self.store
-            .api_keys
-            .iter()
-            .filter(|key| {
-                self.user_by_id(&key.user_id).is_some_and(|user| {
-                    user.role == ApiRole::Admin && Self::is_key_active_for_user(key, user, now)
-                })
-            })
-            .count()
+        self.active_key_count_matching(|_, user| user.role == ApiRole::Admin)
     }
 
     pub(crate) fn active_key_count_for_user(&self, user_id: &str) -> usize {
-        let now = now_unix_seconds();
-        self.store
-            .api_keys
-            .iter()
-            .filter(|key| {
-                if key.user_id != user_id {
-                    return false;
-                }
-                self.user_by_id(&key.user_id)
-                    .is_some_and(|user| Self::is_key_active_for_user(key, user, now))
-            })
+        self.active_key_count_matching(|key, _| key.user_id == user_id)
+    }
+
+    fn active_key_count_matching(
+        &self,
+        predicate: impl Fn(&ApiAuthKey, &ApiAuthUser) -> bool,
+    ) -> usize {
+        self.active_keys_at(now_unix_seconds())
+            .filter(|(key, user)| predicate(key, user))
             .count()
+    }
+
+    fn active_keys_at(&self, now: u64) -> impl Iterator<Item = (&ApiAuthKey, &ApiAuthUser)> {
+        self.store.api_keys.iter().filter_map(move |key| {
+            let user = self.user_by_id(&key.user_id)?;
+            Self::is_key_active_for_user(key, user, now).then_some((key, user))
+        })
     }
 
     pub(crate) fn is_key_active_for_user(key: &ApiAuthKey, user: &ApiAuthUser, now: u64) -> bool {
@@ -183,20 +171,11 @@ impl ApiAuthState {
             });
         }
         self.role_tokens
-            .role_from_authorization_header(authorization)
+            .role_for_token(presented)
             .map(|role| ApiAuthGrantMatch {
                 grant: ApiAuthGrant { role, scopes: None },
                 matched_key_index: None,
             })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn role_from_authorization_header(
-        &mut self,
-        authorization: Option<&str>,
-    ) -> Option<ApiRole> {
-        self.grant_from_authorization_header_read(authorization)
-            .map(|matched| matched.grant.role)
     }
 
     pub(crate) fn grant_for_api_key_token_read(
@@ -244,7 +223,7 @@ impl ApiAuthState {
     pub(crate) fn status_response(&self) -> ApiAuthStatusResponse {
         ApiAuthStatusResponse {
             auth_enabled: self.auth_enabled(),
-            role_token_auth_enabled: self.role_tokens.auth_enabled(),
+            role_token_auth_enabled: self.role_tokens.has_configured_tokens(),
             store_path: self.store_path.to_string_lossy().to_string(),
             user_count: self.store.users.len(),
             key_count: self.store.api_keys.len(),
@@ -254,6 +233,7 @@ impl ApiAuthState {
     }
 
     pub(crate) fn role_summaries(&self) -> Vec<ApiRoleSummary> {
+        let now = now_unix_seconds();
         [ApiRole::Admin, ApiRole::Writer, ApiRole::Reader]
             .iter()
             .copied()
@@ -264,16 +244,9 @@ impl ApiAuthState {
                     .iter()
                     .filter(|user| user.role == role)
                     .count();
-                let now = now_unix_seconds();
                 let active_key_count = self
-                    .store
-                    .api_keys
-                    .iter()
-                    .filter(|key| {
-                        self.user_by_id(&key.user_id).is_some_and(|user| {
-                            user.role == role && Self::is_key_active_for_user(key, user, now)
-                        })
-                    })
+                    .active_keys_at(now)
+                    .filter(|(_, user)| user.role == role)
                     .count();
                 ApiRoleSummary {
                     role,
@@ -406,11 +379,12 @@ impl ApiAuthState {
             updated_user.display_name = normalize_optional_text(display_name);
         }
         if let Some(new_role) = request.role {
+            let active_user_key_count = self.active_key_count_for_user(&updated_user.id);
             if updated_user.role == ApiRole::Admin
                 && new_role != ApiRole::Admin
-                && self.active_key_count_for_user(&updated_user.id) > 0
-                && self.active_admin_key_count() <= self.active_key_count_for_user(&updated_user.id)
-                && self.active_key_count() > self.active_key_count_for_user(&updated_user.id)
+                && active_user_key_count > 0
+                && self.active_admin_key_count() <= active_user_key_count
+                && self.active_key_count() > active_user_key_count
             {
                 return Err(
                     "cannot remove admin role from the last admin with active API keys".to_string(),

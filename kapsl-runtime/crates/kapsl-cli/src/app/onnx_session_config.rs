@@ -1,4 +1,4 @@
-//! Resolution of ONNX Runtime tuning settings.
+//! Resolution of per-session ONNX Runtime configuration.
 //!
 //! Settings come from four layers, each overriding the previous: auto-derived
 //! defaults, environment variables, command-line flags, and per-model
@@ -10,7 +10,7 @@ use crate::runtime::model::{BackendLoadTuning, BackendTuningProvider};
 use kapsl_backends::OnnxRuntimeTuning;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct OnnxTuningProfile {
+pub(crate) struct OnnxSessionConfigProfile {
     pub(crate) global: OnnxRuntimeTuning,
     pub(crate) per_model: HashMap<u32, OnnxRuntimeTuning>,
 }
@@ -35,7 +35,7 @@ pub(crate) fn merge_onnx_runtime_tuning(
     }
 }
 
-impl OnnxTuningProfile {
+impl OnnxSessionConfigProfile {
     pub(crate) fn resolve(&self, model_id: u32) -> OnnxRuntimeTuning {
         if let Some(model_overrides) = self.per_model.get(&model_id) {
             merge_onnx_runtime_tuning(&self.global, model_overrides)
@@ -45,10 +45,10 @@ impl OnnxTuningProfile {
     }
 }
 
-impl BackendTuningProvider for OnnxTuningProfile {
+impl BackendTuningProvider for OnnxSessionConfigProfile {
     fn resolve(&self, model_id: u32, engine_kind: EngineKind) -> BackendLoadTuning {
         if engine_kind.uses_onnx_session() {
-            BackendLoadTuning::Onnx(OnnxTuningProfile::resolve(self, model_id))
+            BackendLoadTuning::Onnx(OnnxSessionConfigProfile::resolve(self, model_id))
         } else {
             BackendLoadTuning::None
         }
@@ -193,8 +193,10 @@ pub(crate) fn parse_onnx_model_tuning_spec(
     Ok((model_id, tuning))
 }
 
-pub(crate) fn build_onnx_tuning_profile(args: &Args) -> Result<OnnxTuningProfile, String> {
-    let mut profile = OnnxTuningProfile {
+pub(crate) fn build_onnx_session_config_profile(
+    args: &Args,
+) -> Result<OnnxSessionConfigProfile, String> {
+    let mut profile = OnnxSessionConfigProfile {
         global: auto_onnx_runtime_tuning(args),
         per_model: HashMap::new(),
     };
@@ -234,7 +236,7 @@ mod dependency_injection_tests {
 
     #[test]
     fn tuning_provider_only_injects_onnx_settings() {
-        let profile = OnnxTuningProfile {
+        let profile = OnnxSessionConfigProfile {
             global: OnnxRuntimeTuning {
                 session_buckets: Some(4),
                 ..OnnxRuntimeTuning::default()

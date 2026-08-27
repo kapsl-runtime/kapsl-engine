@@ -46,50 +46,22 @@ impl ApiRoleTokenConfig {
         }
     }
 
-    pub(crate) fn auth_enabled(&self) -> bool {
+    pub(crate) fn has_configured_tokens(&self) -> bool {
         self.reader_token.is_some() || self.writer_token.is_some() || self.admin_token.is_some()
     }
 
-    pub(crate) fn role_for_token(&self, presented_token: &str) -> Option<ApiRole> {
-        if self
-            .admin_token
-            .as_deref()
-            .is_some_and(|token| authorization_matches_token(Some(presented_token), token))
-        {
-            return Some(ApiRole::Admin);
-        }
-        if self
-            .writer_token
-            .as_deref()
-            .is_some_and(|token| authorization_matches_token(Some(presented_token), token))
-        {
-            return Some(ApiRole::Writer);
-        }
-        if self
-            .reader_token
-            .as_deref()
-            .is_some_and(|token| authorization_matches_token(Some(presented_token), token))
-        {
-            return Some(ApiRole::Reader);
-        }
-        None
-    }
-
-    pub(crate) fn role_from_authorization_header(
-        &self,
-        authorization: Option<&str>,
-    ) -> Option<ApiRole> {
-        let raw_header = authorization?;
-        let trimmed = raw_header.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if let Some((scheme, token)) = trimmed.split_once(' ') {
-            if scheme.eq_ignore_ascii_case("bearer") {
-                return self.role_for_token(token.trim());
-            }
-        }
-        self.role_for_token(trimmed)
+    pub(super) fn role_for_token(&self, presented_token: &str) -> Option<ApiRole> {
+        [
+            (ApiRole::Admin, self.admin_token.as_deref()),
+            (ApiRole::Writer, self.writer_token.as_deref()),
+            (ApiRole::Reader, self.reader_token.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(role, expected_token)| {
+            expected_token
+                .is_some_and(|expected| constant_time_eq(presented_token, expected))
+                .then_some(role)
+        })
     }
 
     pub(crate) fn update_from_payload(
@@ -99,7 +71,7 @@ impl ApiRoleTokenConfig {
         self.reader_token = normalize_optional_text(payload.reader_token);
         self.writer_token = normalize_optional_text(payload.writer_token);
         self.admin_token = normalize_optional_text(payload.admin_token);
-        if self.auth_enabled() && self.admin_token.is_none() {
+        if self.has_configured_tokens() && self.admin_token.is_none() {
             return Err("admin_token is required when role auth is enabled".to_string());
         }
         Ok(())

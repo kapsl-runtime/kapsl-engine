@@ -25,7 +25,7 @@ pub(crate) struct ModelRoutesConfig {
     pub(crate) model_runtime: Arc<ModelRuntime>,
     pub(crate) inference: Arc<InferenceService>,
     pub(crate) telemetry: Arc<ModelTelemetry>,
-    pub(crate) rag_state: RagRuntimeState,
+    pub(crate) rag: RagService,
     pub(crate) auto_scaler: Arc<RwLock<AutoScaler>>,
     pub(crate) log_sensitive_ids: bool,
 }
@@ -35,7 +35,7 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         model_runtime,
         inference,
         telemetry,
-        rag_state: rag_state_for_api,
+        rag,
         auto_scaler: auto_scaler_api,
         log_sensitive_ids: log_sensitive_ids_for_api,
     } = config;
@@ -60,14 +60,14 @@ pub(crate) fn build_model_routes(config: ModelRoutesConfig) -> ModelRoutes {
         models: models.clone(),
         inference: inference.clone(),
         log_sensitive_ids: log_sensitive_ids_for_api,
-        rag_state: rag_state_for_api.clone(),
+        rag: rag.clone(),
     });
 
     let infer_stream_route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
         models: models.clone(),
         inference,
         log_sensitive_ids: log_sensitive_ids_for_api,
-        rag_state: rag_state_for_api.clone(),
+        rag,
     });
 
     let scaling_routes = build_model_scaling_routes(ModelScalingRoutesConfig {
