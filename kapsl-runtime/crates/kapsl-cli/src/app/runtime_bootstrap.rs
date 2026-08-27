@@ -98,10 +98,11 @@ impl RuntimeBootstrap {
             models: models.clone(),
             registry: registry.clone(),
         });
-        let inference = InferenceService::new(
+        let inference = InferenceService::new_with_metrics(
             models.clone(),
             resources.pressure().clone(),
             monitor.telemetry(),
+            model_runtime.shared_metrics().clone(),
         );
         load_startup_models(startup_plans, &model_runtime, &models, &auto_scaler).await?;
 

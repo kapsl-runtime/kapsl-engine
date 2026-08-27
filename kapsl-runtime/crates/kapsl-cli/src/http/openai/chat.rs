@@ -33,6 +33,14 @@ impl ManagedVllmOpenAiMode {
             Err(_) => Self::Translated,
         }
     }
+
+    fn metric_mode(self, streaming: bool) -> &'static str {
+        match (self, streaming) {
+            (Self::Wire, _) => "wire",
+            (Self::Translated, true) => "async_translated",
+            (Self::Translated, false) => "legacy",
+        }
+    }
 }
 
 pub(crate) struct ChatCompletionsConfig {
@@ -94,11 +102,13 @@ pub(crate) fn build_chat_completions_route(
 
     warp::path!("v1" / "chat" / "completions")
         .and(warp::post())
+        .and(warp::any().map(std::time::Instant::now))
         .and(bounded_chat_body())
         .and(warp::header::optional::<String>("x-kapsl-session"))
         .and(warp::header::optional::<String>("authorization"))
         .and_then(
-            move |body: BoundedChatBody,
+            move |ingress_started: std::time::Instant,
+                  body: BoundedChatBody,
                   session_header: Option<String>,
                   authorization: Option<String>| {
                 let models = models.clone();
@@ -107,6 +117,7 @@ pub(crate) fn build_chat_completions_route(
                     Ok::<_, warp::Rejection>(
                         handle_chat_completion(
                             body,
+                            ingress_started,
                             session_header,
                             authorization,
                             &models,
@@ -126,6 +137,7 @@ pub(crate) fn build_chat_completions_route(
 #[allow(clippy::too_many_arguments)]
 async fn handle_chat_completion(
     body: BoundedChatBody,
+    ingress_started: std::time::Instant,
     session_header: Option<String>,
     authorization: Option<String>,
     models: &Arc<ModelManager>,
@@ -200,6 +212,13 @@ async fn handle_chat_completion(
         .registry()
         .get(resolved.id)
         .is_some_and(|model| model.device == "vllm");
+    if is_managed_vllm {
+        inference.observe_managed_vllm_ingress(
+            &resolved.name,
+            managed_vllm_mode.metric_mode(chat.stream),
+            ingress_started.elapsed(),
+        );
+    }
 
     let request_id = completion_id();
     // KV affinity: an explicit session header wins, else the OpenAI end-user id.
@@ -534,10 +553,7 @@ fn wire_stream_response(
 ) -> Result<warp::reply::Response, String> {
     let body = response.body.map(|item| {
         item.map(warp::hyper::body::Bytes::from).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("managed vLLM response stream failed: {error}"),
-            )
+            std::io::Error::other(format!("managed vLLM response stream failed: {error}"))
         })
     });
     wire_response_builder(&response.head)?

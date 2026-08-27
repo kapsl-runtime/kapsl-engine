@@ -46,6 +46,32 @@ pub(super) struct LoadedReplica {
     pub(super) model_info: ModelInfo,
 }
 
+struct ManagedVllmSchedulerMetrics {
+    metrics: kapsl_monitor::metrics::KapslMetrics,
+    model: String,
+    replica: String,
+}
+
+impl kapsl_scheduler::SchedulerObserver for ManagedVllmSchedulerMetrics {
+    fn observe_queue_wait(
+        &self,
+        _priority: kapsl_scheduler::Priority,
+        operation: &'static str,
+        elapsed: Duration,
+    ) {
+        self.metrics
+            .managed_vllm
+            .bridge_stage_seconds
+            .with_label_values(&[
+                self.model.as_str(),
+                self.replica.as_str(),
+                operation,
+                "scheduler_queue",
+            ])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
 /// Turn one immutable load plan into a fully loaded scheduler replica.
 ///
 /// Primary and autoscaled loads share backend construction, memory admission,
@@ -362,6 +388,7 @@ async fn load_managed_vllm_replica(
         device_ids.clone(),
         plan.worker_tp_degree,
         plan.batch_size.max(1),
+        shared_metrics.clone(),
     )?;
     let backend = load_runtime_backend(
         backend,
@@ -382,6 +409,11 @@ async fn load_managed_vllm_replica(
         shared_metrics,
     );
     let swap_handles = vec![engine.clone()];
+    let scheduler_metrics = Arc::new(ManagedVllmSchedulerMetrics {
+        metrics: shared_metrics.clone(),
+        model: plan.loader.manifest.project_name.clone(),
+        replica: plan.replica_id.to_string(),
+    });
     let scheduler = Arc::new(
         Scheduler::new(
             vec![engine],
@@ -393,7 +425,8 @@ async fn load_managed_vllm_replica(
             plan.scheduler_queue_delay_ms,
             None,
         )
-        .with_queue_overflow_policy(plan.queue_overflow_policy),
+        .with_queue_overflow_policy(plan.queue_overflow_policy)
+        .with_observer(scheduler_metrics),
     );
     log::info!("✓ Loaded managed vLLM engine instance");
     Ok(LoadedReplica {

@@ -14,6 +14,7 @@ pub(crate) struct InferenceService {
     models: Arc<ModelManager>,
     pressure: Arc<ResourcePressure>,
     telemetry: Arc<ModelTelemetry>,
+    metrics: Option<kapsl_monitor::metrics::KapslMetrics>,
 }
 
 impl InferenceService {
@@ -26,7 +27,37 @@ impl InferenceService {
             models,
             pressure,
             telemetry,
+            metrics: None,
         })
+    }
+
+    pub(crate) fn new_with_metrics(
+        models: Arc<ModelManager>,
+        pressure: Arc<ResourcePressure>,
+        telemetry: Arc<ModelTelemetry>,
+        metrics: kapsl_monitor::metrics::KapslMetrics,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            models,
+            pressure,
+            telemetry,
+            metrics: Some(metrics),
+        })
+    }
+
+    pub(crate) fn observe_managed_vllm_ingress(
+        &self,
+        model: &str,
+        mode: &'static str,
+        elapsed: Duration,
+    ) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .managed_vllm
+                .bridge_stage_seconds
+                .with_label_values(&[model, "ingress", mode, "ingress_parse_validation"])
+                .observe(elapsed.as_secs_f64());
+        }
     }
 
     pub(crate) fn priority_for_request(&self, request: &InferenceRequest) -> Priority {

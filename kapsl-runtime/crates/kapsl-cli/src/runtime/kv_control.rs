@@ -92,6 +92,21 @@ struct SharedPoolSet {
     _memory_lease: Option<Mutex<MemoryLease>>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ManagedVllmKvDeviceSnapshot {
+    pub(crate) device_id: u32,
+    pub(crate) total_blocks: u64,
+    pub(crate) allocated_blocks: u64,
+    pub(crate) active_blocks: u64,
+    pub(crate) idle_blocks: u64,
+    pub(crate) quarantined_blocks: u64,
+    pub(crate) backing_bytes: u64,
+    pub(crate) logical_leased_bytes: u64,
+    pub(crate) quarantine_bytes: u64,
+    pub(crate) active_sequences: u64,
+    pub(crate) participant_active: bool,
+}
+
 impl SharedPoolSet {
     fn new(
         registration: &KvParticipantRegistration,
@@ -324,6 +339,61 @@ impl SharedPoolSet {
                 .expect("validated shared pool must have a free list")
                 .extend(blocks.iter().copied());
         }
+    }
+
+    fn managed_device_snapshots(
+        &self,
+        active_sequences: u64,
+        participant_active: bool,
+    ) -> Vec<ManagedVllmKvDeviceSnapshot> {
+        let allocator = self.state.lock();
+        let mut devices = BTreeMap::<u32, ManagedVllmKvDeviceSnapshot>::new();
+        for (pool_id, bindings) in &self.bindings_by_pool {
+            let idle_blocks = allocator
+                .free_by_pool
+                .get(pool_id)
+                .map_or(0_u64, |blocks| blocks.len() as u64);
+            let quarantined_blocks = allocator
+                .quarantined_by_pool
+                .get(pool_id)
+                .map_or(0_u64, |blocks| blocks.len() as u64);
+            for binding in bindings {
+                let KvMemoryDomain::Cuda { device_id } = &binding.memory_domain else {
+                    continue;
+                };
+                let active_blocks = binding
+                    .block_count
+                    .saturating_sub(idle_blocks.saturating_add(quarantined_blocks));
+                let snapshot =
+                    devices
+                        .entry(*device_id)
+                        .or_insert_with(|| ManagedVllmKvDeviceSnapshot {
+                            device_id: *device_id,
+                            active_sequences,
+                            participant_active,
+                            ..Default::default()
+                        });
+                snapshot.total_blocks = snapshot.total_blocks.saturating_add(binding.block_count);
+                snapshot.allocated_blocks = snapshot
+                    .allocated_blocks
+                    .saturating_add(binding.block_count);
+                snapshot.active_blocks = snapshot.active_blocks.saturating_add(active_blocks);
+                snapshot.idle_blocks = snapshot.idle_blocks.saturating_add(idle_blocks);
+                snapshot.quarantined_blocks = snapshot
+                    .quarantined_blocks
+                    .saturating_add(quarantined_blocks);
+                snapshot.backing_bytes = snapshot
+                    .backing_bytes
+                    .saturating_add(binding.block_count.saturating_mul(binding.bytes_per_block));
+                snapshot.logical_leased_bytes = snapshot
+                    .logical_leased_bytes
+                    .saturating_add(active_blocks.saturating_mul(binding.bytes_per_block));
+                snapshot.quarantine_bytes = snapshot
+                    .quarantine_bytes
+                    .saturating_add(quarantined_blocks.saturating_mul(binding.bytes_per_block));
+            }
+        }
+        devices.into_values().collect()
     }
 
     #[cfg(test)]
@@ -1124,6 +1194,46 @@ impl ExternalKvCoordinator {
             )
         })?;
         Ok(activation.active)
+    }
+
+    /// Return a bounded per-device view of physical, logical, idle, and
+    /// quarantined capacity for one supervised managed-vLLM namespace.
+    /// Metrics are sampled after cloning the pool reference, so collection
+    /// never holds coordinator state while waiting on allocator state.
+    pub(crate) fn managed_vllm_kv_snapshot(
+        &self,
+        participant_base: &str,
+    ) -> Result<Vec<ManagedVllmKvDeviceSnapshot>, String> {
+        let (pools, active, active_sequences) = {
+            let state = self.state.lock();
+            let mut matches = state.participants.iter().filter(|(participant_id, _)| {
+                participant_matches_managed_base(participant_id, participant_base)
+            });
+            let Some((participant_id, participant)) = matches.next() else {
+                return Ok(Vec::new());
+            };
+            if matches.next().is_some() {
+                return Err(format!(
+                    "multiple live KV participants match managed base '{participant_base}'"
+                ));
+            }
+            let pools = participant.shared_pools.clone().ok_or_else(|| {
+                format!(
+                    "managed KV participant base '{participant_base}' has no shared-pool backing"
+                )
+            })?;
+            let active = participant
+                .shared_activation
+                .as_ref()
+                .is_some_and(|activation| activation.active);
+            let active_sequences = state
+                .sequences
+                .keys()
+                .filter(|(candidate, _)| candidate == participant_id.as_str())
+                .count() as u64;
+            (pools, active, active_sequences)
+        };
+        Ok(pools.managed_device_snapshots(active_sequences, active))
     }
 
     fn retire_one_participant_after_backend_exit(&self, participant_id: &str) -> bool {
@@ -2290,7 +2400,7 @@ mod tests {
                     capacity_pool_id: group.pool_id.clone(),
                     generation: participant_epoch,
                     group_ids: vec![group.group_id.clone()],
-                    memory_domain: KvMemoryDomain::Host,
+                    memory_domain: group.memory_domains[0].clone(),
                     block_count: group.max_allocations.expect("test block cap"),
                     bytes_per_block: group.bytes_per_allocation,
                     allocation_mode: if registration
@@ -3069,6 +3179,67 @@ mod tests {
             .managed_participant_is_active("kapsl-model-1")
             .unwrap_err()
             .contains("multiple live"));
+    }
+
+    #[test]
+    fn managed_vllm_snapshot_distinguishes_backing_active_and_idle_blocks() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(Arc::new(TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            })),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        let mut registration = shared_registration();
+        registration.participant_id = "kapsl-model-7:engine-a".to_string();
+        registration.capacity_model.groups[0].memory_domains =
+            vec![KvMemoryDomain::Cuda { device_id: 0 }];
+        let receipt = coordinator.register(&registration).unwrap();
+        coordinator
+            .attach(&registration.participant_id, &shared_attachment(&receipt))
+            .unwrap();
+        coordinator
+            .activate(&registration.participant_id, receipt.participant_epoch)
+            .unwrap();
+
+        let initial = coordinator
+            .managed_vllm_kv_snapshot("kapsl-model-7")
+            .unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].backing_bytes, 4 * 4096);
+        assert_eq!(initial[0].total_blocks, 4);
+        assert_eq!(initial[0].idle_blocks, 4);
+        assert_eq!(initial[0].active_blocks, 0);
+        assert!(initial[0].participant_active);
+
+        let lease = coordinator
+            .reserve(&registration.participant_id, &reservation(None))
+            .unwrap();
+        let occupied = coordinator
+            .managed_vllm_kv_snapshot("kapsl-model-7")
+            .unwrap();
+        assert_eq!(occupied[0].active_blocks, 2);
+        assert_eq!(occupied[0].idle_blocks, 2);
+        assert_eq!(occupied[0].logical_leased_bytes, 2 * 4096);
+        assert_eq!(occupied[0].active_sequences, 1);
+
+        coordinator
+            .release(
+                &registration.participant_id,
+                &lease.lease_id,
+                Some(&KvReleaseCompletion::BackendSynchronized),
+            )
+            .unwrap();
+        let released = coordinator
+            .managed_vllm_kv_snapshot("kapsl-model-7")
+            .unwrap();
+        assert_eq!(released[0].active_blocks, 0);
+        assert_eq!(released[0].idle_blocks, 4);
+        assert_eq!(released[0].active_sequences, 0);
     }
 
     #[test]

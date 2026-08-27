@@ -1,6 +1,6 @@
 use super::managed_vllm_bridge::{
-    map_ureq_body_error, ManagedVllmBridgeError, ManagedVllmByteStream, ManagedVllmHttpBridge,
-    ManagedVllmRequestTimeouts, ManagedVllmSseStream,
+    map_ureq_body_error, ManagedVllmBridgeError, ManagedVllmBridgeTelemetry, ManagedVllmByteStream,
+    ManagedVllmHttpBridge, ManagedVllmRequestTimeouts, ManagedVllmSseStream,
 };
 use super::*;
 use kapsl_engine_api::{
@@ -2122,6 +2122,245 @@ fn checked_percent_ceil(value: usize, percent: usize, group_id: &str) -> Result<
         .map_err(|_| format!("managed vLLM KV headroom overflow for group '{group_id}'"))
 }
 
+const MANAGED_VLLM_RESERVATION_STATES: &[&str] =
+    &["planned", "reserved", "active", "released", "rejected"];
+
+struct ManagedVllmReservationMetricState {
+    state: &'static str,
+    reserved_at: Option<std::time::Instant>,
+}
+
+struct ManagedVllmTelemetry {
+    metrics: kapsl_monitor::metrics::KapslMetrics,
+    model: String,
+    replica: String,
+    devices: Vec<String>,
+    reservation: Mutex<ManagedVllmReservationMetricState>,
+}
+
+impl ManagedVllmTelemetry {
+    fn new(
+        metrics: kapsl_monitor::metrics::KapslMetrics,
+        model: String,
+        replica_id: u32,
+        device_ids: &[usize],
+    ) -> Arc<Self> {
+        let telemetry = Arc::new(Self {
+            metrics,
+            model,
+            replica: replica_id.to_string(),
+            devices: device_ids.iter().map(ToString::to_string).collect(),
+            reservation: Mutex::new(ManagedVllmReservationMetricState {
+                state: "planned",
+                reserved_at: None,
+            }),
+        });
+        telemetry.set_reservation_state("planned", None);
+        telemetry
+    }
+
+    fn replica_labels(&self) -> [&str; 2] {
+        [&self.model, &self.replica]
+    }
+
+    fn set_reservation_state(&self, state: &'static str, reserved_at: Option<std::time::Instant>) {
+        debug_assert!(MANAGED_VLLM_RESERVATION_STATES.contains(&state));
+        for &candidate in MANAGED_VLLM_RESERVATION_STATES {
+            self.metrics
+                .managed_vllm
+                .provisional_reservation_state
+                .with_label_values(&[self.model.as_str(), self.replica.as_str(), candidate])
+                .set(i64::from(candidate == state));
+        }
+        let mut current = self.reservation.lock();
+        current.state = state;
+        current.reserved_at = reserved_at;
+        drop(current);
+        self.refresh_reservation_age();
+    }
+
+    fn refresh_reservation_age(&self) {
+        let age = self
+            .reservation
+            .lock()
+            .reserved_at
+            .map_or(0.0, |started| started.elapsed().as_secs_f64());
+        self.metrics
+            .managed_vllm
+            .provisional_reservation_age_seconds
+            .with_label_values(&self.replica_labels())
+            .set(age);
+    }
+
+    fn observe_grant(&self, plan: &ManagedVllmExactPlanTemplate, grant: &ProvisionalKvGrant) {
+        for device in &self.devices {
+            let labels = &[self.model.as_str(), self.replica.as_str(), device.as_str()];
+            self.metrics
+                .managed_vllm
+                .kv_requested_bytes
+                .with_label_values(labels)
+                .set(metric_i64(plan.requested_bytes_per_rank));
+            self.metrics
+                .managed_vllm
+                .kv_granted_bytes
+                .with_label_values(labels)
+                .set(metric_i64(
+                    grant
+                        .selected_candidate
+                        .block_count
+                        .saturating_mul(grant.selected_candidate.bytes_per_block),
+                ));
+            self.metrics
+                .managed_vllm
+                .kv_minimum_bytes
+                .with_label_values(labels)
+                .set(metric_i64(plan.minimum_bytes_per_rank));
+        }
+        self.metrics
+            .managed_vllm
+            .effective_target_concurrency
+            .with_label_values(&self.replica_labels())
+            .set(metric_i64(
+                grant.selected_candidate.effective_target_concurrency,
+            ));
+        if grant.selected_candidate_index != 0 {
+            self.metrics
+                .managed_vllm
+                .planning_reductions_total
+                .with_label_values(&[self.model.as_str(), self.replica.as_str(), "authority_cap"])
+                .inc();
+        }
+        if grant.selected_candidate.effective_target_concurrency < plan.target_concurrency {
+            self.metrics
+                .managed_vllm
+                .planning_reductions_total
+                .with_label_values(&[self.model.as_str(), self.replica.as_str(), "concurrency"])
+                .inc();
+        }
+        self.set_reservation_state("reserved", Some(std::time::Instant::now()));
+    }
+
+    fn planning_rejected(&self, reason: &'static str) {
+        self.metrics
+            .managed_vllm
+            .planning_rejections_total
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), reason])
+            .inc();
+        self.set_reservation_state("rejected", None);
+    }
+
+    fn set_generation(&self, generation: u64) {
+        self.metrics
+            .managed_vllm
+            .restart_generation
+            .with_label_values(&self.replica_labels())
+            .set(metric_i64(generation));
+    }
+
+    fn mark_active(&self) {
+        self.set_reservation_state("active", None);
+    }
+
+    fn mark_released(&self) {
+        self.set_reservation_state("released", None);
+        for device in &self.devices {
+            let labels = &[self.model.as_str(), self.replica.as_str(), device.as_str()];
+            self.metrics
+                .managed_vllm
+                .kv_backing_bytes
+                .with_label_values(labels)
+                .set(0);
+            self.metrics
+                .managed_vllm
+                .kv_logical_leased_bytes
+                .with_label_values(labels)
+                .set(0);
+            self.metrics
+                .managed_vllm
+                .kv_blocks_total
+                .with_label_values(labels)
+                .set(0);
+            self.metrics
+                .managed_vllm
+                .kv_blocks_allocated
+                .with_label_values(labels)
+                .set(0);
+            self.metrics
+                .managed_vllm
+                .kv_blocks_active
+                .with_label_values(labels)
+                .set(0);
+            self.metrics
+                .managed_vllm
+                .kv_blocks_idle
+                .with_label_values(labels)
+                .set(0);
+            self.metrics
+                .managed_vllm
+                .kv_quarantine_bytes
+                .with_label_values(labels)
+                .set(0);
+        }
+    }
+
+    fn refresh_live(&self, snapshots: &[ManagedVllmKvDeviceSnapshot]) {
+        self.refresh_reservation_age();
+        let by_device = snapshots
+            .iter()
+            .map(|snapshot| (snapshot.device_id.to_string(), snapshot))
+            .collect::<HashMap<_, _>>();
+        for device in &self.devices {
+            let labels = &[self.model.as_str(), self.replica.as_str(), device.as_str()];
+            let snapshot = by_device.get(device).copied();
+            self.metrics
+                .managed_vllm
+                .kv_backing_bytes
+                .with_label_values(labels)
+                .set(metric_i64(snapshot.map_or(0, |row| row.backing_bytes)));
+            self.metrics
+                .managed_vllm
+                .kv_logical_leased_bytes
+                .with_label_values(labels)
+                .set(metric_i64(
+                    snapshot.map_or(0, |row| row.logical_leased_bytes),
+                ));
+            self.metrics
+                .managed_vllm
+                .kv_blocks_total
+                .with_label_values(labels)
+                .set(metric_i64(snapshot.map_or(0, |row| row.total_blocks)));
+            self.metrics
+                .managed_vllm
+                .kv_blocks_allocated
+                .with_label_values(labels)
+                .set(metric_i64(snapshot.map_or(0, |row| row.allocated_blocks)));
+            self.metrics
+                .managed_vllm
+                .kv_blocks_active
+                .with_label_values(labels)
+                .set(metric_i64(snapshot.map_or(0, |row| row.active_blocks)));
+            self.metrics
+                .managed_vllm
+                .kv_blocks_idle
+                .with_label_values(labels)
+                .set(metric_i64(snapshot.map_or(0, |row| row.idle_blocks)));
+            self.metrics
+                .managed_vllm
+                .kv_quarantine_bytes
+                .with_label_values(labels)
+                .set(metric_i64(snapshot.map_or(0, |row| row.quarantine_bytes)));
+        }
+    }
+}
+
+fn metric_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn metric_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 #[derive(Clone, Debug)]
 struct ManagedVllmProcessSpec {
     python: PathBuf,
@@ -2163,12 +2402,27 @@ struct ManagedVllmProcess {
     kv_readiness_fence: Arc<ManagedVllmKvReadinessFence>,
     published_kv_readiness_epoch: AtomicU64,
     generation: AtomicU64,
+    telemetry: Option<Arc<ManagedVllmTelemetry>>,
 }
 
 impl ManagedVllmProcess {
-    fn new(spec: ManagedVllmProcessSpec, launch: ManagedVllmLaunchSpec) -> Self {
-        let bridge = ManagedVllmHttpBridge::new(&spec.endpoint)
-            .expect("managed vLLM process specs always use a private HTTP origin");
+    fn new(
+        spec: ManagedVllmProcessSpec,
+        launch: ManagedVllmLaunchSpec,
+        telemetry: Option<Arc<ManagedVllmTelemetry>>,
+    ) -> Self {
+        let bridge = match telemetry.as_ref() {
+            Some(telemetry) => ManagedVllmHttpBridge::new_with_telemetry(
+                &spec.endpoint,
+                ManagedVllmBridgeTelemetry::new(
+                    telemetry.metrics.clone(),
+                    telemetry.model.clone(),
+                    telemetry.replica.clone(),
+                ),
+            ),
+            None => ManagedVllmHttpBridge::new(&spec.endpoint),
+        }
+        .expect("managed vLLM process specs always use a private HTTP origin");
         Self {
             spec,
             launch: Mutex::new(launch),
@@ -2184,6 +2438,7 @@ impl ManagedVllmProcess {
             kv_readiness_fence: Arc::new(ManagedVllmKvReadinessFence::new()),
             published_kv_readiness_epoch: AtomicU64::new(0),
             generation: AtomicU64::new(0),
+            telemetry,
         }
     }
 
@@ -2297,7 +2552,7 @@ impl ManagedVllmProcess {
         } else {
             let python = self.spec.python.clone();
             let invocation_for_task = invocation.clone();
-            let template = tokio::task::spawn_blocking(move || {
+            let planned = tokio::task::spawn_blocking(move || {
                 run_managed_vllm_planner(&python, &invocation_for_task)
             })
             .await
@@ -2305,8 +2560,17 @@ impl ManagedVllmProcess {
                 EngineError::backend(format!(
                     "managed vLLM planner task failed before completion: {error}"
                 ))
-            })?
-            .map_err(EngineError::backend)?;
+            })
+            .and_then(|result| result.map_err(EngineError::backend));
+            let template = match planned {
+                Ok(template) => template,
+                Err(error) => {
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.planning_rejected("planner");
+                    }
+                    return Err(error);
+                }
+            };
             *self.exact_plan.lock() = Some(template.clone());
             template
         };
@@ -2320,8 +2584,22 @@ impl ManagedVllmProcess {
             EngineError::backend(format!(
                 "managed vLLM KV grant task failed before completion: {error}"
             ))
-        })?
-        .map_err(|error| EngineError::backend(format!("managed vLLM KV grant: {error}")))?;
+        })
+        .and_then(|result| {
+            result.map_err(|error| EngineError::backend(format!("managed vLLM KV grant: {error}")))
+        });
+        let grant = match grant {
+            Ok(grant) => grant,
+            Err(error) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.planning_rejected("authority");
+                }
+                return Err(error);
+            }
+        };
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.observe_grant(&template, &grant);
+        }
         let granted_bytes = grant
             .selected_candidate
             .block_count
@@ -2377,7 +2655,10 @@ impl ManagedVllmProcess {
                 "managed vLLM process has been shut down".to_string(),
             ));
         }
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.set_generation(generation);
+        }
         self.readiness
             .store(ManagedVllmReplicaState::Starting as u8, Ordering::Release);
         self.readiness_epoch.fetch_add(1, Ordering::AcqRel);
@@ -2569,6 +2850,9 @@ impl ManagedVllmProcess {
                     })?
             {
                 if self.mark_routable(generation, readiness_epoch, kv_readiness_epoch) {
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.mark_active();
+                    }
                     return Ok(());
                 }
                 // A concurrent lifecycle transition fenced this probe. A
@@ -3043,6 +3327,9 @@ impl ManagedVllmRuntime {
         match deployment.retire_participants_after_backend_exit(&self.participant_id) {
             Ok(retired_count) => {
                 *retired = true;
+                if let Some(telemetry) = &self.process.telemetry {
+                    telemetry.mark_released();
+                }
                 if retired_count > 0 {
                     log::info!(
                         "Retired {} managed vLLM KV participant(s) under {} after backend exit",
@@ -3087,6 +3374,7 @@ impl ManagedVllmEngine {
         device_ids: Vec<usize>,
         tensor_parallel_size: usize,
         resolved_target_concurrency: usize,
+        metrics: kapsl_monitor::metrics::KapslMetrics,
     ) -> Result<Box<dyn Engine>, String> {
         if device_ids.is_empty() {
             return Err("managed vLLM requires at least one CUDA device".to_string());
@@ -3180,6 +3468,12 @@ impl ManagedVllmEngine {
                 }),
             ),
         };
+        let telemetry = ManagedVllmTelemetry::new(
+            metrics,
+            manifest.project_name.clone(),
+            replica_id,
+            &device_ids,
+        );
         let process = Arc::new(ManagedVllmProcess::new(
             ManagedVllmProcessSpec {
                 python: deployment.python.clone(),
@@ -3194,6 +3488,7 @@ impl ManagedVllmEngine {
                 planner_invocation,
             },
             launch,
+            Some(telemetry),
         ));
         let memory_report =
             managed_vllm_memory_report(&model_root, &device_ids, model_id, replica_id)?;
@@ -3588,18 +3883,58 @@ impl Engine for ManagedVllmEngine {
     fn metrics(&self) -> EngineMetrics {
         let requests = self.requests.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
+        let kv_snapshots = self
+            .deployment
+            .coordinator()
+            .and_then(|coordinator| {
+                coordinator.managed_vllm_kv_snapshot(&self.runtime.participant_id)
+            })
+            .unwrap_or_default();
+        if let Some(telemetry) = &self.process.telemetry {
+            telemetry.refresh_live(&kv_snapshots);
+        }
+        let kv_cache_bytes_capacity = kv_snapshots
+            .iter()
+            .fold(0_u64, |total, row| total.saturating_add(row.backing_bytes));
+        let kv_cache_bytes_used = kv_snapshots.iter().fold(0_u64, |total, row| {
+            total.saturating_add(row.logical_leased_bytes)
+        });
+        // Tensor-parallel ranks share one logical native block table, so block
+        // occupancy is the most constrained rank rather than a sum across
+        // physical devices. Physical byte metrics above remain device-summed.
+        let kv_cache_blocks_total = kv_snapshots
+            .iter()
+            .map(|row| row.total_blocks)
+            .min()
+            .unwrap_or(0);
+        let kv_cache_blocks_free = kv_snapshots
+            .iter()
+            .map(|row| row.idle_blocks)
+            .min()
+            .unwrap_or(0);
+        let kv_cache_sequences = kv_snapshots
+            .iter()
+            .map(|row| row.active_sequences)
+            .max()
+            .unwrap_or(0);
+        let planned_memory = self
+            .actual_memory()
+            .allocations
+            .iter()
+            .map(|allocation| allocation.bytes)
+            .fold(0_usize, usize::saturating_add);
         EngineMetrics {
-            memory_usage: self
-                .actual_memory()
-                .allocations
-                .iter()
-                .map(|allocation| allocation.bytes)
-                .sum(),
+            memory_usage: planned_memory.saturating_add(metric_usize(kv_cache_bytes_capacity)),
             error_rate: if requests == 0 {
                 0.0
             } else {
                 errors as f64 / requests as f64
             },
+            kv_cache_bytes_used: metric_usize(kv_cache_bytes_used),
+            kv_cache_bytes_capacity: metric_usize(kv_cache_bytes_capacity),
+            kv_cache_blocks_total: metric_usize(kv_cache_blocks_total),
+            kv_cache_blocks_free: metric_usize(kv_cache_blocks_free),
+            kv_cache_sequences: metric_usize(kv_cache_sequences),
             generated_tokens_total: self.generated_tokens.load(Ordering::Relaxed),
             ..Default::default()
         }
@@ -3951,6 +4286,7 @@ mod tests {
                 kv_transfer_config: "{}".to_string(),
                 memory_argument: ManagedVllmMemoryArgument::LegacyFraction(0.25),
             },
+            None,
         ))
     }
 
@@ -4703,6 +5039,7 @@ serving:
                 kv_transfer_config: "{}".to_string(),
                 memory_argument: ManagedVllmMemoryArgument::LegacyFraction(0.25),
             },
+            None,
         );
 
         let command = process.build_command().unwrap();
