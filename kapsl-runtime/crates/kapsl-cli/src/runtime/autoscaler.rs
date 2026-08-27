@@ -38,7 +38,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
                     as u32;
 
                 // Calculate pool state and update metrics.
-                let (total_queue_depth, healthy_replicas, metrics_available) =
+                let (total_queue_depth, healthy_replicas, pool_metrics) =
                     if let Some(pool) = models_for_scaler.pool(base_model_id) {
                         let (high, low) = pool.get_queue_depth();
                         let healthy = pool.get_healthy_replica_count();
@@ -68,10 +68,11 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
                         // engine fields visible to every runtime caller together.
                         shared_metrics_for_scaler.set_kv_cache_metrics(&model_id_str, &metrics);
 
-                        (high + low, healthy as u32, true)
+                        (high + low, healthy as u32, Some(metrics))
                     } else {
-                        (0, 0, false)
+                        (0, 0, None)
                     };
+                let metrics_available = pool_metrics.is_some();
 
                 // Check for scale-up
                 let should_scale_up = auto_scaler_clone.write().should_scale_up(
@@ -84,6 +85,23 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
                 );
 
                 if let Some(target_replicas) = should_scale_up {
+                    if healthy_replicas == current_replicas
+                        && managed_vllm_has_internal_batching_headroom(
+                            &model_info,
+                            pool_metrics.as_ref(),
+                        )
+                    {
+                        let (active, target) = pool_metrics.as_ref().map_or((0, 0), |metrics| {
+                            (metrics.kv_cache_sequences, metrics.batch_size)
+                        });
+                        log::info!(
+                            "Auto-scaler: deferring managed vLLM model {} process replication; internal continuous batching has {}/{} active sequences",
+                            base_model_id,
+                            active,
+                            target,
+                        );
+                        continue;
+                    }
                     // Queue depth driven by a co-tenant squeezing the GPU is not
                     // load growth: a new replica would land on the same starved
                     // device and thrash. Skip and re-evaluate next tick — the
@@ -211,4 +229,60 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
             }
         }
     })
+}
+
+fn managed_vllm_has_internal_batching_headroom(
+    model: &ModelInfo,
+    metrics: Option<&EngineMetrics>,
+) -> bool {
+    if model.device != "vllm" {
+        return false;
+    }
+    let Some(metrics) = metrics else {
+        return true;
+    };
+    metrics.batch_size == 0 || metrics.kv_cache_sequences < metrics.batch_size
+}
+
+#[cfg(test)]
+mod managed_vllm_autoscaling_tests {
+    use super::*;
+
+    fn model(device: &str) -> ModelInfo {
+        ModelInfo::new(
+            1,
+            "model".to_string(),
+            "1".to_string(),
+            "safetensors".to_string(),
+            device.to_string(),
+            "basic".to_string(),
+            "/tmp/model".to_string(),
+        )
+    }
+
+    #[test]
+    fn managed_vllm_replication_waits_for_internal_target_saturation() {
+        let managed = model("vllm");
+        assert!(managed_vllm_has_internal_batching_headroom(
+            &managed,
+            Some(&EngineMetrics {
+                batch_size: 16,
+                kv_cache_sequences: 15,
+                ..Default::default()
+            })
+        ));
+        assert!(!managed_vllm_has_internal_batching_headroom(
+            &managed,
+            Some(&EngineMetrics {
+                batch_size: 16,
+                kv_cache_sequences: 16,
+                ..Default::default()
+            })
+        ));
+        assert!(managed_vllm_has_internal_batching_headroom(&managed, None));
+        assert!(!managed_vllm_has_internal_batching_headroom(
+            &model("CUDAExecutionProvider"),
+            Some(&EngineMetrics::default())
+        ));
+    }
 }

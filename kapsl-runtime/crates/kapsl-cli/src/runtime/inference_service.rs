@@ -18,6 +18,7 @@ pub(crate) struct InferenceService {
 }
 
 impl InferenceService {
+    #[cfg(test)]
     pub(crate) fn new(
         models: Arc<ModelManager>,
         pressure: Arc<ResourcePressure>,

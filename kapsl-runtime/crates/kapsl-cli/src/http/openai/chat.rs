@@ -19,18 +19,19 @@ enum ManagedVllmOpenAiMode {
 
 impl ManagedVllmOpenAiMode {
     fn from_environment() -> Self {
-        match std::env::var(VLLM_BRIDGE_MODE_ENV) {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "wire" => Self::Wire,
-                "legacy" | "async-translated" | "translated" | "" => Self::Translated,
-                other => {
-                    log::warn!(
-                        "Ignoring unsupported {VLLM_BRIDGE_MODE_ENV}={other:?}; expected wire, async-translated, or legacy"
-                    );
-                    Self::Translated
-                }
-            },
-            Err(_) => Self::Translated,
+        Self::from_value(std::env::var(VLLM_BRIDGE_MODE_ENV).ok().as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("wire") => Self::Wire,
+            Some("legacy" | "async-translated" | "translated") => Self::Translated,
+            Some(other) => {
+                log::warn!(
+                    "Ignoring unsupported {VLLM_BRIDGE_MODE_ENV}={other:?}; expected wire, async-translated, or legacy"
+                );
+                Self::Wire
+            }
         }
     }
 
@@ -851,6 +852,30 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_vllm_wire_is_default_with_explicit_translated_rollback() {
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(None),
+            ManagedVllmOpenAiMode::Wire
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("wire")),
+            ManagedVllmOpenAiMode::Wire
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("async-translated")),
+            ManagedVllmOpenAiMode::Translated
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("legacy")),
+            ManagedVllmOpenAiMode::Translated
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("invalid")),
+            ManagedVllmOpenAiMode::Wire
+        );
+    }
 
     #[tokio::test]
     async fn chat_body_filter_rejects_before_buffering_above_the_wire_limit() {

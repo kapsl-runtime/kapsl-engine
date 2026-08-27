@@ -31,6 +31,7 @@ pub(crate) const MANAGED_VLLM_CUDA_RUNTIME_VERSION: &str = "13.0";
 
 const MANAGED_VLLM_PYTHON_ENV: &str = "KAPSL_VLLM_PYTHON";
 const MANAGED_VLLM_BUNDLE_ENV: &str = "KAPSL_VLLM_BUNDLE";
+const MANAGED_VLLM_MEMORY_MODE_ENV: &str = "KAPSL_VLLM_MEMORY_MODE";
 const MANAGED_VLLM_CHAT_MARKER: &str = "__kapsl_managed_vllm_chat_v1";
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -771,6 +772,9 @@ impl ManagedVllmSettings {
             .and_then(|metadata| metadata.get("serving"))
             .and_then(|serving| serving.get("vllm"))
         else {
+            settings.apply_memory_mode_override(
+                std::env::var(MANAGED_VLLM_MEMORY_MODE_ENV).ok().as_deref(),
+            )?;
             return Ok(settings);
         };
         let object = vllm
@@ -827,7 +831,39 @@ impl ManagedVllmSettings {
             }
             settings.startup_timeout = Duration::from_secs(seconds);
         }
+        settings.apply_memory_mode_override(
+            std::env::var(MANAGED_VLLM_MEMORY_MODE_ENV).ok().as_deref(),
+        )?;
         Ok(settings)
+    }
+
+    fn apply_memory_mode_override(&mut self, mode: Option<&str>) -> Result<(), String> {
+        let Some(mode) = mode.map(str::trim).filter(|mode| !mode.is_empty()) else {
+            return Ok(());
+        };
+        match mode.to_ascii_lowercase().as_str() {
+            "exact" | "auto" => {
+                if matches!(
+                    self.kv_cache_policy,
+                    ManagedVllmKvCachePolicy::LegacyFraction { .. }
+                ) {
+                    return Err(format!(
+                        "{MANAGED_VLLM_MEMORY_MODE_ENV}={mode} conflicts with explicitly configured legacy_fraction memory sizing"
+                    ));
+                }
+            }
+            "legacy" | "legacy-fraction" | "legacy_fraction" => {
+                self.kv_cache_policy = ManagedVllmKvCachePolicy::LegacyFraction {
+                    gpu_memory_utilization: self.gpu_memory_utilization,
+                };
+            }
+            _ => {
+                return Err(format!(
+                    "{MANAGED_VLLM_MEMORY_MODE_ENV} must be exact or legacy-fraction"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_launch_policy(&self) -> Result<(), String> {
@@ -2136,6 +2172,7 @@ struct ManagedVllmTelemetry {
     replica: String,
     devices: Vec<String>,
     reservation: Mutex<ManagedVllmReservationMetricState>,
+    effective_target_concurrency: AtomicU64,
 }
 
 impl ManagedVllmTelemetry {
@@ -2144,6 +2181,7 @@ impl ManagedVllmTelemetry {
         model: String,
         replica_id: u32,
         device_ids: &[usize],
+        initial_target_concurrency: usize,
     ) -> Arc<Self> {
         let telemetry = Arc::new(Self {
             metrics,
@@ -2154,6 +2192,9 @@ impl ManagedVllmTelemetry {
                 state: "planned",
                 reserved_at: None,
             }),
+            effective_target_concurrency: AtomicU64::new(
+                u64::try_from(initial_target_concurrency.max(1)).unwrap_or(u64::MAX),
+            ),
         });
         telemetry.set_reservation_state("planned", None);
         telemetry
@@ -2223,6 +2264,10 @@ impl ManagedVllmTelemetry {
             .set(metric_i64(
                 grant.selected_candidate.effective_target_concurrency,
             ));
+        self.effective_target_concurrency.store(
+            grant.selected_candidate.effective_target_concurrency,
+            Ordering::Release,
+        );
         if grant.selected_candidate_index != 0 {
             self.metrics
                 .managed_vllm
@@ -2255,6 +2300,14 @@ impl ManagedVllmTelemetry {
             .restart_generation
             .with_label_values(&self.replica_labels())
             .set(metric_i64(generation));
+    }
+
+    fn target_concurrency(&self) -> usize {
+        metric_usize(
+            self.effective_target_concurrency
+                .load(Ordering::Acquire)
+                .max(1),
+        )
     }
 
     fn mark_active(&self) {
@@ -3473,6 +3526,7 @@ impl ManagedVllmEngine {
             manifest.project_name.clone(),
             replica_id,
             &device_ids,
+            resolved_target_concurrency,
         );
         let process = Arc::new(ManagedVllmProcess::new(
             ManagedVllmProcessSpec {
@@ -3828,7 +3882,13 @@ impl Engine for ManagedVllmEngine {
     }
 
     fn batching_policy(&self) -> BatchingPolicy {
-        BatchingPolicy::delegated().with_priority_support()
+        let mut policy = BatchingPolicy::delegated();
+        policy.max_requests = self
+            .process
+            .telemetry
+            .as_ref()
+            .map_or(1, |telemetry| telemetry.target_concurrency());
+        policy.with_priority_support()
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
@@ -4313,6 +4373,36 @@ mod tests {
             }
         );
         assert!(settings.validate_launch_policy().is_ok());
+    }
+
+    #[test]
+    fn memory_mode_override_is_explicit_and_never_reinterprets_authored_legacy() {
+        let mut settings = ManagedVllmSettings {
+            gpu_memory_utilization: 0.5,
+            kv_cache_policy: ManagedVllmKvCachePolicy::Auto {
+                target_concurrency: Some(8),
+                headroom_percent: 20,
+                min_bytes: None,
+                max_bytes: None,
+                strict: false,
+            },
+            legacy_top_level_fraction_authored: false,
+            max_model_len: 1024,
+            startup_timeout: Duration::from_secs(300),
+        };
+        settings
+            .apply_memory_mode_override(Some("legacy-fraction"))
+            .unwrap();
+        assert_eq!(
+            settings.kv_cache_policy,
+            ManagedVllmKvCachePolicy::LegacyFraction {
+                gpu_memory_utilization: 0.5
+            }
+        );
+        assert!(settings.apply_memory_mode_override(Some("exact")).is_err());
+        assert!(settings
+            .apply_memory_mode_override(Some("unexpected"))
+            .is_err());
     }
 
     #[test]

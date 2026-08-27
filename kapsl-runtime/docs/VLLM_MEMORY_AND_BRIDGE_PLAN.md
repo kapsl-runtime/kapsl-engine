@@ -1,7 +1,9 @@
 # Managed vLLM memory and bridge remediation plan
 
-Status: design and implementation plan only; no runtime or connector changes are
-included with this document.
+Status: implementation in progress on `feature/vllm-complete-remediation`.
+Phases 0 through 4 are implemented and host-verified; Phase 5 and the full GPU,
+semantic, churn, and performance acceptance matrix remain open. No release or
+pull request should be created until those gates pass.
 
 Date: 2026-08-26
 

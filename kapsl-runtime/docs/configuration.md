@@ -125,7 +125,8 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
 | `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. Packaged installs discover the verified lazy cache and legacy beside-binary bundle automatically. |
 | `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
-| `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge rollout mode: `wire` enables the typed byte relay; `async-translated` (the default) and `legacy` retain response translation for rollback. |
+| `KAPSL_VLLM_MEMORY_MODE` | Managed-vLLM KV policy override. Omitted, `exact`, or `auto` preserves the package's exact policy; `legacy-fraction` (also `legacy`/`legacy_fraction`) is the explicit compatibility rollback. Exact cannot override an explicitly authored legacy policy. |
+| `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge mode. Omitted or `wire` uses the typed byte relay; `async-translated`, `translated`, or `legacy` retains response translation for rollback. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -198,32 +199,42 @@ metadata:
     vllm:
       max_model_len: 4096
       kv_cache:
-        mode: legacy_fraction
-        gpu_memory_utilization: 0.5
+        mode: auto
+        target_concurrency: 16
+        headroom_percent: 20
+        max_bytes: 2147483648
       startup_timeout_seconds: 300
 ```
 
-The compatibility defaults are `1024`, a `0.5` legacy fraction, and `300`
-seconds respectively. The deprecated top-level `gpu_memory_utilization` field
-is still accepted for existing packages but conflicts with `kv_cache` when
-both are present.
+The defaults are a 1,024-token context, exact `auto` sizing, 20% bounded KV
+headroom, the resolved per-replica batch/concurrency target, and a 300-second
+startup timeout. The certified planner loads the pinned vLLM configuration,
+derives the packed cache geometry without allocating the final KV cache, and
+asks `MemoryAuthority` for an exact single-use grant before the serving child
+starts. If the full target does not fit, Kapsl first sheds optional headroom and
+then reduces concurrency to the largest whole-sequence capacity that fits;
+`strict: true` rejects that reduction. `min_bytes` and `max_bytes` are optional
+exact limits, and `mode: fixed` accepts one exact `bytes` value. Every exact
+grant must remain block-aligned and large enough for one full maximum-length
+sequence on every tensor-parallel rank.
 
-The manifest parser also validates the future `kv_cache.mode: auto` and
-`kv_cache.mode: fixed` shapes. This release deliberately rejects either exact
-mode before downloading a backend or starting a child: exact launch remains
-fail-closed until the certified runtime geometry provider and provisional
-`MemoryAuthority` grant handoff are installed. It never falls back to `0.5`
-after an operator requested an exact policy. Managed vLLM currently uses one
-selected CUDA device per Kapsl replica. Use `CUDA_VISIBLE_DEVICES` to select or
-isolate GPUs.
+The deprecated top-level `gpu_memory_utilization` field and
+`kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
+paths and conflict with an exact `kv_cache` object. Kapsl never reinterprets an
+exact byte grant as a fraction. `KAPSL_VLLM_MEMORY_MODE=legacy-fraction` forces a
+fresh legacy generation for rollback; `exact` cannot silently reinterpret an
+explicitly authored legacy package. Tensor-parallel replicas receive an exact
+per-rank device grant. Use `CUDA_VISIBLE_DEVICES` to select or isolate the
+physical GPUs visible to Kapsl.
 
-`KAPSL_VLLM_BRIDGE_MODE=wire` enables the protocol-native OpenAI path after
+The default protocol-native OpenAI path runs after
 authentication, model resolution, pressure admission, priority selection, and
 session scoping. The route normalizes the model alias once, forwards the JSON
 body to the private managed process, and relays vLLM's status, allowlisted
 headers, JSON body, or SSE bytes without reconstructing completion events.
-Client authorization is never forwarded. Leave the variable unset to retain
-the translated bridge while canary and semantic tests are running.
+Client authorization is never forwarded. Set
+`KAPSL_VLLM_BRIDGE_MODE=async-translated` (or `legacy`) only to roll a replica
+back to the translated compatibility path.
 
 ### External KV participants
 
