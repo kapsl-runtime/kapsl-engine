@@ -1,3 +1,5 @@
+//! Autoscaler task wiring around the model runtime facade.
+
 use super::*;
 
 pub(crate) struct AutoScalerTaskConfig {

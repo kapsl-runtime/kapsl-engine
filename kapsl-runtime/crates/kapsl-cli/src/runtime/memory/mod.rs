@@ -7,10 +7,22 @@
 //! participate in ownership and lifetime now, without pretending that the
 //! runtime physically allocates their memory.
 
-use super::device_limits::{
-    device_vram_cap_bytes, effective_ceiling_bytes, parse_cuda_memory_limit, smooth_ceiling_bytes,
-};
-use super::host_memory::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
+use super::*;
+
+#[cfg(feature = "gpu-device-pool")]
+mod device;
+#[cfg(any(feature = "gpu-device-pool", test))]
+mod device_budget;
+mod device_limits;
+pub(crate) mod host;
+mod priority;
+
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) use device::*;
+pub(crate) use device_limits::*;
+pub(crate) use priority::*;
+
+use self::host::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
 use crate::app::config::constants::PROVIDER_MEMORY_LIMITS_ENV;
 use kapsl_core::EngineKind;
 #[cfg(any(feature = "gpu-device-pool", test))]
@@ -26,12 +38,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-
-#[cfg(feature = "gpu-device-pool")]
-use super::device_memory::{
-    DeviceMemoryAdmission, DeviceMemoryBootstrapPlan, DeviceMemoryLease, DeviceMemoryManager,
-    DeviceMemorySwapAdmission, DeviceMemoryTransientLease,
-};
 
 /// An independently-budgeted memory domain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1224,7 +1230,7 @@ pub(crate) struct MemoryAuthority {
 
 fn authority_domain_policies(
     device_info: &DeviceInfo,
-    host_budget: super::host_memory::HostMemoryBudget,
+    host_budget: host::HostMemoryBudget,
     provider_limits: &ProviderMemoryLimits,
 ) -> (
     HashMap<usize, MemoryDomainPolicy>,
@@ -3326,7 +3332,7 @@ impl MemorySwapLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::host_memory::HostMemoryBudget;
+    use crate::runtime::memory::host::HostMemoryBudget;
     use kapsl_hal::device::{Device, DeviceBackend};
 
     const MIB: usize = 1024 * 1024;

@@ -1,14 +1,20 @@
+//! Model planning, loading, lifecycle, registry, and scaling orchestration.
+
 use super::*;
 
+mod autoscaler;
 mod backend;
 mod lifecycle;
 pub(crate) mod load_plan;
+mod manager;
 mod replica;
 mod scaling;
 
+pub(crate) use autoscaler::*;
 use backend::*;
 pub(crate) use lifecycle::*;
 pub(crate) use load_plan::*;
+pub(crate) use manager::*;
 use replica::*;
 pub(crate) use scaling::*;
 
@@ -265,7 +271,7 @@ pub(crate) async fn run_worker(
             for handle in &handles {
                 let _ = handle.actual_memory();
             }
-            if let Some(rss) = super::host_memory::process_rss_bytes() {
+            if let Some(rss) = super::memory::host::process_rss_bytes() {
                 memory_for_reconciliation.observe_process_memory(rss);
             }
         }

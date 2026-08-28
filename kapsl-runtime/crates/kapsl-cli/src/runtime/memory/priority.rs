@@ -1,3 +1,5 @@
+//! Weighted arbitration for memory pressure and admission.
+
 use super::*;
 use std::cmp::Reverse;
 use std::sync::Weak;

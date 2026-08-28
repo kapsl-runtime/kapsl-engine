@@ -1,3 +1,5 @@
+//! Runtime-owned model registry state and lifecycle serialization.
+
 use super::*;
 use tokio::sync::OwnedMutexGuard;
 

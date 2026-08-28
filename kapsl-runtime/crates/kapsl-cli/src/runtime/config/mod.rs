@@ -1,4 +1,16 @@
+//! Runtime configuration resolved independently of the CLI surface.
+
 use super::*;
+
+mod auto_sizing;
+mod environment;
+mod load_policy;
+mod system;
+
+pub(crate) use auto_sizing::*;
+pub(crate) use environment::*;
+pub(crate) use load_policy::*;
+pub(crate) use system::*;
 
 pub(crate) fn parse_env_bool(key: &str) -> Option<bool> {
     let value = optional_env_var(key)?;

@@ -1,8 +1,13 @@
-use super::managed_vllm_bridge::{
+//! Managed vLLM lifecycle, admission, and engine integration.
+
+use super::*;
+
+mod bridge;
+
+use self::bridge::{
     map_ureq_body_error, ManagedVllmBridgeError, ManagedVllmByteStream, ManagedVllmHttpBridge,
     ManagedVllmRequestTimeouts, ManagedVllmSseStream,
 };
-use super::*;
 use kapsl_engine_api::{
     CancellationToken, EngineStream, MemoryAllocation, MemoryAllocationClass,
     MemoryAllocationSource, MemoryDomain, MemoryReport, OpenAiWireFormat, OpenAiWireHeader,

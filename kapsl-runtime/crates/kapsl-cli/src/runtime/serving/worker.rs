@@ -1,3 +1,5 @@
+//! Isolated worker process construction and remote engine transport.
+
 use super::*;
 use kapsl_backends::OnnxRuntimeTuning;
 #[cfg(unix)]
