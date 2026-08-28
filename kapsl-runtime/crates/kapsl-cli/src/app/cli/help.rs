@@ -1,7 +1,7 @@
-//! Presentation for `--help`: clap's colour styles and the epilogue shown
+//! Presentation for `--help`: clap's styles and the epilogue shown
 //! after the generated option list.
 
-use super::*;
+use crate::app::Ansi;
 
 pub(crate) fn kapsl_help_styles() -> clap::builder::Styles {
     use clap::builder::styling::{AnsiColor, Effects};

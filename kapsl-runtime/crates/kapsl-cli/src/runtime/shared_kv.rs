@@ -366,7 +366,7 @@ impl KvCoordinatorInner {
 #[cfg(test)]
 mod vram_clamp_tests {
     use super::KvCoordinatorInner;
-    use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+    use crate::app::config::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
     use crate::runtime::device_limits::effective_ceiling_bytes;
     use crate::runtime::memory::{
         MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryDomain,

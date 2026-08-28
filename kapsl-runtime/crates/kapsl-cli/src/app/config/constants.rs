@@ -1,3 +1,5 @@
+//! Environment-variable names and application defaults.
+
 // Hosted service defaults.
 pub(crate) const DEFAULT_REMOTE_URL: &str = "https://api.kapsl.net/v1";
 pub(crate) const EXTENSION_MARKETPLACE_URL: &str =

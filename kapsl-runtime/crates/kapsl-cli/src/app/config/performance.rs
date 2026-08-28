@@ -1,7 +1,7 @@
-//! CLI-specific performance-profile resolution.
+//! Resolution of CLI performance profiles.
 
 use super::*;
-use clap::parser::ValueSource;
+use clap::{parser::ValueSource, ArgMatches};
 
 fn arg_user_supplied(matches: &ArgMatches, arg: &str) -> bool {
     !matches!(

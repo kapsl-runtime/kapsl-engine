@@ -1,4 +1,4 @@
-use crate::app::constants::KAPSL_CPU_MEMORY_LIMIT_MB_ENV;
+use crate::app::config::constants::KAPSL_CPU_MEMORY_LIMIT_MB_ENV;
 use crate::runtime::memory::{MemoryAllocationClass, MemoryClaim, MemoryDomain, MemoryOwner};
 use parking_lot::Mutex;
 use std::collections::HashMap;

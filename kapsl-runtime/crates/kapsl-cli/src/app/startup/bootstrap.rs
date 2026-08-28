@@ -1,6 +1,6 @@
-//! Ordered construction of worker and server runtime modes.
+//! Ordered construction and execution of worker and server runtime modes.
 
-use super::*;
+use super::super::*;
 use futures::{stream, StreamExt};
 
 /// Application bootstrap with hardware supplied by the composition root.

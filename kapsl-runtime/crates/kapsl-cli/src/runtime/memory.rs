@@ -11,7 +11,7 @@ use super::device_limits::{
     device_vram_cap_bytes, effective_ceiling_bytes, parse_cuda_memory_limit, smooth_ceiling_bytes,
 };
 use super::host_memory::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
-use crate::app::constants::PROVIDER_MEMORY_LIMITS_ENV;
+use crate::app::config::constants::PROVIDER_MEMORY_LIMITS_ENV;
 use kapsl_core::EngineKind;
 #[cfg(any(feature = "gpu-device-pool", test))]
 use kapsl_engine_api::{ExternalDeviceMemory, ExternalDeviceMemoryReport};

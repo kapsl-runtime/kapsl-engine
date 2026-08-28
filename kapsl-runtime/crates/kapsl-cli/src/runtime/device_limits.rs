@@ -100,7 +100,7 @@ pub(crate) fn smooth_ceiling_bytes(previous: usize, target: usize) -> usize {
 #[cfg(test)]
 mod vram_cap_tests {
     use super::{device_vram_cap_bytes, parse_cuda_memory_limit, resolve_vram_cap_bytes};
-    use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+    use crate::app::config::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
 
     const MIB: usize = 1024 * 1024;
     const GIB: usize = 1024 * 1024 * 1024;
@@ -180,7 +180,7 @@ mod vram_cap_tests {
 #[cfg(test)]
 mod ceiling_tests {
     use super::{effective_ceiling_bytes, smooth_ceiling_bytes};
-    use crate::app::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
+    use crate::app::config::constants::CUDA_DEVICE_MEMORY_LIMIT_ENV;
 
     const GIB: usize = 1024 * 1024 * 1024;
     const RESERVE_FLOOR: usize = 512 * 1024 * 1024;

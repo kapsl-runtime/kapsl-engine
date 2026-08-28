@@ -1,4 +1,4 @@
-//! CLI-to-runtime composition for model loading.
+//! CLI-to-runtime composition for model loading policy.
 //!
 //! This adapter is the only place that knows both [`Args`] and the runtime's
 //! model-loading abstractions. Runtime code receives an injected planner or a
