@@ -12,6 +12,11 @@ on:
         required: true
         default: "0"
         type: string
+      runner_label:
+        description: Unique self-hosted runner label; gpu selects a persistent runner
+        required: false
+        default: gpu
+        type: string
   workflow_call:
     inputs:
       sdk_ref:
@@ -22,6 +27,11 @@ on:
         description: Physical GPU ordinals/UUIDs exposed to the probe
         required: true
         type: string
+      runner_label:
+        description: Unique self-hosted runner label
+        required: false
+        default: gpu
+        type: string
 
 permissions:
   contents: read
@@ -30,7 +40,7 @@ jobs:
   flash-attn:
     # The host supplies only the NVIDIA driver and GPUs. The immutable job image
     # pins the toolkit used by both the runtime build and the vLLM wheel.
-    runs-on: [self-hosted, linux, x64, gpu]
+    runs-on: [self-hosted, linux, x64, "${{ inputs.runner_label }}"]
     container:
       image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
       options: --gpus all

@@ -1,6 +1,8 @@
 name: GPU Device Pool Integration
 
 on:
+  schedule:
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       suite:
@@ -15,6 +17,22 @@ on:
         description: Exact kapsl-sdk commit for the managed-vLLM suite
         required: false
         type: string
+      runner_backend:
+        description: Runner lifecycle for the managed-vLLM suite
+        required: true
+        default: gcp-ephemeral
+        type: choice
+        options:
+          - gcp-ephemeral
+          - self-hosted
+      provisioning_model:
+        description: GCE provisioning model (Spot is cheaper but can be preempted)
+        required: true
+        default: SPOT
+        type: choice
+        options:
+          - SPOT
+          - STANDARD
       ort_model_path:
         description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
         required: false
@@ -40,6 +58,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: gpu-device-pool-${{ github.event_name == 'schedule' && 'sweeper' || 'conformance' }}
+  cancel-in-progress: false
+
 jobs:
   ort-gguf-sharing:
     if: inputs.suite == 'device-pool'
@@ -61,7 +83,7 @@ jobs:
             exit 1
           }
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -88,15 +110,364 @@ jobs:
 
       - name: Upload GPU integration diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gpu-device-pool-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/kapsl-gpu-pool-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
 
-  vllm-shared-pool:
-    if: inputs.suite == 'vllm-shared-pool'
+  prepare-vllm-gcp-runner:
+    if: inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'gcp-ephemeral'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: gcp-gpu-conformance
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      instance_name: ${{ steps.identity.outputs.instance_name }}
+      runner_id: ${{ steps.jit.outputs.runner_id }}
+      runner_label: ${{ steps.identity.outputs.runner_label }}
+      runner_name: ${{ steps.identity.outputs.runner_name }}
+    env:
+      GCP_GPU_PROJECT_ID: ${{ vars.GCP_GPU_PROJECT_ID }}
+      GCP_GPU_ZONE: ${{ vars.GCP_GPU_ZONE }}
+      GCP_GPU_RUNNER_IMAGE: ${{ vars.GCP_GPU_RUNNER_IMAGE }}
+      GCP_GPU_SUBNET: ${{ vars.GCP_GPU_SUBNET }}
+      GCP_GPU_EXTERNAL_IP: ${{ vars.GCP_GPU_EXTERNAL_IP }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_GPU_PROVISIONER_SERVICE_ACCOUNT: ${{ vars.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+      GCP_GPU_RUNNER_GROUP_ID: ${{ vars.GCP_GPU_RUNNER_GROUP_ID }}
+      GPU_RUNNER_GITHUB_APP_ID: ${{ vars.GPU_RUNNER_GITHUB_APP_ID }}
+      KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate configuration and derive the one-run identity
+        id: identity
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+          for name in \
+            GCP_GPU_PROJECT_ID GCP_GPU_ZONE GCP_GPU_RUNNER_IMAGE \
+            GCP_WORKLOAD_IDENTITY_PROVIDER \
+            GCP_GPU_PROVISIONER_SERVICE_ACCOUNT \
+            GPU_RUNNER_GITHUB_APP_ID; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "The gcp-gpu-conformance environment variable $name is required." >&2
+              exit 1
+            fi
+          done
+          [[ "$GPU_RUNNER_GITHUB_APP_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GPU_RUNNER_GITHUB_APP_ID must be a positive integer." >&2
+            exit 1
+          }
+          runner_group_id=${GCP_GPU_RUNNER_GROUP_ID:-1}
+          [[ "$runner_group_id" =~ ^[1-9][0-9]*$ ]] || {
+            echo "GCP_GPU_RUNNER_GROUP_ID must be a positive integer." >&2
+            exit 1
+          }
+          [[ "${GCP_GPU_EXTERNAL_IP:-true}" =~ ^(true|false)$ ]] || {
+            echo "GCP_GPU_EXTERNAL_IP must be exactly true or false." >&2
+            exit 1
+          }
+          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sdk_ref must be an exact lowercase 40-hex kapsl-sdk commit." >&2
+            exit 1
+          fi
+          actual_sdk_ref=$(gh api \
+            "repos/kapsl-runtime/kapsl-sdk/commits/$KAPSL_VLLM_SDK_REF" \
+            --jq .sha)
+          [[ "$actual_sdk_ref" == "$KAPSL_VLLM_SDK_REF" ]] || {
+            echo "sdk_ref did not resolve to the requested exact commit." >&2
+            exit 1
+          }
+          identity_file="$RUNNER_TEMP/kapsl-gpu-runner-identity.json"
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py identity \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            > "$identity_file"
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py startup-script \
+            --output "$RUNNER_TEMP/kapsl-gpu-runner-startup.sh"
+          {
+            echo "instance_name=$(jq -er .instance_name "$identity_file")"
+            echo "runner_name=$(jq -er .runner_name "$identity_file")"
+            echo "runner_label=$(jq -er .runner_label "$identity_file")"
+            echo "expires_at=$(jq -er .expires_at "$identity_file")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_GPU_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Verify GCE access and immutable runner image
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gcloud compute zones describe "$GCP_GPU_ZONE" \
+            --project "$GCP_GPU_PROJECT_ID" \
+            --format='value(name)' | grep -Fx "$GCP_GPU_ZONE"
+          image_ref=${GCP_GPU_RUNNER_IMAGE#https://www.googleapis.com/compute/v1/}
+          if [[ ! "$image_ref" =~ ^projects/([a-z][a-z0-9-]{4,28}[a-z0-9])/global/images/([a-z][a-z0-9-]{0,61}[a-z0-9])$ ]]; then
+            echo "GCP_GPU_RUNNER_IMAGE must identify one immutable GCE image." >&2
+            exit 1
+          fi
+          image_project=${BASH_REMATCH[1]}
+          image_name=${BASH_REMATCH[2]}
+          gcloud compute images describe "$image_name" \
+            --project "$image_project" \
+            --format='value(status)' | grep -Fx READY
+
+      - name: Mint repository-administration token
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ env.GPU_RUNNER_GITHUB_APP_ID }}
+          private-key: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Create one-job JIT runner registration
+        id: jit
+        shell: bash
+        env:
+          GITHUB_RUNNER_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -Eeuo pipefail
+          runner_group_id=${GCP_GPU_RUNNER_GROUP_ID:-1}
+          result_file="$RUNNER_TEMP/kapsl-gpu-jit-result.json"
+          python3 .github/scripts/github_jit_runner.py create \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --repository "${GITHUB_REPOSITORY#*/}" \
+            --runner-group-id "$runner_group_id" \
+            --name "${{ steps.identity.outputs.runner_name }}" \
+            --label self-hosted \
+            --label linux \
+            --label x64 \
+            --label "${{ steps.identity.outputs.runner_label }}" \
+            --config-file "$RUNNER_TEMP/kapsl-gpu-jit-config" \
+            > "$result_file"
+          echo "runner_id=$(jq -er .runner_id "$result_file")" >> "$GITHUB_OUTPUT"
+
+      - name: Create ephemeral GCE L4 runner
+        shell: bash
+        env:
+          PROVISIONING_MODEL: ${{ inputs.provisioning_model }}
+        run: |
+          set -Eeuo pipefail
+          runner_arguments=(
+            --project "$GCP_GPU_PROJECT_ID" \
+            --zone "$GCP_GPU_ZONE" \
+            --instance-name "${{ steps.identity.outputs.instance_name }}" \
+            --image "$GCP_GPU_RUNNER_IMAGE" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --expires-at "${{ steps.identity.outputs.expires_at }}" \
+            --provisioning-model "$PROVISIONING_MODEL" \
+            --startup-script "$RUNNER_TEMP/kapsl-gpu-runner-startup.sh" \
+            --jit-config "$RUNNER_TEMP/kapsl-gpu-jit-config" \
+            --subnet "${GCP_GPU_SUBNET:-}" \
+            --external-ip "${GCP_GPU_EXTERNAL_IP:-true}"
+          )
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py provision \
+            "${runner_arguments[@]}"
+          instance_contract="$RUNNER_TEMP/kapsl-gpu-instance-contract.json"
+          gcloud compute instances describe \
+            "${{ steps.identity.outputs.instance_name }}" \
+            --project "$GCP_GPU_PROJECT_ID" \
+            --zone "$GCP_GPU_ZONE" \
+            --format=json > "$instance_contract"
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py verify \
+            --input "$instance_contract" \
+            "${runner_arguments[@]}"
+
+      - name: Wait for the exact JIT runner to become online
+        shell: bash
+        env:
+          GITHUB_RUNNER_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -Eeuo pipefail
+          python3 .github/scripts/github_jit_runner.py wait \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --repository "${GITHUB_REPOSITORY#*/}" \
+            --runner-id "${{ steps.jit.outputs.runner_id }}" \
+            --expected-name "${{ steps.identity.outputs.runner_name }}" \
+            --timeout-seconds 900 \
+            --interval-seconds 10
+
+      - name: Delete a VM whose provisioning job failed
+        if: failure() && steps.identity.outputs.instance_name != ''
+        shell: bash
+        run: |
+          gcloud compute instances get-serial-port-output \
+            "${{ steps.identity.outputs.instance_name }}" \
+            --project "$GCP_GPU_PROJECT_ID" \
+            --zone "$GCP_GPU_ZONE" \
+            > "$RUNNER_TEMP/kapsl-gpu-runner-serial.log" 2>&1 || true
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py delete \
+            --project "$GCP_GPU_PROJECT_ID" \
+            --zone "$GCP_GPU_ZONE" \
+            --instance-name "${{ steps.identity.outputs.instance_name }}"
+
+      - name: Remove an unused JIT registration after provisioning failure
+        if: failure() && steps.jit.outputs.runner_id != ''
+        shell: bash
+        env:
+          GITHUB_RUNNER_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          python3 .github/scripts/github_jit_runner.py delete \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --repository "${GITHUB_REPOSITORY#*/}" \
+            --runner-id "${{ steps.jit.outputs.runner_id }}"
+
+      - name: Remove local JIT material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/kapsl-gpu-jit-config" "$RUNNER_TEMP/kapsl-gpu-jit-result.json"
+
+      - name: Upload runner bootstrap diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gcp-gpu-runner-bootstrap-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kapsl-gpu-runner-serial.log
+          if-no-files-found: warn
+
+  vllm-shared-pool-self-hosted:
+    if: inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'self-hosted'
     uses: ./.github/workflows/vllm-shared-pool-conformance.yml
     with:
       sdk_ref: ${{ inputs.sdk_ref }}
       cuda_visible_devices: ${{ inputs.cuda_visible_devices }}
+      runner_label: gpu
+
+  vllm-shared-pool-gcp:
+    needs: prepare-vllm-gcp-runner
+    if: inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'gcp-ephemeral' && needs.prepare-vllm-gcp-runner.result == 'success'
+    uses: ./.github/workflows/vllm-shared-pool-conformance.yml
+    with:
+      sdk_ref: ${{ inputs.sdk_ref }}
+      cuda_visible_devices: ${{ inputs.cuda_visible_devices }}
+      runner_label: ${{ needs.prepare-vllm-gcp-runner.outputs.runner_label }}
+
+  cleanup-vllm-gcp-runner:
+    needs: [prepare-vllm-gcp-runner, vllm-shared-pool-gcp]
+    if: always() && inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'gcp-ephemeral'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: gcp-gpu-conformance
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_GPU_PROJECT_ID: ${{ vars.GCP_GPU_PROJECT_ID }}
+      GCP_GPU_ZONE: ${{ vars.GCP_GPU_ZONE }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_GPU_PROVISIONER_SERVICE_ACCOUNT: ${{ vars.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_GPU_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Capture the runner serial log before deletion
+        shell: bash
+        env:
+          INSTANCE_NAME: ${{ needs.prepare-vllm-gcp-runner.outputs.instance_name }}
+        run: |
+          if [[ -n "$INSTANCE_NAME" ]]; then
+            gcloud compute instances get-serial-port-output "$INSTANCE_NAME" \
+              --project "$GCP_GPU_PROJECT_ID" \
+              --zone "$GCP_GPU_ZONE" \
+              > "$RUNNER_TEMP/kapsl-gpu-runner-serial.log" 2>&1 || true
+          fi
+
+      - name: Delete the exact GCE runner instance
+        shell: bash
+        env:
+          INSTANCE_NAME: ${{ needs.prepare-vllm-gcp-runner.outputs.instance_name }}
+        run: |
+          set -Eeuo pipefail
+          if [[ -n "$INSTANCE_NAME" ]]; then
+            python3 .github/scripts/gcp_ephemeral_gpu_runner.py delete \
+              --project "$GCP_GPU_PROJECT_ID" \
+              --zone "$GCP_GPU_ZONE" \
+              --instance-name "$INSTANCE_NAME"
+          fi
+
+      - name: Mint runner-cleanup token
+        if: needs.prepare-vllm-gcp-runner.outputs.runner_id != ''
+        id: cleanup-app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.GPU_RUNNER_GITHUB_APP_ID }}
+          private-key: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Remove the completed JIT runner registration
+        if: needs.prepare-vllm-gcp-runner.outputs.runner_id != ''
+        shell: bash
+        env:
+          GITHUB_RUNNER_APP_TOKEN: ${{ steps.cleanup-app-token.outputs.token }}
+        run: |
+          python3 .github/scripts/github_jit_runner.py delete \
+            --owner "$GITHUB_REPOSITORY_OWNER" \
+            --repository "${GITHUB_REPOSITORY#*/}" \
+            --runner-id "${{ needs.prepare-vllm-gcp-runner.outputs.runner_id }}"
+
+      - name: Sweep any expired managed runner left by an interrupted workflow
+        shell: bash
+        run: |
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py sweep \
+            --project "$GCP_GPU_PROJECT_ID" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Upload ephemeral runner diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gcp-gpu-runner-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kapsl-gpu-runner-serial.log
+          if-no-files-found: warn
+
+  sweep-expired-vllm-gcp-runners:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: gcp-gpu-conformance
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_GPU_PROJECT_ID: ${{ vars.GCP_GPU_PROJECT_ID }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_GPU_PROVISIONER_SERVICE_ACCOUNT: ${{ vars.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_GPU_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Delete expired managed instances by exact validated name and zone
+        run: >-
+          python3 .github/scripts/gcp_ephemeral_gpu_runner.py sweep
+          --project "$GCP_GPU_PROJECT_ID"
+          --repository "$GITHUB_REPOSITORY"

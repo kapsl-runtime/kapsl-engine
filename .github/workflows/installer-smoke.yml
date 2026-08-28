@@ -41,6 +41,12 @@ on:
       - ".github/scripts/certify-mixed-backend-concurrency.py"
       - ".github/scripts/test_certify_mixed_backend_concurrency.py"
       - ".github/workflows/vllm-shared-pool-conformance.yml"
+      - ".github/workflows/gpu-device-pool-integration.yml"
+      - ".github/scripts/gcp_ephemeral_gpu_runner.py"
+      - ".github/scripts/github_jit_runner.py"
+      - ".github/scripts/test_gcp_ephemeral_gpu_runner.py"
+      - ".github/scripts/test_github_jit_runner.py"
+      - "docs/gcp-ephemeral-gpu-conformance.md"
       - ".github/scripts/generate-backend-index.py"
       - ".github/scripts/test-generate-backend-index.sh"
       - ".github/scripts/verify-public-backend-release.sh"
@@ -97,6 +103,10 @@ jobs:
           python3 -m py_compile .github/scripts/test_managed_vllm_scaling_conformance.py
           python3 -m py_compile .github/scripts/certify-mixed-backend-concurrency.py
           python3 -m py_compile .github/scripts/test_certify_mixed_backend_concurrency.py
+          python3 -m py_compile .github/scripts/gcp_ephemeral_gpu_runner.py
+          python3 -m py_compile .github/scripts/github_jit_runner.py
+          python3 -m py_compile .github/scripts/test_gcp_ephemeral_gpu_runner.py
+          python3 -m py_compile .github/scripts/test_github_jit_runner.py
 
       - name: Test llama.cpp performance threshold math
         run: .github/scripts/benchmark-llama-cpp-backend-pack.py self-test
@@ -142,6 +152,12 @@ jobs:
 
       - name: Test managed-vLLM mixed-backend memory gates
         run: python3 .github/scripts/test_certify_mixed_backend_concurrency.py
+
+      - name: Test ephemeral GCE GPU runner lifecycle
+        run: python3 .github/scripts/test_gcp_ephemeral_gpu_runner.py
+
+      - name: Test GitHub JIT runner lifecycle
+        run: python3 .github/scripts/test_github_jit_runner.py
 
       - name: Test signed backend-index generation
         run: .github/scripts/test-generate-backend-index.sh
