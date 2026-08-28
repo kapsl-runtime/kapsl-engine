@@ -157,6 +157,10 @@ class ProvisionTests(unittest.TestCase):
             / "vllm-shared-pool-conformance.yml"
         ).read_text(encoding="utf-8")
         self.assertIn(runner.CONFORMANCE_IMAGE, conformance_workflow)
+        self.assertIn("options: --runtime=nvidia --gpus all", conformance_workflow)
+        self.assertIn("Verify GPU passthrough before build", conformance_workflow)
+        self.assertIn("test -c /dev/nvidiactl", conformance_workflow)
+        self.assertIn("nvidia-smi --list-gpus", conformance_workflow)
         path = Path(self.temporary.name) / "rendered.sh"
         path.write_text(script, encoding="utf-8")
         subprocess.run(["bash", "-n", str(path)], check=True)

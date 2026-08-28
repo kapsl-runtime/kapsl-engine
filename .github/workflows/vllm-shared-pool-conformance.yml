@@ -43,7 +43,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, "${{ inputs.runner_label }}"]
     container:
       image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
-      options: --gpus all
+      options: --runtime=nvidia --gpus all
     timeout-minutes: 240
     env:
       CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
@@ -67,6 +67,17 @@ jobs:
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
       VLLM_WHEEL_URL: https://wheels.vllm.ai/2ec6f0d71ea3b350952630e310efcda1c744ff4d/vllm-0.26.1rc1.dev1130%2Bg2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl
     steps:
+      - name: Verify GPU passthrough before build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -c /dev/nvidiactl
+          test -c /dev/nvidia0
+          nvidia-smi --list-gpus
+          nvidia-smi \
+            --query-gpu=index,uuid,name,driver_version,memory.total \
+            --format=csv,noheader
+
       - name: Install declared build dependencies
         shell: bash
         run: |
