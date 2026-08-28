@@ -46,6 +46,8 @@ on:
       - ".github/scripts/github_jit_runner.py"
       - ".github/scripts/test_gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/test_github_jit_runner.py"
+      - ".github/scripts/validate_model_package_backend.py"
+      - ".github/scripts/test_validate_model_package_backend.py"
       - "docs/gcp-ephemeral-gpu-conformance.md"
       - ".github/scripts/generate-backend-index.py"
       - ".github/scripts/test-generate-backend-index.sh"
@@ -107,6 +109,8 @@ jobs:
           python3 -m py_compile .github/scripts/github_jit_runner.py
           python3 -m py_compile .github/scripts/test_gcp_ephemeral_gpu_runner.py
           python3 -m py_compile .github/scripts/test_github_jit_runner.py
+          python3 -m py_compile .github/scripts/validate_model_package_backend.py
+          python3 -m py_compile .github/scripts/test_validate_model_package_backend.py
 
       - name: Test llama.cpp performance threshold math
         run: .github/scripts/benchmark-llama-cpp-backend-pack.py self-test
@@ -158,6 +162,9 @@ jobs:
 
       - name: Test GitHub JIT runner lifecycle
         run: python3 .github/scripts/test_github_jit_runner.py
+
+      - name: Test model-package serving contract validation
+        run: python3 .github/scripts/test_validate_model_package_backend.py
 
       - name: Test signed backend-index generation
         run: .github/scripts/test-generate-backend-index.sh

@@ -499,9 +499,10 @@ jobs:
             --serving-backend vllm \
             --metadata-json '{"serving":{"vllm":{"max_model_len":1024,"kv_cache":{"mode":"auto","target_concurrency":1,"headroom_percent":20,"strict":true,"live_resize":{"maximum_concurrency":4,"grow_utilization_percent":50,"shrink_utilization_percent":10,"shrink_idle_seconds":2}},"startup_timeout_seconds":900}}}'
           test -s "$package"
-          "$RUNTIME_BINARY" backend-plan "$package" --cuda true \
-            > "$OUTPUT_DIR/elastic-backend-plan.json"
-          grep -q 'vllm' "$OUTPUT_DIR/elastic-backend-plan.json"
+          python3 engine/.github/scripts/validate_model_package_backend.py \
+            --package "$package" \
+            --expected-backend vllm \
+            --output "$OUTPUT_DIR/elastic-package-contract.json"
           sha256sum "$package" > "$OUTPUT_DIR/elastic-package.sha256"
           echo "ELASTIC_PACKAGE=$package" >> "$GITHUB_ENV"
 
@@ -529,12 +530,14 @@ jobs:
             --serving-backend llama_cpp
           test -s "$fixed_package"
           test -s "$llama_package"
-          "$RUNTIME_BINARY" backend-plan "$fixed_package" --cuda true \
-            > "$OUTPUT_DIR/fixed-backend-plan.json"
-          "$RUNTIME_BINARY" backend-plan "$llama_package" --cuda true \
-            > "$OUTPUT_DIR/llama-backend-plan.json"
-          grep -q 'vllm' "$OUTPUT_DIR/fixed-backend-plan.json"
-          grep -q 'llama' "$OUTPUT_DIR/llama-backend-plan.json"
+          python3 engine/.github/scripts/validate_model_package_backend.py \
+            --package "$fixed_package" \
+            --expected-backend vllm \
+            --output "$OUTPUT_DIR/fixed-package-contract.json"
+          python3 engine/.github/scripts/validate_model_package_backend.py \
+            --package "$llama_package" \
+            --expected-backend llama_cpp \
+            --output "$OUTPUT_DIR/llama-package-contract.json"
           sha256sum "$fixed_package" "$llama_package" \
             > "$OUTPUT_DIR/fixed-and-llama-packages.sha256"
           {
