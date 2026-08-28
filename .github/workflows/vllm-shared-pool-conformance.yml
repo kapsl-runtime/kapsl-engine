@@ -54,6 +54,7 @@ jobs:
       EXPECTED_TORCH_VERSION: "2.13.0+cu130"
       EXPECTED_TORCHVISION_VERSION: "0.28.0+cu130"
       EXPECTED_TORCHAUDIO_VERSION: "2.11.0+cu130"
+      EXPECTED_TORCHCODEC_VERSION: "0.16.0+cu130"
       EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
       EXPECTED_CONNECTOR_VERSION: "0.7.0"
       EXPECTED_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-ipc/flash-attn"
@@ -206,9 +207,8 @@ jobs:
             --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
             "torch==$EXPECTED_TORCH_VERSION" \
             "torchvision==$EXPECTED_TORCHVISION_VERSION" \
-            "torchaudio==$EXPECTED_TORCHAUDIO_VERSION"
-          "$VENV_DIR/bin/python" -m pip install \
-            --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
+            "torchaudio==$EXPECTED_TORCHAUDIO_VERSION" \
+            "torchcodec==$EXPECTED_TORCHCODEC_VERSION" \
             "$VLLM_WHEEL_PATH"
           "$VENV_DIR/bin/python" -m build --wheel --outdir "$OUTPUT_DIR/wheels" sdk/integrations/vllm
           "$VENV_DIR/bin/python" -m pip install \
@@ -239,6 +239,7 @@ jobs:
               "torch": torch.__version__,
               "torchvision": importlib.metadata.version("torchvision"),
               "torchaudio": importlib.metadata.version("torchaudio"),
+              "torchcodec": importlib.metadata.version("torchcodec"),
               "vllm": importlib.metadata.version("vllm"),
               "connector_distribution": importlib.metadata.version(
                   "kapsl-vllm-connector"
@@ -255,6 +256,7 @@ jobs:
               "torch": os.environ["EXPECTED_TORCH_VERSION"],
               "torchvision": os.environ["EXPECTED_TORCHVISION_VERSION"],
               "torchaudio": os.environ["EXPECTED_TORCHAUDIO_VERSION"],
+              "torchcodec": os.environ["EXPECTED_TORCHCODEC_VERSION"],
               "vllm": os.environ["EXPECTED_VLLM_VERSION"],
               "connector_distribution": os.environ["EXPECTED_CONNECTOR_VERSION"],
               "connector": os.environ["EXPECTED_CONNECTOR_VERSION"],

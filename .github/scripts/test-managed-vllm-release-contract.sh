@@ -83,6 +83,8 @@ for workflow in \
     require_literal "$workflow" 'EXPECTED_ELASTIC_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"'
     require_literal "$workflow" "EXPECTED_KV_ABI_MAJOR: \"$kv_abi_major\""
     require_literal "$workflow" "EXPECTED_KV_ABI_MINOR: \"$kv_abi_minor\""
+    require_literal "$workflow" 'EXPECTED_TORCHCODEC_VERSION: "0.16.0+cu130"'
+    require_literal "$workflow" '"torchcodec==$EXPECTED_TORCHCODEC_VERSION"'
     require_literal "$workflow" '--index-url https://pypi.org/simple'
     require_literal "$workflow" '--extra-index-url "$PYTORCH_INDEX_URL"'
     require_literal "$workflow" 'engine/.cargo/config.toml'
