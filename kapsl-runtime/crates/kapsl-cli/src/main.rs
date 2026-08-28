@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use clap::{ArgGroup, ArgMatches, FromArgMatches, Parser};
+use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -44,7 +44,6 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::future::Future;
 use std::io::{BufRead, BufWriter, Read, Write};
 use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};

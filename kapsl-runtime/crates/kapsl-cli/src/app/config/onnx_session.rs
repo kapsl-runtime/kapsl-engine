@@ -1,9 +1,9 @@
-//! Resolution of per-session ONNX Runtime configuration.
+//! Resolution of per-session ONNX Runtime configuration policy.
 //!
 //! Settings come from four layers, each overriding the previous: auto-derived
 //! defaults, environment variables, command-line flags, and per-model
 //! `--onnx-model-tuning` specs. This module owns that precedence chain; the CLI
-//! surface itself lives in [`super::cli`].
+//! surface itself lives in [`crate::app::cli`].
 
 use super::*;
 use crate::runtime::model::{BackendLoadTuning, BackendTuningProvider};

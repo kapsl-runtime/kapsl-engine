@@ -1,6 +1,7 @@
-//! Translation from CLI/environment input into immutable runtime configuration.
+//! Translation from CLI and environment input into immutable runtime configuration.
 
 use super::*;
+use clap::ArgMatches;
 
 pub(crate) struct ResolvedRuntimeConfig {
     pub(crate) model_paths: Vec<PathBuf>,
