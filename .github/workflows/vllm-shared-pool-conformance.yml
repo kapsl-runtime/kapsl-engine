@@ -84,6 +84,13 @@ jobs:
           wheel_path="$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
           mkdir -p "$output_dir"
           {
+            echo "github_run_id=$GITHUB_RUN_ID"
+            echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "engine_ref=$GITHUB_REF"
+            echo "engine_sha=$GITHUB_SHA"
+            echo "sdk_ref=$KAPSL_VLLM_SDK_REF"
+          } > "$output_dir/run-context.txt"
+          {
             echo "OUTPUT_DIR=$output_dir"
             echo "VENV_DIR=$venv_dir"
             echo "VLLM_WHEEL_PATH=$wheel_path"
@@ -116,18 +123,12 @@ jobs:
         with:
           toolchain: 1.92.0
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: engine/kapsl-runtime
-          cache-on-failure: true
-
-      - name: Build CUDA shared-pool runtime against the checked-out SDK
-        working-directory: engine
+      - name: Configure checked-out SDK Cargo patches
         shell: bash
         run: |
           set -Eeuo pipefail
-          cargo_patch="$RUNNER_TEMP/kapsl-sdk-patches.toml"
-          python3 - "$cargo_patch" "$GITHUB_WORKSPACE/sdk/crates" <<'PY'
+          mkdir -p engine/.cargo
+          python3 - engine/.cargo/config.toml "$GITHUB_WORKSPACE/sdk/crates" <<'PY'
           import sys
           from pathlib import Path
 
@@ -146,9 +147,21 @@ jobs:
           )
           destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine/kapsl-runtime
+          key: ${{ inputs.sdk_ref }}
+          cache-on-failure: true
+
+      - name: Build CUDA shared-pool runtime against the checked-out SDK
+        working-directory: engine
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           metadata_path="$RUNNER_TEMP/kapsl-cargo-metadata.json"
           cargo metadata --manifest-path kapsl-runtime/Cargo.toml \
-            --locked --format-version 1 --config "$cargo_patch" > "$metadata_path"
+            --locked --format-version 1 > "$metadata_path"
           python3 - "$metadata_path" <<'PY'
           import json
           import os
@@ -176,8 +189,7 @@ jobs:
               )
           PY
           cargo build --manifest-path kapsl-runtime/Cargo.toml --locked \
-            --release -p kapsl --no-default-features --features cuda \
-            --config "$cargo_patch"
+            --release -p kapsl --no-default-features --features cuda
 
       - name: Install pinned adapter and backend artifacts
         shell: bash
@@ -189,7 +201,8 @@ jobs:
           python3 -m venv "$VENV_DIR"
           "$VENV_DIR/bin/python" -m pip install --upgrade pip build
           "$VENV_DIR/bin/python" -m pip install \
-            --index-url "$PYTORCH_INDEX_URL" \
+            --index-url https://pypi.org/simple \
+            --extra-index-url "$PYTORCH_INDEX_URL" \
             --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
             "torch==$EXPECTED_TORCH_VERSION" \
             "torchvision==$EXPECTED_TORCHVISION_VERSION" \

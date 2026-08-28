@@ -83,8 +83,18 @@ for workflow in \
     require_literal "$workflow" 'EXPECTED_ELASTIC_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"'
     require_literal "$workflow" "EXPECTED_KV_ABI_MAJOR: \"$kv_abi_major\""
     require_literal "$workflow" "EXPECTED_KV_ABI_MINOR: \"$kv_abi_minor\""
+    require_literal "$workflow" '--index-url https://pypi.org/simple'
+    require_literal "$workflow" '--extra-index-url "$PYTORCH_INDEX_URL"'
+    require_literal "$workflow" 'engine/.cargo/config.toml'
+    require_literal "$workflow" 'key: ${{ inputs.sdk_ref }}'
   fi
 done
+
+if grep -Fq -- '--index-url "$PYTORCH_INDEX_URL"' \
+  .github/workflows/vllm-shared-pool-conformance.yml; then
+  echo "Managed-vLLM conformance must keep PyPI available for ordinary dependencies." >&2
+  exit 1
+fi
 
 if grep -Eq 'KAPSL_VLLM_SDK_REF:-|sdk_ref:.*default:' "$packager" \
   .github/workflows/release-runtime-installers.yml \
