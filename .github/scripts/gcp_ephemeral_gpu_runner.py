@@ -502,13 +502,20 @@ readonly RUNNER_ARCHIVE="actions-runner-linux-x64-${{RUNNER_VERSION}}.tar.gz"
 readonly RUNNER_RELEASES='https://github.com/actions/runner/releases/download'
 readonly RUNNER_URL="$RUNNER_RELEASES/v${{RUNNER_VERSION}}/${{RUNNER_ARCHIVE}}"
 readonly CONFORMANCE_IMAGE='{CONFORMANCE_IMAGE}'
+readonly FAILURE_SHUTDOWN_MINUTES='20'
 
 finish() {{
   status=$?
   trap - EXIT
   unset jit_config || true
   sync || true
-  shutdown -h now || systemctl poweroff || true
+  if (( status == 0 )); then
+    shutdown -h now || systemctl poweroff || true
+  else
+    echo "Runner bootstrap/execution failed with status $status; " \
+      "retaining the VM for diagnostics for $FAILURE_SHUTDOWN_MINUTES minutes." >&2
+    shutdown -h "+$FAILURE_SHUTDOWN_MINUTES" || true
+  fi
   exit "$status"
 }}
 trap finish EXIT

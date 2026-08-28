@@ -147,6 +147,9 @@ class ProvisionTests(unittest.TestCase):
         self.assertIn("metadata runner-jit-config", script)
         self.assertIn("driver_major < 580", script)
         self.assertIn("./run.sh --jitconfig", script)
+        self.assertIn("if (( status == 0 )); then", script)
+        self.assertIn('shutdown -h "+$FAILURE_SHUTDOWN_MINUTES"', script)
+        self.assertIn("retaining the VM for diagnostics", script)
         self.assertNotIn("super-secret-jit", script)
         conformance_workflow = (
             MODULE_PATH.parent.parent
