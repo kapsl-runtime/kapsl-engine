@@ -92,6 +92,7 @@ class ProvisionTests(unittest.TestCase):
         self.assertIn("--instance-termination-action=DELETE", command)
         self.assertIn("--max-run-duration=18000s", command)
         self.assertIn("--no-service-account", command)
+        self.assertIn("--no-scopes", command)
         self.assertIn("--maintenance-policy=TERMINATE", command)
         self.assertIn("--network=default", command)
         self.assertIn("managed-by=kapsl-gha", joined)

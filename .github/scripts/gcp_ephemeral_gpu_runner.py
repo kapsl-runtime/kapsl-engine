@@ -239,6 +239,7 @@ def build_create_command(config: ProvisionConfig) -> list[str]:
         "--instance-termination-action=DELETE",
         f"--max-run-duration={config.max_run_seconds}s",
         "--no-service-account",
+        "--no-scopes",
         "--shielded-vtpm",
         "--shielded-integrity-monitoring",
         "--network-tier=PREMIUM",
