@@ -79,10 +79,14 @@ jobs:
       - name: Initialize isolated artifact paths
         shell: bash
         run: |
+          output_dir="$RUNNER_TEMP/kapsl-vllm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          venv_dir="$RUNNER_TEMP/kapsl-vllm-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          wheel_path="$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
+          mkdir -p "$output_dir"
           {
-            echo "OUTPUT_DIR=$RUNNER_TEMP/kapsl-vllm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            echo "VENV_DIR=$RUNNER_TEMP/kapsl-vllm-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-            echo "VLLM_WHEEL_PATH=$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
+            echo "OUTPUT_DIR=$output_dir"
+            echo "VENV_DIR=$venv_dir"
+            echo "VLLM_WHEEL_PATH=$wheel_path"
           } >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
@@ -115,6 +119,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine/kapsl-runtime
+          cache-on-failure: true
 
       - name: Build CUDA shared-pool runtime against the checked-out SDK
         working-directory: engine

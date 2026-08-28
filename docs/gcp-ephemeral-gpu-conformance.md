@@ -145,7 +145,8 @@ to the VM.
 
 ## 5. Configure GitHub OIDC to GCP
 
-Create one Workload Identity Pool/provider restricted to this repository:
+Create one Workload Identity Pool/provider restricted to this repository's
+`gcp-gpu-conformance` environment:
 
 ```bash
 export GCP_PROJECT_NUMBER=$(gcloud projects describe "$GCP_GPU_PROJECT_ID" --format='value(projectNumber)')
@@ -162,7 +163,7 @@ gcloud iam workload-identity-pools providers create-oidc "$GCP_WIF_PROVIDER" \
   --workload-identity-pool "$GCP_WIF_POOL" \
   --issuer-uri https://token.actions.githubusercontent.com \
   --attribute-mapping 'google.subject=assertion.sub,attribute.repository=assertion.repository' \
-  --attribute-condition "assertion.repository == 'kapsl-runtime/kapsl-engine'"
+  --attribute-condition "assertion.repository == 'kapsl-runtime/kapsl-engine' && assertion.sub == 'repo:kapsl-runtime/kapsl-engine:environment:gcp-gpu-conformance'"
 
 export GCP_WORKLOAD_IDENTITY_PROVIDER=$(gcloud iam workload-identity-pools providers describe \
   "$GCP_WIF_PROVIDER" \
@@ -264,7 +265,7 @@ that is why the narrowly installed App is required.
 ## 8. Run conformance
 
 Use the exact certified SDK commit. From this remediation branch, the current
-commit is `0d7db15c70a4735f6c89fc4c3179968cae283322`:
+commit is `d5dcd0b09629f00853dfbbf810bba08d5d411d5d`:
 
 ```bash
 gh workflow run gpu-device-pool-integration.yml \
@@ -273,7 +274,7 @@ gh workflow run gpu-device-pool-integration.yml \
   -f suite=vllm-shared-pool \
   -f runner_backend=gcp-ephemeral \
   -f provisioning_model=SPOT \
-  -f sdk_ref=0d7db15c70a4735f6c89fc4c3179968cae283322 \
+  -f sdk_ref=d5dcd0b09629f00853dfbbf810bba08d5d411d5d \
   -f cuda_visible_devices=0
 ```
 
