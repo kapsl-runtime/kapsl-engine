@@ -1,3 +1,5 @@
+//! Serving-backend selection and preliminary admission policy.
+
 use super::*;
 use clap::ValueEnum;
 
@@ -592,38 +594,34 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
         memory.status = MemoryAdmissionStatus::Unknown;
         memory.reason = "CUDA was enabled by --cuda, but this host exposes no GPU capacity; final memory admission must run on the target host".to_string();
     }
-    let onnx_profile = if crate::onnx_backend_pack::lazy_onnx_packs_enabled() {
+    let onnx_profile = if crate::backend::lazy_onnx_packs_enabled() {
         match args.cuda {
-            Some(true) => crate::onnx_backend_pack::onnx_pack_profile_for_target(
-                &manifest,
-                BackendAccelerator::Cuda,
-            )?,
-            Some(false) => crate::onnx_backend_pack::onnx_pack_profile_for_target(
-                &manifest,
-                BackendAccelerator::Cpu,
-            )?,
-            None => crate::onnx_backend_pack::onnx_pack_profile_for_manifest(
-                &manifest,
-                &planned_device_info,
-            )?,
+            Some(true) => {
+                crate::backend::onnx_pack_profile_for_target(&manifest, BackendAccelerator::Cuda)?
+            }
+            Some(false) => {
+                crate::backend::onnx_pack_profile_for_target(&manifest, BackendAccelerator::Cpu)?
+            }
+            None => {
+                crate::backend::onnx_pack_profile_for_manifest(&manifest, &planned_device_info)?
+            }
         }
     } else {
         None
     };
-    let llama_profile = if crate::llama_cpp_backend_pack::lazy_llama_cpp_packs_enabled() {
+    let llama_profile = if crate::backend::lazy_llama_cpp_packs_enabled() {
         match args.cuda {
-            Some(true) => crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_target(
+            Some(true) => crate::backend::llama_cpp_pack_profile_for_target(
                 &manifest,
                 BackendAccelerator::Cuda,
             ),
-            Some(false) => crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_target(
+            Some(false) => crate::backend::llama_cpp_pack_profile_for_target(
                 &manifest,
                 BackendAccelerator::Cpu,
             ),
-            None => crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_manifest(
-                &manifest,
-                &planned_device_info,
-            ),
+            None => {
+                crate::backend::llama_cpp_pack_profile_for_manifest(&manifest, &planned_device_info)
+            }
         }
     } else {
         None
@@ -691,7 +689,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
             }
             let manager = BackendManager::from_env(args.offline)?;
             let plan = manager.plan_llama_cpp(llama_profile, &target)?;
-            memory = crate::llama_cpp_backend_pack::preliminary_llama_cpp_memory_admission(
+            memory = crate::backend::preliminary_llama_cpp_memory_admission(
                 llama_profile,
                 &absolute_path,
                 &manifest,

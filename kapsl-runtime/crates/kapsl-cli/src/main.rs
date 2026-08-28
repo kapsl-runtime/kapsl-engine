@@ -56,25 +56,16 @@ use tokio::sync::Mutex as AsyncMutex;
 use warp::Filter;
 
 mod app;
-mod backend_bundle;
-mod backend_manager;
+mod backend;
 mod features;
 mod http;
-mod llama_cpp_backend_pack;
-mod llama_cpp_shared_pool;
-mod onnx_backend_pack;
 mod runtime;
-mod serving_backend;
 
 use app::*;
-use backend_bundle::*;
-use backend_manager::*;
+use backend::*;
 use features::*;
 use http::*;
-use llama_cpp_backend_pack::*;
-use onnx_backend_pack::*;
 use runtime::*;
-use serving_backend::*;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(test)]

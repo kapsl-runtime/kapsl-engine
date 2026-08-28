@@ -1565,44 +1565,35 @@ pub(crate) fn execute_backend_command(
                         model.display()
                     ))
                 })?;
-                let manifest = crate::serving_backend::inspect_serving_manifest(&absolute)?;
-                crate::serving_backend::validate_model_contract(&manifest)?;
-                let decision = crate::serving_backend::resolve_serving_backend(
-                    &manifest,
-                    device_info.has_cuda,
-                )?;
-                crate::serving_backend::validate_runtime_serving_backend(&manifest, decision)?;
-                let memory = crate::serving_backend::preliminary_memory_admission(
+                let manifest = crate::backend::inspect_serving_manifest(&absolute)?;
+                crate::backend::validate_model_contract(&manifest)?;
+                let decision =
+                    crate::backend::resolve_serving_backend(&manifest, device_info.has_cuda)?;
+                crate::backend::validate_runtime_serving_backend(&manifest, decision)?;
+                let memory = crate::backend::preliminary_memory_admission(
                     &absolute,
                     &manifest,
                     decision,
                     &device_info,
                 )?;
-                if memory.status == crate::serving_backend::MemoryAdmissionStatus::Rejected {
+                if memory.status == crate::backend::MemoryAdmissionStatus::Rejected {
                     return Err(format!(
                         "preliminary memory admission rejected `{}` before backend download: {}",
                         manifest.project_name, memory.reason
                     )
                     .into());
                 }
-                let onnx_profile = if crate::onnx_backend_pack::lazy_onnx_packs_enabled() {
-                    crate::onnx_backend_pack::onnx_pack_profile_for_manifest(
-                        &manifest,
-                        &device_info,
-                    )?
+                let onnx_profile = if crate::backend::lazy_onnx_packs_enabled() {
+                    crate::backend::onnx_pack_profile_for_manifest(&manifest, &device_info)?
                 } else {
                     None
                 };
-                let llama_profile = if crate::llama_cpp_backend_pack::lazy_llama_cpp_packs_enabled()
-                {
-                    crate::llama_cpp_backend_pack::llama_cpp_pack_profile_for_manifest(
-                        &manifest,
-                        &device_info,
-                    )
+                let llama_profile = if crate::backend::lazy_llama_cpp_packs_enabled() {
+                    crate::backend::llama_cpp_pack_profile_for_manifest(&manifest, &device_info)
                 } else {
                     None
                 };
-                if decision.selected == crate::serving_backend::ResolvedServingBackend::Vllm
+                if decision.selected == crate::backend::ResolvedServingBackend::Vllm
                     && ensured.insert(("vllm", MANAGED_VLLM_PACK_PROFILE))
                 {
                     let installed = manager.ensure_vllm(&target)?;
@@ -1637,18 +1628,15 @@ pub(crate) fn execute_backend_command(
                             llama_target.driver_version = None;
                         }
                         let plan = manager.plan_llama_cpp(profile, &llama_target)?;
-                        let admission =
-                            crate::llama_cpp_backend_pack::preliminary_llama_cpp_memory_admission(
-                                profile,
-                                &absolute,
-                                &manifest,
-                                &device_info,
-                                &plan.manifest,
-                                None,
-                            )?;
-                        if admission.status
-                            == crate::serving_backend::MemoryAdmissionStatus::Rejected
-                        {
+                        let admission = crate::backend::preliminary_llama_cpp_memory_admission(
+                            profile,
+                            &absolute,
+                            &manifest,
+                            &device_info,
+                            &plan.manifest,
+                            None,
+                        )?;
+                        if admission.status == crate::backend::MemoryAdmissionStatus::Rejected {
                             return Err(format!(
                                 "preliminary memory admission rejected `{}` before backend download: {}",
                                 manifest.project_name, admission.reason
@@ -1662,8 +1650,7 @@ pub(crate) fn execute_backend_command(
                             installed.display()
                         );
                     }
-                } else if decision.selected != crate::serving_backend::ResolvedServingBackend::Vllm
-                {
+                } else if decision.selected != crate::backend::ResolvedServingBackend::Vllm {
                     println!(
                         "{} uses the in-process {} backend; no lazy pack is required by this runtime build",
                         manifest.project_name,

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{ArgGroup, ValueEnum};
 
-use crate::serving_backend::ServingBackendPolicy;
+use crate::backend::ServingBackendPolicy;
 
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Build Options")]

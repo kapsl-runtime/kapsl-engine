@@ -5,18 +5,18 @@
 //! native-KV CUDA pack requires an explicit policy acknowledgement until a
 //! pack advertises the shared-pool callback capability.
 
-use crate::backend_manager::{
+mod shared_pool;
+
+use self::shared_pool::host_log_bridge;
+#[cfg(feature = "gpu-device-pool")]
+use self::shared_pool::LlamaCppSharedPoolHost;
+use super::{inspect_model_weight_bytes, MemoryAdmissionStatus, PreliminaryMemoryAdmission};
+use super::{
     BackendAccelerator, BackendManager, BackendPackManifest, BackendTarget,
     LlamaCppBackendPackProfile,
 };
-use crate::llama_cpp_shared_pool::host_log_bridge;
-#[cfg(feature = "gpu-device-pool")]
-use crate::llama_cpp_shared_pool::LlamaCppSharedPoolHost;
 use crate::runtime::RuntimeResources;
 use crate::runtime::{MemoryDomain, MemorySnapshot};
-use crate::serving_backend::{
-    inspect_model_weight_bytes, MemoryAdmissionStatus, PreliminaryMemoryAdmission,
-};
 use futures::channel::mpsc;
 use kapsl_backend_abi::*;
 use kapsl_core::{EngineKind, Manifest};
@@ -108,7 +108,7 @@ pub(crate) fn lazy_llama_cpp_packs_enabled() -> bool {
     }
     env_switch(
         LAZY_LLAMA_PACKS_ENV,
-        llama_cpp_lazy_packs_supported_for_platform(&crate::backend_manager::current_platform())
+        llama_cpp_lazy_packs_supported_for_platform(&super::current_platform())
             && !eager_llama_backend_compiled(),
     )
 }
