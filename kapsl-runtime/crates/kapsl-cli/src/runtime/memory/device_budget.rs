@@ -1,4 +1,4 @@
-use super::memory::{MemoryAllocationClass, MemoryOwner};
+use super::{MemoryAllocationClass, MemoryOwner};
 use std::collections::HashMap;
 
 pub(crate) const AUTO_POOL_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;

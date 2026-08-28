@@ -2,6 +2,18 @@
 
 use super::*;
 
+#[cfg(unix)]
+mod control;
+#[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+mod cuda_ipc;
+mod shared;
+
+#[cfg(unix)]
+pub(crate) use control::*;
+#[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+pub(crate) use cuda_ipc::*;
+pub(crate) use shared::*;
+
 #[derive(Clone, Debug)]
 pub(crate) struct KvControlConfig {
     pub(crate) socket_path: Option<PathBuf>,

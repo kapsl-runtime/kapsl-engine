@@ -1,3 +1,5 @@
+//! In-process inference dispatch and scheduler adaptation.
+
 use super::*;
 use futures::StreamExt;
 use kapsl_engine_api::{OpenAiWireRequest, OpenAiWireResponse, OpenAiWireStreamResponse};

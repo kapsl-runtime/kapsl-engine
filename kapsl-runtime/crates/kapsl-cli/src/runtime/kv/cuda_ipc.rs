@@ -4,8 +4,8 @@
 //! suballocator. CUDA IPC exports the entire allocation, so exporting a shared
 //! allocator slab would expose unrelated models and sessions to the importer.
 
-use super::kv_control::{ProvisionedSharedPools, SharedPoolBacking, SharedPoolProvisioner};
-use super::memory::{
+use super::control::{ProvisionedSharedPools, SharedPoolBacking, SharedPoolProvisioner};
+use crate::runtime::memory::{
     MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryDomain, MemoryLease, MemoryOwner,
     MemoryPlan,
 };

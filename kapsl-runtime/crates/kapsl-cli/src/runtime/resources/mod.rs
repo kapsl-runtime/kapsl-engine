@@ -1,4 +1,10 @@
+//! Process-scoped resource ownership and resource-pressure monitoring.
+
 use super::*;
+
+mod monitor;
+
+pub(crate) use monitor::*;
 
 /// Shared pressure snapshot consumed by ingress and resource policy.
 pub(crate) struct ResourcePressure {

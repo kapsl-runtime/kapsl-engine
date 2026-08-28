@@ -1,3 +1,5 @@
+//! Runtime telemetry sampling, pressure evaluation, and metrics export.
+
 use super::*;
 use sysinfo::{Pid, System};
 

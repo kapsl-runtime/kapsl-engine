@@ -4,8 +4,8 @@
 //! Unix connection. Policy and byte accounting live in `ExternalKvCoordinator`;
 //! framing only decodes the versioned `kapsl-kv-abi` envelopes.
 
-use super::managed_vllm::ManagedVllmKvReadinessFence;
-use super::memory::{
+use crate::runtime::managed::ManagedVllmKvReadinessFence;
+use crate::runtime::memory::{
     MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryDomain, MemoryLease, MemoryOwner,
     MemoryPlan,
 };

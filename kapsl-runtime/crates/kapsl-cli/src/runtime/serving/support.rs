@@ -1,3 +1,5 @@
+//! Runtime command clients and shared serving-boundary helpers.
+
 use super::*;
 use crate::features::http_client::format_remote_http_error;
 
