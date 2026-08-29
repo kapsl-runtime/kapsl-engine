@@ -411,6 +411,7 @@ struct ManagedVllmEnvironment {
     cuda_available: bool,
     planner_schema_version: u64,
     exact_cache_memory_flag: bool,
+    no_async_scheduling_flag: bool,
 }
 
 fn discover_certified_vllm_python() -> Result<PathBuf, String> {
@@ -553,6 +554,10 @@ exact_cache_memory_flag = any(
     "--kv-cache-memory-bytes" in action.option_strings
     for action in parser._actions
 )
+no_async_scheduling_flag = any(
+    "--no-async-scheduling" in action.option_strings
+    for action in parser._actions
+)
 planner_schema = planner_json_schema()
 print(json.dumps({
     "python": platform.python_version(),
@@ -571,6 +576,7 @@ print(json.dumps({
     "planner_schema_version": PLANNER_SCHEMA_VERSION,
     "planner_schema_const": planner_schema["properties"]["schema_version"]["const"],
     "exact_cache_memory_flag": exact_cache_memory_flag,
+    "no_async_scheduling_flag": no_async_scheduling_flag,
 }, sort_keys=True))
 "#;
     let output = Command::new(python)
@@ -624,6 +630,7 @@ print(json.dumps({
         cuda_available: true,
         planner_schema_version: 1,
         exact_cache_memory_flag: true,
+        no_async_scheduling_flag: true,
     };
     if actual != expected {
         return Err(format!(
@@ -2952,6 +2959,12 @@ impl ManagedVllmProcess {
                 }
                 command.args(["--kv-cache-memory-bytes", &bytes.to_string()]);
             }
+        }
+        if self.spec.settings.live_resize.is_some() {
+            // Pinned vLLM enables overlapping async batches by default. Safe
+            // tail unmapping is certified only after the sole in-flight model
+            // batch has settled on every worker.
+            command.arg("--no-async-scheduling");
         }
         if self.spec.tensor_parallel_size > 1 {
             command.args([
@@ -5946,6 +5959,37 @@ serving:
         assert!(arguments
             .iter()
             .any(|argument| argument == "--enable-prefix-caching"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "--no-async-scheduling"));
+    }
+
+    #[test]
+    fn elastic_process_disables_overlapping_vllm_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("model");
+        std::fs::create_dir(&model_root).unwrap();
+        let mut process = test_managed_process();
+        let process = Arc::get_mut(&mut process).expect("test owns the process");
+        process.spec.model_root = model_root;
+        process.spec.log_path = directory.path().join("vllm.log");
+        process.spec.settings.live_resize = Some(ManagedVllmLiveResizeSettings {
+            maximum_concurrency: 8,
+            grow_utilization_percent: 80,
+            shrink_utilization_percent: 25,
+            shrink_idle: Duration::from_secs(60),
+        });
+        process.install_exact_launch("{\"exact\":true}".to_string(), 316_416, 309);
+
+        let command = process.build_command().unwrap();
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments
+            .iter()
+            .any(|argument| argument == "--no-async-scheduling"));
     }
 
     #[cfg(all(unix, feature = "gpu-device-pool"))]
