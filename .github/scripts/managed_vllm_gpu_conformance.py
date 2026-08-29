@@ -906,6 +906,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "managed-vLLM device identities changed during live growth: "
                     f"{snapshot.row_keys} != {growth_baseline.row_keys}"
                 )
+            if snapshot.restart_generation != growth_baseline.restart_generation:
+                raise ConformanceError(
+                    "managed-vLLM restarted during live growth instead of "
+                    "completing the in-place resize"
+                )
             if all(
                 current > previous
                 for current, previous in zip(
@@ -939,6 +944,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 raise ConformanceError(
                     "managed-vLLM device identities changed during live shrink: "
                     f"{snapshot.row_keys} != {initial.row_keys}"
+                )
+            if snapshot.restart_generation != growth_baseline.restart_generation:
+                raise ConformanceError(
+                    "managed-vLLM restarted during live shrink instead of "
+                    "completing the in-place resize"
                 )
             return snapshot if snapshot.allocated_blocks == minimum_blocks else None
 

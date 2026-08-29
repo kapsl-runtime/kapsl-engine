@@ -1068,5 +1068,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vllm-shared-pool-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
+            !${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/**/*.safetensors
+            !${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/**/*.gguf
+            !${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.aimod
           if-no-files-found: error
