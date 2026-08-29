@@ -2,7 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::serving_backend::BackendPlanCommandArgs;
+use crate::backend::BackendPlanCommandArgs;
 
 mod commands;
 mod help;

@@ -1,4 +1,4 @@
-use crate::serving_backend::ServingBackendPolicy;
+use crate::backend::ServingBackendPolicy;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]

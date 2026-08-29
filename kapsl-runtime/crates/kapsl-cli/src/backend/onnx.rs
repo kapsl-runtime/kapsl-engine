@@ -4,7 +4,7 @@
 //! the selected provider family, then this module opens its ORT sidecars by
 //! pack-local absolute path. It deliberately never mutates `LD_LIBRARY_PATH`.
 
-use crate::backend_manager::{
+use crate::backend::{
     BackendAccelerator, BackendManager, BackendPackManifest, BackendTarget, OnnxBackendPackProfile,
     ONNX_CPU_PACK_PROFILE, ONNX_CUDA12_PACK_PROFILE, ONNX_TENSORRT10_PACK_PROFILE,
 };
@@ -54,7 +54,7 @@ pub(crate) fn configure_onnx_backend_packs(offline: bool) -> Result<(), String> 
     if !lazy_onnx_packs_enabled() {
         return Ok(());
     }
-    let cache_root = crate::backend_manager::backend_cache_root()
+    let cache_root = crate::backend::backend_cache_root()
         .ok_or_else(|| "resolve the Kapsl backend cache directory".to_string())?;
     let cache_root = if cache_root.is_absolute() {
         cache_root
@@ -64,7 +64,7 @@ pub(crate) fn configure_onnx_backend_packs(offline: bool) -> Result<(), String> 
             .join(cache_root)
     };
     let onnx_root = cache_root
-        .join(crate::backend_manager::runtime_release_version())
+        .join(crate::backend::runtime_release_version())
         .join("onnx");
     // Register all stable profile roots before model loading can become
     // parallel. The directories may not exist yet; the signed manager creates
@@ -211,7 +211,7 @@ pub(crate) fn lazy_onnx_packs_enabled() -> bool {
     }
     env_switch(
         LAZY_ONNX_PACKS_ENV,
-        onnx_lazy_packs_supported_for_platform(&crate::backend_manager::current_platform()),
+        onnx_lazy_packs_supported_for_platform(&crate::backend::current_platform()),
     )
 }
 
@@ -408,13 +408,13 @@ fn activate_onnx_pack(pack: &BackendPackManifest, root: &Path) -> Result<(), Str
 fn validate_ort_provider_available(pack: &BackendPackManifest) -> Result<(), String> {
     use ort::execution_providers::ExecutionProvider as _;
     let available = match pack.profile.as_str() {
-        crate::backend_manager::ONNX_CPU_PACK_PROFILE => true,
-        crate::backend_manager::ONNX_CUDA12_PACK_PROFILE => {
+        crate::backend::ONNX_CPU_PACK_PROFILE => true,
+        crate::backend::ONNX_CUDA12_PACK_PROFILE => {
             ort::execution_providers::CUDAExecutionProvider::default()
                 .is_available()
                 .unwrap_or(false)
         }
-        crate::backend_manager::ONNX_TENSORRT10_PACK_PROFILE => {
+        crate::backend::ONNX_TENSORRT10_PACK_PROFILE => {
             ort::execution_providers::CUDAExecutionProvider::default()
                 .is_available()
                 .unwrap_or(false)
@@ -449,14 +449,14 @@ fn validate_pack_entrypoint(
     let descriptor = unsafe { descriptor.as_ref() }
         .ok_or_else(|| "ONNX pack entrypoint returned a null descriptor".to_string())?;
     let expected_profile = match pack.profile.as_str() {
-        crate::backend_manager::ONNX_CPU_PACK_PROFILE => 1,
-        crate::backend_manager::ONNX_CUDA12_PACK_PROFILE => 2,
-        crate::backend_manager::ONNX_TENSORRT10_PACK_PROFILE => 3,
+        crate::backend::ONNX_CPU_PACK_PROFILE => 1,
+        crate::backend::ONNX_CUDA12_PACK_PROFILE => 2,
+        crate::backend::ONNX_TENSORRT10_PACK_PROFILE => 3,
         other => return Err(format!("unknown ONNX pack profile `{other}`")),
     };
     if descriptor.magic != ONNX_PACK_ENTRYPOINT_MAGIC
         || descriptor.struct_size < std::mem::size_of::<OnnxPackEntrypointV1>() as u32
-        || descriptor.runtime_abi != crate::backend_manager::BACKEND_RUNTIME_ABI
+        || descriptor.runtime_abi != crate::backend::BACKEND_RUNTIME_ABI
         || descriptor.profile != expected_profile
     {
         return Err(format!(
@@ -465,7 +465,7 @@ fn validate_pack_entrypoint(
             descriptor.struct_size,
             descriptor.runtime_abi,
             descriptor.profile,
-            crate::backend_manager::BACKEND_RUNTIME_ABI,
+            crate::backend::BACKEND_RUNTIME_ABI,
             expected_profile
         ));
     }
@@ -667,16 +667,16 @@ mod tests {
         let pack = BackendPackManifest {
             schema_version: 1,
             backend: "onnx".to_string(),
-            profile: crate::backend_manager::ONNX_CUDA12_PACK_PROFILE.to_string(),
+            profile: crate::backend::ONNX_CUDA12_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: 1,
             compatible_kapsl: "=0.2.3".to_string(),
-            platform: crate::backend_manager::current_platform(),
+            platform: crate::backend::current_platform(),
             architecture: std::env::consts::ARCH.to_string(),
             accelerator_profile: "cuda".to_string(),
             minimum_cuda: None,
             minimum_driver: None,
-            execution_mode: crate::backend_manager::BackendExecutionMode::Native,
+            execution_mode: crate::backend::BackendExecutionMode::Native,
             kv_mode: None,
             entrypoint: "libkapsl_backend_onnx.so".to_string(),
             artifact: "https://downloads.kapsl.net/fixture.tar.gz".to_string(),
@@ -684,8 +684,8 @@ mod tests {
             installed_bytes: 1,
             sha256: "0".repeat(64),
             signature: "fixture".to_string(),
-            memory: crate::backend_manager::BackendMemoryManifest::default(),
-            installer: crate::backend_manager::BackendInstaller::Extract,
+            memory: crate::backend::BackendMemoryManifest::default(),
+            installer: crate::backend::BackendInstaller::Extract,
             files: std::collections::BTreeMap::new(),
             licenses: Vec::new(),
             priority: 0,

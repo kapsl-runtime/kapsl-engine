@@ -5,21 +5,19 @@
 //! `BackendManager`; there is no weaker import-only verification path.
 
 use crate::app::BundleCommandArgs;
-use crate::backend_manager::{
+use crate::backend::{
     backend_cache_root, current_platform, runtime_release_version, safe_extract_tar_gz,
     sha256_file, BackendAccelerator, BackendIndex, BackendManager, BackendPackManifest,
     BackendTarget, LlamaCppBackendPackProfile, OnnxBackendPackProfile, MANAGED_VLLM_PACK_PROFILE,
 };
-use crate::llama_cpp_backend_pack::{
-    llama_cpp_lazy_packs_supported_for_platform, llama_cpp_pack_profile_for_target,
-};
-use crate::onnx_backend_pack::{
-    onnx_lazy_packs_supported_for_platform, onnx_pack_profile_for_target,
-};
-use crate::serving_backend::{
+use crate::backend::{
     inspect_serving_manifest, resolve_serving_backend, validate_model_contract,
     validate_serving_backend_declaration, ResolvedServingBackend,
 };
+use crate::backend::{
+    llama_cpp_lazy_packs_supported_for_platform, llama_cpp_pack_profile_for_target,
+};
+use crate::backend::{onnx_lazy_packs_supported_for_platform, onnx_pack_profile_for_target};
 use crate::DynError;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
@@ -603,10 +601,8 @@ fn target_for_backend_identity(
 ) -> BackendTarget {
     if backend == "llama-cpp" {
         let profile = match profile {
-            crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE => {
-                Some(LlamaCppBackendPackProfile::Cpu)
-            }
-            crate::backend_manager::LLAMA_CPP_CUDA12_PACK_PROFILE => {
+            crate::backend::LLAMA_CPP_CPU_PACK_PROFILE => Some(LlamaCppBackendPackProfile::Cpu),
+            crate::backend::LLAMA_CPP_CUDA12_PACK_PROFILE => {
                 Some(LlamaCppBackendPackProfile::Cuda12)
             }
             _ => None,
@@ -619,11 +615,9 @@ fn target_for_backend_identity(
         return target.clone();
     }
     let profile = match profile {
-        crate::backend_manager::ONNX_CPU_PACK_PROFILE => Some(OnnxBackendPackProfile::Cpu),
-        crate::backend_manager::ONNX_CUDA12_PACK_PROFILE => Some(OnnxBackendPackProfile::Cuda12),
-        crate::backend_manager::ONNX_TENSORRT10_PACK_PROFILE => {
-            Some(OnnxBackendPackProfile::TensorRt10)
-        }
+        crate::backend::ONNX_CPU_PACK_PROFILE => Some(OnnxBackendPackProfile::Cpu),
+        crate::backend::ONNX_CUDA12_PACK_PROFILE => Some(OnnxBackendPackProfile::Cuda12),
+        crate::backend::ONNX_TENSORRT10_PACK_PROFILE => Some(OnnxBackendPackProfile::TensorRt10),
         _ => None,
     };
     profile
@@ -1078,12 +1072,12 @@ fn bundle_process_path_lock(path: &Path) -> Arc<Mutex<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend_manager::{
+    use crate::backend::ServingBackendPolicy;
+    use crate::backend::{
         BackendExecutionMode, BackendInstaller, BackendMemoryManifest,
         BACKEND_INDEX_SCHEMA_VERSION, BACKEND_PACK_SCHEMA_VERSION, BACKEND_RUNTIME_ABI,
     };
     use crate::features::packaging::{create_kapsl_package, PackageKapslRequest};
-    use crate::serving_backend::ServingBackendPolicy;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
@@ -1167,7 +1161,7 @@ mod tests {
         let payload = serde_json::json!({
             "schema_version": BACKEND_PACK_SCHEMA_VERSION,
             "backend": "onnx",
-            "profile": crate::backend_manager::ONNX_CPU_PACK_PROFILE,
+            "profile": crate::backend::ONNX_CPU_PACK_PROFILE,
             "pack_version": "test",
             "runtime_abi": BACKEND_RUNTIME_ABI,
             "platform": "linux-x86_64",
@@ -1194,7 +1188,7 @@ mod tests {
         let onnx_pack = BackendPackManifest {
             schema_version: BACKEND_PACK_SCHEMA_VERSION,
             backend: "onnx".to_string(),
-            profile: crate::backend_manager::ONNX_CPU_PACK_PROFILE.to_string(),
+            profile: crate::backend::ONNX_CPU_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: BACKEND_RUNTIME_ABI,
             compatible_kapsl: format!("={}", runtime_release_version()),
@@ -1229,7 +1223,7 @@ mod tests {
         let payload = serde_json::json!({
             "schema_version": BACKEND_PACK_SCHEMA_VERSION,
             "backend": "llama-cpp",
-            "profile": crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE,
+            "profile": crate::backend::LLAMA_CPP_CPU_PACK_PROFILE,
             "pack_version": "test",
             "runtime_abi": BACKEND_RUNTIME_ABI,
             "platform": "linux-x86_64",
@@ -1257,7 +1251,7 @@ mod tests {
         let llama_pack = BackendPackManifest {
             schema_version: BACKEND_PACK_SCHEMA_VERSION,
             backend: "llama-cpp".to_string(),
-            profile: crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE.to_string(),
+            profile: crate::backend::LLAMA_CPP_CPU_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: BACKEND_RUNTIME_ABI,
             compatible_kapsl: format!("={}", runtime_release_version()),
@@ -1381,7 +1375,7 @@ mod tests {
         let cpu = target_for_backend_identity(
             &base,
             "llama-cpp",
-            crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE,
+            crate::backend::LLAMA_CPP_CPU_PACK_PROFILE,
         );
         assert_eq!(cpu.accelerator, BackendAccelerator::Cpu);
         assert_eq!(cpu.cuda_version, None);
@@ -1390,7 +1384,7 @@ mod tests {
         let cuda = target_for_backend_identity(
             &base,
             "llama-cpp",
-            crate::backend_manager::LLAMA_CPP_CUDA12_PACK_PROFILE,
+            crate::backend::LLAMA_CPP_CUDA12_PACK_PROFILE,
         );
         assert_eq!(cuda.accelerator, BackendAccelerator::Cuda);
         assert_eq!(cuda.cuda_version.as_deref(), Some("12.6"));
@@ -1457,7 +1451,7 @@ mod tests {
         assert_eq!(manifest.backends[0].backend, "onnx");
         assert_eq!(
             manifest.backends[0].profile,
-            crate::backend_manager::ONNX_CPU_PACK_PROFILE
+            crate::backend::ONNX_CPU_PACK_PROFILE
         );
     }
 
@@ -1484,7 +1478,7 @@ mod tests {
         assert_eq!(manifest.backends[0].backend, "llama-cpp");
         assert_eq!(
             manifest.backends[0].profile,
-            crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE
+            crate::backend::LLAMA_CPP_CPU_PACK_PROFILE
         );
     }
 
@@ -1519,7 +1513,7 @@ mod tests {
         assert_eq!(installed[0].backend, "llama-cpp");
         assert_eq!(
             installed[0].profile,
-            crate::backend_manager::LLAMA_CPP_CPU_PACK_PROFILE
+            crate::backend::LLAMA_CPP_CPU_PACK_PROFILE
         );
         assert!(installed[0].valid);
     }
