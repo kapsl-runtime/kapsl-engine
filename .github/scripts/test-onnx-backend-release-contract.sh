@@ -10,8 +10,8 @@ require_literal() {
   fi
 }
 
-manager="kapsl-runtime/crates/kapsl-cli/src/backend_manager.rs"
-activator="kapsl-runtime/crates/kapsl-cli/src/onnx_backend_pack.rs"
+manager="kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
+activator="kapsl-runtime/crates/kapsl-cli/src/backend/onnx.rs"
 packager=".github/scripts/package-linux-onnx-backend-packs.sh"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 
