@@ -33,6 +33,7 @@ pub(crate) const MANAGED_VLLM_CUDA_RUNTIME_VERSION: &str = "13.0";
 const MANAGED_VLLM_PYTHON_ENV: &str = "KAPSL_VLLM_PYTHON";
 const MANAGED_VLLM_BUNDLE_ENV: &str = "KAPSL_VLLM_BUNDLE";
 const MANAGED_VLLM_MEMORY_MODE_ENV: &str = "KAPSL_VLLM_MEMORY_MODE";
+const MANAGED_VLLM_VMM_CONFORMANCE_ENV: &str = "KAPSL_VLLM_VMM_CONFORMANCE";
 const MANAGED_VLLM_CHAT_MARKER: &str = "__kapsl_managed_vllm_chat_v1";
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -3118,6 +3119,11 @@ impl ManagedVllmProcess {
             deployment.lease_ttl_ms,
             Some(&grant.proof),
             template.live_resize,
+            template.live_resize
+                && matches!(
+                    std::env::var(MANAGED_VLLM_VMM_CONFORMANCE_ENV),
+                    Ok(value) if value == "1"
+                ),
         ) {
             Ok(config) => config,
             Err(error) => {
@@ -4170,6 +4176,7 @@ impl ManagedVllmEngine {
                         deployment.lease_ttl_ms,
                         None,
                         false,
+                        false,
                     )?,
                     memory_argument: ManagedVllmMemoryArgument::LegacyFraction(
                         *gpu_memory_utilization,
@@ -4819,7 +4826,11 @@ fn build_kv_transfer_config(
     lease_ttl_ms: u64,
     provisioning_grant: Option<&kapsl_kv_abi::KvProvisioningGrant>,
     live_resize: bool,
+    vmm_conformance: bool,
 ) -> Result<String, String> {
+    if vmm_conformance && !live_resize {
+        return Err("managed vLLM VMM conformance requires live resize".to_string());
+    }
     let memory_domains = device_ids
         .iter()
         .map(|device_id| serde_json::json!({"kind": "cuda", "device_id": device_id}))
@@ -4838,6 +4849,7 @@ fn build_kv_transfer_config(
         "kapsl_rank_device_map": rank_device_map,
         "kapsl_lease_ttl_ms": lease_ttl_ms,
         "kapsl_live_resize": live_resize,
+        "kapsl_vmm_conformance": vmm_conformance,
     });
     if let Some(grant) = provisioning_grant {
         extra["kapsl_provisioning_grant"] = serde_json::to_value(grant)
@@ -5896,6 +5908,7 @@ serving:
             30_000,
             None,
             false,
+            false,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -5905,6 +5918,18 @@ serving:
         assert_eq!(extra["kapsl_rank_device_map"]["0"], 0);
         assert_eq!(extra["kapsl_rank_device_map"]["1"], 2);
         assert_eq!(extra["kapsl_kv_mode"], "shared_pool");
+        assert_eq!(extra["kapsl_vmm_conformance"], false);
+        assert!(build_kv_transfer_config(
+            "unix:///tmp/kapsl.sock",
+            "worker",
+            "sha256:model",
+            &[0],
+            30_000,
+            None,
+            false,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
@@ -5923,6 +5948,7 @@ serving:
             30_000,
             Some(&proof),
             false,
+            false,
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
@@ -5940,11 +5966,16 @@ serving:
             30_000,
             None,
             true,
+            true,
         )
         .unwrap();
         let live_value: serde_json::Value = serde_json::from_str(&live_encoded).unwrap();
         assert_eq!(
             live_value["kv_connector_extra_config"]["kapsl_live_resize"],
+            true
+        );
+        assert_eq!(
+            live_value["kv_connector_extra_config"]["kapsl_vmm_conformance"],
             true
         );
     }
