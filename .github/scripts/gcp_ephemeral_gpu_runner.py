@@ -527,6 +527,15 @@ metadata() {{
 }}
 
 export DEBIAN_FRONTEND=noninteractive
+systemctl mask --now \
+  apt-daily.timer \
+  apt-daily-upgrade.timer \
+  apt-daily.service \
+  apt-daily-upgrade.service
+for unit in apt-daily.timer apt-daily-upgrade.timer \
+    apt-daily.service apt-daily-upgrade.service; do
+  test "$(systemctl is-enabled "$unit")" = masked
+done
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl git gnupg jq
@@ -594,6 +603,12 @@ runuser -u github-runner -- ./run.sh --jitconfig "$jit_config"
 runner_status=$?
 set -e
 unset jit_config
+runner_result=$(grep -hE 'Job .* completed with result: ' \
+  /opt/actions-runner/_diag/Runner_*.log 2>/dev/null | tail -n 1 || true)
+if (( runner_status == 0 )) && [[ "$runner_result" != *'result: Succeeded'* ]]; then
+  echo "JIT runner did not report a successful job result: $runner_result" >&2
+  runner_status=1
+fi
 exit "$runner_status"
 """
 
