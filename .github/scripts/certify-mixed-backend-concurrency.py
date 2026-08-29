@@ -199,12 +199,24 @@ def validate_mixed_memory(
     quarantine = _integral_by_device(
         metrics, "kapsl_managed_vllm_kv_quarantine_bytes", vllm_labels
     )
-    owner = f"gguf_kv:{llama_model_id}"
+    # Runtime pool metrics retain the allocation class in the owner label.
+    # Admission is established with the model-load representative while the
+    # persistent shared KV allocation is charged to the same workload under
+    # its exact class. Bind both samples to the selected primary replica so an
+    # unrelated GGUF model cannot satisfy this gate.
+    workload = f"gguf:{llama_model_id}:0"
+    admission_owner = f"{workload}:persistent-weights"
+    kv_owner = f"{workload}:kv-cache"
     llama_admitted = _integral_by_device(
-        metrics, "kapsl_gpu_device_pool_owner_admitted", {"owner": owner}
+        metrics,
+        "kapsl_gpu_device_pool_owner_admitted",
+        {"owner": admission_owner},
+    )
+    llama_kv_admitted = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_owner_admitted", {"owner": kv_owner}
     )
     llama_usage = _integral_by_device(
-        metrics, "kapsl_gpu_device_pool_owner_usage_bytes", {"owner": owner}
+        metrics, "kapsl_gpu_device_pool_owner_usage_bytes", {"owner": kv_owner}
     )
     authority_available = _integral_by_device(
         metrics, "kapsl_device_memory_available_bytes"
@@ -230,11 +242,18 @@ def validate_mixed_memory(
         raise ValueError(f"managed-vLLM backing is not active: {backing}")
     if any(quarantine.values()):
         raise ValueError(f"managed-vLLM has quarantined memory: {quarantine}")
-    if set(llama_admitted) != set(llama_usage) or any(
-        value != 1 for value in llama_admitted.values()
-    ) or any(value <= 0 for value in llama_usage.values()):
+    if (
+        set(llama_admitted) != set(llama_usage)
+        or set(llama_kv_admitted) != set(llama_usage)
+        or any(value != 1 for value in llama_admitted.values())
+        or any(value != 1 for value in llama_kv_admitted.values())
+        or any(value <= 0 for value in llama_usage.values())
+    ):
         raise ValueError(
-            f"llama.cpp shared-pool owner is not active: admitted={llama_admitted} usage={llama_usage}"
+            "llama.cpp shared-pool workload is not active: "
+            f"admission_owner={admission_owner} admitted={llama_admitted} "
+            f"kv_owner={kv_owner} kv_admitted={llama_kv_admitted} "
+            f"usage={llama_usage}"
         )
     missing_authority = set(backing) - set(authority_available)
     if missing_authority or any(
@@ -245,6 +264,11 @@ def validate_mixed_memory(
             f"{authority_available}"
         )
     owner_devices = set(llama_usage)
+    if not owner_devices.issubset(backing):
+        raise ValueError(
+            "llama.cpp and managed vLLM are not active on the same devices: "
+            f"llama={sorted(owner_devices)} vllm={sorted(backing)}"
+        )
     pool_maps = (
         pool_allocated,
         pool_free,
@@ -269,7 +293,8 @@ def validate_mixed_memory(
     return {
         "vllm_backing_bytes": backing,
         "vllm_quarantine_bytes": quarantine,
-        "llama_owner": owner,
+        "llama_admission_owner": admission_owner,
+        "llama_kv_owner": kv_owner,
         "llama_owner_usage_bytes": llama_usage,
         "authority_available_bytes": authority_available,
         "general_pool_allocated_bytes": pool_allocated,
