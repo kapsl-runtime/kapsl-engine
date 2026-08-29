@@ -44,6 +44,29 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
         self.assertEqual(parsed["metric_name"][0].labels, {"mode": "wire", "device": "0"})
         self.assertEqual(parsed["metric_name"][0].value, 12)
 
+    def test_vllm_prefix_cache_counters_use_prometheus_counter_names(self):
+        exposition = "\n".join(
+            [
+                '# TYPE vllm:prefix_cache_queries_total counter',
+                'vllm:prefix_cache_queries_total{model_name="model",engine="0"} 48.0',
+                '# TYPE vllm:prefix_cache_hits_total counter',
+                'vllm:prefix_cache_hits_total{model_name="model",engine="0"} 32.0',
+            ]
+        )
+        with mock.patch.object(probe, "_get_text", return_value=exposition):
+            self.assertEqual(
+                probe._vllm_counter(
+                    "http://127.0.0.1:8000", probe.VLLM_PREFIX_CACHE_QUERY_METRIC
+                ),
+                48,
+            )
+            self.assertEqual(
+                probe._vllm_counter(
+                    "http://127.0.0.1:8000", probe.VLLM_PREFIX_CACHE_HIT_METRIC
+                ),
+                32,
+            )
+
     def test_exact_initial_and_resized_accounting_are_distinct(self):
         snapshot = self.snapshot()
         self.assertEqual(

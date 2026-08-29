@@ -39,6 +39,8 @@ MEMORY_METRICS = {
 GENERATION_METRIC = "kapsl_managed_vllm_restart_generation"
 CANCELLATION_METRIC = "kapsl_managed_vllm_bridge_cancellations_total"
 WIRE_REQUEST_METRIC = "kapsl_managed_vllm_bridge_requests_total"
+VLLM_PREFIX_CACHE_QUERY_METRIC = "vllm:prefix_cache_queries_total"
+VLLM_PREFIX_CACHE_HIT_METRIC = "vllm:prefix_cache_hits_total"
 _LABEL_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)="((?:\\.|[^"\\])*)"')
 _VMM_EVIDENCE_RE = re.compile(
     r"KAPSL_VMM_CONFORMANCE stable_address=(0x[0-9a-f]+) "
@@ -379,8 +381,11 @@ def _require_prefix_cache_hit(
     completion_url: str, model: str, runtime_log: Path, log_root: Path
 ) -> dict[str, Any]:
     endpoint = _managed_vllm_endpoint(runtime_log, log_root)
-    query_metric = "vllm:prefix_cache_queries"
-    hit_metric = "vllm:prefix_cache_hits"
+    # vLLM constructs these as prometheus_client Counter instances. The
+    # constructor names omit the suffix, but Prometheus exposition follows the
+    # Counter contract and publishes the samples with ``_total``.
+    query_metric = VLLM_PREFIX_CACHE_QUERY_METRIC
+    hit_metric = VLLM_PREFIX_CACHE_HIT_METRIC
     queries_before = _vllm_counter(endpoint, query_metric)
     prompt = (
         "Preserve this deterministic validation prefix and reply with OK: "
