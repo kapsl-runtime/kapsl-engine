@@ -43,6 +43,7 @@ The runtime binary depends on those crates through normal Cargo dependencies.
 - `kapsl-runtime/ui/`: embedded web dashboard assets
 - `kapsl-runtime/docs/`: runtime-specific user and API docs
 - `kapsl-runtime/patches/`: active third-party crate patches used only by this workspace
+- `installers/`: source scripts published at the stable and beta installer URLs
 - `docker/`: Dockerfiles for CPU and CUDA images
 - `docs/`: runtime-specific documentation
 
@@ -59,7 +60,8 @@ RAG primitives, and Python packaging belong in `kapsl-sdk`.
 
 ## Requirements
 
-- Rust `1.92.0`
+- Rust `1.98.0` (pinned by `rust-toolchain.toml`); the runtime workspace MSRV
+  remains Rust `1.92.0`
 - platform build tools for your target OS
 - optional accelerator toolchains depending on which runtime backends you enable
 

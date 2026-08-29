@@ -3,6 +3,9 @@
 set -eu
 
 version="9.9.9"
+script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
+repository_root="$(CDPATH= cd "${script_dir}/../.." && pwd)"
+installer_dir="${repository_root}/installers"
 test_root="$(mktemp -d)"
 release_dir="${test_root}/release"
 asset_dir="${release_dir}/runtime/v${version}"
@@ -115,8 +118,8 @@ echo "single-exe"
 EOF
 
 # install-cuda.sh fetches the general installer from the same origin.
-cp install.sh "${release_dir}/install.sh"
-cp install.sh "${release_dir}/install-beta-base.sh"
+cp "${installer_dir}/install.sh" "${release_dir}/install.sh"
+cp "${installer_dir}/install.sh" "${release_dir}/install-beta-base.sh"
 cp "${asset_dir}/${portable_asset}" "${beta_asset_dir}/${portable_asset}"
 cp "${asset_dir}/${cuda_asset}" "${beta_asset_dir}/${cuda_asset}"
 cp "${asset_dir}/kapsl-backend-vllm-${version}-linux-x86_64.tar.gz" "${beta_asset_dir}/"
@@ -159,7 +162,7 @@ run_install() {
     fi
 
     set +e
-    PATH="${fake_bin}:${PATH}" sh install.sh "$@" >"${log_file}" 2>&1
+    PATH="${fake_bin}:${PATH}" sh "${installer_dir}/install.sh" "$@" >"${log_file}" 2>&1
     install_status=$?
     set -e
 }
@@ -245,7 +248,7 @@ expect_log "installed on first eligible run"
 reject_log "legacy split"
 
 echo "case: direct CUDA wrapper selects the same merged bundle"
-run_cuda_wrapper "cuda-wrapper" install-cuda.sh
+run_cuda_wrapper "cuda-wrapper" "${installer_dir}/install-cuda.sh"
 expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
@@ -255,7 +258,7 @@ if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
 fi
 
 echo "case: beta CUDA wrapper selects the merged beta bundle"
-run_cuda_wrapper "beta-cuda-wrapper" install-beta-cuda.sh
+run_cuda_wrapper "beta-cuda-wrapper" "${installer_dir}/install-beta-cuda.sh"
 expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"
@@ -265,7 +268,7 @@ if [ -e "${install_dir}/backends/vllm/bin/python" ]; then
 fi
 
 echo "case: generic beta wrapper selects portable runtime without an NVIDIA driver"
-run_cuda_wrapper "beta-wrapper-cpu" install-beta.sh
+run_cuda_wrapper "beta-wrapper-cpu" "${installer_dir}/install-beta.sh"
 expect_status 0
 expect_binary "portable"
 
@@ -278,7 +281,7 @@ esac
 exit 0
 EOF
 chmod +x "${fake_bin}/nvidia-smi"
-run_cuda_wrapper "beta-wrapper-cuda" install-beta.sh
+run_cuda_wrapper "beta-wrapper-cuda" "${installer_dir}/install-beta.sh"
 expect_status 0
 expect_binary "cuda12"
 expect_file "kapsl-provider-cuda12.json"

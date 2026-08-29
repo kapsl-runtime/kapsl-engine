@@ -98,7 +98,8 @@ graph TB
 
 ### Required
 
-- **Rust**: 1.92.0
+- **Rust**: 1.98.0 is the pinned development and release toolchain; Rust 1.92.0
+  is the workspace MSRV
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh

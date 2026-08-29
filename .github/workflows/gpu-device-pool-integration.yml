@@ -37,9 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+      - uses: ./.github/actions/setup-rust
 
       - uses: Swatinem/rust-cache@v2
 

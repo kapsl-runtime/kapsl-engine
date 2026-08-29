@@ -23,15 +23,12 @@ jobs:
 
       - name: Set up Rust
         if: runner.os != 'Windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Rust (Windows)
         if: runner.os == 'Windows'
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
 
       - name: Enable long paths on Windows
@@ -74,6 +71,24 @@ jobs:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
 
+  msrv:
+    name: Cargo check (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up workspace MSRV
+        uses: ./.github/actions/setup-rust
+        with:
+          msrv: true
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: Check runtime workspace on its minimum Rust version
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --locked
 
   test:
     name: Cargo test (${{ matrix.os }})
@@ -87,15 +102,12 @@ jobs:
 
       - name: Set up Rust
         if: runner.os != 'Windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Rust (Windows)
         if: runner.os == 'Windows'
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
 
       - name: Enable long paths on Windows

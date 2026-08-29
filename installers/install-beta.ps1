@@ -1,4 +1,4 @@
-# Latest Kapsl beta Windows installer.
+# Published latest Kapsl beta Windows installer.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 

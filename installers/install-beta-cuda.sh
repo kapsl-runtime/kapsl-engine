@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# One-command Linux x86_64 CUDA installer for the beta channel.
+# Published one-command Linux x86_64 CUDA installer for the beta channel.
 set -e
 
 base_url="${KAPSL_BASE_URL:-https://downloads.kapsl.net}"

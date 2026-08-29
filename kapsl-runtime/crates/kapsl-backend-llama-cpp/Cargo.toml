@@ -2,6 +2,7 @@
 name = "kapsl-backend-llama-cpp"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 build = "build.rs"
 license = "Apache-2.0"
 description = "Native llama.cpp backend pack for Kapsl"

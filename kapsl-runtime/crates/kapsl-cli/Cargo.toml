@@ -2,6 +2,7 @@
 name = "kapsl"
 version = "0.2.3"
 edition = "2021"
+rust-version.workspace = true
 
 [features]
 # Release profiles. Portable installers use `default`; the Linux CUDA bundle

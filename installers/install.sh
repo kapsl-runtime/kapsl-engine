@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Kapsl CLI installer
+# Published Kapsl CLI installer
 # Usage: curl -fsSL https://downloads.kapsl.net/install.sh | sh
 # CUDA: curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
 set -e
