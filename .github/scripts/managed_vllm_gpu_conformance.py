@@ -44,6 +44,10 @@ _VMM_EVIDENCE_RE = re.compile(
     r"KAPSL_VMM_CONFORMANCE stable_address=(0x[0-9a-f]+) "
     r"mapped_bytes=([0-9]+) virtual_bytes=([0-9]+) phase=(initial|grow|shrink)"
 )
+_ELASTIC_WARMUP_CAP_RE = re.compile(
+    r"capped vLLM startup warmup to ([0-9]+) mapped blocks out of "
+    r"([0-9]+) virtual blocks"
+)
 _MANAGED_VLLM_LOG_RE = re.compile(
     r"Managed vLLM process started:.*?\blog=([^\r\n]+)"
 )
@@ -776,6 +780,18 @@ def _validate_vmm_logs(
         raise ConformanceError(
             "not every CUDA VMM worker proved zero PyTorch KV allocation delta"
         )
+    warmup_caps = [
+        (int(mapped), int(virtual))
+        for mapped, virtual in _ELASTIC_WARMUP_CAP_RE.findall(text)
+    ]
+    if len(warmup_caps) < len(by_address):
+        raise ConformanceError(
+            "not every CUDA VMM worker proved bounded elastic startup warmup"
+        )
+    if any(mapped <= 1 or mapped >= virtual for mapped, virtual in warmup_caps):
+        raise ConformanceError(
+            f"invalid elastic startup warmup block evidence: {warmup_caps}"
+        )
     if "quarantined blocks" in text or "failed to release CUDA VMM" in text:
         raise ConformanceError("runtime log reports a CUDA VMM quarantine/release failure")
     return {
@@ -785,6 +801,7 @@ def _validate_vmm_logs(
         "phase_counts": phase_counts,
         "virtual_sizes": sorted(virtual_sizes),
         "allocator_delta_zero_count": allocator_evidence,
+        "startup_warmup_caps": warmup_caps,
     }
 
 

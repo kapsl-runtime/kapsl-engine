@@ -127,12 +127,14 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
                     [
                         "KAPSL_VMM_CONFORMANCE stable_address=0x1000 mapped_bytes=200 virtual_bytes=800 phase=initial zeroed=true",
                         "KAPSL_VMM_CONFORMANCE allocator_delta_bytes=0 virtual_bytes=800",
+                        "capped vLLM startup warmup to 2 mapped blocks out of 8 virtual blocks",
                         "KAPSL_VMM_CONFORMANCE stable_address=0x1000 mapped_bytes=600 virtual_bytes=800 phase=grow zeroed=true",
                         "KAPSL_VMM_CONFORMANCE stable_address=0x1000 mapped_bytes=200 virtual_bytes=800 phase=shrink",
                         # A new generation may have only initial evidence by the
                         # time the report is finalized.
                         "KAPSL_VMM_CONFORMANCE stable_address=0x2000 mapped_bytes=200 virtual_bytes=800 phase=initial zeroed=true",
                         "KAPSL_VMM_CONFORMANCE allocator_delta_bytes=0 virtual_bytes=800",
+                        "capped vLLM startup warmup to 2 mapped blocks out of 8 virtual blocks",
                     ]
                 ),
                 encoding="utf-8",
@@ -140,10 +142,22 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
             evidence = probe._validate_vmm_logs(runtime_log, root / "state")
             self.assertEqual(evidence["resize_stable_addresses"], ["0x1000"])
             self.assertEqual(evidence["child_logs"], [str(child_log.resolve())])
+            self.assertEqual(evidence["startup_warmup_caps"], [(2, 8), (2, 8)])
             with self.assertRaisesRegex(probe.ConformanceError, "churn"):
                 probe._validate_vmm_logs(
                     runtime_log, root / "state", minimum_resize_cycles=2
                 )
+
+            child_log.write_text(
+                "\n".join(
+                    line
+                    for line in child_log.read_text(encoding="utf-8").splitlines()
+                    if "startup warmup" not in line
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(probe.ConformanceError, "startup warmup"):
+                probe._validate_vmm_logs(runtime_log, root / "state")
 
     def test_runtime_cannot_redirect_log_evidence_outside_state_root(self):
         with tempfile.TemporaryDirectory() as directory:
