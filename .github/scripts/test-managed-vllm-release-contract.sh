@@ -89,8 +89,19 @@ for workflow in \
     require_literal "$workflow" '--extra-index-url "$PYTORCH_INDEX_URL"'
     require_literal "$workflow" 'engine/.cargo/config.toml'
     require_literal "$workflow" 'key: ${{ inputs.sdk_ref }}'
+    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.json'
+    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.log'
+    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt'
+    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256'
+    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/wheels/*.whl'
   fi
 done
+
+if grep -Fxq '            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}' \
+  .github/workflows/vllm-shared-pool-conformance.yml; then
+  echo "Managed-vLLM conformance must upload an evidence allowlist, not the artifact root." >&2
+  exit 1
+fi
 
 if grep -Fq -- '--index-url "$PYTORCH_INDEX_URL"' \
   .github/workflows/vllm-shared-pool-conformance.yml; then

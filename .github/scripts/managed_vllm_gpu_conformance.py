@@ -542,7 +542,15 @@ def _require_full_context_request(
             candidate,
             tokenize=True,
             add_generation_prompt=True,
+            return_dict=False,
         )
+        if not isinstance(token_ids, list) or not all(
+            isinstance(token_id, int) and not isinstance(token_id, bool)
+            for token_id in token_ids
+        ):
+            raise ConformanceError(
+                "the certified tokenizer did not return a flat token-ID sequence"
+            )
         count = len(token_ids)
         if count <= target_prompt:
             selected_messages = candidate

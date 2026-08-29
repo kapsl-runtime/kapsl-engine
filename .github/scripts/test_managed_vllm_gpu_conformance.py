@@ -254,8 +254,16 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
         self.assertEqual((candidate, start, boundary), ("cD", 2, 3))
 
     def test_full_context_request_accounts_exact_prompt_and_generation_tokens(self):
+        template_calls = []
+
         class FakeTokenizer:
-            def apply_chat_template(self, messages, **_kwargs):
+            def apply_chat_template(self, messages, **kwargs):
+                template_calls.append(kwargs)
+                if kwargs.get("return_dict") is not False:
+                    return {
+                        "input_ids": [1, 2, 3],
+                        "attention_mask": [1, 1, 1],
+                    }
                 repetitions = messages[0]["content"].count("capacity ")
                 return list(range(10 + repetitions))
 
@@ -285,6 +293,8 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
         self.assertEqual(evidence["prompt_tokens"], 96)
         self.assertEqual(evidence["completion_tokens"], 32)
         self.assertEqual(evidence["total_tokens"], 128)
+        self.assertTrue(template_calls)
+        self.assertTrue(all(call["return_dict"] is False for call in template_calls))
 
 
 if __name__ == "__main__":

@@ -1069,8 +1069,9 @@ jobs:
         with:
           name: vllm-shared-pool-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}
-            !${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/**/*.safetensors
-            !${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/**/*.gguf
-            !${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.aimod
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/wheels/*.whl
           if-no-files-found: error
