@@ -1,4 +1,4 @@
-# Kapsl CLI installer for Windows
+# Published Kapsl CLI installer for Windows
 # Usage: irm https://downloads.kapsl.net/install.ps1 | iex
 # Saved-script usage: .\install.ps1 -Accelerator cuda
 [CmdletBinding()]

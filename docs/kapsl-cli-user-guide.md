@@ -94,7 +94,7 @@ Test the script locally (without hitting the real server):
 cd /tmp/kapsl-test-serve && python3 -m http.server 8787
 
 # In another terminal — override the base URL
-KAPSL_BASE_URL=http://127.0.0.1:8787 KAPSL_INSTALL_DIR=/tmp/kapsl-out sh install.sh
+KAPSL_BASE_URL=http://127.0.0.1:8787 KAPSL_INSTALL_DIR=/tmp/kapsl-out sh installers/install.sh
 ```
 
 ### Build from source

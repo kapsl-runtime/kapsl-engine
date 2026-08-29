@@ -85,9 +85,7 @@ jobs:
         shell: bash
         run: engine/.github/scripts/verify-managed-vllm-sdk-checkout.sh sdk "$KAPSL_VLLM_SDK_REF"
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+      - uses: ./engine/.github/actions/setup-rust
 
       - uses: Swatinem/rust-cache@v2
         with:

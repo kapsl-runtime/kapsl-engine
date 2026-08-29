@@ -6,7 +6,8 @@ For full runtime documentation, see `FULL_DOCUMENTATION.md`.
 
 ## Prerequisites
 
-- Rust 1.92.0
+- Rust 1.98.0 (installed automatically by `rustup` from the repository's
+  `rust-toolchain.toml`); the workspace MSRV is Rust 1.92.0
 - (Optional) CUDA Toolkit for NVIDIA GPU support
 
 ## Layout
