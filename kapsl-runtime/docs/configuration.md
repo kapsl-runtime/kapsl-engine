@@ -226,6 +226,14 @@ exact limits, and `mode: fixed` accepts one exact `bytes` value. Every exact
 grant must remain block-aligned and large enough for one full maximum-length
 sequence on every tensor-parallel rank.
 
+The pinned vLLM build still evaluates `gpu_memory_utilization` as a
+whole-device free-memory startup guard even when `kv_cache_memory_bytes`
+supplies the exact cache size. Exact Kapsl launches pass a certified positive
+`0.000000001` compatibility sentinel solely to neutralize that unrelated
+upstream guard for co-resident replicas. The sentinel is not a KV sizing input:
+the authority grant and `--kv-cache-memory-bytes` remain the physical cache
+decision, and normal CUDA allocation failure still fails the child closed.
+
 `live_resize` is optional and valid only with `mode: auto`. It reserves a
 certified BLNHC virtual address range sized for `maximum_concurrency`, while
 initially mapping only the exact admitted physical prefix. At or above the grow

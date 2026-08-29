@@ -420,10 +420,14 @@ current build as:
 --kv-cache-memory-bytes <granted-bytes>
 ```
 
-Remove the implicit `--gpu-memory-utilization 0.5` from the auto path. Before
-shipping, certify the exact precedence and startup checks of this flag against
-the pinned vLLM wheel; no assumption about a newer or older upstream CLI is
-acceptable.
+Remove the implicit `--gpu-memory-utilization 0.5` sizing policy from the auto
+path. The pinned build nevertheless evaluates that option as a whole-device
+startup guard even when exact bytes are authoritative, so certified exact
+launches pass a positive `0.000000001` compatibility sentinel alongside
+`--kv-cache-memory-bytes`. The sentinel is not a cache budget and must never be
+used in authority arithmetic. The environment probe certifies that the pinned
+`EngineArgs` accepts both values, while GPU scale tests prove that the exact
+byte grant controls the eventual packed backing.
 
 The process command, resolved plan, and startup log must expose:
 
@@ -739,9 +743,10 @@ fixtures.
 - Make attachment, activation, and scheduler publication one readiness path.
 - Re-plan restarts and scale-ups.
 
-Exit gate: no default fraction is passed; the physical IPC backing equals the
-authority grant within certified alignment; two admitted replicas cannot exceed
-the authority budget.
+Exit gate: no default or card-sizing fraction is passed; the only exact-mode
+fraction is the certified non-sizing startup sentinel. The physical IPC backing
+equals the authority grant within certified alignment, and two admitted
+replicas cannot exceed the authority budget.
 
 ### Phase 2: low-risk bridge cleanup
 
@@ -916,8 +921,9 @@ differ.
 
 ### Memory gates
 
-- The default auto policy passes an exact KV byte count and no implicit 0.5
-  fraction.
+- The default auto policy passes an exact KV byte count and no implicit 0.5 or
+  card-sizing fraction; the pinned-build startup sentinel is fixed and never
+  participates in cache sizing.
 - The provisioned CUDA-IPC backing equals the authority grant within one
   certified allocation-alignment unit.
 - Active vLLM KV tensors consume no second physical cache allocation.

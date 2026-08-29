@@ -43,6 +43,13 @@ const SUPERVISOR_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RESTARTS: u32 = 5;
 const MAX_CONSECUTIVE_HEALTH_FAILURES: u8 = 15;
 const DEFAULT_LEGACY_GPU_MEMORY_UTILIZATION: f64 = 0.5;
+// Pinned vLLM applies gpu_memory_utilization as a whole-device free-memory
+// startup guard even when kv_cache_memory_bytes is the sizing authority. A
+// normal default (currently 0.92 upstream) prevents an independently admitted
+// replica from starting beside an active one. Exact launches therefore pass a
+// positive, negligible compatibility sentinel; MemoryAuthority admission and
+// --kv-cache-memory-bytes remain the only sizing decisions.
+const EXACT_MODE_GPU_MEMORY_UTILIZATION_SENTINEL: &str = "0.000000001";
 const DEFAULT_KV_HEADROOM_PERCENT: usize = 20;
 const MAX_KV_HEADROOM_PERCENT: usize = 100;
 const DEFAULT_KV_GROW_UTILIZATION_PERCENT: usize = 80;
@@ -412,6 +419,7 @@ struct ManagedVllmEnvironment {
     cuda_available: bool,
     planner_schema_version: u64,
     exact_cache_memory_flag: bool,
+    exact_cache_memory_guard_compatible: bool,
     no_async_scheduling_flag: bool,
 }
 
@@ -555,6 +563,17 @@ exact_cache_memory_flag = any(
     "--kv-cache-memory-bytes" in action.option_strings
     for action in parser._actions
 )
+exact_cache_memory_guard_compatible = False
+if exact_cache_memory_flag:
+    exact_args = EngineArgs(
+        model="__kapsl_exact_probe__",
+        kv_cache_memory_bytes=4096,
+        gpu_memory_utilization=1e-9,
+    )
+    exact_cache_memory_guard_compatible = (
+        exact_args.kv_cache_memory_bytes == 4096
+        and exact_args.gpu_memory_utilization == 1e-9
+    )
 no_async_scheduling_flag = any(
     "--no-async-scheduling" in action.option_strings
     for action in parser._actions
@@ -577,6 +596,7 @@ print(json.dumps({
     "planner_schema_version": PLANNER_SCHEMA_VERSION,
     "planner_schema_const": planner_schema["properties"]["schema_version"]["const"],
     "exact_cache_memory_flag": exact_cache_memory_flag,
+    "exact_cache_memory_guard_compatible": exact_cache_memory_guard_compatible,
     "no_async_scheduling_flag": no_async_scheduling_flag,
 }, sort_keys=True))
 "#;
@@ -631,6 +651,7 @@ print(json.dumps({
         cuda_available: true,
         planner_schema_version: 1,
         exact_cache_memory_flag: true,
+        exact_cache_memory_guard_compatible: true,
         no_async_scheduling_flag: true,
     };
     if actual != expected {
@@ -2958,7 +2979,12 @@ impl ManagedVllmProcess {
                         "managed vLLM exact launch has a zero-byte KV grant".to_string(),
                     ));
                 }
-                command.args(["--kv-cache-memory-bytes", &bytes.to_string()]);
+                command
+                    .args(["--kv-cache-memory-bytes", &bytes.to_string()])
+                    .args([
+                        "--gpu-memory-utilization",
+                        EXACT_MODE_GPU_MEMORY_UTILIZATION_SENTINEL,
+                    ]);
             }
         }
         if self.spec.settings.live_resize.is_some() {
@@ -6052,7 +6078,7 @@ serving:
     }
 
     #[test]
-    fn exact_process_uses_the_pinned_byte_flag_and_never_the_fraction() {
+    fn exact_process_uses_the_pinned_byte_flag_and_only_the_startup_sentinel() {
         let directory = tempfile::tempdir().unwrap();
         let model_root = directory.path().join("model");
         std::fs::create_dir(&model_root).unwrap();
@@ -6071,9 +6097,19 @@ serving:
         assert!(arguments
             .windows(2)
             .any(|pair| pair == ["--kv-cache-memory-bytes", "316416"]));
-        assert!(!arguments
-            .iter()
-            .any(|argument| argument == "--gpu-memory-utilization"));
+        assert!(arguments.windows(2).any(|pair| {
+            pair == [
+                "--gpu-memory-utilization",
+                EXACT_MODE_GPU_MEMORY_UTILIZATION_SENTINEL,
+            ]
+        }));
+        assert_eq!(
+            arguments
+                .iter()
+                .filter(|argument| *argument == "--gpu-memory-utilization")
+                .count(),
+            1
+        );
         assert!(arguments
             .iter()
             .any(|argument| argument == "--enable-prefix-caching"));
