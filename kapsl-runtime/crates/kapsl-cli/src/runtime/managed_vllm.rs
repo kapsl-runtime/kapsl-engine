@@ -3686,7 +3686,78 @@ impl Drop for ManagedVllmProcess {
 #[cfg(unix)]
 fn process_group_alive(process_group: i32) -> bool {
     let result = unsafe { libc::kill(-process_group, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if result != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+        return false;
+    }
+
+    // kill(2) reports a process group as present while its only remaining
+    // members are zombies. Those processes have no address space, file
+    // descriptors, or CUDA mappings, so they cannot retain an imported pool.
+    // This matters in containers whose PID 1 does not promptly reap orphaned
+    // vLLM multiprocessing children. Fail closed if procfs cannot prove the
+    // group contains only dead members.
+    #[cfg(target_os = "linux")]
+    {
+        linux_process_group_has_live_members(process_group).unwrap_or(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_stat(stat: &str) -> std::io::Result<(i32, u8)> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "malformed Linux /proc process stat",
+        )
+    };
+    // The command field is parenthesized and may itself contain spaces or
+    // parentheses, so fields after it must be located from the final ')'.
+    let command_end = stat.rfind(')').ok_or_else(invalid)?;
+    let mut fields = stat
+        .get(command_end + 1..)
+        .ok_or_else(invalid)?
+        .split_whitespace();
+    let state = fields
+        .next()
+        .and_then(|value| value.as_bytes().first().copied())
+        .ok_or_else(invalid)?;
+    let _parent_pid = fields.next().ok_or_else(invalid)?;
+    let process_group = fields
+        .next()
+        .ok_or_else(invalid)?
+        .parse::<i32>()
+        .map_err(|_| invalid())?;
+    Ok((process_group, state))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_stat_is_live_group_member(stat: &str, process_group: i32) -> std::io::Result<bool> {
+    let (member_group, state) = parse_linux_proc_stat(stat)?;
+    Ok(member_group == process_group && !matches!(state, b'Z' | b'X' | b'x'))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_has_live_members(process_group: i32) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat_path = entry.path().join("stat");
+        let stat = match std::fs::read_to_string(&stat_path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if linux_proc_stat_is_live_group_member(&stat, process_group)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn start_managed_vllm_supervisor(
@@ -4900,6 +4971,22 @@ mod tests {
     // one exact cross-language fixture catches JSON/digest/arithmetic drift
     // before the executor-backed planner is exercised on a GPU host.
     const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.0","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_stat_parser_distinguishes_live_and_zombie_group_members() {
+        let live = "101 (worker name (rank 0)) S 10 77 77 0 -1";
+        let zombie = "102 (worker name) Z 10 77 77 0 -1";
+        let other_group = "103 (worker name) S 10 88 88 0 -1";
+
+        assert_eq!(parse_linux_proc_stat(live).unwrap(), (77, b'S'));
+        assert_eq!(parse_linux_proc_stat(zombie).unwrap(), (77, b'Z'));
+        assert_ne!(parse_linux_proc_stat(other_group).unwrap().0, 77);
+        assert!(linux_proc_stat_is_live_group_member(live, 77).unwrap());
+        assert!(!linux_proc_stat_is_live_group_member(zombie, 77).unwrap());
+        assert!(!linux_proc_stat_is_live_group_member(other_group, 77).unwrap());
+        assert!(parse_linux_proc_stat("malformed").is_err());
+    }
 
     fn settings_from_metadata(metadata: &str) -> Result<ManagedVllmSettings, String> {
         let metadata = serde_yaml::from_str(metadata).expect("test metadata YAML");

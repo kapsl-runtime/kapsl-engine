@@ -176,7 +176,8 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
 
     def test_private_endpoint_and_cross_token_stop_candidate_are_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
-            runtime_log = Path(directory) / "runtime.log"
+            root = Path(directory)
+            runtime_log = root / "runtime.log"
             runtime_log.write_text(
                 "Managed vLLM process started: pid=42 "
                 "endpoint=http://127.0.0.1:8123 log=/tmp/vllm.log\n",
@@ -193,6 +194,26 @@ class ManagedVllmGpuConformanceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(probe.ConformanceError, "loopback"):
                 probe._managed_vllm_endpoint(runtime_log)
+
+            state = root / "state" / "managed-vllm" / "model-0"
+            state.mkdir(parents=True)
+            child_log = state / "vllm.log"
+            runtime_log.write_text("normal runtime output\n", encoding="utf-8")
+            child_log.write_text(
+                "(APIServer pid=42) INFO [entry.py:139] "
+                "Starting vLLM server on http://127.0.0.1:9123\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                probe._managed_vllm_endpoint(runtime_log, root / "state"),
+                "http://127.0.0.1:9123",
+            )
+            child_log.write_text(
+                "Starting vLLM server on http://192.0.2.1:9123\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(probe.ConformanceError, "loopback"):
+                probe._managed_vllm_endpoint(runtime_log, root / "state")
 
         class FakeTokenizer:
             def __call__(self, *_args, **_kwargs):

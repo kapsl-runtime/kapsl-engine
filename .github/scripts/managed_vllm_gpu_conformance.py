@@ -54,6 +54,9 @@ _MANAGED_VLLM_LOG_RE = re.compile(
 _MANAGED_VLLM_ENDPOINT_RE = re.compile(
     r"Managed vLLM process started:.*?\bendpoint=(http://\S+?)\s+log="
 )
+_VLLM_SERVER_ENDPOINT_RE = re.compile(
+    r"\bStarting vLLM server on (http://\S+)"
+)
 
 
 class ConformanceError(RuntimeError):
@@ -325,12 +328,8 @@ def _require_completion(
     return payload
 
 
-def _managed_vllm_endpoint(runtime_log: Path) -> str:
-    text = runtime_log.read_text(encoding="utf-8", errors="replace")
-    endpoints = _MANAGED_VLLM_ENDPOINT_RE.findall(text)
-    if not endpoints:
-        raise ConformanceError("runtime log contains no managed vLLM endpoint")
-    endpoint = endpoints[-1].rstrip("/")
+def _validate_private_vllm_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.rstrip("/")
     parsed = urllib.parse.urlsplit(endpoint)
     if (
         parsed.scheme != "http"
@@ -346,6 +345,28 @@ def _managed_vllm_endpoint(runtime_log: Path) -> str:
     return endpoint
 
 
+def _managed_vllm_endpoint(runtime_log: Path, log_root: Path | None = None) -> str:
+    text = runtime_log.read_text(encoding="utf-8", errors="replace")
+    endpoints = _MANAGED_VLLM_ENDPOINT_RE.findall(text)
+    if endpoints:
+        return _validate_private_vllm_endpoint(endpoints[-1])
+
+    if log_root is not None:
+        child_logs = _managed_vllm_log_paths(runtime_log, log_root)
+        newest_log = max(
+            child_logs,
+            key=lambda path: (path.stat().st_mtime_ns, str(path)),
+        )
+        child_text = newest_log.read_text(encoding="utf-8", errors="replace")
+        endpoints = _VLLM_SERVER_ENDPOINT_RE.findall(child_text)
+        if endpoints:
+            return _validate_private_vllm_endpoint(endpoints[-1])
+
+    raise ConformanceError(
+        "runtime and managed child logs contain no managed vLLM endpoint"
+    )
+
+
 def _vllm_counter(endpoint: str, name: str) -> int:
     metrics = parse_prometheus(_get_text(endpoint.rstrip("/") + "/metrics"))
     samples = metrics.get(name, [])
@@ -355,9 +376,9 @@ def _vllm_counter(endpoint: str, name: str) -> int:
 
 
 def _require_prefix_cache_hit(
-    completion_url: str, model: str, runtime_log: Path
+    completion_url: str, model: str, runtime_log: Path, log_root: Path
 ) -> dict[str, Any]:
-    endpoint = _managed_vllm_endpoint(runtime_log)
+    endpoint = _managed_vllm_endpoint(runtime_log, log_root)
     query_metric = "vllm:prefix_cache_queries"
     hit_metric = "vllm:prefix_cache_hits"
     queries_before = _vllm_counter(endpoint, query_metric)
@@ -841,7 +862,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     one_shot = _require_completion(completion_url, args.model)
     stream = _require_stream(completion_url, args.model)
     prefix_cache = _require_prefix_cache_hit(
-        completion_url, args.model, args.runtime_log
+        completion_url, args.model, args.runtime_log, args.vllm_log_root
     )
     cross_token_stop = _require_cross_token_stop(
         completion_url, args.model, args.model_dir

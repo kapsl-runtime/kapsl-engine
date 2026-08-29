@@ -631,15 +631,28 @@ jobs:
             wait "$LIVE_RUNTIME_PID" || true
           fi
           if [[ -f "$OUTPUT_DIR/nvml-before-live.txt" ]]; then
-            : > "$OUTPUT_DIR/nvml-after-live.txt"
-            while read -r device before; do
-              after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
-              printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-live.txt"
-              if (( after > before + 128 )); then
-                echo "GPU $device retained $((after - before)) MiB after clean managed-vLLM shutdown" >&2
-                exit 1
+            released=0
+            for _ in $(seq 1 60); do
+              pending=0
+              : > "$OUTPUT_DIR/nvml-after-live.txt"
+              while read -r device before; do
+                after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+                printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-live.txt"
+                (( after <= before + 128 )) || pending=1
+              done < "$OUTPUT_DIR/nvml-before-live.txt"
+              if (( pending == 0 )); then
+                released=1
+                break
               fi
-            done < "$OUTPUT_DIR/nvml-before-live.txt"
+              sleep 1
+            done
+            if (( released == 0 )); then
+              while read -r device before; do
+                after=$(awk -v device="$device" '$1 == device { print $2 }' "$OUTPUT_DIR/nvml-after-live.txt")
+                echo "GPU $device retained $((after - before)) MiB after clean managed-vLLM shutdown" >&2
+              done < "$OUTPUT_DIR/nvml-before-live.txt"
+              exit 1
+            fi
           fi
 
       - name: Start one fixed exact managed-vLLM replica
@@ -808,15 +821,28 @@ jobs:
             wait "$FIXED_RUNTIME_PID" || true
           fi
           if [[ -f "$OUTPUT_DIR/nvml-before-fixed.txt" ]]; then
-            : > "$OUTPUT_DIR/nvml-after-fixed.txt"
-            while read -r device before; do
-              after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
-              printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-fixed.txt"
-              if (( after > before + 128 )); then
-                echo "GPU $device retained $((after - before)) MiB after fixed runtime shutdown" >&2
-                exit 1
+            released=0
+            for _ in $(seq 1 60); do
+              pending=0
+              : > "$OUTPUT_DIR/nvml-after-fixed.txt"
+              while read -r device before; do
+                after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+                printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-fixed.txt"
+                (( after <= before + 128 )) || pending=1
+              done < "$OUTPUT_DIR/nvml-before-fixed.txt"
+              if (( pending == 0 )); then
+                released=1
+                break
               fi
-            done < "$OUTPUT_DIR/nvml-before-fixed.txt"
+              sleep 1
+            done
+            if (( released == 0 )); then
+              while read -r device before; do
+                after=$(awk -v device="$device" '$1 == device { print $2 }' "$OUTPUT_DIR/nvml-after-fixed.txt")
+                echo "GPU $device retained $((after - before)) MiB after fixed runtime shutdown" >&2
+              done < "$OUTPUT_DIR/nvml-before-fixed.txt"
+              exit 1
+            fi
           fi
 
       - name: Start direct vLLM with the identical exact engine settings
@@ -1013,15 +1039,28 @@ jobs:
             wait "$MIXED_RUNTIME_PID" || true
           fi
           if [[ -f "$OUTPUT_DIR/nvml-before-mixed.txt" ]]; then
-            : > "$OUTPUT_DIR/nvml-after-mixed.txt"
-            while read -r device before; do
-              after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
-              printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-mixed.txt"
-              if (( after > before + 128 )); then
-                echo "GPU $device retained $((after - before)) MiB after mixed shutdown" >&2
-                exit 1
+            released=0
+            for _ in $(seq 1 60); do
+              pending=0
+              : > "$OUTPUT_DIR/nvml-after-mixed.txt"
+              while read -r device before; do
+                after=$(nvidia-smi --id="$device" --query-gpu=memory.used --format=csv,noheader,nounits)
+                printf '%s %s\n' "$device" "$after" >> "$OUTPUT_DIR/nvml-after-mixed.txt"
+                (( after <= before + 128 )) || pending=1
+              done < "$OUTPUT_DIR/nvml-before-mixed.txt"
+              if (( pending == 0 )); then
+                released=1
+                break
               fi
-            done < "$OUTPUT_DIR/nvml-before-mixed.txt"
+              sleep 1
+            done
+            if (( released == 0 )); then
+              while read -r device before; do
+                after=$(awk -v device="$device" '$1 == device { print $2 }' "$OUTPUT_DIR/nvml-after-mixed.txt")
+                echo "GPU $device retained $((after - before)) MiB after mixed shutdown" >&2
+              done < "$OUTPUT_DIR/nvml-before-mixed.txt"
+              exit 1
+            fi
           fi
 
       - name: Upload conformance evidence
