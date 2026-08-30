@@ -12,6 +12,8 @@ connector_version="0.7.0"
 planner_schema_version="1"
 kv_abi_major="1"
 kv_abi_minor="5"
+rust_sdk_version="0.3.0"
+rust_kv_abi_version="0.6.0"
 
 require_literal() {
   local file="$1"
@@ -88,8 +90,10 @@ for workflow in \
     require_literal "$workflow" 'ninja-build'
     require_literal "$workflow" '--index-url https://pypi.org/simple'
     require_literal "$workflow" '--extra-index-url "$PYTORCH_INDEX_URL"'
-    require_literal "$workflow" 'engine/.cargo/config.toml'
-    require_literal "$workflow" 'key: ${{ inputs.sdk_ref }}'
+    require_literal "$workflow" "EXPECTED_RUST_SDK_VERSION: \"$rust_sdk_version\""
+    require_literal "$workflow" "EXPECTED_RUST_KV_ABI_VERSION: \"$rust_kv_abi_version\""
+    require_literal "$workflow" 'startswith("registry+")'
+    require_literal "$workflow" 'key: published-sdk-${{ env.EXPECTED_RUST_SDK_VERSION }}-kv-abi-${{ env.EXPECTED_RUST_KV_ABI_VERSION }}'
     require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.json'
     require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.log'
     require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt'
@@ -100,6 +104,12 @@ for workflow in \
     require_literal "$workflow" 'general_pool_allocated_bytes'
   fi
 done
+
+if grep -Eq 'engine/\.cargo/config\.toml|\[patch\.crates-io\]|patch\.crates-io\.kapsl-' \
+  .github/workflows/vllm-shared-pool-conformance.yml; then
+  echo "Managed-vLLM conformance must resolve published Rust SDK crates without path patches." >&2
+  exit 1
+fi
 
 if grep -Eq "grep .*kv_path=(shared-kv|native).*mixed-runtime\\.log" \
   .github/workflows/vllm-shared-pool-conformance.yml; then

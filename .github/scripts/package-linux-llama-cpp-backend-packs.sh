@@ -39,25 +39,6 @@ build_profile() {
   feature="$2"
   override="$3"
   kv_mode="$4"
-  sdk_dir="${KAPSL_LLAMA_SDK_DIR:-}"
-  if [ "$kv_mode" = "shared_pool" ] && [ -z "$sdk_dir" ]; then
-    echo "KAPSL_LLAMA_SDK_DIR is required for shared-pool packs" >&2
-    exit 1
-  fi
-  if [ -n "$sdk_dir" ]; then
-    sdk_ref="${KAPSL_LLAMA_SDK_REF:?KAPSL_LLAMA_SDK_REF is required when KAPSL_LLAMA_SDK_DIR is set}"
-    if [ ! -f "$sdk_dir/crates/kapsl-llm/Cargo.toml" ] \
-      || [ ! -f "$sdk_dir/crates/kapsl-engine-api/Cargo.toml" ]; then
-      echo "KAPSL llama.cpp SDK checkout is missing kapsl-llm or kapsl-engine-api: $sdk_dir" >&2
-      exit 1
-    fi
-    actual_sdk_ref="$(git -C "$sdk_dir" rev-parse HEAD)"
-    if [ "$actual_sdk_ref" != "$sdk_ref" ]; then
-      echo "kapsl-sdk checkout is $actual_sdk_ref, expected $sdk_ref" >&2
-      exit 1
-    fi
-    sdk_dir="$(cd "$sdk_dir" && pwd)"
-  fi
   if [ -n "$override" ]; then
     if [ ! -f "$override" ]; then
       echo "Configured $profile llama.cpp library does not exist: $override" >&2
@@ -68,35 +49,20 @@ build_profile() {
   fi
 
   target_dir="$work_root/target-$profile"
-  build_features="$feature"
-  if [ "$kv_mode" = "shared_pool" ]; then
-    build_features="$build_features,kapsl-llm/gguf-external-kv"
-  fi
   cargo_args=(
     build
     --manifest-path kapsl-runtime/Cargo.toml
     -p kapsl-backend-llama-cpp
     --release
+    --locked
     --no-default-features
-    --features "$build_features"
+    --features "$feature"
     --target-dir "$target_dir"
   )
-  if [ "$kv_mode" = "shared_pool" ]; then
-    # The backend entrypoint is a cdylib which statically links llama.cpp's
-    # C/CUDA archives. Force every CMake target (including nvcc objects) to be
-    # position independent so the final shared object is linkable on Linux.
-    CMAKE_POSITION_INDEPENDENT_CODE=ON KAPSL_LLAMA_EXTERNAL_POOL_SDK=1 cargo \
-      --config "patch.crates-io.kapsl-llm.path='$sdk_dir/crates/kapsl-llm'" \
-      --config "patch.crates-io.kapsl-engine-api.path='$sdk_dir/crates/kapsl-engine-api'" \
-      "${cargo_args[@]}"
-  elif [ -n "$sdk_dir" ]; then
-    CMAKE_POSITION_INDEPENDENT_CODE=ON cargo \
-      --config "patch.crates-io.kapsl-llm.path='$sdk_dir/crates/kapsl-llm'" \
-      --config "patch.crates-io.kapsl-engine-api.path='$sdk_dir/crates/kapsl-engine-api'" \
-      "${cargo_args[@]}"
-  else
-    CMAKE_POSITION_INDEPENDENT_CODE=ON cargo "${cargo_args[@]}"
-  fi
+  # The backend entrypoint is a cdylib which statically links llama.cpp's
+  # C/CUDA archives. Force every CMake target (including nvcc objects) to be
+  # position independent so the final shared object is linkable on Linux.
+  CMAKE_POSITION_INDEPENDENT_CODE=ON cargo "${cargo_args[@]}"
   printf '%s\n' "$target_dir/release/libkapsl_backend_llama_cpp.so"
 }
 
@@ -300,8 +266,4 @@ PY
 }
 
 package_profile cpu cpu cpu "${KAPSL_LLAMA_CPU_LIBRARY:-}" native
-if [ -n "${KAPSL_LLAMA_SDK_DIR:-}" ]; then
-  package_profile cuda12 cuda cuda12-shared-pool "${KAPSL_LLAMA_CUDA_LIBRARY:-}" shared_pool
-else
-  package_profile cuda12 cuda cuda12 "${KAPSL_LLAMA_CUDA_LIBRARY:-}" native
-fi
+package_profile cuda12 cuda cuda12-shared-pool "${KAPSL_LLAMA_CUDA_LIBRARY:-}" shared_pool

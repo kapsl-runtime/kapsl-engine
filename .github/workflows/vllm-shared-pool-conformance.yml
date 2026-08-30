@@ -62,6 +62,8 @@ jobs:
       EXPECTED_PLANNER_SCHEMA_VERSION: "1"
       EXPECTED_KV_ABI_MAJOR: "1"
       EXPECTED_KV_ABI_MINOR: "5"
+      EXPECTED_RUST_SDK_VERSION: "0.3.0"
+      EXPECTED_RUST_KV_ABI_VERSION: "0.6.0"
       KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
       PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
@@ -133,38 +135,13 @@ jobs:
 
       - uses: ./engine/.github/actions/setup-rust
 
-      - name: Configure checked-out SDK Cargo patches
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p engine/.cargo
-          python3 - engine/.cargo/config.toml "$GITHUB_WORKSPACE/sdk/crates" <<'PY'
-          import sys
-          from pathlib import Path
-
-          destination = Path(sys.argv[1])
-          crates = Path(sys.argv[2])
-          names = [
-              "kapsl-backends", "kapsl-core", "kapsl-engine-api", "kapsl-hal",
-              "kapsl-ipc", "kapsl-kernels", "kapsl-kv-abi", "kapsl-llm",
-              "kapsl-loader", "kapsl-monitor", "kapsl-quantization", "kapsl-rag",
-              "kapsl-rag-sdk", "kapsl-scheduler", "kapsl-shm", "kapsl-transport",
-          ]
-          lines = ["[patch.crates-io]"]
-          lines.extend(
-              f'{name} = {{ path = "{(crates / name).as_posix()}" }}'
-              for name in names
-          )
-          destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
-
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine/kapsl-runtime
-          key: ${{ inputs.sdk_ref }}
+          key: published-sdk-${{ env.EXPECTED_RUST_SDK_VERSION }}-kv-abi-${{ env.EXPECTED_RUST_KV_ABI_VERSION }}
           cache-on-failure: true
 
-      - name: Build CUDA shared-pool runtime against the checked-out SDK
+      - name: Build CUDA shared-pool runtime from published SDK crates
         working-directory: engine
         shell: bash
         run: |
@@ -179,24 +156,31 @@ jobs:
           from pathlib import Path
 
           metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          sdk_crates = Path(os.environ["GITHUB_WORKSPACE"]) / "sdk" / "crates"
-          patched = {
-              package["name"]: Path(package["manifest_path"]).resolve()
-              for package in metadata["packages"]
-              if package["name"].startswith("kapsl-")
-              and package["name"] != "kapsl-pyo3"
-              and str(Path(package["manifest_path"]).resolve()).startswith(
-                  str(sdk_crates.resolve())
-              )
+          expected = {
+              "kapsl-engine-api": os.environ["EXPECTED_RUST_SDK_VERSION"],
+              "kapsl-hal": os.environ["EXPECTED_RUST_SDK_VERSION"],
+              "kapsl-kv-abi": os.environ["EXPECTED_RUST_KV_ABI_VERSION"],
+              "kapsl-llm": os.environ["EXPECTED_RUST_SDK_VERSION"],
+              "kapsl-monitor": os.environ["EXPECTED_RUST_SDK_VERSION"],
+              "kapsl-scheduler": os.environ["EXPECTED_RUST_SDK_VERSION"],
+              "kapsl-transport": os.environ["EXPECTED_RUST_SDK_VERSION"],
           }
-          required = {
-              "kapsl-engine-api", "kapsl-hal", "kapsl-kv-abi", "kapsl-llm",
-              "kapsl-monitor", "kapsl-scheduler", "kapsl-transport",
+          resolved = {name: [] for name in expected}
+          for package in metadata["packages"]:
+              if package["name"] in expected:
+                  resolved[package["name"]].append(
+                      (package["version"], package.get("source"))
+                  )
+          invalid = {
+              name: candidates
+              for name, candidates in resolved.items()
+              if len(candidates) != 1
+              or candidates[0][0] != expected[name]
+              or not (candidates[0][1] or "").startswith("registry+")
           }
-          if not required.issubset(patched):
-              raise SystemExit(
-                  f"runtime did not resolve the checked-out SDK contract: {patched}"
-              )
+          if invalid:
+              raise SystemExit(f"runtime did not resolve published SDK crates: {invalid}")
+          print(resolved)
           PY
           cargo build --manifest-path kapsl-runtime/Cargo.toml --locked \
             --release -p kapsl --no-default-features --features cuda
