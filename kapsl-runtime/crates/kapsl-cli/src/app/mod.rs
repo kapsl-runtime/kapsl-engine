@@ -1,22 +1,13 @@
 use super::*;
-use clap::{Parser, Subcommand, ValueEnum};
 
 pub(crate) mod cli;
-pub(crate) mod constants;
-pub(crate) mod help;
-pub(crate) mod model_loading;
-pub(crate) mod onnx_tuning;
-pub(crate) mod performance;
-pub(crate) mod runtime_bootstrap;
-pub(crate) mod runtime_config;
-pub(crate) mod support;
+pub(crate) mod config;
+mod error;
+pub(crate) mod startup;
+pub(crate) mod terminal;
 
 pub(crate) use cli::*;
-pub(crate) use constants::*;
-pub(crate) use help::*;
-pub(crate) use model_loading::*;
-pub(crate) use onnx_tuning::*;
-pub(crate) use performance::*;
-pub(crate) use runtime_bootstrap::*;
-pub(crate) use runtime_config::*;
-pub(crate) use support::*;
+pub(crate) use config::*;
+pub(crate) use error::*;
+pub(crate) use startup::*;
+pub(crate) use terminal::*;

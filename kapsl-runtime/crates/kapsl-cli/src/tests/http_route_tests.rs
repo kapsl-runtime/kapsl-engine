@@ -1,4 +1,5 @@
 use super::*;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use std::net::SocketAddr;
 use warp::http::StatusCode;
 use warp::Reply;
@@ -331,13 +332,13 @@ async fn test_rag_query_route_rejects_missing_workspace_before_store_access() {
     let rag_root = unique_temp_path("rag");
     let docs_root = rag_root.join("docs");
     fs::create_dir_all(&docs_root).expect("create rag docs dir");
-    let rag_state = RagRuntimeState {
-        vector_store: Arc::new(
+    let rag = RagService::new(
+        Arc::new(
             SqliteVectorStore::open(&rag_root.join("vectors.sqlite3")).expect("open vector store"),
         ),
-        doc_store: FsDocStore::new(&docs_root),
-    };
-    let routes = build_rag_routes(rag_state);
+        Arc::new(FsDocStore::new(&docs_root)),
+    );
+    let routes = build_rag_routes(rag);
 
     let response = warp::test::request()
         .method("POST")
@@ -385,19 +386,19 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
     let rag_root = unique_temp_path("infer-stream-rag");
     let docs_root = rag_root.join("docs");
     fs::create_dir_all(&docs_root).expect("create rag docs dir");
-    let rag_state = RagRuntimeState {
-        vector_store: Arc::new(
+    let rag = RagService::new(
+        Arc::new(
             SqliteVectorStore::open(&rag_root.join("vectors.sqlite3")).expect("open vector store"),
         ),
-        doc_store: FsDocStore::new(&docs_root),
-    };
+        Arc::new(FsDocStore::new(&docs_root)),
+    );
 
     let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     let route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
         models: models.clone(),
         inference: test_inference_service(models),
         log_sensitive_ids: false,
-        rag_state,
+        rag,
     });
 
     let response = warp::test::request()

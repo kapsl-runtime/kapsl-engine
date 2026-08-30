@@ -5,16 +5,9 @@ pub(crate) fn build_extension_routes(
     running_connectors_for_api: Arc<
         AsyncMutex<HashMap<String, ConnectorClient<ConnectorRuntimeHandle>>>,
     >,
-    rag_state_for_api: RagRuntimeState,
+    rag: RagService,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     // Extensions API
-    #[derive(Deserialize)]
-    struct InstallExtensionRequest {
-        path: Option<String>,
-        extension_id: Option<String>,
-        marketplace_url: Option<String>,
-    }
-
     #[derive(Deserialize)]
     struct ExtensionConfigRequest {
         workspace_id: String,
@@ -26,16 +19,13 @@ pub(crate) fn build_extension_routes(
         workspace_id: String,
     }
 
+    type ErrorResponse = ExtensionErrorResponse;
+
     let extension_manager_for_list = extension_manager_for_api.clone();
     let list_extensions = warp::path!("api" / "extensions")
         .and(warp::get())
         .map(move || {
             use warp::http::StatusCode;
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                error: String,
-            }
 
             let extensions = match extension_manager_for_list.registry.discover() {
                 Ok(list) => list,
@@ -68,11 +58,6 @@ pub(crate) fn build_extension_routes(
         .map(move |query: HashMap<String, String>| {
             use warp::http::StatusCode;
 
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                error: String,
-            }
-
             let q = query.get("q").map(String::as_str);
             let marketplace_url = query.get("marketplace_url").map(String::as_str);
 
@@ -91,13 +76,8 @@ pub(crate) fn build_extension_routes(
     let install_extension = warp::path!("api" / "extensions" / "install")
         .and(warp::post())
         .and(warp::body::json())
-        .map(move |req: InstallExtensionRequest| {
+        .map(move |req: ExtensionInstallRequest| {
             use warp::http::StatusCode;
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                error: String,
-            }
 
             let path = req.path.as_deref().unwrap_or("").trim().to_string();
             let extension_id = req.extension_id.as_deref().unwrap_or("").trim().to_string();
@@ -126,7 +106,7 @@ pub(crate) fn build_extension_routes(
                     .install_from_dir(&path)
                     .map_err(|e| e.to_string())
             } else {
-                install_extension_from_marketplace(
+                download_and_install_marketplace_extension(
                     &extension_manager_for_install.registry,
                     &extension_id,
                     req.marketplace_url.as_deref(),
@@ -135,13 +115,7 @@ pub(crate) fn build_extension_routes(
 
             match install_result {
                 Ok(ext) => warp::reply::with_status(
-                    warp::reply::json(&json!({
-                        "status": "ok",
-                        "extension": {
-                            "manifest": ext.manifest,
-                            "path": ext.path.to_string_lossy()
-                        }
-                    })),
+                    warp::reply::json(&ExtensionInstallResponse::installed(ext)),
                     StatusCode::OK,
                 ),
                 Err(err) => warp::reply::with_status(
@@ -158,11 +132,6 @@ pub(crate) fn build_extension_routes(
         .and(warp::post())
         .map(move |extension_id: String| {
             use warp::http::StatusCode;
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                error: String,
-            }
 
             match extension_manager_for_uninstall
                 .registry
@@ -187,11 +156,6 @@ pub(crate) fn build_extension_routes(
         .and(warp::body::json())
         .map(move |extension_id: String, req: ExtensionConfigRequest| {
             use warp::http::StatusCode;
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                error: String,
-            }
 
             match extension_manager_for_config.set_workspace_config(
                 &req.workspace_id,
@@ -218,11 +182,6 @@ pub(crate) fn build_extension_routes(
         .map(
             move |extension_id: String, query: HashMap<String, String>| {
                 use warp::http::StatusCode;
-
-                #[derive(Serialize)]
-                struct ErrorResponse {
-                    error: String,
-                }
 
                 let workspace_id = match query.get("workspace_id") {
                     Some(id) if !id.trim().is_empty() => id.to_string(),
@@ -263,11 +222,6 @@ pub(crate) fn build_extension_routes(
             let running_connectors = running_connectors_for_launch.clone();
             async move {
                 use warp::http::StatusCode;
-
-                #[derive(Serialize)]
-                struct ErrorResponse {
-                    error: String,
-                }
 
                 let key = extension_key(&req.workspace_id, &extension_id);
                 {
@@ -379,21 +333,16 @@ pub(crate) fn build_extension_routes(
 
     let extension_manager_for_sync = extension_manager_for_api.clone();
     let running_connectors_for_sync = running_connectors_for_api.clone();
-    let rag_state_for_sync = rag_state_for_api.clone();
+    let rag_for_sync = rag.clone();
     let sync_extension = warp::path!("api" / "extensions" / String / "sync")
     .and(warp::post())
     .and(warp::body::json())
     .and_then(move |extension_id: String, req: SyncExtensionRequest| {
         let extension_manager = extension_manager_for_sync.clone();
         let running_connectors = running_connectors_for_sync.clone();
-        let rag_state = rag_state_for_sync.clone();
+        let rag = rag_for_sync.clone();
         async move {
             use warp::http::StatusCode;
-
-            #[derive(Serialize)]
-            struct ErrorResponse {
-                error: String,
-            }
 
             let workspace_id = req.workspace_id.trim().to_string();
             if workspace_id.is_empty() {
@@ -572,14 +521,9 @@ pub(crate) fn build_extension_routes(
             let mut chunk_count = 0usize;
 
             for doc_id in delete_doc_ids {
-                match delete_document_from_rag(
-                    &rag_state,
-                    &tenant_id,
-                    &workspace_id,
-                    &source_id,
-                    &doc_id,
-                )
-                .await
+                match rag
+                    .delete_document(&tenant_id, &workspace_id, &source_id, &doc_id)
+                    .await
                 {
                     Ok(()) => deleted += 1,
                     Err(error) => {
@@ -596,14 +540,9 @@ pub(crate) fn build_extension_routes(
             }
 
             for payload in upsert_payloads {
-                match ingest_document_payload_into_rag(
-                    &rag_state,
-                    &tenant_id,
-                    &workspace_id,
-                    &source_id,
-                    &payload,
-                )
-                .await
+                match rag
+                    .ingest_document(&tenant_id, &workspace_id, &source_id, &payload)
+                    .await
                 {
                     Ok(chunks) if chunks > 0 => {
                         upserted += 1;

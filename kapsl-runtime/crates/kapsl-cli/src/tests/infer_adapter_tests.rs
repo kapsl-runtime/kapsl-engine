@@ -1,5 +1,7 @@
 use super::*;
+use base64::Engine as _;
 use image::{DynamicImage, ImageFormat, RgbImage};
+use kapsl_engine_api::{BinaryTensorPacket, InferenceRequest, TensorDtype};
 use serde_json::json;
 use std::io::Cursor;
 

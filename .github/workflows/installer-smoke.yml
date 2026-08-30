@@ -3,10 +3,7 @@ name: Installer Smoke Tests
 on:
   pull_request:
     paths:
-      - "install.sh"
-      - "install-cuda.sh"
-      - "install-beta-cuda.sh"
-      - "install-beta.sh"
+      - "installers/**"
       - ".github/scripts/test-install-script.sh"
       - ".github/scripts/package-linux-cuda-runtime.sh"
       - ".github/scripts/test-package-linux-cuda-runtime.sh"
@@ -70,10 +67,10 @@ jobs:
 
       - name: Check shell syntax
         run: |
-          sh -n install.sh
-          sh -n install-cuda.sh
-          sh -n install-beta-cuda.sh
-          sh -n install-beta.sh
+          sh -n installers/install.sh
+          sh -n installers/install-cuda.sh
+          sh -n installers/install-beta-cuda.sh
+          sh -n installers/install-beta.sh
           sh -n .github/scripts/test-install-script.sh
           bash -n .github/scripts/package-linux-cuda-runtime.sh
           bash -n .github/scripts/test-package-linux-cuda-runtime.sh

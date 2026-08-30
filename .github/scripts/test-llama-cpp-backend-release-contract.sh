@@ -12,8 +12,8 @@ require_literal() {
 
 abi="kapsl-runtime/crates/kapsl-backend-abi/src/lib.rs"
 header="kapsl-runtime/include/kapsl_llama_cpp_backend.h"
-manager="kapsl-runtime/crates/kapsl-cli/src/backend_manager.rs"
-loader="kapsl-runtime/crates/kapsl-cli/src/llama_cpp_backend_pack.rs"
+manager="kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
+loader="kapsl-runtime/crates/kapsl-cli/src/backend/llama_cpp/mod.rs"
 packager=".github/scripts/package-linux-llama-cpp-backend-packs.sh"
 
 require_literal "$abi" 'pub const KAPSL_LLAMA_CPP_ABI_VERSION: u32 = 1;'

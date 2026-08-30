@@ -1,5 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=KAPSL_VERSION");
+    println!("cargo:rerun-if-changed=native/linux/glibc_compat.c");
+    println!("cargo:rerun-if-changed=native/windows/posix_memalign_compat.c");
     // rust-embed consumes files outside this crate directory. Register the
     // dashboard explicitly for ordinary incremental builds. Timestamp-
     // preserving deployment syncs should use scripts/build-with-embedded-ui.sh,
@@ -10,7 +12,7 @@ fn main() {
     // on older cluster glibc (< 2.38 lacks __isoc23_strtoll et al.).
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         cc::Build::new()
-            .file("compat_glibc.c")
+            .file("native/linux/glibc_compat.c")
             .compile("compat_glibc");
 
         // ONNX Runtime loads its provider bridge with a bare-name dlopen(), so
@@ -28,7 +30,7 @@ fn main() {
     // On Windows, provide a posix_memalign shim for llama-cpp-sys-2
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         cc::Build::new()
-            .file("posix_memalign_compat.c")
+            .file("native/windows/posix_memalign_compat.c")
             .compile("posix_memalign_compat");
     }
 }

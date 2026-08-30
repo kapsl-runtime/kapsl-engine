@@ -11,16 +11,22 @@ fn test_sysinfo_total_memory_is_already_reported_in_bytes() {
 }
 
 #[test]
-fn test_authorization_matches_token_plain_and_bearer() {
-    assert!(authorization_matches_token(Some("token123"), "token123"));
-    assert!(authorization_matches_token(
-        Some("Bearer token123"),
-        "token123"
-    ));
-    assert!(authorization_matches_token(
-        Some("bearer token123"),
-        "token123"
-    ));
+fn test_parse_authorization_token_plain_and_bearer() {
+    assert_eq!(
+        parse_authorization_token(Some("token123")),
+        Some("token123")
+    );
+    assert_eq!(
+        parse_authorization_token(Some("Bearer token123")),
+        Some("token123")
+    );
+    assert_eq!(
+        parse_authorization_token(Some("bearer\ttoken123")),
+        Some("token123")
+    );
+    assert_eq!(parse_authorization_token(Some("Bearer  ")), None);
+    assert_eq!(parse_authorization_token(Some("  ")), None);
+    assert_eq!(parse_authorization_token(None), None);
 }
 
 #[test]
@@ -172,36 +178,29 @@ fn test_device_code_login_rejects_non_github_provider() {
 }
 
 #[test]
-fn test_authorization_mismatch_rejected() {
-    assert!(!authorization_matches_token(
-        Some("Bearer wrong"),
-        "token123"
-    ));
-    assert!(!authorization_matches_token(Some("wrong"), "token123"));
-    assert!(!authorization_matches_token(None, "token123"));
-}
-
-#[test]
 fn test_api_role_resolution_and_hierarchy() {
-    let config = ApiRoleTokenConfig {
+    let mut state = make_test_auth_state();
+    state.role_tokens = ApiRoleTokenConfig {
         reader_token: Some("reader-token".to_string()),
         writer_token: Some("writer-token".to_string()),
         admin_token: Some("admin-token".to_string()),
     };
 
+    let resolve_role = |authorization| {
+        state
+            .grant_from_authorization_header_read(authorization)
+            .map(|matched| matched.grant.role)
+    };
     assert_eq!(
-        config.role_from_authorization_header(Some("Bearer reader-token")),
+        resolve_role(Some("Bearer reader-token")),
         Some(ApiRole::Reader)
     );
+    assert_eq!(resolve_role(Some("writer-token")), Some(ApiRole::Writer));
     assert_eq!(
-        config.role_from_authorization_header(Some("writer-token")),
-        Some(ApiRole::Writer)
-    );
-    assert_eq!(
-        config.role_from_authorization_header(Some("Bearer admin-token")),
+        resolve_role(Some("Bearer admin-token")),
         Some(ApiRole::Admin)
     );
-    assert_eq!(config.role_from_authorization_header(Some("invalid")), None);
+    assert_eq!(resolve_role(Some("invalid")), None);
 
     assert!(ApiRole::Admin.allows(ApiRole::Admin));
     assert!(ApiRole::Admin.allows(ApiRole::Writer));
@@ -263,7 +262,7 @@ fn test_api_role_update_requires_admin_token_when_enabled() {
         admin_token: Some("admin-token".to_string()),
     });
     assert!(result.is_ok());
-    assert!(config.auth_enabled());
+    assert!(config.has_configured_tokens());
 }
 
 #[test]
@@ -281,13 +280,7 @@ fn test_redact_identifier_for_logs() {
 
 fn make_test_auth_state() -> ApiAuthState {
     let now = now_unix_seconds();
-    let mut bytes = [0u8; 4];
-    OsRng.fill_bytes(&mut bytes);
-    let unique_suffix = bytes
-        .iter()
-        .map(|byte| format!("{:02x}", byte))
-        .collect::<String>();
-    let store_path = std::env::temp_dir().join(format!("kapsl-auth-state-{}.json", unique_suffix));
+    let store_path = std::env::temp_dir().join(format!("{}.json", generate_random_id("auth-test")));
     ApiAuthState {
         role_tokens: ApiRoleTokenConfig::default(),
         store_path,
@@ -346,10 +339,10 @@ fn test_generated_api_key_authenticates_user_role() {
             },
         )
         .expect("create key");
-    assert_eq!(
-        state.role_from_authorization_header(Some(&format!("Bearer {}", created.raw_key))),
-        Some(ApiRole::Admin)
-    );
+    let role = state
+        .grant_from_authorization_header_read(Some(&format!("Bearer {}", created.raw_key)))
+        .map(|matched| matched.grant.role);
+    assert_eq!(role, Some(ApiRole::Admin));
     let _ = fs::remove_file(&state.store_path);
 }
 
@@ -390,7 +383,7 @@ fn parse_and_tune(argv: &[&str]) -> (Args, AppliedPerformanceTuning) {
     (args, tuning)
 }
 
-fn onnx_tuning_env_names() -> [&'static str; 6] {
+fn onnx_session_config_env_names() -> [&'static str; 6] {
     [
         ORT_MEMORY_PATTERN_ENV,
         ORT_DISABLE_CPU_MEM_ARENA_ENV,
@@ -568,9 +561,9 @@ fn test_auto_profile_does_not_export_gguf_prefill_chunk_before_model_resolution(
 }
 
 #[test]
-fn test_onnx_tuning_profile_resolves_global_and_per_model_overrides() {
+fn test_onnx_session_config_resolves_global_and_per_model_overrides() {
     let _guard = lock_env_tests();
-    let env_names = onnx_tuning_env_names();
+    let env_names = onnx_session_config_env_names();
     let saved_env = save_env(&env_names);
     clear_env(&env_names);
 
@@ -584,7 +577,8 @@ fn test_onnx_tuning_profile_resolves_global_and_per_model_overrides() {
         "7:disable_cpu_mem_arena=true,peak_concurrency=8",
     ]);
 
-    let profile = build_onnx_tuning_profile(&args).expect("valid ONNX tuning profile");
+    let profile =
+        build_onnx_session_config_profile(&args).expect("valid ONNX session configuration");
     let model_7 = profile.resolve(7);
     assert_eq!(model_7.memory_pattern, Some(false));
     assert_eq!(model_7.session_buckets, Some(2));
@@ -604,9 +598,9 @@ fn test_onnx_tuning_profile_resolves_global_and_per_model_overrides() {
 }
 
 #[test]
-fn test_onnx_tuning_profile_uses_env_as_override_below_cli() {
+fn test_onnx_session_config_uses_env_as_override_below_cli() {
     let _guard = lock_env_tests();
-    let env_names = onnx_tuning_env_names();
+    let env_names = onnx_session_config_env_names();
     let saved_env = save_env(&env_names);
     clear_env(&env_names);
     std::env::set_var(ORT_MEMORY_PATTERN_ENV, "false");
@@ -621,7 +615,8 @@ fn test_onnx_tuning_profile_uses_env_as_override_below_cli() {
         "7:peak_concurrency=8",
     ]);
 
-    let profile = build_onnx_tuning_profile(&args).expect("valid ONNX tuning profile");
+    let profile =
+        build_onnx_session_config_profile(&args).expect("valid ONNX session configuration");
     let model_9 = profile.resolve(9);
     assert_eq!(model_9.memory_pattern, Some(false));
     assert_eq!(model_9.session_buckets, Some(2));
@@ -634,14 +629,14 @@ fn test_onnx_tuning_profile_uses_env_as_override_below_cli() {
 }
 
 #[test]
-fn test_onnx_tuning_profile_rejects_unknown_keys() {
+fn test_onnx_session_config_rejects_unknown_keys() {
     let _guard = lock_env_tests();
-    let env_names = onnx_tuning_env_names();
+    let env_names = onnx_session_config_env_names();
     let saved_env = save_env(&env_names);
     clear_env(&env_names);
 
     let (args, _) = parse_and_tune(&["kapsl", "--onnx-model-tuning", "3:not_a_real_key=1"]);
-    let err = build_onnx_tuning_profile(&args).expect_err("unknown key should fail");
+    let err = build_onnx_session_config_profile(&args).expect_err("unknown key should fail");
     assert!(err.contains("unknown ONNX tuning key"));
 
     restore_env(saved_env);

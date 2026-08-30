@@ -87,10 +87,10 @@ pub(crate) fn start_http_server(
     let rag_docs_root = state_layout.rag_root.join("docs");
     let rag_vector_path = state_layout.rag_root.join("vectors.sqlite3");
     fs::create_dir_all(&rag_docs_root)?;
-    let rag_state = RagRuntimeState {
-        vector_store: Arc::new(SqliteVectorStore::open(&rag_vector_path)?),
-        doc_store: FsDocStore::new(&rag_docs_root),
-    };
+    let rag = RagService::new(
+        Arc::new(SqliteVectorStore::open(&rag_vector_path)?),
+        Arc::new(FsDocStore::new(&rag_docs_root)),
+    );
 
     let metrics_route =
         build_metrics_route(registry.clone(), auth_state.clone(), resources.clone());
@@ -98,7 +98,7 @@ pub(crate) fn start_http_server(
         model_runtime,
         inference: inference.clone(),
         telemetry,
-        rag_state: rag_state.clone(),
+        rag: rag.clone(),
         auto_scaler,
         log_sensitive_ids,
     });
@@ -116,8 +116,8 @@ pub(crate) fn start_http_server(
     );
     let engine_routes = build_engine_routes();
     let extension_routes =
-        build_extension_routes(extension_manager, running_connectors, rag_state.clone());
-    let rag_routes = build_rag_routes(rag_state);
+        build_extension_routes(extension_manager, running_connectors, rag.clone());
+    let rag_routes = build_rag_routes(rag);
     let auth_routes = build_auth_routes(auth_state.clone());
     let static_routes = build_static_routes();
 

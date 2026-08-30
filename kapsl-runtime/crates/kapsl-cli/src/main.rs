@@ -1,8 +1,6 @@
-use base64::engine::general_purpose::{
-    STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
-};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use clap::{ArgGroup, ArgMatches, FromArgMatches, Parser};
+use clap::Parser;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -17,26 +15,19 @@ use kapsl_engine_api::{
     BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineHandle, EngineMetrics,
     EngineModelInfo, InferenceRequest, TensorDtype,
 };
-#[cfg(feature = "gpu-device-pool")]
-use kapsl_engine_api::{ExternalDeviceMemory, ExternalDeviceMemoryReport};
 use kapsl_hal::device::DeviceInfo;
 use kapsl_ipc::{IpcServer, TcpServer};
 use kapsl_llm::block_manager::{new_shared_allocator, SharedBlockAllocator};
 use kapsl_llm::global_scheduler::{EngineHandle as KvEngineHandle, GlobalKvScheduler};
 use kapsl_llm::llm_backend::LLMBackend;
-use kapsl_llm::rag::{
-    build_rag_prompt, CitationStyle, RagChunk, RagPromptConfig, WhitespaceTokenCounter,
-};
 use kapsl_monitor::middleware::MonitoringMiddleware;
 use kapsl_rag::extension::{
     ConnectorRuntimeHandle, ExtensionManager, ExtensionRegistry, InstalledExtension,
 };
 use kapsl_rag::vector::SqliteVectorStore;
-use kapsl_rag::{
-    AccessControl, ConnectorClient, DocStore, EmbeddedChunk, FsDocStore, VectorQuery, VectorStore,
-};
+use kapsl_rag::{ConnectorClient, FsDocStore};
 use kapsl_rag_sdk::protocol::{ConnectorRequestKind, ConnectorResponseKind, ConnectorResult};
-use kapsl_rag_sdk::types::{DeltaOp, DocumentDelta, DocumentPayload, SourceDescriptor};
+use kapsl_rag_sdk::types::{DeltaOp, DocumentDelta};
 use kapsl_scheduler::{
     determine_priority, PoolStrategy, ReplicaPool, ReplicaScheduler,
     RequestMetadata as SchedulerRequestMetadata, Scheduler,
@@ -51,9 +42,8 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::future::Future;
-use std::io::{BufRead, BufWriter, Cursor, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
+use std::io::{BufRead, BufWriter, Read, Write};
+use std::net::{IpAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -66,25 +56,16 @@ use tokio::sync::Mutex as AsyncMutex;
 use warp::Filter;
 
 mod app;
-mod backend_bundle;
-mod backend_manager;
+mod backend;
 mod features;
 mod http;
-mod llama_cpp_backend_pack;
-mod llama_cpp_shared_pool;
-mod onnx_backend_pack;
 mod runtime;
-mod serving_backend;
 
 use app::*;
-use backend_bundle::*;
-use backend_manager::*;
+use backend::*;
 use features::*;
 use http::*;
-use llama_cpp_backend_pack::*;
-use onnx_backend_pack::*;
 use runtime::*;
-use serving_backend::*;
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 #[cfg(test)]

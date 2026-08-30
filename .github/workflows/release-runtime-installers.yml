@@ -84,9 +84,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
@@ -394,9 +392,7 @@ jobs:
           path: sdk-llama
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Build kapsl with statically compiled GGUF CUDA
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
@@ -571,8 +567,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          for script in install.sh install-cuda.sh; do
-            aws s3 cp "$script" \
+          for script_path in installers/install.sh installers/install-cuda.sh; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
@@ -585,8 +582,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          for script in install.ps1 install-cuda.ps1 install-tensorrt.ps1; do
-            aws s3 cp "$script" \
+          for script_path in installers/install.ps1 installers/install-cuda.ps1 installers/install-tensorrt.ps1; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
