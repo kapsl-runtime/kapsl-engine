@@ -1019,8 +1019,63 @@ jobs:
             --llama-model qwen2.5-0.5b-llama \
             --vllm-model qwen2.5-0.5b-vllm-fixed \
             --output "$OUTPUT_DIR/mixed-backend-conformance.json"
-          grep -Fq 'kv_path=shared-kv' "$OUTPUT_DIR/mixed-runtime.log"
-          ! grep -Fq 'kv_path=native' "$OUTPUT_DIR/mixed-runtime.log"
+          python3 - "$OUTPUT_DIR/mixed-backend-conformance.json" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if report.get("schema_version") != 1:
+              raise SystemExit("mixed-backend report has an unsupported schema")
+          if report.get("status") != "passed" or report.get("failures") != []:
+              raise SystemExit(
+                  f"mixed-backend report did not pass: {report.get('failures')!r}"
+              )
+          memory = report.get("memory")
+          if not isinstance(memory, dict):
+              raise SystemExit("mixed-backend report has no memory evidence")
+
+          def require_positive_map(name):
+              values = memory.get(name)
+              if not isinstance(values, dict) or not values or any(
+                  isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                  for value in values.values()
+              ):
+                  raise SystemExit(
+                      f"mixed-backend report has invalid {name}: {values!r}"
+                  )
+              return values
+
+          backing = require_positive_map("vllm_backing_bytes")
+          llama_usage = require_positive_map("llama_owner_usage_bytes")
+          if set(llama_usage) - set(backing):
+              raise SystemExit("llama.cpp and managed vLLM did not share a device")
+          if not str(memory.get("llama_kv_owner", "")).endswith(":kv-cache"):
+              raise SystemExit("mixed-backend report has no shared-pool KV owner")
+          quarantine = memory.get("vllm_quarantine_bytes")
+          if not isinstance(quarantine, dict) or set(quarantine) != set(backing) or any(
+              isinstance(value, bool) or not isinstance(value, int) or value != 0
+              for value in quarantine.values()
+          ):
+              raise SystemExit(
+                  f"mixed-backend report contains quarantined memory: {quarantine!r}"
+              )
+          released = memory.get("post_completion")
+          released_allocated = (
+              released.get("general_pool_allocated_bytes")
+              if isinstance(released, dict)
+              else None
+          )
+          if (
+              not isinstance(released_allocated, dict)
+              or set(released_allocated) != set(llama_usage)
+              or any(
+                  isinstance(value, bool) or not isinstance(value, int) or value != 0
+                  for value in released_allocated.values()
+              )
+          ):
+              raise SystemExit("mixed-backend report did not prove KV release")
+          PY
 
       - name: Stop mixed runtime and prove clean co-resident release
         if: always()

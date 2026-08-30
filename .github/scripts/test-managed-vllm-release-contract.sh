@@ -95,8 +95,17 @@ for workflow in \
     require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt'
     require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256'
     require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/wheels/*.whl'
+    require_literal "$workflow" 'mixed-backend report did not pass'
+    require_literal "$workflow" 'llama_owner_usage_bytes'
+    require_literal "$workflow" 'general_pool_allocated_bytes'
   fi
 done
+
+if grep -Eq "grep .*kv_path=(shared-kv|native).*mixed-runtime\\.log" \
+  .github/workflows/vllm-shared-pool-conformance.yml; then
+  echo "Managed-vLLM conformance must gate mixed memory from metrics evidence, not log strings." >&2
+  exit 1
+fi
 
 if grep -Fxq '            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}' \
   .github/workflows/vllm-shared-pool-conformance.yml; then
