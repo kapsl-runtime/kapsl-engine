@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import hashlib
 import http.client
@@ -238,6 +239,93 @@ def run_target(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def combine_reports(reports: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    if len(reports) < 2:
+        raise BenchmarkError("combining measurements requires at least two reports")
+
+    first = reports[0]
+    invariant_fields = (
+        "schema_version",
+        "status",
+        "target",
+        "model",
+        "request_body_sha256",
+        "request_body",
+        "engine_settings",
+        "target_artifacts",
+    )
+    first_points = {row["concurrency"]: row for row in first["points"]}
+    if not first_points:
+        raise BenchmarkError("benchmark report has no concurrency points")
+
+    total_trials = 0
+    measurement_blocks = []
+    for block_index, report in enumerate(reports):
+        for field in invariant_fields:
+            if report.get(field) != first.get(field):
+                raise BenchmarkError(f"benchmark blocks differ in {field}")
+        points = {row["concurrency"]: row for row in report["points"]}
+        if points.keys() != first_points.keys():
+            raise BenchmarkError("benchmark blocks cover different concurrencies")
+        declared_trials = int(report.get("trials", 0))
+        if declared_trials <= 0:
+            raise BenchmarkError("benchmark block declares no trials")
+        for concurrency, point in points.items():
+            if len(point.get("trials", [])) != declared_trials:
+                raise BenchmarkError(
+                    f"benchmark block trial count diverges at concurrency {concurrency}"
+                )
+            if point.get("request_count_per_trial") != first_points[concurrency].get(
+                "request_count_per_trial"
+            ):
+                raise BenchmarkError(
+                    "benchmark blocks use different request counts per trial"
+                )
+        measurement_blocks.append(
+            {
+                "block": block_index,
+                "base_url": report.get("base_url"),
+                "trials": declared_trials,
+            }
+        )
+        total_trials += declared_trials
+
+    if total_trials < MINIMUM_CONFIDENCE_TRIALS:
+        raise BenchmarkError(
+            "combined acceptance measurements require at least "
+            f"{MINIMUM_CONFIDENCE_TRIALS} independent trials"
+        )
+
+    combined = copy.deepcopy(first)
+    combined["trials"] = total_trials
+    combined["measurement_blocks"] = measurement_blocks
+    for combined_point in combined["points"]:
+        concurrency = combined_point["concurrency"]
+        combined_trials = []
+        for block_index, report in enumerate(reports):
+            report_points = {row["concurrency"]: row for row in report["points"]}
+            for block_trial in report_points[concurrency]["trials"]:
+                trial = copy.deepcopy(block_trial)
+                trial["measurement_block"] = block_index
+                trial["block_trial"] = trial.get("trial")
+                trial["trial"] = len(combined_trials)
+                combined_trials.append(trial)
+        combined_point["trials"] = combined_trials
+    return combined
+
+
+def combine(args: argparse.Namespace) -> dict[str, Any]:
+    reports = [
+        json.loads(path.read_text(encoding="utf-8")) for path in args.inputs
+    ]
+    report = combine_reports(reports)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return report
+
+
 def _bootstrap_interval(
     direct: Sequence[float],
     kapsl: Sequence[float],
@@ -394,6 +482,11 @@ def _parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--direct", type=Path, required=True)
     compare_parser.add_argument("--kapsl", type=Path, required=True)
     compare_parser.add_argument("--output", type=Path, required=True)
+    combine_parser = subparsers.add_parser("combine")
+    combine_parser.add_argument(
+        "--input", dest="inputs", action="append", type=Path, required=True
+    )
+    combine_parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -401,8 +494,10 @@ def main() -> int:
     args = _parser().parse_args()
     if args.command == "run":
         run_target(args)
-    else:
+    elif args.command == "compare":
         compare(args)
+    else:
+        combine(args)
     return 0
 
 

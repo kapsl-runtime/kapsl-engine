@@ -108,10 +108,14 @@ if grep -Eq "grep .*kv_path=(shared-kv|native).*mixed-runtime\\.log" \
 fi
 
 if [[ "$(grep -F -c -- '--trials 15' \
-  .github/workflows/vllm-shared-pool-conformance.yml)" != "2" ]]; then
-  echo "Managed-vLLM conformance must run 15 independent trials for each bridge target." >&2
+  .github/workflows/vllm-shared-pool-conformance.yml)" != "4" ]]; then
+  echo "Managed-vLLM conformance must declare initial and crossover 15-trial blocks for each bridge target." >&2
   exit 1
 fi
+require_literal .github/workflows/vllm-shared-pool-conformance.yml \
+  'BRIDGE_CROSSOVER_REQUIRED=true'
+require_literal .github/workflows/vllm-shared-pool-conformance.yml \
+  'managed_vllm_bridge_benchmark.py combine'
 
 if grep -Fxq '            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}' \
   .github/workflows/vllm-shared-pool-conformance.yml; then

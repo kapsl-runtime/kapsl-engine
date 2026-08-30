@@ -16,13 +16,23 @@ sys.modules[SPEC.name] = benchmark
 SPEC.loader.exec_module(benchmark)
 
 
-def report(target: str, throughput: float, median_ttft: float, p95_ttft: float):
+def report(
+    target: str,
+    throughput: float,
+    median_ttft: float,
+    p95_ttft: float,
+    *,
+    trials: int = 3,
+):
     return {
         "schema_version": 1,
+        "status": "measured",
         "target": target,
+        "base_url": "http://127.0.0.1:8000",
         "model": "model",
         "request_body_sha256": "sha256:body",
-        "trials": 3,
+        "request_body": {"model": "model"},
+        "trials": trials,
         "engine_settings": {
             "vllm_version": "pinned",
             "vllm_build_id": "sha256:vllm",
@@ -33,16 +43,22 @@ def report(target: str, throughput: float, median_ttft: float, p95_ttft: float):
             "attention_backend": "FLASH_ATTN",
             "enforce_eager": True,
         },
+        "target_artifacts": {
+            "runtime_build_id": "sha256:runtime",
+            "adapter_build_id": "sha256:adapter",
+        },
         "points": [
             {
                 "concurrency": concurrency,
+                "request_count_per_trial": max(8, concurrency * 4),
                 "trials": [
                     {
+                        "trial": trial,
                         "output_tokens_per_second": throughput,
                         "median_ttft_seconds": median_ttft,
                         "p95_ttft_seconds": p95_ttft,
                     }
-                    for _ in range(3)
+                    for trial in range(trials)
                 ],
             }
             for concurrency in (1, 4, 8, 16)
@@ -84,6 +100,38 @@ class ManagedVllmBridgeBenchmarkTests(unittest.TestCase):
     def test_percentile_interpolates(self):
         self.assertEqual(benchmark.percentile([1.0, 2.0, 3.0], 0.5), 2.0)
         self.assertAlmostEqual(benchmark.percentile([1.0, 3.0], 0.25), 1.5)
+
+    def test_combines_crossover_blocks_and_reindexes_trials(self):
+        first = report("kapsl", 98.0, 0.011, 0.021, trials=15)
+        second = report("kapsl", 99.0, 0.010, 0.020, trials=15)
+        second["base_url"] = "http://127.0.0.1:9000"
+
+        combined = benchmark.combine_reports([first, second])
+
+        self.assertEqual(combined["trials"], 30)
+        self.assertEqual(
+            combined["measurement_blocks"],
+            [
+                {"block": 0, "base_url": first["base_url"], "trials": 15},
+                {"block": 1, "base_url": second["base_url"], "trials": 15},
+            ],
+        )
+        trials = combined["points"][0]["trials"]
+        self.assertEqual([row["trial"] for row in trials], list(range(30)))
+        self.assertEqual(
+            [row["measurement_block"] for row in trials], [0] * 15 + [1] * 15
+        )
+        self.assertEqual(
+            [row["block_trial"] for row in trials], list(range(15)) * 2
+        )
+
+    def test_rejects_crossover_blocks_with_different_engine_settings(self):
+        first = report("direct", 100.0, 0.010, 0.020, trials=15)
+        second = report("direct", 100.0, 0.010, 0.020, trials=15)
+        second["engine_settings"]["kv_cache_memory_bytes_per_rank"] = 2048
+
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "engine_settings"):
+            benchmark.combine_reports([first, second])
 
     def test_acceptance_thresholds_pass_at_or_below_limits(self):
         result = benchmark.compare_reports(

@@ -944,6 +944,11 @@ differ.
   Use at least 15 independent trials per target and concurrency, and require
   both the median loss and the upper bound of its two-sided 95% bootstrap
   interval to stay within 2%.
+- The release job treats an initial passing 15-trial comparison as decisive.
+  If that comparison misses any bridge gate, it gathers a second 15-trial
+  block for both targets in the same job. The two Kapsl blocks bracket the two
+  direct blocks, and the unchanged gates are then enforced over all 30 trials
+  per target so host-phase drift is represented as measured variance.
 - Added median TTFT is no more than 5 ms and added p95 TTFT is no more than
   10 ms on the same-host benchmark.
 - There is no per-request health call and no OS thread per stream.
