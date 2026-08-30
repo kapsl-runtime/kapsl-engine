@@ -69,9 +69,11 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.6.0",
-    "connector": "0.6.0",
+    "connector_distribution": "0.7.0",
+    "connector": "0.7.0",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
+    "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
+    "kv_abi": {"major": 1, "minor": 5},
     "cuda_runtime": "13.0",
     "planner_schema_version": 1,
 }
@@ -97,7 +99,7 @@ PY
   "torchvision==0.28.0+cu130" \
   "torchaudio==2.11.0+cu130" \
   "vllm==0.26.1rc1.dev1130+g2ec6f0d71" \
-  "kapsl-vllm-connector==0.6.0"
+  "kapsl-vllm-connector==0.7.0"
 "$staging_python" -m pip check
 
 "$staging_python" <<'PY'
@@ -105,7 +107,12 @@ import importlib.metadata as md
 import json
 import platform
 import torch
-from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION
+from kapsl_vllm_connector import (
+    ADAPTER_PROFILE_ID,
+    ADAPTER_VERSION,
+    ELASTIC_ADAPTER_PROFILE_ID,
+)
+from kapsl_vllm_connector.contract import ABI_VERSION
 from kapsl_vllm_connector.planning import PLANNER_SCHEMA_VERSION
 
 actual = {
@@ -117,6 +124,8 @@ actual = {
     "connector_distribution": md.version("kapsl-vllm-connector"),
     "connector": ADAPTER_VERSION,
     "profile": ADAPTER_PROFILE_ID,
+    "elastic_profile": ELASTIC_ADAPTER_PROFILE_ID,
+    "kv_abi": ABI_VERSION,
     "cuda_runtime": str(torch.version.cuda),
     "planner_schema_version": PLANNER_SCHEMA_VERSION,
 }
@@ -126,9 +135,11 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.6.0",
-    "connector": "0.6.0",
+    "connector_distribution": "0.7.0",
+    "connector": "0.7.0",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
+    "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
+    "kv_abi": {"major": 1, "minor": 5},
     "cuda_runtime": "13.0",
     "planner_schema_version": 1,
 }

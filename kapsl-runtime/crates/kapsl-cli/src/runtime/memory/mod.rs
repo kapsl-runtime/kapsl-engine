@@ -1404,7 +1404,7 @@ impl MemoryAuthority {
             .unwrap_or(MemoryDomain::Host)
     }
 
-    #[cfg(all(feature = "gpu-device-pool", target_os = "linux"))]
+    #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
     pub(crate) fn cuda_device(
         &self,
         device_id: usize,
@@ -2703,6 +2703,50 @@ impl MemoryLease {
         let authority = Arc::clone(&self.authority);
         let _operation = authority.operations.lock();
         self.shrink_locked(plan)
+    }
+
+    /// Return externally owned KV bytes after the caller has fenced every
+    /// importer and physically released the backing. Unlike a speculative
+    /// shrink, this is authoritative evidence that the old observed footprint
+    /// no longer exists, so the observation floor may move down with it.
+    pub(crate) fn shrink_after_external_release(
+        &mut self,
+        plan: &MemoryPlan,
+    ) -> Result<(), String> {
+        let authority = Arc::clone(&self.authority);
+        let _operation = authority.operations.lock();
+        if plan.claims().iter().any(|claim| {
+            claim.class != MemoryAllocationClass::KvCache
+                || !matches!(claim.source, MemoryClaimSource::External { .. })
+        }) {
+            return Err(
+                "externally fenced shrink accepts only external KV-cache claims".to_string(),
+            );
+        }
+        self.validate_growth_plan(plan)?;
+        let current = aggregate_claim_rows(&self.claims);
+        let reductions = aggregate_claim_rows(plan.claims());
+        for (key, reduction) in reductions {
+            let current_bytes = current.get(&key).copied().unwrap_or(0);
+            if reduction > current_bytes {
+                return Err(format!(
+                    "externally fenced shrink exceeds the live {} allocation for {}",
+                    key.class, key.owner
+                ));
+            }
+            let target = current_bytes - reduction;
+            self.observed.insert(key.clone(), target);
+            self.resize_adapter_row(&key, target)?;
+            self.set_claim_row_bytes(&key, target);
+            if let Some(committed) = self.committed.get_mut(&key) {
+                *committed = (*committed).min(target);
+            }
+            if let Some(planned) = self.planned.get_mut(&key) {
+                *planned = planned.saturating_sub(reduction);
+            }
+        }
+        self.refresh_accounting(false);
+        Ok(())
     }
 
     fn shrink_locked(&mut self, plan: &MemoryPlan) -> Result<(), String> {

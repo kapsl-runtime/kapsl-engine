@@ -125,7 +125,8 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_GGUF_DISABLE_SHARED_KV` | Set to `1` to force llama.cpp native KV for GGUF diagnosis or rollback. |
 | `KAPSL_VLLM_PYTHON` | Development override pointing at the exact certified managed-vLLM Python executable. Packaged installs discover the verified lazy cache and legacy beside-binary bundle automatically. |
 | `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
-| `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge rollout mode: `wire` enables the typed byte relay; `async-translated` (the default) and `legacy` retain response translation for rollback. |
+| `KAPSL_VLLM_MEMORY_MODE` | Managed-vLLM KV policy override. Omitted, `exact`, or `auto` preserves the package's exact policy; `legacy-fraction` (also `legacy`/`legacy_fraction`) is the explicit compatibility rollback. Exact cannot override an explicitly authored legacy policy. |
+| `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge mode. Omitted or `wire` uses the typed byte relay; `async-translated`, `translated`, or `legacy` retains response translation for rollback. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -181,8 +182,10 @@ installer no longer downloads this multi-gigabyte pack by default; pass
 complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
-`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.6.0` with profile
-`vllm-v1-packed-cuda-ipc/flash-attn`. A missing or different bundle fails
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.0` with KV ABI
+`1.5`. Fixed pools use profile
+`vllm-v1-packed-cuda-ipc/flash-attn`; live-resizable pools use
+`vllm-v1-packed-cuda-vmm/flash-attn-blnhc`. A missing or different bundle fails
 closed; Kapsl never falls back to ONNX Runtime, native SafeTensors, or another
 attention implementation. Source/development builds can point to the same
 certified environment with `KAPSL_VLLM_PYTHON=/path/to/venv/bin/python`.
@@ -198,32 +201,73 @@ metadata:
     vllm:
       max_model_len: 4096
       kv_cache:
-        mode: legacy_fraction
-        gpu_memory_utilization: 0.5
+        mode: auto
+        target_concurrency: 16
+        headroom_percent: 20
+        max_bytes: 2147483648
+        strict: true
+        live_resize:
+          maximum_concurrency: 32
+          grow_utilization_percent: 80
+          shrink_utilization_percent: 25
+          shrink_idle_seconds: 60
       startup_timeout_seconds: 300
 ```
 
-The compatibility defaults are `1024`, a `0.5` legacy fraction, and `300`
-seconds respectively. The deprecated top-level `gpu_memory_utilization` field
-is still accepted for existing packages but conflicts with `kv_cache` when
-both are present.
+The defaults are a 1,024-token context, exact `auto` sizing, 20% bounded KV
+headroom, the resolved per-replica batch/concurrency target, and a 300-second
+startup timeout. The certified planner loads the pinned vLLM configuration,
+derives the packed cache geometry without allocating the final KV cache, and
+asks `MemoryAuthority` for an exact single-use grant before the serving child
+starts. If the full target does not fit, Kapsl first sheds optional headroom and
+then reduces concurrency to the largest whole-sequence capacity that fits;
+`strict: true` rejects that reduction. `min_bytes` and `max_bytes` are optional
+exact limits, and `mode: fixed` accepts one exact `bytes` value. Every exact
+grant must remain block-aligned and large enough for one full maximum-length
+sequence on every tensor-parallel rank.
 
-The manifest parser also validates the future `kv_cache.mode: auto` and
-`kv_cache.mode: fixed` shapes. This release deliberately rejects either exact
-mode before downloading a backend or starting a child: exact launch remains
-fail-closed until the certified runtime geometry provider and provisional
-`MemoryAuthority` grant handoff are installed. It never falls back to `0.5`
-after an operator requested an exact policy. Managed vLLM currently uses one
-selected CUDA device per Kapsl replica. Use `CUDA_VISIBLE_DEVICES` to select or
-isolate GPUs.
+The pinned vLLM build still evaluates `gpu_memory_utilization` as a
+whole-device free-memory startup guard even when `kv_cache_memory_bytes`
+supplies the exact cache size. Exact Kapsl launches pass a certified positive
+`0.000000001` compatibility sentinel solely to neutralize that unrelated
+upstream guard for co-resident replicas. The sentinel is not a KV sizing input:
+the authority grant and `--kv-cache-memory-bytes` remain the physical cache
+decision, and normal CUDA allocation failure still fails the child closed.
 
-`KAPSL_VLLM_BRIDGE_MODE=wire` enables the protocol-native OpenAI path after
+`live_resize` is optional and valid only with `mode: auto`. It reserves a
+certified BLNHC virtual address range sized for `maximum_concurrency`, while
+initially mapping only the exact admitted physical prefix. At or above the grow
+threshold Kapsl admits and maps aligned, zeroed CUDA VMM segments before
+publishing new native vLLM blocks. Below the shrink threshold for the idle
+interval, vLLM first retires a free physical tail and workers then unmap it
+before Kapsl lowers the authority charge. The stable tensor address,
+one-sequence physical minimum, native block-table ownership, and per-rank
+geometry do not change.
+
+The defaults are 80% grow utilization, 25% shrink utilization, and 60 seconds
+of low utilization before shrink. `maximum_concurrency` is required and cannot
+be below the initial target. Set `live_resize.enabled: false` alone to retain a
+fixed exact pool. A live block, incomplete acknowledgement, timeout, CUDA
+release failure, or ambiguous detach fences the replica and retains or
+quarantines the affected charge; it is never reassigned speculatively.
+
+The deprecated top-level `gpu_memory_utilization` field and
+`kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
+paths and conflict with an exact `kv_cache` object. Kapsl never reinterprets an
+exact byte grant as a fraction. `KAPSL_VLLM_MEMORY_MODE=legacy-fraction` forces a
+fresh legacy generation for rollback; `exact` cannot silently reinterpret an
+explicitly authored legacy package. Tensor-parallel replicas receive an exact
+per-rank device grant. Use `CUDA_VISIBLE_DEVICES` to select or isolate the
+physical GPUs visible to Kapsl.
+
+The default protocol-native OpenAI path runs after
 authentication, model resolution, pressure admission, priority selection, and
 session scoping. The route normalizes the model alias once, forwards the JSON
 body to the private managed process, and relays vLLM's status, allowlisted
 headers, JSON body, or SSE bytes without reconstructing completion events.
-Client authorization is never forwarded. Leave the variable unset to retain
-the translated bridge while canary and semantic tests are running.
+Client authorization is never forwarded. Set
+`KAPSL_VLLM_BRIDGE_MODE=async-translated` (or `legacy`) only to roll a replica
+back to the translated compatibility path.
 
 ### External KV participants
 
@@ -241,7 +285,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.6.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn'
+    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+  --kv-shared-pool-profile \
+    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four
@@ -270,14 +316,15 @@ is rejected before backend allocation when the domain budget is unavailable or
 exhausted. CUDA domains require a build with the CUDA memory authority
 (`gpu-device-pool`) enabled.
 
-ABI 1.2 defines two provisioned, runtime-owned `shared_pool` allocation modes.
+ABI 1.5 retains two provisioned, runtime-owned `shared_pool` allocation modes.
 `runtime_leased` publishes epoch/generation-checked block handles, zeros blocks
 before assignment, requires synchronized release, and quarantines an unfenced
 expiry. `participant_managed` exports the whole isolated backing while leaving
 block-index selection to the backend; Kapsl still grants aggregate request
 capacity, but those leases contain no physical block handles.
 
-ABI 1.3 adds a fail-closed activation lifecycle. Registration only provisions
+The fail-closed activation lifecycle first introduced in ABI 1.3 remains
+mandatory. Registration only provisions
 the isolated bindings. Every backend worker must then report its exact
 epoch-bound binding, shard, adapter profile, imported byte size, and bounded
 cache-layer views. The runtime accepts those attachments only when their exact
@@ -287,13 +334,29 @@ request reservations are rejected before that point. Detach requires no live
 leases plus backend-synchronized completion, and the backing is released only
 after the coordinator lock is dropped.
 
+ABI 1.4 adds the single-use, generation-bound provisioning grant. The serving
+child must register the exact participant/model/profile, rank/device map,
+geometry digest, and bytes selected during the pre-start authority transaction.
+Registration atomically adopts that precharged lease; it never releases and
+re-admits or creates a second charge. Expired, replayed, or mismatched grants
+are rejected before physical allocation.
+
+ABI 1.5 adds synchronized live-pool resize operations and CUDA VMM segment
+descriptors. Growth maps workers before increasing the scheduler block count.
+Shrink retires a native free tail before workers unmap it and before physical
+segments or authority bytes are released. Actor, shard, generation, stage,
+block count, VMM alignment, and transferred file descriptors are validated at
+every acknowledgement. A timeout advances the readiness fence and retains the
+ambiguous backing.
+
 On Linux builds with `gpu-device-pool`, enabling the control socket
 automatically installs the CUDA IPC provisioner. It synchronously allocates and
 zeros a dedicated exportable region for each participant/pool/device, charges
 that physical region once through `MemoryAuthority`, and never exports the
-runtime's general CUDA allocator slab. Other builds retain opaque support and
-reject external `shared_pool` registration rather than accepting an
-unprovisioned data plane.
+runtime's general CUDA allocator slab. The elastic allowlisted profile instead
+reserves one stable CUDA virtual range and maps individually owned physical
+segments behind it. Other builds retain opaque support and reject external
+`shared_pool` registration rather than accepting an unprovisioned data plane.
 
 Participants heartbeat active leases. A requested TTL may be shorter than the
 runtime maximum but never longer. When heartbeats stop, an opaque lease returns
@@ -311,6 +374,15 @@ and immediately allocatable bytes use the same prefix plus an `owner` label
 (`onnx`, `gguf_kv:<model-id>`, or `native_kv:<model-id>`). Unloaded owner rows
 are removed on the next scrape. `kapsl_device_memory_pooled_bytes` remains the
 fixed backing capacity, not current usage.
+
+Managed-vLLM series separately expose requested, granted, minimum, physical,
+logical, active, idle, and quarantined capacity; provisional reservation
+state/age; effective concurrency; planning reductions/rejections; and restart
+generation. Bridge histograms and counters distinguish scheduler queue,
+upstream dispatch/headers/first byte, relayed bytes/chunks, active streams,
+connections, cancellations, upstream errors, and wire versus compatibility
+mode. Device-wide NVML usage remains separate: an idle mapped block is reusable
+by its participant but is not device-free.
 
 ### Observability
 

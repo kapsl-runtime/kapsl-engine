@@ -1,7 +1,11 @@
 # Managed vLLM memory and bridge remediation plan
 
-Status: design and implementation plan only; no runtime or connector changes are
-included with this document.
+Status: all five implementation phases are present on
+`feature/vllm-complete-remediation` and host-verified. The pinned self-hosted
+GPU workflow is the remaining acceptance step; it must pass the native
+attention, exact-memory, live-resize, semantic, restart, 1->2->1 scaling,
+mixed-backend, reclamation, and direct-vLLM performance gates before any pull
+request or release allowlist is created.
 
 Date: 2026-08-26
 
@@ -28,17 +32,18 @@ These are two related but independent fixes:
 2. **The OpenAI wire fast path** removes avoidable CPU, latency, connection, and
    allocation overhead from the out-of-process bridge.
 
-True live growth and shrinkage of a running vLLM KV cache is a later phase. The
-current packed KV tensor and single CUDA-IPC backing are fixed at engine startup
-and cannot safely be resized in place.
+Fixed exact pools retain one startup-sized CUDA-IPC backing. The optional
+Phase-5 elastic profile instead reserves a stable CUDA virtual address and maps
+or unmaps Kapsl-owned physical segments behind it, with synchronized native
+vLLM tail-block growth and retirement.
 
-## What the current implementation actually does
+## What the benchmarked pre-remediation implementation did
 
-### Current memory path
+### Pre-remediation memory path
 
-`ManagedVllmSettings` currently defaults `gpu_memory_utilization` to `0.5` and
-accepts values from `0.1` through `0.9`. `ManagedVllmProcess::build_command`
-passes that value to every managed vLLM process as
+At the benchmarked commit, `ManagedVllmSettings` defaulted
+`gpu_memory_utilization` to `0.5` and accepted values from `0.1` through `0.9`.
+`ManagedVllmProcess::build_command` passed that value to every managed vLLM process as
 `--gpu-memory-utilization`.
 
 The resulting allocation path is:
@@ -83,9 +88,9 @@ The current `shared_pool` name also needs precise interpretation:
 Consequently, unused blocks remain physically resident and appear as used VRAM
 in NVML until the participant is retired and the whole backing is released.
 
-### Current OpenAI bridge path
+### Pre-remediation OpenAI bridge path
 
-For managed vLLM chat requests, the current path is:
+At the benchmarked commit, managed vLLM chat requests followed this path:
 
 ```text
 client JSON
@@ -412,13 +417,17 @@ Launch the pinned vLLM build with its exact-byte cache option, shown by the
 current build as:
 
 ```text
---kv-cache-memory <granted-bytes>
+--kv-cache-memory-bytes <granted-bytes>
 ```
 
-Remove the implicit `--gpu-memory-utilization 0.5` from the auto path. Before
-shipping, certify the exact precedence and startup checks of this flag against
-the pinned vLLM wheel; no assumption about a newer or older upstream CLI is
-acceptable.
+Remove the implicit `--gpu-memory-utilization 0.5` sizing policy from the auto
+path. The pinned build nevertheless evaluates that option as a whole-device
+startup guard even when exact bytes are authoritative, so certified exact
+launches pass a positive `0.000000001` compatibility sentinel alongside
+`--kv-cache-memory-bytes`. The sentinel is not a cache budget and must never be
+used in authority arithmetic. The environment probe certifies that the pinned
+`EngineArgs` accepts both values, while GPU scale tests prove that the exact
+byte grant controls the eventual packed backing.
 
 The process command, resolved plan, and startup log must expose:
 
@@ -659,13 +668,11 @@ Measure at least:
 These measurements are required to attribute the existing 4-9% throughput and
 TTFT gaps rather than inferring causality from source inspection.
 
-## True live KV elasticity: later phase
+## True live KV elasticity: Phase-5 implementation
 
-Exact initial sizing fixes the immediate waste, but it does not let a running
-vLLM instance return free pages to llama.cpp or acquire more pages without a
-restart. The existing allocation is one fixed contiguous packed buffer.
-
-Live elasticity requires all of the following:
+The fixed CUDA-IPC profile remains intentionally immutable. The separately
+versioned CUDA VMM profile implements live physical growth and shrink while the
+model stays loaded. It satisfies the following requirements:
 
 1. Reserve a stable virtual-address range and map/unmap Kapsl-owned CUDA memory
    granules with CUDA virtual memory management, or teach the certified vLLM
@@ -681,17 +688,35 @@ Live elasticity requires all of the following:
 7. Re-run native FlashAttention write/read, guard, exhaustion, reuse, and detach
    conformance for the new segmented or virtual-memory profile.
 
-The safest target representation is a stable contiguous virtual address with
-Kapsl mapping physical granules behind it. That minimizes changes to vLLM's
-packed tensor views, but feasibility depends on PyTorch storage and CUDA IPC/VMM
-interoperability in the pinned stack. A prototype must prove this before the
-ABI promises live resize.
+The implementation uses that stable contiguous virtual representation. ABI 1.5
+describes the minimum/mapped/maximum blocks, VMM granularity and segments, and
+generation-bound resize stages. Growth maps and zeroes workers first, then
+publishes scheduler blocks; shrink retires a native-free scheduler tail first,
+then unmaps workers and lowers physical accounting. Target and speculative
+forwards share a resize lock. Timeouts and ambiguous detach fence routing and
+retain the charge.
 
-Until then, capacity changes require a controlled replica restart. Autoscaling
-should prefer increasing vLLM's internal batching up to the planned target
-before adding another process and its duplicated weights/context.
+The elastic profile remains disabled outside an explicit package policy and
+exact conformance allowlist. The GPU workflow must prove stable addresses,
+zeroed segments, zero second PyTorch allocation, native attention before and
+after resize, minimum-floor shrink, churn, reclamation, and quarantine behavior
+before deployment. Process autoscaling still prefers internal batching and
+elastic headroom before adding duplicated processes.
 
 ## Implementation phases
+
+| Phase | Implementation state | Remaining gate |
+|---|---|---|
+| 0: measurement/contracts | Implemented; host fixtures pass | GPU baseline evidence |
+| 1: exact initial budget | Implemented; host transaction/lifecycle tests pass | Exact multi-rank GPU allocation |
+| 2: async cleanup | Implemented; fake-upstream/backpressure tests pass | Same-host GPU observation |
+| 3: wire fast path | Implemented; API/transport/scheduler/runtime tests pass | Semantic and performance matrix |
+| 4: autoscaling/rollout | Implemented; unit and public-API harnesses present | Real 1->2->1 and restart cycle |
+| 5: live resize | Implemented as ABI 1.5 CUDA VMM profile; host state-machine tests pass | Native GPU VMM/churn/reclamation matrix |
+
+The remaining entries are acceptance execution, not missing implementation.
+They are all enforced by `vllm-shared-pool-conformance.yml`; failure prevents
+creation of the elastic allowlist and the final pull request.
 
 ### Phase 0: measurement and contracts
 
@@ -713,14 +738,15 @@ fixtures.
 - Add `kv_cache` manifest policy and legacy migration parsing.
 - Add checked block/byte planning.
 - Add transactional provisional external-KV reservations.
-- Pass exact `--kv-cache-memory` bytes.
+- Pass exact `--kv-cache-memory-bytes` bytes.
 - Transfer the reservation during connector registration.
 - Make attachment, activation, and scheduler publication one readiness path.
 - Re-plan restarts and scale-ups.
 
-Exit gate: no default fraction is passed; the physical IPC backing equals the
-authority grant within certified alignment; two admitted replicas cannot exceed
-the authority budget.
+Exit gate: no default or card-sizing fraction is passed; the only exact-mode
+fraction is the certified non-sizing startup sentinel. The physical IPC backing
+equals the authority grant within certified alignment, and two admitted
+replicas cannot exceed the authority budget.
 
 ### Phase 2: low-risk bridge cleanup
 
@@ -895,8 +921,9 @@ differ.
 
 ### Memory gates
 
-- The default auto policy passes an exact KV byte count and no implicit 0.5
-  fraction.
+- The default auto policy passes an exact KV byte count and no implicit 0.5 or
+  card-sizing fraction; the pinned-build startup sentinel is fixed and never
+  participates in cache sizing.
 - The provisioned CUDA-IPC backing equals the authority grant within one
   certified allocation-alignment unit.
 - Active vLLM KV tensors consume no second physical cache allocation.
@@ -914,6 +941,14 @@ differ.
 
 - Output-token throughput loss versus direct vLLM is no more than 2% at
   concurrency 1, 4, 8, and 16 after statistical confidence is established.
+  Use at least 15 independent trials per target and concurrency, and require
+  both the median loss and the upper bound of its two-sided 95% bootstrap
+  interval to stay within 2%.
+- The release job treats an initial passing 15-trial comparison as decisive.
+  If that comparison misses any bridge gate, it gathers a second 15-trial
+  block for both targets in the same job. The two Kapsl blocks bracket the two
+  direct blocks, and the unchanged gates are then enforced over all 30 trials
+  per target so host-phase drift is represented as measured variance.
 - Added median TTFT is no more than 5 ms and added p95 TTFT is no more than
   10 ms on the same-host benchmark.
 - There is no per-request health call and no OS thread per stream.
@@ -950,23 +985,25 @@ Rollback must never reinterpret an exact grant as a fraction. It should stop
 the affected replica, retire its participant safely, and start a fresh legacy
 generation only after memory is released or quarantined.
 
-## Decisions still required before implementation
+## Resolved implementation decisions
 
-1. Whether default `target_concurrency` follows resolved Kapsl batch size or a
-   separate managed-vLLM setting.
-2. The default bounded prefix-cache and headroom policy.
-3. Whether a reduced effective concurrency is allowed by default or requires
-   explicit opt-in.
-4. The exact vLLM planner API that can reproduce cache-group geometry without
-   performing the final KV allocation.
-5. Whether the pinned API server's UDS mode is stable enough to certify; the
-   bridge plan must still work over pooled loopback TCP.
-6. The engine-api representation for protocol-native request/response streams
-   and its sequence-serialization migration.
-7. Whether Kapsl should disable process autoscaling for vLLM until internal
-   continuous batching is saturated.
-8. Whether live elasticity will use CUDA VMM behind one stable virtual address
-   or a new segmented attention profile.
+1. Omitted `target_concurrency` follows the resolved per-replica Kapsl
+   batch/delegated-concurrency target; operators may override it in the package.
+2. Auto sizing uses 20% bounded headroom and no implicit prefix-retention pool.
+3. Whole-sequence concurrency reduction is allowed by default and observable;
+   `strict: true` rejects it.
+4. The pinned planner constructs the executor, registers backend-customized
+   specs, resolves layouts/groups, calls vLLM's own cache-config builder, and
+   exits before `initialize_from_config` performs final KV allocation.
+5. The bridge uses persistent pooled private loopback TCP. UDS is not required
+   by the certified profile.
+6. `OpenAiWireRequest` and versioned transport envelopes carry normalized
+   request bytes; raw unary/SSE response frames preserve upstream semantics.
+7. Autoscaling defers process replication while native continuous batching or
+   elastic physical headroom remains, except that an explicit minimum-replica
+   floor is authoritative.
+8. Live elasticity uses CUDA VMM physical segments behind one stable BLNHC
+   virtual address.
 
 ## Definition of done
 

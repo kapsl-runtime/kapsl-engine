@@ -331,19 +331,11 @@ jobs:
         shell: bash
         run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
 
-      - name: Checkout certified llama.cpp shared-pool SDK
-        if: ${{ vars.KAPSL_LLAMA_SDK_REF != '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ vars.KAPSL_LLAMA_SDK_REF }}
-          path: sdk-llama
-
       - name: Install Rust
         uses: ./.github/actions/setup-rust
 
       - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
 
       - name: Collect ONNX Runtime sidecars
         shell: bash
@@ -361,11 +353,8 @@ jobs:
         shell: bash
         run: .github/scripts/package-linux-onnx-backend-packs.sh
 
-      - name: Package native llama.cpp backend packs
+      - name: Package llama.cpp backend packs from published SDK crates
         shell: bash
-        env:
-          KAPSL_LLAMA_SDK_DIR: ${{ vars.KAPSL_LLAMA_SDK_REF != '' && 'sdk-llama' || '' }}
-          KAPSL_LLAMA_SDK_REF: ${{ vars.KAPSL_LLAMA_SDK_REF }}
         run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
 
       - name: Reclaim CUDA build scratch before backend packaging

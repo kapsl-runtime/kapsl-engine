@@ -16,7 +16,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wheel", type=pathlib.Path, required=True)
     parser.add_argument("--connector-version", required=True)
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--elastic-profile", required=True)
     parser.add_argument("--planner-schema", type=int, required=True)
+    parser.add_argument("--kv-abi-major", type=int, required=True)
+    parser.add_argument("--kv-abi-minor", type=int, required=True)
     return parser.parse_args()
 
 
@@ -57,9 +60,11 @@ def main() -> None:
             names, "kapsl_vllm_connector/connector.py", args.wheel
         )
         planning_path = one(names, "kapsl_vllm_connector/planning.py", args.wheel)
+        contract_path = one(names, "kapsl_vllm_connector/contract.py", args.wheel)
         entry_points_path = one(names, ".dist-info/entry_points.txt", args.wheel)
         connector_source = wheel.read(connector_path).decode("utf-8")
         planning_source = wheel.read(planning_path).decode("utf-8")
+        contract_source = wheel.read(contract_path).decode("utf-8")
         entry_points = configparser.ConfigParser()
         entry_points.read_string(wheel.read(entry_points_path).decode("utf-8"))
 
@@ -71,6 +76,15 @@ def main() -> None:
         ),
         "profile": literal_assignment(
             connector_source, "ADAPTER_PROFILE_ID", connector_path, args.wheel
+        ),
+        "elastic_profile": literal_assignment(
+            connector_source,
+            "ELASTIC_ADAPTER_PROFILE_ID",
+            connector_path,
+            args.wheel,
+        ),
+        "kv_abi": literal_assignment(
+            contract_source, "ABI_VERSION", contract_path, args.wheel
         ),
         "planner_schema_version": literal_assignment(
             planning_source, "PLANNER_SCHEMA_VERSION", planning_path, args.wheel
@@ -84,6 +98,8 @@ def main() -> None:
         "distribution_version": args.connector_version,
         "connector": args.connector_version,
         "profile": args.profile,
+        "elastic_profile": args.elastic_profile,
+        "kv_abi": {"major": args.kv_abi_major, "minor": args.kv_abi_minor},
         "planner_schema_version": args.planner_schema,
         "planner_entry_point": "kapsl_vllm_connector.plan:main",
     }

@@ -46,6 +46,32 @@ pub(super) struct LoadedReplica {
     pub(super) model_info: ModelInfo,
 }
 
+struct ManagedVllmSchedulerMetrics {
+    metrics: kapsl_monitor::metrics::KapslMetrics,
+    model: String,
+    replica: String,
+}
+
+impl kapsl_scheduler::SchedulerObserver for ManagedVllmSchedulerMetrics {
+    fn observe_queue_wait(
+        &self,
+        _priority: kapsl_scheduler::Priority,
+        operation: &'static str,
+        elapsed: Duration,
+    ) {
+        self.metrics
+            .managed_vllm
+            .bridge_stage_seconds
+            .with_label_values(&[
+                self.model.as_str(),
+                self.replica.as_str(),
+                operation,
+                "scheduler_queue",
+            ])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
 /// Turn one immutable load plan into a fully loaded scheduler replica.
 ///
 /// Primary and autoscaled loads share backend construction, memory admission,
@@ -330,11 +356,8 @@ async fn load_managed_vllm_replica(
             plan.base_model_id
         );
     }
-    if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
-        return Err(
-            "managed vLLM currently supports one CUDA device per Kapsl replica; use CUDA_VISIBLE_DEVICES to select the device and keep --tp-degree=1"
-                .into(),
-        );
+    if plan.use_pipeline_backend {
+        return Err("managed vLLM does not support pipeline topology".into());
     }
     let deployment = resources.managed_vllm().ok_or_else(|| {
         "managed vLLM was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
@@ -348,40 +371,35 @@ async fn load_managed_vllm_replica(
             error
         )
     })?;
-    let cuda_device_ids = selection
-        .devices
+    let device_ids =
+        select_managed_vllm_device_ids(&selection.devices, plan.worker_tp_degree, plan.replica_id)?;
+    let memory_domains = device_ids
         .iter()
-        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
-        .map(|device| device.id)
+        .map(|device_id| MemoryDomain::Cuda {
+            device_id: *device_id,
+        })
         .collect::<Vec<_>>();
-    if cuda_device_ids.is_empty() {
-        return Err("managed vLLM device selection produced no CUDA device".into());
-    }
-    let device_index = if role.is_primary() {
-        0
-    } else {
-        plan.replica_id as usize % cuda_device_ids.len()
-    };
-    let device_id = cuda_device_ids[device_index];
     let backend = ManagedVllmEngine::create(
         deployment,
         &plan.loader.manifest,
         &plan.model_file_path,
         plan.base_model_id,
         plan.replica_id,
-        vec![device_id],
-        1,
+        device_ids.clone(),
+        plan.worker_tp_degree,
+        plan.batch_size.max(1),
+        shared_metrics.clone(),
     )?;
     let backend = load_runtime_backend(
         backend,
         &plan.model_file_path,
-        &[MemoryDomain::Cuda { device_id }],
+        &memory_domains,
         &resources,
         plan.base_model_id,
         plan.replica_id,
         EngineKind::Native,
         plan.priority_weight,
-        &role.load_context(&plan, Some(device_id)),
+        &role.load_context(&plan, device_ids.first().copied()),
     )
     .await?;
     let engine = monitor_runtime_backend(
@@ -391,6 +409,11 @@ async fn load_managed_vllm_replica(
         shared_metrics,
     );
     let swap_handles = vec![engine.clone()];
+    let scheduler_metrics = Arc::new(ManagedVllmSchedulerMetrics {
+        metrics: shared_metrics.clone(),
+        model: plan.loader.manifest.project_name.clone(),
+        replica: plan.replica_id.to_string(),
+    });
     let scheduler = Arc::new(
         Scheduler::new(
             vec![engine],
@@ -402,7 +425,8 @@ async fn load_managed_vllm_replica(
             plan.scheduler_queue_delay_ms,
             None,
         )
-        .with_queue_overflow_policy(plan.queue_overflow_policy),
+        .with_queue_overflow_policy(plan.queue_overflow_policy)
+        .with_observer(scheduler_metrics),
     );
     log::info!("✓ Loaded managed vLLM engine instance");
     Ok(LoadedReplica {

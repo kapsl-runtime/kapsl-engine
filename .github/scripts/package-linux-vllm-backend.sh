@@ -11,9 +11,12 @@ fi
 
 sdk_dir="${KAPSL_VLLM_SDK_DIR:-sdk-vllm}"
 sdk_ref="$KAPSL_VLLM_SDK_REF"
-connector_version="0.6.0"
+connector_version="0.7.0"
 connector_profile="vllm-v1-packed-cuda-ipc/flash-attn"
+connector_elastic_profile="vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
 planner_schema_version="1"
+kv_abi_major="1"
+kv_abi_minor="5"
 connector_root="$sdk_dir/integrations/vllm"
 requirements_lock=".github/scripts/managed-vllm-cu130.lock"
 .github/scripts/verify-managed-vllm-sdk-checkout.sh "$sdk_dir" "$sdk_ref"
@@ -91,7 +94,10 @@ connector_wheel="${connector_wheels[0]}"
   --wheel "$connector_wheel" \
   --connector-version "$connector_version" \
   --profile "$connector_profile" \
-  --planner-schema "$planner_schema_version"
+  --elastic-profile "$connector_elastic_profile" \
+  --planner-schema "$planner_schema_version" \
+  --kv-abi-major "$kv_abi_major" \
+  --kv-abi-minor "$kv_abi_minor"
 
 "$bootstrap_python" -m pip download \
   --disable-pip-version-check \
@@ -139,6 +145,8 @@ cat > "$payload/installed-manifest.json" <<EOF
   "connector_distribution": "$connector_version",
   "connector": "$connector_version",
   "profile": "$connector_profile",
+  "elastic_profile": "$connector_elastic_profile",
+  "kv_abi": {"major": $kv_abi_major, "minor": $kv_abi_minor},
   "planner_schema_version": $planner_schema_version
 }
 EOF
@@ -164,6 +172,8 @@ cat > "$payload/manifest.json" <<EOF
   "connector_distribution": "$connector_version",
   "connector": "$connector_version",
   "profile": "$connector_profile",
+  "elastic_profile": "$connector_elastic_profile",
+  "kv_abi": {"major": $kv_abi_major, "minor": $kv_abi_minor},
   "planner_schema_version": $planner_schema_version
 }
 EOF

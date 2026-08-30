@@ -29,6 +29,23 @@ on:
       - ".github/scripts/managed-vllm-cu130.lock"
       - ".github/scripts/test-bootstrap-vllm-backend.sh"
       - ".github/scripts/test-managed-vllm-release-contract.sh"
+      - ".github/scripts/managed_vllm_gpu_conformance.py"
+      - ".github/scripts/test_managed_vllm_gpu_conformance.py"
+      - ".github/scripts/managed_vllm_scaling_conformance.py"
+      - ".github/scripts/test_managed_vllm_scaling_conformance.py"
+      - ".github/scripts/managed_vllm_bridge_benchmark.py"
+      - ".github/scripts/test_managed_vllm_bridge_benchmark.py"
+      - ".github/scripts/certify-mixed-backend-concurrency.py"
+      - ".github/scripts/test_certify_mixed_backend_concurrency.py"
+      - ".github/workflows/vllm-shared-pool-conformance.yml"
+      - ".github/workflows/gpu-device-pool-integration.yml"
+      - ".github/scripts/gcp_ephemeral_gpu_runner.py"
+      - ".github/scripts/github_jit_runner.py"
+      - ".github/scripts/test_gcp_ephemeral_gpu_runner.py"
+      - ".github/scripts/test_github_jit_runner.py"
+      - ".github/scripts/validate_model_package_backend.py"
+      - ".github/scripts/test_validate_model_package_backend.py"
+      - "docs/gcp-ephemeral-gpu-conformance.md"
       - ".github/scripts/generate-backend-index.py"
       - ".github/scripts/test-generate-backend-index.sh"
       - ".github/scripts/verify-public-backend-release.sh"
@@ -77,6 +94,20 @@ jobs:
           python3 -m py_compile .github/scripts/generate-backend-index.py
           python3 -m py_compile .github/scripts/benchmark-llama-cpp-backend-pack.py
           python3 -m py_compile .github/scripts/verify-managed-vllm-connector-wheel.py
+          python3 -m py_compile .github/scripts/managed_vllm_gpu_conformance.py
+          python3 -m py_compile .github/scripts/test_managed_vllm_gpu_conformance.py
+          python3 -m py_compile .github/scripts/managed_vllm_bridge_benchmark.py
+          python3 -m py_compile .github/scripts/test_managed_vllm_bridge_benchmark.py
+          python3 -m py_compile .github/scripts/managed_vllm_scaling_conformance.py
+          python3 -m py_compile .github/scripts/test_managed_vllm_scaling_conformance.py
+          python3 -m py_compile .github/scripts/certify-mixed-backend-concurrency.py
+          python3 -m py_compile .github/scripts/test_certify_mixed_backend_concurrency.py
+          python3 -m py_compile .github/scripts/gcp_ephemeral_gpu_runner.py
+          python3 -m py_compile .github/scripts/github_jit_runner.py
+          python3 -m py_compile .github/scripts/test_gcp_ephemeral_gpu_runner.py
+          python3 -m py_compile .github/scripts/test_github_jit_runner.py
+          python3 -m py_compile .github/scripts/validate_model_package_backend.py
+          python3 -m py_compile .github/scripts/test_validate_model_package_backend.py
 
       - name: Test llama.cpp performance threshold math
         run: .github/scripts/benchmark-llama-cpp-backend-pack.py self-test
@@ -110,6 +141,27 @@ jobs:
 
       - name: Test managed-vLLM connector wheel verification
         run: .github/scripts/test-verify-managed-vllm-connector-wheel.sh
+
+      - name: Test managed-vLLM GPU conformance evidence parser
+        run: python3 .github/scripts/test_managed_vllm_gpu_conformance.py
+
+      - name: Test managed-vLLM bridge performance gate math
+        run: python3 .github/scripts/test_managed_vllm_bridge_benchmark.py
+
+      - name: Test managed-vLLM scaling evidence parser
+        run: python3 .github/scripts/test_managed_vllm_scaling_conformance.py
+
+      - name: Test managed-vLLM mixed-backend memory gates
+        run: python3 .github/scripts/test_certify_mixed_backend_concurrency.py
+
+      - name: Test ephemeral GCE GPU runner lifecycle
+        run: python3 .github/scripts/test_gcp_ephemeral_gpu_runner.py
+
+      - name: Test GitHub JIT runner lifecycle
+        run: python3 .github/scripts/test_github_jit_runner.py
+
+      - name: Test model-package serving contract validation
+        run: python3 .github/scripts/test_validate_model_package_backend.py
 
       - name: Test signed backend-index generation
         run: .github/scripts/test-generate-backend-index.sh

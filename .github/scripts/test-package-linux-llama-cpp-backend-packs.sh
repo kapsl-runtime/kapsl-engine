@@ -74,6 +74,7 @@ int kapsl_fixture_cuda_link(void) { return kapsl_fixture_cuda_runtime(); }
 EOF
 cc -shared -fPIC -O2 \
   -DTEST_CAPABILITY=KAPSL_LLAMA_CAP_CUDA \
+  -DTEST_KV_CAPABILITY=KAPSL_LLAMA_CAP_SHARED_POOL \
   -DTEST_CUDA_LINK=1 \
   -I "$test_root/repo/kapsl-runtime/include" \
   "$test_root/fake-pack.c" \
@@ -137,14 +138,17 @@ class ApiPrefix(ctypes.Structure):
         ("capabilities", ctypes.c_uint64),
     ]
 
-for profile, accelerator, capability in (("cpu", "cpu", 1), ("cuda12", "cuda", 2)):
+for profile, accelerator, capability, kv_mode, kv_capability in (
+    ("cpu", "cpu", 1, "native", 4),
+    ("cuda12", "cuda", 2, "shared_pool", 8),
+):
     archive = dist / f"kapsl-backend-llama-cpp-{profile}-1.2.3-linux-x86_64.tar.gz"
     template = json.loads(pathlib.Path(str(archive) + ".manifest.json").read_text())
     assert template["backend"] == "llama-cpp"
     assert template["profile"] == profile
     assert template["accelerator_profile"] == accelerator
     assert template["execution_mode"] == "native"
-    assert template["kv_mode"] == "native"
+    assert template["kv_mode"] == kv_mode
     assert template["entrypoint"] == "lib/libkapsl_backend_llama_cpp.so"
     assert template["compatible_kapsl"] == "=1.2.3"
     assert len(template["licenses"]) == (3 if profile == "cpu" else 4)
@@ -154,7 +158,7 @@ for profile, accelerator, capability in (("cpu", "cpu", 1), ("cuda12", "cuda", 2
         bundle.extractall(root)
     payload = json.loads((root / "backend-pack.json").read_text())
     assert payload["profile"] == profile
-    assert payload["kv_mode"] == "native"
+    assert payload["kv_mode"] == kv_mode
     assert (root / "include/kapsl_llama_cpp_backend.h").is_file()
     if profile == "cpu":
         assert not (root / "lib/libcudart.so.12").exists()
@@ -171,88 +175,14 @@ for profile, accelerator, capability in (("cpu", "cpu", 1), ("cuda12", "cuda", 2
     assert api.abi_version == 1
     assert api.wire_format == 1
     assert api.capabilities & capability
-    assert api.capabilities & 4
+    assert api.capabilities & kv_capability
+    if kv_mode == "shared_pool":
+        assert not api.capabilities & 4
 
 assert "minimum_cuda" not in next(
     pack for pack in index["packs"] if pack["profile"] == "cpu"
 )
 assert next(pack for pack in index["packs"] if pack["profile"] == "cuda12")["minimum_cuda"] == "12.0"
-PY
-
-cc -shared -fPIC -O2 \
-  -DTEST_CAPABILITY=KAPSL_LLAMA_CAP_CUDA \
-  -DTEST_KV_CAPABILITY=KAPSL_LLAMA_CAP_SHARED_POOL \
-  -DTEST_CUDA_LINK=1 \
-  -I "$test_root/repo/kapsl-runtime/include" \
-  "$test_root/fake-pack.c" \
-  -L "$test_root" \
-  -Wl,-rpath,"$test_root" \
-  -Wl,--no-as-needed \
-  -Wl,-l:libcudart.so.12 \
-  -o "$test_root/libllama-cuda-shared.so"
-
-mkdir -p \
-  "$test_root/sdk/crates/kapsl-llm" \
-  "$test_root/sdk/crates/kapsl-engine-api"
-printf '[package]\nname = "fixture-kapsl-llm"\nversion = "0.0.0"\n' \
-  > "$test_root/sdk/crates/kapsl-llm/Cargo.toml"
-printf '[package]\nname = "fixture-kapsl-engine-api"\nversion = "0.0.0"\n' \
-  > "$test_root/sdk/crates/kapsl-engine-api/Cargo.toml"
-git -C "$test_root/sdk" init -q
-git -C "$test_root/sdk" config user.name 'Kapsl Test'
-git -C "$test_root/sdk" config user.email 'test@kapsl.invalid'
-git -C "$test_root/sdk" add .
-git -C "$test_root/sdk" commit -qm fixture
-sdk_ref="$(git -C "$test_root/sdk" rev-parse HEAD)"
-
-(
-  cd "$test_root/repo"
-  PATH="$test_root/bin:$PATH" \
-  RUNNER_OS=Linux \
-  RUNNER_ARCH=X64 \
-  RUNNER_TEMP="$test_root/runner" \
-  KAPSL_VERSION=1.2.3 \
-  KAPSL_NVIDIA_LICENSE_FILE="$test_root/NVIDIA-CONTAINER-LICENSE" \
-  KAPSL_LLAMA_CPU_LIBRARY="$test_root/libllama-cpu.so" \
-  KAPSL_LLAMA_CUDA_LIBRARY="$test_root/libllama-cuda-shared.so" \
-  KAPSL_LLAMA_SDK_DIR="$test_root/sdk" \
-  KAPSL_LLAMA_SDK_REF="$sdk_ref" \
-  .github/scripts/package-linux-llama-cpp-backend-packs.sh
-)
-
-python3 - "$test_root/repo/dist" "$test_root/extracted-shared" <<'PY'
-import ctypes
-import json
-import pathlib
-import sys
-import tarfile
-
-dist = pathlib.Path(sys.argv[1])
-root = pathlib.Path(sys.argv[2])
-archive = dist / "kapsl-backend-llama-cpp-cuda12-1.2.3-linux-x86_64.tar.gz"
-template = json.loads(pathlib.Path(str(archive) + ".manifest.json").read_text())
-assert template["kv_mode"] == "shared_pool"
-root.mkdir(parents=True)
-with tarfile.open(archive, "r:gz") as bundle:
-    bundle.extractall(root)
-payload = json.loads((root / "backend-pack.json").read_text())
-assert payload["kv_mode"] == "shared_pool"
-
-class ApiPrefix(ctypes.Structure):
-    _fields_ = [
-        ("magic", ctypes.c_uint32),
-        ("abi_version", ctypes.c_uint32),
-        ("struct_size", ctypes.c_uint32),
-        ("wire_format", ctypes.c_uint32),
-        ("capabilities", ctypes.c_uint64),
-    ]
-
-native = ctypes.CDLL(str(root / "lib/libkapsl_backend_llama_cpp.so"))
-native.kapsl_llama_cpp_backend_v1.restype = ctypes.POINTER(ApiPrefix)
-api = native.kapsl_llama_cpp_backend_v1().contents
-assert api.capabilities & 2
-assert api.capabilities & 8
-assert not api.capabilities & 4
 PY
 
 echo "Linux llama.cpp backend packager tests passed."
