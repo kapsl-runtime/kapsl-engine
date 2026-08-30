@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+MINIMUM_CONFIDENCE_TRIALS = 15
+
+
 class BenchmarkError(RuntimeError):
     pass
 
@@ -139,6 +142,11 @@ def run_target(args: argparse.Namespace) -> dict[str, Any]:
     concurrencies = [int(value) for value in args.concurrencies.split(",")]
     if not concurrencies or any(value <= 0 for value in concurrencies):
         raise BenchmarkError("concurrencies must be positive")
+    if args.trials < MINIMUM_CONFIDENCE_TRIALS:
+        raise BenchmarkError(
+            "acceptance measurements require at least "
+            f"{MINIMUM_CONFIDENCE_TRIALS} independent trials"
+        )
     if args.kv_cache_memory_bytes <= 0 or args.tensor_parallel_size <= 0:
         raise BenchmarkError("exact KV bytes and tensor parallel size must be positive")
     points: list[dict[str, Any]] = []
@@ -368,7 +376,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--target", choices=("direct", "kapsl"), required=True)
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--concurrencies", default="1,4,8,16")
-    run.add_argument("--trials", type=int, default=7)
+    run.add_argument("--trials", type=int, default=MINIMUM_CONFIDENCE_TRIALS)
     run.add_argument("--requests-per-worker", type=int, default=4)
     run.add_argument("--minimum-requests", type=int, default=8)
     run.add_argument("--warmup-requests", type=int, default=2)

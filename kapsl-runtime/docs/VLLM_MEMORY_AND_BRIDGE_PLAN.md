@@ -941,6 +941,9 @@ differ.
 
 - Output-token throughput loss versus direct vLLM is no more than 2% at
   concurrency 1, 4, 8, and 16 after statistical confidence is established.
+  Use at least 15 independent trials per target and concurrency, and require
+  both the median loss and the upper bound of its two-sided 95% bootstrap
+  interval to stay within 2%.
 - Added median TTFT is no more than 5 ms and added p95 TTFT is no more than
   10 ms on the same-host benchmark.
 - There is no per-request health call and no OS thread per stream.

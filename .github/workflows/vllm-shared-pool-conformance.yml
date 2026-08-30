@@ -785,6 +785,7 @@ jobs:
             --base-url "$FIXED_HTTP_BASE" \
             --model qwen2.5-0.5b-vllm-fixed \
             --target kapsl \
+            --trials 15 \
             --output "$OUTPUT_DIR/bridge-kapsl.json" \
             --vllm-version "$EXPECTED_VLLM_VERSION" \
             --vllm-build-id "$BACKEND_DIGEST" \
@@ -893,6 +894,7 @@ jobs:
             --base-url "$DIRECT_HTTP_BASE" \
             --model qwen2.5-0.5b-vllm-fixed \
             --target direct \
+            --trials 15 \
             --output "$OUTPUT_DIR/bridge-direct.json" \
             --vllm-version "$EXPECTED_VLLM_VERSION" \
             --vllm-build-id "$BACKEND_DIGEST" \

@@ -107,6 +107,12 @@ if grep -Eq "grep .*kv_path=(shared-kv|native).*mixed-runtime\\.log" \
   exit 1
 fi
 
+if [[ "$(grep -F -c -- '--trials 15' \
+  .github/workflows/vllm-shared-pool-conformance.yml)" != "2" ]]; then
+  echo "Managed-vLLM conformance must run 15 independent trials for each bridge target." >&2
+  exit 1
+fi
+
 if grep -Fxq '            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}' \
   .github/workflows/vllm-shared-pool-conformance.yml; then
   echo "Managed-vLLM conformance must upload an evidence allowlist, not the artifact root." >&2

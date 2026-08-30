@@ -51,6 +51,36 @@ def report(target: str, throughput: float, median_ttft: float, p95_ttft: float):
 
 
 class ManagedVllmBridgeBenchmarkTests(unittest.TestCase):
+    def test_acceptance_run_defaults_to_fifteen_independent_trials(self):
+        parser = benchmark._parser()
+        args = parser.parse_args(
+            [
+                "run",
+                "--base-url",
+                "http://127.0.0.1:8000",
+                "--model",
+                "model",
+                "--target",
+                "kapsl",
+                "--output",
+                "/tmp/report.json",
+                "--vllm-version",
+                "pinned",
+                "--vllm-build-id",
+                "sha256:vllm",
+                "--model-revision",
+                "commit",
+                "--kv-cache-memory-bytes",
+                "1024",
+                "--tensor-parallel-size",
+                "1",
+            ]
+        )
+        self.assertEqual(args.trials, 15)
+        args.trials = 14
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "at least 15"):
+            benchmark.run_target(args)
+
     def test_percentile_interpolates(self):
         self.assertEqual(benchmark.percentile([1.0, 2.0, 3.0], 0.5), 2.0)
         self.assertAlmostEqual(benchmark.percentile([1.0, 3.0], 0.25), 1.5)
