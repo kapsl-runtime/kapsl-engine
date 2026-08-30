@@ -2,13 +2,13 @@
 
 use super::*;
 
-#[cfg(unix)]
+// Coordinator and accounting types are portable; control.rs gates the Unix
+// socket transport internally so non-Unix fail-closed paths still compile.
 mod control;
 #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
 mod cuda_ipc;
 mod shared;
 
-#[cfg(unix)]
 pub(crate) use control::*;
 #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
 pub(crate) use cuda_ipc::*;
