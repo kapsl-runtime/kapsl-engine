@@ -33,6 +33,11 @@ printf 'ORT CUDA\n' > "$test_root/repo/ort-cuda-libs/libonnxruntime_providers_cu
 printf 'ORT TensorRT\n' > "$test_root/repo/ort-tensorrt-libs/libonnxruntime_providers_tensorrt.so"
 printf 'cuDNN\n' > "$test_root/repo/cuda-runtime/libcudnn.so.9"
 printf 'CUDA runtime\n' > "$test_root/repo/cuda-runtime/libcudart.so.12"
+# The full CUDA runtime archive also contains ORT sidecars. Use deliberately
+# different bytes so this fixture catches accidental copying or conflicts with
+# the authoritative provider-specific staging directories above.
+printf 'Bundled ORT shared copy\n' > "$test_root/repo/cuda-runtime/libonnxruntime_providers_shared.so"
+printf 'Bundled ORT CUDA copy\n' > "$test_root/repo/cuda-runtime/libonnxruntime_providers_cuda.so"
 printf 'NVIDIA license\n' > "$test_root/repo/cuda-runtime/NVIDIA-CONTAINER-LICENSE"
 printf 'TensorRT\n' > "$test_root/repo/tensorrt-runtime-libs/libnvinfer.so.10"
 printf 'TensorRT parser\n' > "$test_root/repo/tensorrt-runtime-libs/libnvonnxparser.so.10"
@@ -129,6 +134,10 @@ assert not (cpu / "libonnxruntime_providers_cuda.so").exists()
 assert not (cpu / "libcudnn.so.9").exists()
 cuda = extracted / "cuda12"
 assert (cuda / "kapsl-provider-cuda12.json").is_file()
+assert (cuda / "libonnxruntime_providers_shared.so").read_text() == "ORT shared\n"
+assert (cuda / "libonnxruntime_providers_cuda.so").read_text() == "ORT CUDA\n"
+assert (cuda / "libcudnn.so.9").is_file()
+assert (cuda / "libcudart.so.12").is_file()
 assert not (cuda / "libonnxruntime_providers_tensorrt.so").exists()
 tensorrt = extracted / "tensorrt10"
 assert (tensorrt / "kapsl-provider-cuda12.json").is_file()
