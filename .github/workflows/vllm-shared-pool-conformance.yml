@@ -1,24 +1,12 @@
 name: vLLM Shared-Pool Conformance
 
 on:
-  workflow_dispatch:
-    inputs:
-      sdk_ref:
-        description: Exact lowercase 40-hex kapsl-sdk commit containing the adapter
-        required: true
-        type: string
-      cuda_visible_devices:
-        description: Physical GPU ordinals/UUIDs exposed to the probe (for example 0 or 0,2)
-        required: true
-        default: "0"
-        type: string
-      runner_label:
-        description: Unique self-hosted runner label; gpu selects a persistent runner
-        required: false
-        default: gpu
-        type: string
   workflow_call:
     inputs:
+      release_tag:
+        description: Official stable engine release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
       sdk_ref:
         description: Exact lowercase 40-hex kapsl-sdk commit containing the adapter
         required: true
@@ -37,7 +25,27 @@ permissions:
   contents: read
 
 jobs:
+  authorize-stable-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject non-stable, beta, and manual GPU contexts
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+        run: >-
+          python3 .github/scripts/validate_stable_gpu_release.py
+          --event-name "$GITHUB_EVENT_NAME"
+          --ref-type "$GITHUB_REF_TYPE"
+          --ref-name "$GITHUB_REF_NAME"
+          --release-tag "$RELEASE_TAG"
+          --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml
+          --sdk-ref "$KAPSL_VLLM_SDK_REF"
+
   flash-attn:
+    needs: authorize-stable-release
     # The host supplies only the NVIDIA driver and GPUs. The immutable job image
     # pins the toolkit used by both the runtime build and the vLLM wheel.
     runs-on: [self-hosted, linux, x64, "${{ inputs.runner_label }}"]

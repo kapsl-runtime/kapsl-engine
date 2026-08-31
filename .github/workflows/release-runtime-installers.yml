@@ -29,6 +29,7 @@ jobs:
       numeric_version: ${{ steps.version.outputs.numeric_version }}
       deb_version: ${{ steps.version.outputs.deb_version }}
       is_release: ${{ steps.version.outputs.is_release }}
+      is_stable_release: ${{ steps.version.outputs.is_stable_release }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,6 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          is_stable_release=false
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
             version="${GITHUB_REF_NAME#v}"
             if [ "$cargo_version" != "$version" ]; then
@@ -46,6 +48,9 @@ jobs:
               exit 1
             fi
             is_release=true
+            if [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              is_stable_release=true
+            fi
           else
             version="${cargo_version}-dev.${GITHUB_RUN_NUMBER}"
             is_release=false
@@ -61,6 +66,18 @@ jobs:
           echo "numeric_version=$numeric_version" >> "$GITHUB_OUTPUT"
           echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
           echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
+          echo "is_stable_release=$is_stable_release" >> "$GITHUB_OUTPUT"
+
+  stable-release-gpu-conformance:
+    name: Stable release GPU conformance
+    needs: prepare-version
+    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    uses: ./.github/workflows/gpu-device-pool-integration.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
+      cuda_visible_devices: "0"
+    secrets: inherit
 
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})

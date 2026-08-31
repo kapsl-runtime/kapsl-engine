@@ -1,8 +1,12 @@
 name: Lazy llama.cpp Backend Pack GPU Certification
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      release_tag:
+        description: Official stable engine release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
       backend_index_url:
         description: Public HTTPS URL of the signed candidate backend-index.json
         required: true
@@ -29,12 +33,12 @@ on:
         type: string
       cuda_visible_devices:
         description: Exactly one CUDA device index, GPU UUID, or MIG UUID
-        required: true
+        required: false
         default: "0"
         type: string
       benchmark_requests:
         description: Measured streaming requests for each eager/lazy performance case
-        required: true
+        required: false
         default: "20"
         type: string
 
@@ -42,7 +46,25 @@ permissions:
   contents: read
 
 jobs:
+  authorize-stable-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject non-stable, beta, and manual GPU contexts
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: >-
+          python3 .github/scripts/validate_stable_gpu_release.py
+          --event-name "$GITHUB_EVENT_NAME"
+          --ref-type "$GITHUB_REF_TYPE"
+          --ref-name "$GITHUB_REF_NAME"
+          --release-tag "$RELEASE_TAG"
+          --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml
+
   certify:
+    needs: authorize-stable-release
     runs-on: [self-hosted, linux, x64, gpu]
     timeout-minutes: 150
     steps:
