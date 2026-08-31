@@ -3,55 +3,19 @@ name: GPU Device Pool Integration
 on:
   schedule:
     - cron: "17 */6 * * *"
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      suite:
-        description: GPU conformance suite to execute
+      release_tag:
+        description: Official stable engine release tag (vMAJOR.MINOR.PATCH)
         required: true
-        default: device-pool
-        type: choice
-        options:
-          - device-pool
-          - vllm-shared-pool
+        type: string
       sdk_ref:
-        description: Exact kapsl-sdk commit for the managed-vLLM suite
-        required: false
-        type: string
-      runner_backend:
-        description: Runner lifecycle for the managed-vLLM suite
+        description: Exact kapsl-sdk commit certified for the stable release
         required: true
-        default: gcp-ephemeral
-        type: choice
-        options:
-          - gcp-ephemeral
-          - self-hosted
-      provisioning_model:
-        description: GCE provisioning model (Spot is cheaper but can be preempted)
-        required: true
-        default: SPOT
-        type: choice
-        options:
-          - SPOT
-          - STANDARD
-      ort_model_path:
-        description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
-        required: false
-        type: string
-      gguf_model_path:
-        description: Absolute path to a uniform-KV causal GGUF/AIMOD artifact on the GPU runner
-        required: false
-        type: string
-      ort_request_path:
-        description: Optional absolute path to a model-specific ONNX inference JSON request
-        required: false
-        type: string
-      pool_bytes:
-        description: Optional exact pool size (for example 8g); empty uses strict automatic sizing
-        required: false
         type: string
       cuda_visible_devices:
-        description: Exactly one CUDA device index, GPU UUID, or MIG UUID
-        required: true
+        description: Exactly one CUDA device index
+        required: false
         default: "0"
         type: string
 
@@ -63,59 +27,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ort-gguf-sharing:
-    if: inputs.suite == 'device-pool'
-    # The runner must have a CUDA developer toolkit, ORT CUDA dependencies,
-    # nvidia-smi, curl, jq, and both model artifacts at the input paths.
-    runs-on: [self-hosted, linux, x64, gpu]
-    timeout-minutes: 90
+  authorize-stable-release:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.policy.outputs.release_tag }}
+      sdk_ref: ${{ steps.policy.outputs.sdk_ref }}
     steps:
-      - name: Validate device-pool model inputs
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          test -n "${{ inputs.ort_model_path }}" || {
-            echo "ort_model_path is required for the device-pool suite" >&2
-            exit 1
-          }
-          test -n "${{ inputs.gguf_model_path }}" || {
-            echo "gguf_model_path is required for the device-pool suite" >&2
-            exit 1
-          }
-
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: ./.github/actions/setup-rust
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build stable shared-KV CUDA runtime
-        run: >-
-          cargo build --manifest-path kapsl-runtime/Cargo.toml
-          --release -p kapsl --no-default-features --features cuda
-
-      - name: Exercise ORT/GGUF sharing and both unload/reload cycles
+      - name: Authorize official stable release GPU certification
+        id: policy
+        shell: bash
         env:
-          KAPSL_GPU_INTEGRATION: "1"
-          KAPSL_GPU_TEST_BINARY: ${{ github.workspace }}/kapsl-runtime/target/release/kapsl
-          KAPSL_GPU_TEST_ORT_MODEL: ${{ inputs.ort_model_path }}
-          KAPSL_GPU_TEST_GGUF_MODEL: ${{ inputs.gguf_model_path }}
-          KAPSL_GPU_TEST_ORT_REQUEST: ${{ inputs.ort_request_path }}
-          KAPSL_GPU_TEST_POOL_BYTES: ${{ inputs.pool_bytes }}
-          KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
-          KAPSL_GPU_TEST_OUTPUT_DIR: ${{ runner.temp }}/kapsl-gpu-pool-${{ github.run_id }}-${{ github.run_attempt }}
-        run: .github/scripts/test-gpu-device-pool-integration.sh
-
-      - name: Upload GPU integration diagnostics
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gpu-device-pool-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/kapsl-gpu-pool-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: warn
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+        run: |
+          set -Eeuo pipefail
+          python3 .github/scripts/validate_stable_gpu_release.py \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --ref-type "$GITHUB_REF_TYPE" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --release-tag "$RELEASE_TAG" \
+            --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml \
+            --sdk-ref "$KAPSL_VLLM_SDK_REF"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sdk_ref=$KAPSL_VLLM_SDK_REF" >> "$GITHUB_OUTPUT"
 
   prepare-vllm-gcp-runner:
-    if: inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'gcp-ephemeral'
+    needs: authorize-stable-release
+    if: needs.authorize-stable-release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     environment: gcp-gpu-conformance
@@ -137,7 +78,7 @@ jobs:
       GCP_GPU_PROVISIONER_SERVICE_ACCOUNT: ${{ vars.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
       GCP_GPU_RUNNER_GROUP_ID: ${{ vars.GCP_GPU_RUNNER_GROUP_ID }}
       GPU_RUNNER_GITHUB_APP_ID: ${{ vars.GPU_RUNNER_GITHUB_APP_ID }}
-      KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+      KAPSL_VLLM_SDK_REF: ${{ needs.authorize-stable-release.outputs.sdk_ref }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -256,7 +197,7 @@ jobs:
       - name: Create ephemeral GCE L4 runner
         shell: bash
         env:
-          PROVISIONING_MODEL: ${{ inputs.provisioning_model }}
+          PROVISIONING_MODEL: STANDARD
         run: |
           set -Eeuo pipefail
           runner_arguments=(
@@ -338,26 +279,19 @@ jobs:
           path: ${{ runner.temp }}/kapsl-gpu-runner-serial.log
           if-no-files-found: warn
 
-  vllm-shared-pool-self-hosted:
-    if: inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'self-hosted'
-    uses: ./.github/workflows/vllm-shared-pool-conformance.yml
-    with:
-      sdk_ref: ${{ inputs.sdk_ref }}
-      cuda_visible_devices: ${{ inputs.cuda_visible_devices }}
-      runner_label: gpu
-
   vllm-shared-pool-gcp:
-    needs: prepare-vllm-gcp-runner
-    if: inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'gcp-ephemeral' && needs.prepare-vllm-gcp-runner.result == 'success'
+    needs: [authorize-stable-release, prepare-vllm-gcp-runner]
+    if: needs.authorize-stable-release.result == 'success' && needs.prepare-vllm-gcp-runner.result == 'success'
     uses: ./.github/workflows/vllm-shared-pool-conformance.yml
     with:
-      sdk_ref: ${{ inputs.sdk_ref }}
+      release_tag: ${{ needs.authorize-stable-release.outputs.release_tag }}
+      sdk_ref: ${{ needs.authorize-stable-release.outputs.sdk_ref }}
       cuda_visible_devices: ${{ inputs.cuda_visible_devices }}
       runner_label: ${{ needs.prepare-vllm-gcp-runner.outputs.runner_label }}
 
   cleanup-vllm-gcp-runner:
-    needs: [prepare-vllm-gcp-runner, vllm-shared-pool-gcp]
-    if: always() && inputs.suite == 'vllm-shared-pool' && inputs.runner_backend == 'gcp-ephemeral'
+    needs: [authorize-stable-release, prepare-vllm-gcp-runner, vllm-shared-pool-gcp]
+    if: always() && needs.authorize-stable-release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: gcp-gpu-conformance

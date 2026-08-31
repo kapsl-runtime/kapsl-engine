@@ -7,7 +7,8 @@ permanent self-hosted runner is required.
 The implemented lifecycle is:
 
 ```text
-workflow_dispatch
+official vMAJOR.MINOR.PATCH release tag
+  -> Release Runtime Installers calls the reusable GPU workflow
   -> GitHub OIDC authenticates to a narrow GCP provisioner account
   -> a GitHub App creates a repository-scoped JIT runner registration
   -> one g2-standard-12 VM (one NVIDIA L4, 24 GiB VRAM) starts
@@ -26,8 +27,8 @@ Two independent fallbacks limit cost if GitHub is cancelled or unavailable:
 The VM has no Google service account, receives no GitHub App token, and adds no
 inbound firewall rule. Only the single-use JIT configuration is copied into VM
 metadata. Its unique label deliberately omits the generic `gpu` label, so an
-older queued job cannot claim it. The workflow retains the existing
-`self-hosted` option for a permanent `gpu` runner.
+older queued job cannot claim it. Each reusable workflow independently
+revalidates the stable-release tag context before selecting a GPU runner.
 
 ## 1. Create the GCP project and quota
 
@@ -51,9 +52,9 @@ gcloud services enable \
   --project "$GCP_GPU_PROJECT_ID"
 ```
 
-G2 availability and Spot capacity vary by zone. `SPOT` is cheaper and is the
-workflow default, but it can be preempted. Use `STANDARD` for the final
-acceptance run or after a Spot-capacity failure.
+G2 availability varies by zone. Official release conformance always uses the
+`STANDARD` provisioning model so a Spot preemption cannot invalidate release
+evidence.
 
 ## 2. Pin an immutable NVIDIA 580 image
 
@@ -197,12 +198,14 @@ not the App key or token.
 
 ## 7. Configure the protected GitHub environment
 
-Create the environment `gcp-gpu-conformance` and restrict it to protected
-branches. Do not add a required-reviewer rule if cleanup must be completely
-unattended: GitHub evaluates environment protection for each job, including the
-always-run deletion job and scheduled sweeper. Manual `workflow_dispatch`
-already requires repository write access. Protect the allowed branches from
-direct pushes and require review for workflow changes.
+Create the environment `gcp-gpu-conformance` with custom deployment policies
+that allow the `main` branch and `v*` tags. `main` is required for the scheduled
+expired-runner sweeper; release tags are required for conformance. Do not add a
+required-reviewer rule if cleanup must be completely unattended: GitHub
+evaluates environment protection for each job, including the always-run
+deletion job and scheduled sweeper. The workflow itself accepts only an exact
+stable `vMAJOR.MINOR.PATCH` tag and rejects branches, manual dispatches, beta
+tags, and release candidates before provisioning.
 
 Set these environment variables:
 
@@ -224,12 +227,18 @@ Set this environment secret:
 | --- | --- |
 | `GPU_RUNNER_GITHUB_APP_PRIVATE_KEY` | Entire PEM private key downloaded from the App |
 
+Set the repository variable `KAPSL_VLLM_SDK_REF` to the exact lowercase
+40-character commit for the SDK release certified with the engine release.
+Update it deliberately when promoting a new SDK release; branch names and
+floating tags are rejected.
+
 After creating the environment in the repository settings and saving the App
 private key as `github-app-private-key.pem`, the non-interactive configuration
 is:
 
 ```bash
 export GPU_RUNNER_GITHUB_APP_ID=123456
+export KAPSL_VLLM_SDK_REF=0123456789abcdef0123456789abcdef01234567
 
 gh api --method PUT \
   repos/kapsl-runtime/kapsl-engine/environments/gcp-gpu-conformance >/dev/null
@@ -253,6 +262,9 @@ gh secret set GPU_RUNNER_GITHUB_APP_PRIVATE_KEY \
   --repo kapsl-runtime/kapsl-engine \
   --env gcp-gpu-conformance \
   < github-app-private-key.pem
+gh variable set KAPSL_VLLM_SDK_REF \
+  --repo kapsl-runtime/kapsl-engine \
+  --body "$KAPSL_VLLM_SDK_REF"
 ```
 
 For the private-subnet option, also set `GCP_GPU_SUBNET` to the full resource
@@ -264,19 +276,12 @@ that is why the narrowly installed App is required.
 
 ## 8. Run conformance
 
-Use the exact certified SDK commit. From this remediation branch, the current
-commit is `d5dcd0b09629f00853dfbbf810bba08d5d411d5d`:
-
-```bash
-gh workflow run gpu-device-pool-integration.yml \
-  --repo kapsl-runtime/kapsl-engine \
-  --ref feature/vllm-complete-remediation \
-  -f suite=vllm-shared-pool \
-  -f runner_backend=gcp-ephemeral \
-  -f provisioning_model=SPOT \
-  -f sdk_ref=d5dcd0b09629f00853dfbbf810bba08d5d411d5d \
-  -f cuda_visible_devices=0
-```
+There is no manual GPU trigger. After the separate `develop` to `main` release
+PR is merged, pushing the official stable `vMAJOR.MINOR.PATCH` tag starts
+`release-runtime-installers.yml`, which calls the GPU workflow exactly once.
+The beta installer workflow does not call it. The GPU entry-point workflows
+expose only `workflow_call`, and each repeats the stable-tag authorization
+before a real GPU runner can be selected.
 
 The hosted preparation job waits until the exact unique runner is online before
 it releases the conformance job, preventing a silent 24-hour self-hosted-runner
@@ -284,7 +289,7 @@ queue. If you deliberately configure environment reviewers, approve every
 pending lifecycle job promptly, including cleanup; otherwise rely on branch
 restrictions for an unattended run.
 
-Use `provisioning_model=STANDARD` for the final performance acceptance run.
+The official run always uses `STANDARD` provisioning.
 
 ## Diagnostics and cleanup
 

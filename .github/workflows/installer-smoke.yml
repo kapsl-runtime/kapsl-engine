@@ -39,8 +39,11 @@ on:
       - ".github/scripts/test_certify_mixed_backend_concurrency.py"
       - ".github/workflows/vllm-shared-pool-conformance.yml"
       - ".github/workflows/gpu-device-pool-integration.yml"
+      - ".github/workflows/release-runtime-installers.yml"
+      - ".github/workflows/beta-runtime-installers.yml"
       - ".github/scripts/gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/github_jit_runner.py"
+      - ".github/scripts/validate_stable_gpu_release.py"
       - ".github/scripts/test_gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/test_github_jit_runner.py"
       - ".github/scripts/validate_model_package_backend.py"
@@ -104,6 +107,7 @@ jobs:
           python3 -m py_compile .github/scripts/test_certify_mixed_backend_concurrency.py
           python3 -m py_compile .github/scripts/gcp_ephemeral_gpu_runner.py
           python3 -m py_compile .github/scripts/github_jit_runner.py
+          python3 -m py_compile .github/scripts/validate_stable_gpu_release.py
           python3 -m py_compile .github/scripts/test_gcp_ephemeral_gpu_runner.py
           python3 -m py_compile .github/scripts/test_github_jit_runner.py
           python3 -m py_compile .github/scripts/validate_model_package_backend.py

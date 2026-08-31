@@ -22,6 +22,15 @@ runner = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = runner
 SPEC.loader.exec_module(runner)
 
+POLICY_PATH = Path(__file__).with_name("validate_stable_gpu_release.py")
+POLICY_SPEC = importlib.util.spec_from_file_location(
+    "validate_stable_gpu_release", POLICY_PATH
+)
+assert POLICY_SPEC and POLICY_SPEC.loader
+policy = importlib.util.module_from_spec(POLICY_SPEC)
+sys.modules[POLICY_SPEC.name] = policy
+POLICY_SPEC.loader.exec_module(policy)
+
 
 class IdentityTests(unittest.TestCase):
     def test_identity_is_unique_bounded_and_expiring(self) -> None:
@@ -49,6 +58,90 @@ class IdentityTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('--label "${{ steps.identity.outputs.runner_label }}"', dispatcher)
         self.assertNotIn("--label gpu", dispatcher)
+
+
+class StableGpuReleasePolicyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.manifest = Path(self.temporary.name) / "Cargo.toml"
+        self.manifest.write_text(
+            '[package]\nname = "kapsl"\nversion = "0.2.4"\n',
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def authorize(self, **overrides: object) -> None:
+        values: dict[str, object] = {
+            "event_name": "push",
+            "ref_type": "tag",
+            "ref_name": "v0.2.4",
+            "release_tag": "v0.2.4",
+            "manifest": self.manifest,
+            "sdk_ref": "a" * 40,
+        }
+        values.update(overrides)
+        policy.authorize(**values)
+
+    def test_official_stable_release_is_authorized(self) -> None:
+        self.authorize()
+
+    def test_manual_branch_beta_and_prerelease_contexts_are_rejected(self) -> None:
+        invalid = (
+            {"event_name": "workflow_dispatch"},
+            {"ref_type": "branch", "ref_name": "main", "release_tag": "main"},
+            {
+                "ref_name": "v0.2.4-beta.20260831.abcdef12",
+                "release_tag": "v0.2.4-beta.20260831.abcdef12",
+            },
+            {"ref_name": "v0.2.4-rc.1", "release_tag": "v0.2.4-rc.1"},
+            {"ref_name": "v0.2.5", "release_tag": "v0.2.5"},
+            {"release_tag": "v0.2.5"},
+            {"sdk_ref": "main"},
+        )
+        for overrides in invalid:
+            with self.subTest(overrides), self.assertRaises(policy.AuthorizationError):
+                self.authorize(**overrides)
+
+    def test_every_real_gpu_entry_point_is_stable_release_only(self) -> None:
+        workflows = MODULE_PATH.parent.parent / "workflows"
+        dispatcher = (workflows / "gpu-device-pool-integration.yml").read_text(
+            encoding="utf-8"
+        )
+        conformance = (workflows / "vllm-shared-pool-conformance.yml").read_text(
+            encoding="utf-8"
+        )
+        lazy = (
+            workflows / "lazy-llama-cpp-backend-pack-gpu-certification.yml"
+        ).read_text(encoding="utf-8")
+        stable_release = (workflows / "release-runtime-installers.yml").read_text(
+            encoding="utf-8"
+        )
+        beta_release = (workflows / "beta-runtime-installers.yml").read_text(
+            encoding="utf-8"
+        )
+
+        for workflow in (dispatcher, conformance, lazy):
+            self.assertIn("workflow_call:", workflow)
+            self.assertNotIn("workflow_dispatch:", workflow)
+            self.assertIn("validate_stable_gpu_release.py", workflow)
+
+        self.assertIn('cron: "17 */6 * * *"', dispatcher)
+        self.assertIn("if: github.event_name == 'schedule'", dispatcher)
+        self.assertIn("PROVISIONING_MODEL: STANDARD", dispatcher)
+        self.assertNotIn("runs-on: [self-hosted, linux, x64, gpu]", dispatcher)
+
+        self.assertIn("stable-release-gpu-conformance:", stable_release)
+        self.assertIn("./.github/workflows/gpu-device-pool-integration.yml", stable_release)
+        self.assertIn("is_stable_release:", stable_release)
+        self.assertIn(
+            "if: needs.prepare-version.outputs.is_stable_release == 'true'",
+            stable_release,
+        )
+        self.assertIn("release_tag: ${{ github.ref_name }}", stable_release)
+        self.assertIn("sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}", stable_release)
+        self.assertNotIn("gpu-device-pool-integration.yml", beta_release)
 
 
 class ProvisionTests(unittest.TestCase):
