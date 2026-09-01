@@ -65,6 +65,7 @@ require_literal "$manager" 'let model_paths = crate::backend::expand_run_bundles
 require_literal "$parity_certifier" '--target linux-x86_64-cpu'
 require_literal "$parity_certifier" 'KAPSL_GENERIC_NATIVE_PACKS=1'
 require_literal "$parity_certifier" 'PYTHONDONTWRITEBYTECODE=1'
+require_literal "$parity_certifier" 'KAPSL_ORT_PARITY_HARNESS_PATH'
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
@@ -79,14 +80,14 @@ import sys
 
 lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert lock.get("schema_version") == 1
-assert lock.get("benchmarks", {}).get("repository") == "kapsl-runtime/kapsl-benchmarks"
+assert lock.get("conformance", {}).get("repository") == "kapsl-runtime/kapsl-integrations"
 assert lock.get("model", {}).get("repository") == "kapsl-runtime/kapsl-sdk"
-assert re.fullmatch(r"[0-9a-f]{40}", lock["benchmarks"]["commit"])
-assert re.fullmatch(r"[0-9a-f]{64}", lock["benchmarks"]["entrypoint_sha256"])
+assert re.fullmatch(r"[0-9a-f]{64}", lock["conformance"]["entrypoint_sha256"])
 assert re.fullmatch(r"[0-9a-f]{40}", lock["model"]["commit"])
 assert re.fullmatch(r"[0-9a-f]{64}", lock["model"]["sha256"])
-path = pathlib.PurePosixPath(lock["model"]["path"])
-assert not path.is_absolute() and ".." not in path.parts
+for entry in (lock["conformance"], lock["model"]):
+    path = pathlib.PurePosixPath(entry["path"])
+    assert not path.is_absolute() and ".." not in path.parts
 PY
 
 if grep -Fq 'package_profile cpu ' "$packager"; then
@@ -133,17 +134,16 @@ require_literal ".github/workflows/installer-smoke.yml" '.github/scripts/certify
 python3 - "$parity_lock" ".github/workflows/installer-smoke.yml" <<'PY'
 import json
 import pathlib
-import re
 import sys
 
 lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 workflow = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-match = re.search(
-    r"uses: kapsl-runtime/kapsl-benchmarks/ort_cpu_parity@([0-9a-f]{40})",
-    workflow,
-)
-if match is None or match.group(1) != lock["benchmarks"]["commit"]:
-    raise SystemExit("installer smoke must pin the exact locked ORT parity action commit")
+conformance_dir = pathlib.PurePosixPath(lock["conformance"]["path"]).parent
+expected = f"uses: ./kapsl-integrations-ort/{conformance_dir}"
+if expected not in workflow:
+    raise SystemExit("installer smoke must use parity from the locked integrations checkout")
+if "kapsl-runtime/kapsl-benchmarks" in workflow:
+    raise SystemExit("public engine CI must not depend on a private benchmark action")
 PY
 
 if grep -Eq 'KAPSL_ORT_INTEGRATIONS_REF:-|ref:.*feature/ort|ref:.*(main|develop)' \

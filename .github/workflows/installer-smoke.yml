@@ -225,25 +225,30 @@ jobs:
           lock = json.loads(pathlib.Path(".github/ort-cpu-parity.lock.json").read_text())
           if lock.get("schema_version") != 1:
               raise SystemExit("ORT CPU parity lock schema must be 1")
-          benchmarks = lock.get("benchmarks", {})
+          conformance = lock.get("conformance", {})
           model = lock.get("model", {})
           expected_repositories = {
-              "benchmarks": "kapsl-runtime/kapsl-benchmarks",
+              "conformance": "kapsl-runtime/kapsl-integrations",
               "model": "kapsl-runtime/kapsl-sdk",
           }
-          if benchmarks.get("repository") != expected_repositories["benchmarks"]:
-              raise SystemExit("ORT CPU parity benchmarks repository is not approved")
+          if conformance.get("repository") != expected_repositories["conformance"]:
+              raise SystemExit("ORT CPU parity conformance repository is not approved")
           if model.get("repository") != expected_repositories["model"]:
               raise SystemExit("ORT CPU parity model repository is not approved")
-          for label, value in (
-              ("benchmarks commit", benchmarks.get("commit")),
-              ("model commit", model.get("commit")),
+          model_ref = model.get("commit")
+          if not isinstance(model_ref, str) or not re.fullmatch(r"[0-9a-f]{40}", model_ref):
+              raise SystemExit("ORT CPU parity model commit must be an exact lowercase commit")
+          conformance_path = conformance.get("path")
+          if (
+              not isinstance(conformance_path, str)
+              or not conformance_path
+              or pathlib.PurePosixPath(conformance_path).is_absolute()
+              or ".." in pathlib.PurePosixPath(conformance_path).parts
           ):
-              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
-                  raise SystemExit(f"ORT CPU parity {label} must be an exact lowercase commit")
-          benchmarks_entrypoint_sha256 = benchmarks.get("entrypoint_sha256")
-          if not isinstance(benchmarks_entrypoint_sha256, str) or not re.fullmatch(
-              r"[0-9a-f]{64}", benchmarks_entrypoint_sha256
+              raise SystemExit("ORT CPU parity conformance path must be a safe relative path")
+          conformance_entrypoint_sha256 = conformance.get("entrypoint_sha256")
+          if not isinstance(conformance_entrypoint_sha256, str) or not re.fullmatch(
+              r"[0-9a-f]{64}", conformance_entrypoint_sha256
           ):
               raise SystemExit("ORT CPU parity harness SHA-256 is invalid")
           model_path = model.get("path")
@@ -260,9 +265,9 @@ jobs:
           ):
               raise SystemExit("ORT CPU parity model SHA-256 is invalid")
           outputs = {
-              "benchmarks_ref": benchmarks["commit"],
-              "benchmarks_entrypoint_sha256": benchmarks_entrypoint_sha256,
-              "model_ref": model["commit"],
+              "conformance_path": conformance_path,
+              "conformance_entrypoint_sha256": conformance_entrypoint_sha256,
+              "model_ref": model_ref,
               "model_path": model_path,
               "model_sha256": model_sha256,
           }
@@ -280,7 +285,7 @@ jobs:
 
       - name: Resolve exact ORT parity harness
         id: ort-parity-harness
-        uses: kapsl-runtime/kapsl-benchmarks/ort_cpu_parity@c3a81cbd60ad52de70c1bb8f93a647201fde86c7
+        uses: ./kapsl-integrations-ort/integrations/ort/conformance
 
       - name: Checkout exact ORT parity model source
         uses: actions/checkout@v4
@@ -342,9 +347,9 @@ jobs:
 
       - name: Certify embedded versus packaged ORT CPU parity
         env:
-          KAPSL_ORT_PARITY_BENCHMARKS_REF: ${{ steps.release-inputs.outputs.benchmarks_ref }}
           KAPSL_ORT_PARITY_HARNESS: ${{ steps.ort-parity-harness.outputs.harness_path }}
-          KAPSL_ORT_PARITY_HARNESS_SHA256: ${{ steps.release-inputs.outputs.benchmarks_entrypoint_sha256 }}
+          KAPSL_ORT_PARITY_HARNESS_PATH: ${{ steps.release-inputs.outputs.conformance_path }}
+          KAPSL_ORT_PARITY_HARNESS_SHA256: ${{ steps.release-inputs.outputs.conformance_entrypoint_sha256 }}
           KAPSL_ORT_PARITY_MODEL_REF: ${{ steps.release-inputs.outputs.model_ref }}
           KAPSL_ORT_PARITY_MODEL_PATH: ${{ steps.release-inputs.outputs.model_path }}
           KAPSL_ORT_PARITY_MODEL_SHA256: ${{ steps.release-inputs.outputs.model_sha256 }}

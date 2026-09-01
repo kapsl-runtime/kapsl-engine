@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "benchmarks": {
-    "repository": "kapsl-runtime/kapsl-benchmarks",
-    "commit": "c3a81cbd60ad52de70c1bb8f93a647201fde86c7",
-    "entrypoint_sha256": "27dff51edf896945f2fbba4b8544aa84b470147e3466ab52fc4546b98850c2cf"
+  "conformance": {
+    "repository": "kapsl-runtime/kapsl-integrations",
+    "path": "integrations/ort/conformance/parity.py",
+    "entrypoint_sha256": "3da3dd25fb143597badbe2c801c4663c5c06fb2e5c62d7b341840bf9ee3a5732"
   },
   "model": {
     "repository": "kapsl-runtime/kapsl-sdk",

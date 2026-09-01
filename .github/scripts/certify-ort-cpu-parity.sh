@@ -3,8 +3,8 @@ set -euo pipefail
 
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 : "${KAPSL_ORT_INTEGRATIONS_REF:?KAPSL_ORT_INTEGRATIONS_REF is required}"
-: "${KAPSL_ORT_PARITY_BENCHMARKS_REF:?KAPSL_ORT_PARITY_BENCHMARKS_REF is required}"
 : "${KAPSL_ORT_PARITY_HARNESS:?KAPSL_ORT_PARITY_HARNESS is required}"
+: "${KAPSL_ORT_PARITY_HARNESS_PATH:?KAPSL_ORT_PARITY_HARNESS_PATH is required}"
 : "${KAPSL_ORT_PARITY_HARNESS_SHA256:?KAPSL_ORT_PARITY_HARNESS_SHA256 is required}"
 : "${KAPSL_ORT_PARITY_MODEL_REF:?KAPSL_ORT_PARITY_MODEL_REF is required}"
 : "${KAPSL_ORT_PARITY_MODEL_PATH:?KAPSL_ORT_PARITY_MODEL_PATH is required}"
@@ -17,6 +17,7 @@ if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+integrations_repo_dir="${KAPSL_ORT_INTEGRATIONS_REPO_DIR:-$repo_root/kapsl-integrations-ort}"
 model_repo_dir="${KAPSL_ORT_PARITY_MODEL_REPO_DIR:-$repo_root/kapsl-sdk-ort-model}"
 artifacts_dir="${KAPSL_ORT_PARITY_ARTIFACTS_DIR:-$repo_root/dist}"
 evidence_dir="${KAPSL_ORT_PARITY_EVIDENCE_DIR:-$artifacts_dir/ort-cpu-parity}"
@@ -66,7 +67,13 @@ verify_checkout() {
   fi
 }
 
+verify_checkout "$integrations_repo_dir" "$KAPSL_ORT_INTEGRATIONS_REF" "Integrations source"
 verify_checkout "$model_repo_dir" "$KAPSL_ORT_PARITY_MODEL_REF" "Model source"
+expected_parity_harness="$integrations_repo_dir/$KAPSL_ORT_PARITY_HARNESS_PATH"
+if [ "$(realpath "$parity_harness")" != "$(realpath "$expected_parity_harness")" ]; then
+  echo "ORT parity harness is not the locked integrations checkout entrypoint." >&2
+  exit 1
+fi
 actual_harness_sha256="$(sha256sum "$parity_harness" | awk '{ print $1 }')"
 if [ "$actual_harness_sha256" != "$KAPSL_ORT_PARITY_HARNESS_SHA256" ]; then
   echo "Pinned ORT parity harness digest is $actual_harness_sha256, expected $KAPSL_ORT_PARITY_HARNESS_SHA256" >&2
@@ -295,7 +302,8 @@ python3 - \
   "$evidence_dir/certification-inputs.json" \
   "$engine_ref" \
   "$KAPSL_ORT_INTEGRATIONS_REF" \
-  "$KAPSL_ORT_PARITY_BENCHMARKS_REF" \
+  "$KAPSL_ORT_PARITY_HARNESS_PATH" \
+  "$KAPSL_ORT_PARITY_HARNESS_SHA256" \
   "$KAPSL_ORT_PARITY_MODEL_REF" \
   "$KAPSL_ORT_PARITY_MODEL_PATH" \
   "$KAPSL_ORT_PARITY_MODEL_SHA256" \
@@ -309,7 +317,8 @@ import sys
     output,
     engine_commit,
     integrations_commit,
-    benchmarks_commit,
+    conformance_path,
+    conformance_sha256,
     model_source_commit,
     model_source_path,
     model_source_sha256,
@@ -320,7 +329,12 @@ payload = {
     "schema_version": 1,
     "engine_commit": engine_commit,
     "integrations_commit": integrations_commit,
-    "benchmarks_commit": benchmarks_commit,
+    "conformance_harness": {
+        "repository": "kapsl-runtime/kapsl-integrations",
+        "commit": integrations_commit,
+        "path": conformance_path,
+        "sha256": conformance_sha256,
+    },
     "model_source": {
         "commit": model_source_commit,
         "path": model_source_path,
