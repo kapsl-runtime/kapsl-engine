@@ -82,6 +82,7 @@ assert lock.get("schema_version") == 1
 assert lock.get("benchmarks", {}).get("repository") == "kapsl-runtime/kapsl-benchmarks"
 assert lock.get("model", {}).get("repository") == "kapsl-runtime/kapsl-sdk"
 assert re.fullmatch(r"[0-9a-f]{40}", lock["benchmarks"]["commit"])
+assert re.fullmatch(r"[0-9a-f]{64}", lock["benchmarks"]["entrypoint_sha256"])
 assert re.fullmatch(r"[0-9a-f]{40}", lock["model"]["commit"])
 assert re.fullmatch(r"[0-9a-f]{64}", lock["model"]["sha256"])
 path = pathlib.PurePosixPath(lock["model"]["path"])
@@ -126,9 +127,24 @@ for workflow in \
 done
 
 require_literal ".github/workflows/installer-smoke.yml" '.github/ort-cpu-parity.lock.json'
-require_literal ".github/workflows/installer-smoke.yml" 'repository: kapsl-runtime/kapsl-benchmarks'
 require_literal ".github/workflows/installer-smoke.yml" 'repository: kapsl-runtime/kapsl-sdk'
 require_literal ".github/workflows/installer-smoke.yml" '.github/scripts/certify-ort-cpu-parity.sh'
+
+python3 - "$parity_lock" ".github/workflows/installer-smoke.yml" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+workflow = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+match = re.search(
+    r"uses: kapsl-runtime/kapsl-benchmarks/ort_cpu_parity@([0-9a-f]{40})",
+    workflow,
+)
+if match is None or match.group(1) != lock["benchmarks"]["commit"]:
+    raise SystemExit("installer smoke must pin the exact locked ORT parity action commit")
+PY
 
 if grep -Eq 'KAPSL_ORT_INTEGRATIONS_REF:-|ref:.*feature/ort|ref:.*(main|develop)' \
   "$cpu_packager" \

@@ -4,6 +4,8 @@ set -euo pipefail
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 : "${KAPSL_ORT_INTEGRATIONS_REF:?KAPSL_ORT_INTEGRATIONS_REF is required}"
 : "${KAPSL_ORT_PARITY_BENCHMARKS_REF:?KAPSL_ORT_PARITY_BENCHMARKS_REF is required}"
+: "${KAPSL_ORT_PARITY_HARNESS:?KAPSL_ORT_PARITY_HARNESS is required}"
+: "${KAPSL_ORT_PARITY_HARNESS_SHA256:?KAPSL_ORT_PARITY_HARNESS_SHA256 is required}"
 : "${KAPSL_ORT_PARITY_MODEL_REF:?KAPSL_ORT_PARITY_MODEL_REF is required}"
 : "${KAPSL_ORT_PARITY_MODEL_PATH:?KAPSL_ORT_PARITY_MODEL_PATH is required}"
 : "${KAPSL_ORT_PARITY_MODEL_SHA256:?KAPSL_ORT_PARITY_MODEL_SHA256 is required}"
@@ -15,14 +17,13 @@ if [ "$(uname -s)" != "Linux" ] || [ "$(uname -m)" != "x86_64" ]; then
 fi
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
-benchmarks_dir="${KAPSL_ORT_PARITY_BENCHMARKS_DIR:-$repo_root/kapsl-benchmarks-ort-parity}"
 model_repo_dir="${KAPSL_ORT_PARITY_MODEL_REPO_DIR:-$repo_root/kapsl-sdk-ort-model}"
 artifacts_dir="${KAPSL_ORT_PARITY_ARTIFACTS_DIR:-$repo_root/dist}"
 evidence_dir="${KAPSL_ORT_PARITY_EVIDENCE_DIR:-$artifacts_dir/ort-cpu-parity}"
 index_path="$artifacts_dir/backend-index.json"
 archive_name="kapsl-backend-onnx-cpu-${KAPSL_VERSION}-linux-x86_64.tar.gz"
 archive_path="$artifacts_dir/$archive_name"
-parity_harness="$benchmarks_dir/ort_cpu_parity/parity.py"
+parity_harness="$KAPSL_ORT_PARITY_HARNESS"
 source_model="$model_repo_dir/$KAPSL_ORT_PARITY_MODEL_PATH"
 engine_binary="$repo_root/kapsl-runtime/target/release/kapsl"
 work_root="$(mktemp -d)"
@@ -65,8 +66,12 @@ verify_checkout() {
   fi
 }
 
-verify_checkout "$benchmarks_dir" "$KAPSL_ORT_PARITY_BENCHMARKS_REF" "Benchmarks"
 verify_checkout "$model_repo_dir" "$KAPSL_ORT_PARITY_MODEL_REF" "Model source"
+actual_harness_sha256="$(sha256sum "$parity_harness" | awk '{ print $1 }')"
+if [ "$actual_harness_sha256" != "$KAPSL_ORT_PARITY_HARNESS_SHA256" ]; then
+  echo "Pinned ORT parity harness digest is $actual_harness_sha256, expected $KAPSL_ORT_PARITY_HARNESS_SHA256" >&2
+  exit 1
+fi
 actual_model_sha256="$(sha256sum "$source_model" | awk '{ print $1 }')"
 if [ "$actual_model_sha256" != "$KAPSL_ORT_PARITY_MODEL_SHA256" ]; then
   echo "Pinned ORT parity model digest is $actual_model_sha256, expected $KAPSL_ORT_PARITY_MODEL_SHA256" >&2

@@ -2,7 +2,8 @@
   "schema_version": 1,
   "benchmarks": {
     "repository": "kapsl-runtime/kapsl-benchmarks",
-    "commit": "a0da68a96654c58d00eb45309cc250b4f227ebe0"
+    "commit": "c3a81cbd60ad52de70c1bb8f93a647201fde86c7",
+    "entrypoint_sha256": "27dff51edf896945f2fbba4b8544aa84b470147e3466ab52fc4546b98850c2cf"
   },
   "model": {
     "repository": "kapsl-runtime/kapsl-sdk",

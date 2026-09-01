@@ -241,6 +241,11 @@ jobs:
           ):
               if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
                   raise SystemExit(f"ORT CPU parity {label} must be an exact lowercase commit")
+          benchmarks_entrypoint_sha256 = benchmarks.get("entrypoint_sha256")
+          if not isinstance(benchmarks_entrypoint_sha256, str) or not re.fullmatch(
+              r"[0-9a-f]{64}", benchmarks_entrypoint_sha256
+          ):
+              raise SystemExit("ORT CPU parity harness SHA-256 is invalid")
           model_path = model.get("path")
           if (
               not isinstance(model_path, str)
@@ -256,6 +261,7 @@ jobs:
               raise SystemExit("ORT CPU parity model SHA-256 is invalid")
           outputs = {
               "benchmarks_ref": benchmarks["commit"],
+              "benchmarks_entrypoint_sha256": benchmarks_entrypoint_sha256,
               "model_ref": model["commit"],
               "model_path": model_path,
               "model_sha256": model_sha256,
@@ -272,13 +278,9 @@ jobs:
           ref: ${{ steps.release-inputs.outputs.integrations_ref }}
           path: kapsl-integrations-ort
 
-      - name: Checkout exact ORT parity harness
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-benchmarks
-          ref: ${{ steps.release-inputs.outputs.benchmarks_ref }}
-          path: kapsl-benchmarks-ort-parity
-          persist-credentials: false
+      - name: Resolve exact ORT parity harness
+        id: ort-parity-harness
+        uses: kapsl-runtime/kapsl-benchmarks/ort_cpu_parity@c3a81cbd60ad52de70c1bb8f93a647201fde86c7
 
       - name: Checkout exact ORT parity model source
         uses: actions/checkout@v4
@@ -341,6 +343,8 @@ jobs:
       - name: Certify embedded versus packaged ORT CPU parity
         env:
           KAPSL_ORT_PARITY_BENCHMARKS_REF: ${{ steps.release-inputs.outputs.benchmarks_ref }}
+          KAPSL_ORT_PARITY_HARNESS: ${{ steps.ort-parity-harness.outputs.harness_path }}
+          KAPSL_ORT_PARITY_HARNESS_SHA256: ${{ steps.release-inputs.outputs.benchmarks_entrypoint_sha256 }}
           KAPSL_ORT_PARITY_MODEL_REF: ${{ steps.release-inputs.outputs.model_ref }}
           KAPSL_ORT_PARITY_MODEL_PATH: ${{ steps.release-inputs.outputs.model_path }}
           KAPSL_ORT_PARITY_MODEL_SHA256: ${{ steps.release-inputs.outputs.model_sha256 }}
