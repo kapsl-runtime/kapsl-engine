@@ -33,6 +33,8 @@ source_ref = os.environ["SOURCE_REF"]
 output_dir = pathlib.Path(os.environ["KAPSL_ORT_PACK_OUTPUT_DIR"])
 output_dir.mkdir(parents=True, exist_ok=True)
 adapter_abi = "invalid-adapter" if os.environ.get("FIXTURE_BAD_ADAPTER") else "kapsl-backend-v1"
+entrypoint_bytes = b"fixture standard ABI entrypoint\n"
+runtime_bytes = b"fixture pack-local ONNX Runtime\n"
 payload = {
     "schema_version": 1,
     "backend": "onnx",
@@ -49,13 +51,42 @@ provenance = {
     "source_repository": "https://github.com/kapsl-runtime/kapsl-integrations",
     "source_commit": source_ref,
     "adapter": {"adapter_abi": adapter_abi},
+    "onnx_runtime": {
+        "version": "1.23.2",
+        "distribution_url": (
+            "https://github.com/microsoft/onnxruntime/releases/download/"
+            "v1.23.2/onnxruntime-linux-x64-1.23.2.tgz"
+        ),
+        "distribution_sha256": (
+            "0" * 64
+            if os.environ.get("FIXTURE_BAD_RUNTIME_SOURCE")
+            else "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b"
+        ),
+        "library": {
+            "path": "libonnxruntime.so.1",
+            "sha256": hashlib.sha256(runtime_bytes).hexdigest(),
+            "soname": "libonnxruntime.so.1",
+            "needed_libraries": ["libc.so.6", "libm.so.6"],
+            "maximum_required_glibc": "2.27",
+        },
+    },
+    "build": {"maximum_permitted_glibc": "2.35"},
+    "entrypoint": {
+        "path": "libkapsl_backend_ort.so",
+        "sha256": hashlib.sha256(entrypoint_bytes).hexdigest(),
+        "needed_libraries": ["libc.so.6", "libonnxruntime.so.1"],
+        "maximum_required_glibc": "2.35",
+    },
 }
 entries = {
     "backend-pack.json": (json.dumps(payload, sort_keys=True) + "\n").encode(),
-    "libkapsl_backend_ort.so": b"fixture standard ABI entrypoint\n",
+    "libkapsl_backend_ort.so": entrypoint_bytes,
+    "libonnxruntime.so.1": runtime_bytes,
     "licenses/FIXTURE-LICENSE": b"fixture license\n",
     "provenance.json": (json.dumps(provenance, sort_keys=True) + "\n").encode(),
 }
+if os.environ.get("FIXTURE_OMIT_RUNTIME"):
+    del entries["libonnxruntime.so.1"]
 name = f"kapsl-backend-onnx-cpu-{version}-linux-x86_64.tar.gz"
 archive_path = output_dir / name
 with archive_path.open("wb") as output:
@@ -141,6 +172,16 @@ fi
 rm -rf "$output_dir"
 if FIXTURE_BAD_ADAPTER=1 run_packager >/dev/null 2>&1; then
   echo "ORT CPU packager unexpectedly accepted an unrecognized adapter ABI" >&2
+  exit 1
+fi
+rm -rf "$output_dir"
+if FIXTURE_OMIT_RUNTIME=1 run_packager >/dev/null 2>&1; then
+  echo "ORT CPU packager unexpectedly accepted a missing pack-local runtime" >&2
+  exit 1
+fi
+rm -rf "$output_dir"
+if FIXTURE_BAD_RUNTIME_SOURCE=1 run_packager >/dev/null 2>&1; then
+  echo "ORT CPU packager unexpectedly accepted unpinned runtime provenance" >&2
   exit 1
 fi
 

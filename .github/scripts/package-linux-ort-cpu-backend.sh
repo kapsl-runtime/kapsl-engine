@@ -61,6 +61,7 @@ python3 - "$archive" "$manifest" "$KAPSL_VERSION" "$KAPSL_ORT_INTEGRATIONS_REF" 
 import hashlib
 import json
 import pathlib
+import re
 import sys
 import tarfile
 
@@ -69,6 +70,16 @@ manifest_path = pathlib.Path(sys.argv[2])
 version = sys.argv[3]
 source_ref = sys.argv[4]
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+runtime_soname = "libonnxruntime.so.1"
+runtime_version = "1.23.2"
+runtime_distribution_url = (
+    "https://github.com/microsoft/onnxruntime/releases/download/"
+    "v1.23.2/onnxruntime-linux-x64-1.23.2.tgz"
+)
+runtime_distribution_sha256 = (
+    "1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b"
+)
+maximum_glibc = (2, 35)
 expected = {
     "schema_version": 1,
     "backend": "onnx",
@@ -107,7 +118,12 @@ with tarfile.open(archive_path, "r:gz") as archive:
                 raise SystemExit(f"{archive_path}: cannot read {normalized}")
             members[normalized] = stream.read()
 
-for required in ("backend-pack.json", "provenance.json", expected["entrypoint"]):
+for required in (
+    "backend-pack.json",
+    "provenance.json",
+    expected["entrypoint"],
+    runtime_soname,
+):
     if required not in members:
         raise SystemExit(f"{archive_path}: missing {required}")
 payload = json.loads(members["backend-pack.json"])
@@ -124,13 +140,6 @@ for field in (
 ):
     if payload.get(field) != manifest.get(field):
         raise SystemExit(f"{archive_path}: payload/template mismatch for {field}")
-provenance = json.loads(members["provenance.json"])
-if provenance.get("source_repository") != "https://github.com/kapsl-runtime/kapsl-integrations":
-    raise SystemExit(f"{archive_path}: unexpected source repository")
-if provenance.get("source_commit") != source_ref:
-    raise SystemExit(f"{archive_path}: source commit does not match the certified checkout")
-if provenance.get("adapter", {}).get("adapter_abi") != "kapsl-backend-v1":
-    raise SystemExit(f"{archive_path}: provenance does not identify the standard adapter ABI")
 
 signed_files = manifest.get("files")
 if not isinstance(signed_files, dict) or set(signed_files) != set(members):
@@ -139,6 +148,73 @@ for name, payload_bytes in members.items():
     digest = hashlib.sha256(payload_bytes).hexdigest()
     if signed_files.get(name) != digest:
         raise SystemExit(f"{manifest_path}: digest mismatch for {name}")
+
+provenance = json.loads(members["provenance.json"])
+if provenance.get("source_repository") != "https://github.com/kapsl-runtime/kapsl-integrations":
+    raise SystemExit(f"{archive_path}: unexpected source repository")
+if provenance.get("source_commit") != source_ref:
+    raise SystemExit(f"{archive_path}: source commit does not match the certified checkout")
+if provenance.get("adapter", {}).get("adapter_abi") != "kapsl-backend-v1":
+    raise SystemExit(f"{archive_path}: provenance does not identify the standard adapter ABI")
+
+onnx_runtime = provenance.get("onnx_runtime")
+if not isinstance(onnx_runtime, dict):
+    raise SystemExit(f"{archive_path}: provenance is missing ONNX Runtime metadata")
+runtime_expected = {
+    "version": runtime_version,
+    "distribution_url": runtime_distribution_url,
+    "distribution_sha256": runtime_distribution_sha256,
+}
+for field, value in runtime_expected.items():
+    if onnx_runtime.get(field) != value:
+        raise SystemExit(
+            f"{archive_path}: onnx_runtime.{field}={onnx_runtime.get(field)!r}, "
+            f"expected {value!r}"
+        )
+
+runtime_library = onnx_runtime.get("library")
+if not isinstance(runtime_library, dict):
+    raise SystemExit(f"{archive_path}: provenance is missing ONNX Runtime library metadata")
+for field in ("path", "soname"):
+    if runtime_library.get(field) != runtime_soname:
+        raise SystemExit(
+            f"{archive_path}: onnx_runtime.library.{field} must be {runtime_soname}"
+        )
+if runtime_library.get("sha256") != signed_files[runtime_soname]:
+    raise SystemExit(
+        f"{archive_path}: ONNX Runtime provenance digest does not match the signed file"
+    )
+
+entrypoint = provenance.get("entrypoint")
+if not isinstance(entrypoint, dict) or entrypoint.get("path") != expected["entrypoint"]:
+    raise SystemExit(f"{archive_path}: provenance entrypoint path is invalid")
+if entrypoint.get("sha256") != signed_files[expected["entrypoint"]]:
+    raise SystemExit(f"{archive_path}: entrypoint provenance digest does not match the signed file")
+needed_libraries = entrypoint.get("needed_libraries")
+if not isinstance(needed_libraries, list) or runtime_soname not in needed_libraries:
+    raise SystemExit(
+        f"{archive_path}: entrypoint does not declare the pack-local ONNX Runtime dependency"
+    )
+
+def parse_glibc(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", value):
+        raise SystemExit(f"{archive_path}: {label} is not a GLIBC version")
+    return tuple(int(component) for component in value.split("."))
+
+
+build = provenance.get("build")
+if not isinstance(build, dict) or build.get("maximum_permitted_glibc") != "2.35":
+    raise SystemExit(f"{archive_path}: provenance does not enforce the GLIBC 2.35 policy")
+for metadata, label in (
+    (runtime_library, "ONNX Runtime library"),
+    (entrypoint, "ORT adapter entrypoint"),
+):
+    required_glibc = parse_glibc(metadata.get("maximum_required_glibc"), label)
+    if required_glibc > maximum_glibc:
+        raise SystemExit(
+            f"{archive_path}: {label} requires GLIBC {metadata['maximum_required_glibc']}, "
+            "which exceeds 2.35"
+        )
 PY
 
 echo "Accepted certified ORT CPU adapter from $KAPSL_ORT_INTEGRATIONS_REF"
