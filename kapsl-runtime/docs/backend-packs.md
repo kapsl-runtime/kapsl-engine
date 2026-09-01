@@ -93,6 +93,15 @@ passed CPU parity, GPU memory-ownership, unload/reload, and stable release
 conformance. An invalid gate value is an error rather than a request to fall
 back.
 
+When a native adapter advertises ABI v1 cancellation, Kapsl bridges each
+request's `CancellationToken` to the adapter's `cancel(request_id)` hook on one
+process-wide event-driven cancellation runtime. This does not poll and does not
+create an operating-system thread per request. The borrowed request callback
+remains available for cancellation that races initial dispatch, while the
+explicit hook can interrupt a backend run already in progress. Model load,
+unload, and shutdown take an exclusive cancellation guard so a late task
+cannot race lifecycle mutation or call a retired adapter handle.
+
 Inspect a decision without running the model:
 
 ```bash
