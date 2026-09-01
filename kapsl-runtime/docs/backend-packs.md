@@ -89,6 +89,14 @@ signed accelerator profile must exactly match the adapter's CPU, CUDA, or
 TensorRT capability bits. CUDA and TensorRT adapters must allocate device
 memory through the runtime-owned `GpuDevicePool` callbacks.
 
+The standard-ABI ORT family also binds the versioned pack identity exactly:
+`cpu` maps to accelerator `cpu`, `cuda12` maps to `cuda`, and `tensorrt10`
+maps to `tensorrt`. Provider aliases are normalized only at the engine policy
+boundary. The adapter receives the signed canonical provider, and activation
+rejects a descriptor unless its one compiled profile, ABI, wire format,
+execution mode, and governed-memory declaration match the signed manifest and
+static function table.
+
 This path stays in-process: tensor buffers cross the adapter boundary as
 borrowed views, and ORT's allocator forwards directly to the same Kapsl-owned
 pool. It introduces no backend RPC, CUDA IPC, tensor serialization, or second
