@@ -247,6 +247,16 @@ pub(crate) fn ensure_onnx_backend_pack(
     let pack_plan = manager
         .plan_onnx(profile, &target)
         .map_err(|error| error.to_string())?;
+    let standard_adapter = pack_plan.manifest.adapter_abi.as_deref()
+        == Some(crate::backend::STANDARD_NATIVE_ADAPTER_ABI);
+    if standard_adapter && !generic_native_backend_packs_enabled()? {
+        log::debug!(
+            "Signed standard-ABI ONNX pack {}/{} is available, but generic native packs are disabled; using the embedded ORT rollback",
+            pack_plan.manifest.backend,
+            pack_plan.manifest.profile
+        );
+        return Ok(None);
+    }
     preliminary_memory_admission(
         profile,
         model_path,
@@ -258,7 +268,7 @@ pub(crate) fn ensure_onnx_backend_pack(
     let installed = manager
         .ensure_pack(&pack_plan.manifest)
         .map_err(|error| error.to_string())?;
-    if generic_native_backend_packs_enabled()? {
+    if standard_adapter {
         activate_native_backend_pack(&pack_plan.manifest, &installed)?;
     } else {
         activate_onnx_pack(&pack_plan.manifest, &installed)?;
@@ -675,6 +685,7 @@ mod tests {
             profile: crate::backend::ONNX_CUDA12_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: 1,
+            adapter_abi: None,
             compatible_kapsl: "=0.2.3".to_string(),
             platform: crate::backend::current_platform(),
             architecture: std::env::consts::ARCH.to_string(),

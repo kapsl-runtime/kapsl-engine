@@ -267,6 +267,14 @@ fn active_native_pack(backend: &str, accelerator_profile: &str) -> Option<Arc<Ac
         .cloned()
 }
 
+pub(crate) fn native_backend_pack_active_for_provider(
+    backend: &str,
+    provider: &str,
+) -> Result<bool, String> {
+    let accelerator_profile = provider_accelerator_profile(provider)?;
+    Ok(active_native_pack(backend, accelerator_profile).is_some())
+}
+
 fn provider_accelerator_profile(provider: &str) -> Result<&'static str, String> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "cpu" | "cpuexecutionprovider" => Ok("cpu"),
@@ -290,9 +298,7 @@ pub(crate) fn create_native_backend_pack_engine(
 ) -> Result<Box<dyn Engine>, String> {
     let accelerator_profile = provider_accelerator_profile(provider)?;
     let pack = active_native_pack("onnx", accelerator_profile).ok_or_else(|| {
-        format!(
-            "generic native packs are enabled, but no signed onnx/{accelerator_profile} pack was activated"
-        )
+        format!("no signed standard-ABI onnx/{accelerator_profile} pack was activated")
     })?;
     let instance = NativePackInstance::initialize(
         pack, manifest, provider, resources, device_id, model_id, replica_id, tuning,
@@ -1993,6 +1999,7 @@ mod tests {
             profile: accelerator_profile.to_string(),
             pack_version: "1.0.0".to_string(),
             runtime_abi: 1,
+            adapter_abi: Some(crate::backend::STANDARD_NATIVE_ADAPTER_ABI.to_string()),
             compatible_kapsl: "*".to_string(),
             platform: "linux-x86_64".to_string(),
             architecture: "x86_64".to_string(),

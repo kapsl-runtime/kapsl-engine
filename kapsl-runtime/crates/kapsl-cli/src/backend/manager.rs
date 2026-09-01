@@ -31,6 +31,7 @@ pub(crate) const MANAGED_VLLM_PACK_PROFILE: &str = "cu130-flash-attn";
 pub(crate) const ONNX_CPU_PACK_PROFILE: &str = "cpu";
 pub(crate) const ONNX_CUDA12_PACK_PROFILE: &str = "cuda12";
 pub(crate) const ONNX_TENSORRT10_PACK_PROFILE: &str = "tensorrt10";
+pub(crate) const STANDARD_NATIVE_ADAPTER_ABI: &str = "kapsl-backend-v1";
 pub(crate) const LLAMA_CPP_CPU_PACK_PROFILE: &str = "cpu";
 pub(crate) const LLAMA_CPP_CUDA12_PACK_PROFILE: &str = "cuda12";
 
@@ -133,6 +134,9 @@ pub(crate) struct BackendPackManifest {
     pub(crate) profile: String,
     pub(crate) pack_version: String,
     pub(crate) runtime_abi: u32,
+    /// Standard in-process adapter contract. Legacy provider-only packs omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) adapter_abi: Option<String>,
     /// A semver requirement evaluated against the Kapsl runtime version.
     pub(crate) compatible_kapsl: String,
     /// Canonical OS/architecture pair, for example `linux-x86_64`.
@@ -187,6 +191,8 @@ struct BackendPayloadManifest {
     profile: String,
     pack_version: String,
     runtime_abi: u32,
+    #[serde(default)]
+    adapter_abi: Option<String>,
     platform: String,
     execution_mode: BackendExecutionMode,
     #[serde(default)]
@@ -1110,6 +1116,18 @@ impl BackendManager {
                 "backend ABI {} does not match runtime ABI {}",
                 pack.runtime_abi, BACKEND_RUNTIME_ABI
             )));
+        }
+        if let Some(adapter_abi) = pack.adapter_abi.as_deref() {
+            if pack.execution_mode != BackendExecutionMode::Native {
+                return Err(BackendManagerError::new(
+                    "only native backend packs may declare adapter_abi",
+                ));
+            }
+            if adapter_abi != STANDARD_NATIVE_ADAPTER_ABI {
+                return Err(BackendManagerError::new(format!(
+                    "unsupported native adapter ABI `{adapter_abi}`"
+                )));
+            }
         }
         validate_cache_component("backend", &pack.backend)?;
         validate_cache_component("profile", &pack.profile)?;
@@ -2207,6 +2225,7 @@ fn validate_payload_manifest(
         && payload.profile == signed.profile
         && payload.pack_version == signed.pack_version
         && payload.runtime_abi == signed.runtime_abi
+        && payload.adapter_abi == signed.adapter_abi
         && payload.platform == signed.platform
         && payload.execution_mode == signed.execution_mode
         && payload.kv_mode == signed.kv_mode
@@ -2334,6 +2353,7 @@ mod tests {
             profile: MANAGED_VLLM_PACK_PROFILE.to_string(),
             pack_version: "0.26.1".to_string(),
             runtime_abi: 1,
+            adapter_abi: None,
             platform: current_platform(),
             execution_mode: BackendExecutionMode::External,
             kv_mode: None,
@@ -2376,6 +2396,7 @@ mod tests {
             profile: MANAGED_VLLM_PACK_PROFILE.to_string(),
             pack_version: "0.26.1".to_string(),
             runtime_abi: 1,
+            adapter_abi: None,
             compatible_kapsl: ">=0.2.3, <0.3.0".to_string(),
             platform: current_platform(),
             architecture: std::env::consts::ARCH.to_string(),
@@ -2462,6 +2483,7 @@ mod tests {
         pack.accelerator_profile = "cpu".to_string();
         pack.minimum_cuda = None;
         pack.execution_mode = BackendExecutionMode::Native;
+        pack.adapter_abi = Some(STANDARD_NATIVE_ADAPTER_ABI.to_string());
         let index = BackendIndex {
             schema_version: BACKEND_INDEX_SCHEMA_VERSION,
             runtime_version: manager.runtime_version().to_string(),
@@ -2483,11 +2505,57 @@ mod tests {
         assert_eq!(plan.selected_backend, "onnx");
         assert_eq!(plan.profile, ONNX_CPU_PACK_PROFILE);
         assert_eq!(plan.execution_mode, "native");
+        assert_eq!(
+            plan.manifest.adapter_abi.as_deref(),
+            Some(STANDARD_NATIVE_ADAPTER_ABI)
+        );
         assert!(manager
             .plan_onnx(OnnxBackendPackProfile::Cuda12, &cpu_target())
             .unwrap_err()
             .to_string()
             .contains("requires a cuda target"));
+    }
+
+    #[test]
+    fn adapter_abi_is_explicit_and_fail_closed() {
+        let (_root, manager, mut pack, _) = fixture();
+        pack.execution_mode = BackendExecutionMode::Native;
+        pack.adapter_abi = Some("vendor-private-v1".to_string());
+        let error = manager
+            .validate_pack_manifest(&pack, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported native adapter ABI"));
+
+        pack.adapter_abi = Some(STANDARD_NATIVE_ADAPTER_ABI.to_string());
+        pack.execution_mode = BackendExecutionMode::External;
+        let error = manager
+            .validate_pack_manifest(&pack, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only native backend packs"));
+    }
+
+    #[test]
+    fn payload_must_repeat_the_signed_adapter_abi() {
+        let (_root, _manager, mut signed, _) = fixture();
+        signed.execution_mode = BackendExecutionMode::Native;
+        signed.adapter_abi = Some(STANDARD_NATIVE_ADAPTER_ABI.to_string());
+        let mut payload = BackendPayloadManifest {
+            schema_version: signed.schema_version,
+            backend: signed.backend.clone(),
+            profile: signed.profile.clone(),
+            pack_version: signed.pack_version.clone(),
+            runtime_abi: signed.runtime_abi,
+            adapter_abi: None,
+            platform: signed.platform.clone(),
+            execution_mode: signed.execution_mode,
+            kv_mode: signed.kv_mode.clone(),
+            entrypoint: signed.entrypoint.clone(),
+        };
+        assert!(validate_payload_manifest(&signed, &payload).is_err());
+        payload.adapter_abi = signed.adapter_abi.clone();
+        assert!(validate_payload_manifest(&signed, &payload).is_ok());
     }
 
     #[test]
