@@ -224,8 +224,8 @@ config = {
     ],
     "workload": {
         "model_id": 0,
-        "warmup_requests": 10,
-        "requests_per_payload": 40,
+        "warmup_requests": 40,
+        "requests_per_payload": 1000,
         "trials": 3,
         "concurrency": [1, 4],
         "timeout_seconds": 30,
@@ -291,10 +291,12 @@ config = {
 pathlib.Path(config_path).write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 PY
 
+certification_status=0
 PYTHONDONTWRITEBYTECODE=1 python3 "$parity_harness" certify \
   --config "$config_path" \
-  --output-dir "$evidence_dir"
+  --output-dir "$evidence_dir" || certification_status=$?
 
+rm -f "$evidence_dir/kapsl.sock"
 cp "$work_root/backend-ensure.log" "$evidence_dir/backend-ensure.log"
 cp "$work_root/backend-list.json" "$evidence_dir/backend-list.json"
 cp "$config_path" "$evidence_dir/certification-config.json"
@@ -347,3 +349,4 @@ pathlib.Path(output).write_text(json.dumps(payload, indent=2) + "\n", encoding="
 PY
 
 echo "ORT CPU host parity evidence: $evidence_dir"
+exit "$certification_status"

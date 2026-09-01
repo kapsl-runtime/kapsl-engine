@@ -3,7 +3,7 @@
   "conformance": {
     "repository": "kapsl-runtime/kapsl-integrations",
     "path": "integrations/ort/conformance/parity.py",
-    "entrypoint_sha256": "3da3dd25fb143597badbe2c801c4663c5c06fb2e5c62d7b341840bf9ee3a5732"
+    "entrypoint_sha256": "fe03da5c49e70957e022b8983936a0228221914860557b65da5f5f5f8268ea3c"
   },
   "model": {
     "repository": "kapsl-runtime/kapsl-sdk",

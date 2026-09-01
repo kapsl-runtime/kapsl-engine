@@ -70,6 +70,11 @@ require_literal "$parity_certifier" '--target linux-x86_64-cpu'
 require_literal "$parity_certifier" 'KAPSL_GENERIC_NATIVE_PACKS=1'
 require_literal "$parity_certifier" 'PYTHONDONTWRITEBYTECODE=1'
 require_literal "$parity_certifier" 'KAPSL_ORT_PARITY_HARNESS_PATH'
+require_literal "$parity_certifier" '"warmup_requests": 40'
+require_literal "$parity_certifier" '"requests_per_payload": 1000'
+require_literal "$parity_certifier" 'certification_status=0'
+require_literal "$parity_certifier" 'rm -f "$evidence_dir/kapsl.sock"'
+require_literal "$parity_certifier" 'exit "$certification_status"'
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
