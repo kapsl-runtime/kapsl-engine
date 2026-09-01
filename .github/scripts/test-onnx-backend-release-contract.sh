@@ -13,6 +13,10 @@ require_literal() {
 manager="kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
 activator="kapsl-runtime/crates/kapsl-cli/src/backend/onnx.rs"
 packager=".github/scripts/package-linux-onnx-backend-packs.sh"
+cpu_packager=".github/scripts/package-linux-ort-cpu-backend.sh"
+integration_verifier=".github/scripts/verify-ort-integration-checkout.sh"
+index_generator=".github/scripts/generate-backend-index.py"
+integration_lock=".github/ort-cpu-integration.lock"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
 cli_manifest="kapsl-runtime/crates/kapsl-cli/Cargo.toml"
@@ -23,10 +27,12 @@ require_literal "$manager" 'pub(crate) const ONNX_TENSORRT10_PACK_PROFILE: &str 
 require_literal "$activator" 'libloading::os::unix::Library::open'
 require_literal "$activator" 'libc::RTLD_NOW | libc::RTLD_GLOBAL'
 require_literal "$activator" 'TensorRT may only be selected when the .aimod explicitly declares it'
-require_literal "$activator" 'if generic_native_backend_packs_enabled()?'
+require_literal "$activator" '!generic_native_backend_packs_enabled()?'
+require_literal "$activator" 'pack_plan.manifest.adapter_abi.as_deref()'
+require_literal "$activator" 'STANDARD_NATIVE_ADAPTER_ABI'
 require_literal "$activator" 'activate_native_backend_pack(&pack_plan.manifest, &installed)?;'
 require_literal "$runtime_backend" 'LLMBackend::with_device(provider.to_owned(), device_id as i32)'
-require_literal "$runtime_backend" 'engine_kind.uses_onnx_session() && generic_native_backend_packs_enabled()?'
+require_literal "$runtime_backend" 'native_backend_pack_active_for_provider("onnx", provider)?'
 require_literal "$runtime_backend" 'return create_native_backend_pack_engine('
 require_literal "$native_host" 'const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";'
 require_literal "$native_host" 'KAPSL_BACKEND_ENTRYPOINT_SYMBOL'
@@ -37,11 +43,29 @@ require_literal "$native_host" '"onnx_tuning": tuning.map'
 require_literal "$native_host" 'pointer.cast::<KapslBackendApiPrefixV1>().read()'
 require_literal "$native_host" 'pack.api.shutdown'
 require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.1.0"'
-require_literal "$packager" 'package_profile cpu cpu 1'
 require_literal "$packager" 'package_profile cuda12 cuda 2'
 require_literal "$packager" 'package_profile tensorrt10 tensorrt 3'
 require_literal "$packager" '"execution_mode": "native"'
 require_literal "$packager" '"entrypoint": "libkapsl_backend_onnx.so"'
+require_literal "$cpu_packager" ': "${KAPSL_ORT_INTEGRATIONS_REF:?'
+require_literal "$cpu_packager" 'verify-ort-integration-checkout.sh'
+require_literal "$cpu_packager" 'integrations/ort/packaging/build_cpu_pack.sh'
+require_literal "$cpu_packager" '"adapter_abi": "kapsl-backend-v1"'
+require_literal "$cpu_packager" 'engine index publisher owns the release key'
+require_literal "$integration_verifier" '^[0-9a-f]{40}$'
+require_literal "$integration_verifier" '--untracked-files=all'
+require_literal "$integration_verifier" '--ignored=matching'
+require_literal "$index_generator" 'adapter_abi != "kapsl-backend-v1"'
+if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
+  || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
+  echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
+  exit 1
+fi
+
+if grep -Fq 'package_profile cpu ' "$packager"; then
+  echo "$packager must not publish the legacy provider-only CPU bundle" >&2
+  exit 1
+fi
 
 python3 - "$runtime_backend" <<'PY'
 import pathlib
@@ -49,7 +73,7 @@ import sys
 
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 generic = source.index(
-    "engine_kind.uses_onnx_session() && generic_native_backend_packs_enabled()?"
+    'native_backend_pack_active_for_provider("onnx", provider)?'
 )
 embedded = source.index("if engine_kind.is_onnx_generate()")
 if generic >= embedded:
@@ -65,7 +89,22 @@ for workflow in \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/release-runtime-installers.yml; do
   require_literal "$workflow" '.github/scripts/package-linux-onnx-backend-packs.sh'
+  require_literal "$workflow" '.github/scripts/package-linux-ort-cpu-backend.sh'
+  require_literal "$workflow" '.github/ort-cpu-integration.lock'
+  require_literal "$workflow" 'ref: ${{ steps.ort-integrations.outputs.ref }}'
+  require_literal "$workflow" 'repository: kapsl-runtime/kapsl-integrations'
+  require_literal "$workflow" 'verify-ort-integration-checkout.sh'
+  require_literal "$workflow" 'Install certified ORT packaging toolchain'
+  require_literal "$workflow" 'rustup toolchain install "$toolchain" --profile minimal'
   require_literal "$workflow" '.github/scripts/collect-linux-tensorrt-runtime.sh'
 done
+
+if grep -Eq 'KAPSL_ORT_INTEGRATIONS_REF:-|ref:.*feature/ort|ref:.*(main|develop)' \
+  "$cpu_packager" \
+  .github/workflows/beta-runtime-installers.yml \
+  .github/workflows/release-runtime-installers.yml; then
+  echo "ORT release paths must use an exact configured integrations commit without a branch fallback." >&2
+  exit 1
+fi
 
 echo "ONNX backend release contract tests passed."

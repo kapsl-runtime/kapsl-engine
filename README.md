@@ -16,11 +16,14 @@ kapsl run model.aimod
 ```
 
 Managed vLLM and Linux x86_64 ONNX CPU/CUDA 12/TensorRT 10 and llama.cpp
-CPU/CUDA 12 profiles use the signed lazy cache. Provider fallback remains
-package-controlled, and TensorRT is selected only when the model contract
-explicitly permits it. The portable core lazily loads llama.cpp CPU; the
-certified eager CUDA shared-KV profile remains the default during CUDA pack
-certification.
+CPU/CUDA 12 profiles use the signed lazy cache. The ORT CPU candidate is built
+from an exact out-of-tree integrations commit and is distinguished from the
+legacy accelerator bundles by its signed standard-ABI marker. Embedded ORT
+remains the default CPU rollback during parity certification. Provider
+fallback remains package-controlled, and TensorRT is selected only when the
+model contract explicitly permits it. The portable core lazily loads llama.cpp
+CPU; the certified eager CUDA shared-KV profile remains the default during
+CUDA pack certification.
 
 For a no-network host, prepare one verified bundle on a connected machine and
 run it directly after transfer:

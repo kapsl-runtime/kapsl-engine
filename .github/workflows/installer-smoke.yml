@@ -8,9 +8,14 @@ on:
       - ".github/scripts/package-linux-cuda-runtime.sh"
       - ".github/scripts/test-package-linux-cuda-runtime.sh"
       - ".github/scripts/package-linux-onnx-backend-packs.sh"
+      - ".github/scripts/package-linux-ort-cpu-backend.sh"
+      - ".github/scripts/verify-ort-integration-checkout.sh"
+      - ".github/ort-cpu-integration.lock"
       - ".github/scripts/collect-linux-tensorrt-runtime.sh"
       - ".github/scripts/onnx-backend-pack-entrypoint.c"
       - ".github/scripts/test-package-linux-onnx-backend-packs.sh"
+      - ".github/scripts/test-package-linux-ort-cpu-backend.sh"
+      - ".github/scripts/test-verify-ort-integration-checkout.sh"
       - ".github/scripts/test-onnx-backend-release-contract.sh"
       - ".github/licenses/ONNX-RUNTIME-LICENSE"
       - ".github/scripts/package-linux-llama-cpp-backend-packs.sh"
@@ -80,8 +85,12 @@ jobs:
           bash -n .github/scripts/package-linux-cuda-runtime.sh
           bash -n .github/scripts/test-package-linux-cuda-runtime.sh
           bash -n .github/scripts/package-linux-onnx-backend-packs.sh
+          bash -n .github/scripts/package-linux-ort-cpu-backend.sh
+          bash -n .github/scripts/verify-ort-integration-checkout.sh
           bash -n .github/scripts/collect-linux-tensorrt-runtime.sh
           bash -n .github/scripts/test-package-linux-onnx-backend-packs.sh
+          bash -n .github/scripts/test-package-linux-ort-cpu-backend.sh
+          bash -n .github/scripts/test-verify-ort-integration-checkout.sh
           bash -n .github/scripts/test-onnx-backend-release-contract.sh
           bash -n .github/scripts/package-linux-llama-cpp-backend-packs.sh
           bash -n .github/scripts/test-package-linux-llama-cpp-backend-packs.sh
@@ -124,7 +133,13 @@ jobs:
       - name: Test merged CUDA archive contents
         run: .github/scripts/test-package-linux-cuda-runtime.sh
 
-      - name: Test split ONNX backend packs
+      - name: Test certified ORT CPU release handoff
+        run: .github/scripts/test-package-linux-ort-cpu-backend.sh
+
+      - name: Test exact ORT integrations checkout verification
+        run: .github/scripts/test-verify-ort-integration-checkout.sh
+
+      - name: Test legacy ONNX accelerator packs
         run: .github/scripts/test-package-linux-onnx-backend-packs.sh
 
       - name: Test ONNX backend release contract
@@ -171,3 +186,81 @@ jobs:
 
       - name: Test signed backend-index generation
         run: .github/scripts/test-generate-backend-index.sh
+
+  ort-cpu-release-handoff:
+    name: Build exact ORT CPU release handoff
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout engine
+        uses: actions/checkout@v4
+
+      - name: Resolve exact release inputs
+        id: release-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          integrations_ref="$(tr -d '\r\n' < .github/ort-cpu-integration.lock)"
+          if [[ ! "$integrations_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/ort-cpu-integration.lock must contain one exact lowercase 40-hex commit." >&2
+            exit 1
+          fi
+          version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          echo "KAPSL_ORT_INTEGRATIONS_REF=$integrations_ref" >> "$GITHUB_ENV"
+          echo "KAPSL_VERSION=$version" >> "$GITHUB_ENV"
+          echo "integrations_ref=$integrations_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact ORT integration
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.release-inputs.outputs.integrations_ref }}
+          path: kapsl-integrations-ort
+
+      - name: Verify exact integrations checkout
+        run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils build-essential libssl-dev openssl pkg-config
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install exact ORT packaging toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-ort/rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$toolchain" --profile minimal
+
+      - name: Build and validate release handoff
+        run: .github/scripts/package-linux-ort-cpu-backend.sh
+
+      - name: Validate handoff through the signed index publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/ort-cpu-test-key.pem"
+          openssl genpkey -algorithm ED25519 -out "$key_file"
+          public_key="$(openssl pkey -in "$key_file" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+          .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" \
+            --artifacts-dir dist \
+            --output dist/backend-index.json \
+            --signing-key "$key_file" \
+            --expected-public-key "$public_key"
+          rm -f "$key_file"
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          index = json.loads(pathlib.Path("dist/backend-index.json").read_text())
+          packs = [
+              pack
+              for pack in index["packs"]
+              if pack["backend"] == "onnx" and pack["profile"] == "cpu"
+          ]
+          if len(packs) != 1 or packs[0].get("adapter_abi") != "kapsl-backend-v1":
+              raise SystemExit("signed index does not contain exactly one standard-ABI ORT CPU pack")
+          PY
