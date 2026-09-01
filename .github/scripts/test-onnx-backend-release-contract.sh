@@ -17,8 +17,11 @@ cpu_packager=".github/scripts/package-linux-ort-cpu-backend.sh"
 integration_verifier=".github/scripts/verify-ort-integration-checkout.sh"
 index_generator=".github/scripts/generate-backend-index.py"
 integration_lock=".github/ort-cpu-integration.lock"
+parity_lock=".github/ort-cpu-parity.lock.json"
+parity_certifier=".github/scripts/certify-ort-cpu-parity.sh"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
+bundle="kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
 cli_manifest="kapsl-runtime/crates/kapsl-cli/Cargo.toml"
 
 require_literal "$manager" 'pub(crate) const ONNX_CPU_PACK_PROFILE: &str = "cpu";'
@@ -56,11 +59,34 @@ require_literal "$integration_verifier" '^[0-9a-f]{40}$'
 require_literal "$integration_verifier" '--untracked-files=all'
 require_literal "$integration_verifier" '--ignored=matching'
 require_literal "$index_generator" 'adapter_abi != "kapsl-backend-v1"'
+require_literal "$bundle" 'backend_artifacts_dir'
+require_literal "$bundle" 'manager.verify_pack_archive(pack, &candidate)?;'
+require_literal "$manager" 'let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;'
+require_literal "$parity_certifier" '--target linux-x86_64-cpu'
+require_literal "$parity_certifier" 'KAPSL_GENERIC_NATIVE_PACKS=1'
+require_literal "$parity_certifier" 'PYTHONDONTWRITEBYTECODE=1'
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
   exit 1
 fi
+
+python3 - "$parity_lock" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert lock.get("schema_version") == 1
+assert lock.get("benchmarks", {}).get("repository") == "kapsl-runtime/kapsl-benchmarks"
+assert lock.get("model", {}).get("repository") == "kapsl-runtime/kapsl-sdk"
+assert re.fullmatch(r"[0-9a-f]{40}", lock["benchmarks"]["commit"])
+assert re.fullmatch(r"[0-9a-f]{40}", lock["model"]["commit"])
+assert re.fullmatch(r"[0-9a-f]{64}", lock["model"]["sha256"])
+path = pathlib.PurePosixPath(lock["model"]["path"])
+assert not path.is_absolute() and ".." not in path.parts
+PY
 
 if grep -Fq 'package_profile cpu ' "$packager"; then
   echo "$packager must not publish the legacy provider-only CPU bundle" >&2
@@ -98,6 +124,11 @@ for workflow in \
   require_literal "$workflow" 'rustup toolchain install "$toolchain" --profile minimal'
   require_literal "$workflow" '.github/scripts/collect-linux-tensorrt-runtime.sh'
 done
+
+require_literal ".github/workflows/installer-smoke.yml" '.github/ort-cpu-parity.lock.json'
+require_literal ".github/workflows/installer-smoke.yml" 'repository: kapsl-runtime/kapsl-benchmarks'
+require_literal ".github/workflows/installer-smoke.yml" 'repository: kapsl-runtime/kapsl-sdk'
+require_literal ".github/workflows/installer-smoke.yml" '.github/scripts/certify-ort-cpu-parity.sh'
 
 if grep -Eq 'KAPSL_ORT_INTEGRATIONS_REF:-|ref:.*feature/ort|ref:.*(main|develop)' \
   "$cpu_packager" \

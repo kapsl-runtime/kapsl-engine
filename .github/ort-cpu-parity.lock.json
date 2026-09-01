@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "benchmarks": {
+    "repository": "kapsl-runtime/kapsl-benchmarks",
+    "commit": "a0da68a96654c58d00eb45309cc250b4f227ebe0"
+  },
+  "model": {
+    "repository": "kapsl-runtime/kapsl-sdk",
+    "commit": "676720d168d8c7eb2ed1e4fe5786d331bd76b6dc",
+    "path": "crates/kapsl-backends/tests/fixtures/identity_logits.onnx",
+    "sha256": "3f5d32c1415ef48416a9d7745f51d30a663af119151cd9eaf548747dbd94bd70"
+  }
+}
