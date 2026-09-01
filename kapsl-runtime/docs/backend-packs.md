@@ -108,6 +108,15 @@ engine validates its payload, provenance, file hashes, and standard ABI marker.
 The engine's existing Ed25519 backend-index publisher remains the sole owner of
 official release signing.
 
+Host CI pins the parity harness and its tiny ONNX model source in
+`.github/ort-cpu-parity.lock.json`. It builds the exact integration pack,
+constructs a signed offline bundle, preinstalls that bundle through the normal
+backend manager, and runs an ABBA embedded/candidate comparison. This is a
+CPU-only forward-path smoke gate; it does not provision a GPU and does not by
+itself authorize removing embedded ORT. The broader retirement gate still
+requires every supported CPU task class plus the separate CUDA/TensorRT memory
+ownership and lifecycle suites.
+
 When a native adapter advertises ABI v1 cancellation, Kapsl bridges each
 request's `CancellationToken` to the adapter's `cancel(request_id)` hook on one
 process-wide event-driven cancellation runtime. This does not poll and does not
@@ -183,10 +192,35 @@ kapsl bundle model-a.aimod model-b.aimod \
   --output production.kapsl-bundle
 ```
 
+If the signed release files are already on the preparation host, bundle them
+without downloading the archives again:
+
+```bash
+KAPSL_BACKEND_INDEX_PATH=/release/backend-index.json \
+KAPSL_BACKEND_PUBLIC_KEYS="$PUBLIC_KEYS" \
+kapsl bundle model.aimod \
+  --backend-artifacts-dir /release \
+  --target linux-x86_64-cpu \
+  --output model.kapsl-bundle
+```
+
+The local directory is only a source for offline-bundle creation. Kapsl maps
+the filename from the signed HTTPS index entry, confines it to that directory,
+and verifies the signed size and digest before copying it into the bundle. It
+does not permit local artifacts during an ordinary online or offline model
+run.
+
 Copy the resulting file to the offline host and run it directly:
 
 ```bash
 kapsl run model.kapsl-bundle
+```
+
+To populate and validate the backend cache without starting a server, use the
+same verified activation path:
+
+```bash
+kapsl backend ensure model.kapsl-bundle --offline
 ```
 
 Kapsl verifies the bundle checksums, signed backend index, signed pack
@@ -196,7 +230,7 @@ the embedded `.aimod` paths to the normal memory-admission and startup flow.
 The bundle's verified index is anchored into the ordinary backend cache, so a
 subsequent offline validation never needs to fetch the index. A different
 signed index claiming the same immutable runtime release is rejected.
-There is no public export/import command pair.
+There is no weaker raw-archive import path.
 
 For an ordinary `.aimod` run that must not use the network, use `--offline` or
 set `KAPSL_OFFLINE=1`. If its pack is not already cached, Kapsl reports the

@@ -33,6 +33,11 @@ kapsl bundle model.aimod --output model.kapsl-bundle
 kapsl run model.kapsl-bundle
 ```
 
+Release engineers can build the same bundle from an already-downloaded,
+signed release directory with `--backend-artifacts-dir`. Kapsl still verifies
+the signed index entry, archive size, SHA-256 digest, and Ed25519 signature;
+the option does not enable `file://` artifacts in ordinary runtime startup.
+
 See [Lazy Backend Packs](kapsl-runtime/docs/backend-packs.md) for the trust,
 cache, administration, and cross-target bundle model.
 

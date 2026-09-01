@@ -638,6 +638,18 @@ impl BackendManager {
         self.download_artifact(pack, destination)
     }
 
+    /// Verify a caller-supplied archive against its signed index entry without
+    /// installing it. Offline bundle creation uses this for release artifacts
+    /// already present on the preparation host.
+    pub(crate) fn verify_pack_archive(
+        &self,
+        pack: &BackendPackManifest,
+        archive_path: &Path,
+    ) -> ManagerResult<()> {
+        self.validate_pack_manifest(pack, None)?;
+        self.verify_artifact_file(pack, archive_path)
+    }
+
     pub(crate) fn load_index(&self) -> ManagerResult<BackendIndex> {
         let index_dir = self.runtime_cache_root().join(".index");
         fs::create_dir_all(&index_dir)?;
@@ -1574,9 +1586,10 @@ pub(crate) fn execute_backend_command(
         crate::app::BackendSubcommand::Ensure(args) => {
             let device_info = DeviceInfo::probe();
             let target = BackendTarget::current(&device_info);
+            let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;
             let manager = BackendManager::from_env(args.offline)?;
             let mut ensured = HashSet::new();
-            for model in args.model {
+            for model in model_paths {
                 let absolute = model.canonicalize().map_err(|error| {
                     BackendManagerError::new(format!(
                         "invalid model path {}: {error}",
