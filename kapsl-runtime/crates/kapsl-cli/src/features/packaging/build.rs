@@ -1,3 +1,4 @@
+use super::archive::{write_package_archive, PackageArchivePlan};
 use super::*;
 
 pub(crate) fn infer_framework_from_model_path(model_path: &Path) -> String {
@@ -10,7 +11,7 @@ pub(crate) fn infer_framework_from_model_path(model_path: &Path) -> String {
     match ext.as_str() {
         "onnx" => "onnx".to_string(),
         "gguf" => "gguf".to_string(),
-        "safetensors" => "pytorch".to_string(),
+        "safetensors" => "safetensors".to_string(),
         "pt" | "pth" => "pytorch".to_string(),
         "pb" => "tensorflow".to_string(),
         _ => "onnx".to_string(),
@@ -49,23 +50,6 @@ pub(crate) fn resolve_package_loader(
             .map_err(|e| format!("Failed to load model directory {model_id}: {e}").into());
     }
     PackageLoader::load(path).map_err(|e| format!("Failed to load model {model_id}: {e}").into())
-}
-
-pub(crate) fn append_tar_bytes_entry<W: Write>(
-    builder: &mut Builder<W>,
-    entry_path: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
-    let mut header = tar::Header::new_gnu();
-    header
-        .set_path(entry_path)
-        .map_err(|e| format!("Failed to set tar path {}: {}", entry_path, e))?;
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o644);
-    header.set_cksum();
-    builder
-        .append(&header, bytes)
-        .map_err(|e| format!("Failed to append {} to archive: {}", entry_path, e))
 }
 
 pub(crate) fn create_kapsl_package(
@@ -211,24 +195,16 @@ pub(crate) fn create_kapsl_package(
             output_path.set_extension("aimod");
         }
 
-        if let Some(parent) = output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!(
-                        "Failed to create parent directory {}: {}",
-                        parent.display(),
-                        e
-                    )
-                })?;
-            }
-        }
-
         let created_at = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("System clock error: {}", e))?
-            .as_secs();
+            .as_secs()
+            .to_string();
 
-        let metadata = match request.metadata.as_ref() {
+        let metadata = match apply_serving_backend_override(
+            request.metadata.clone(),
+            request.serving_backend,
+        )? {
             Some(metadata) => Some(
                 serde_yaml::to_value(metadata)
                     .map_err(|e| format!("Failed to convert metadata payload: {}", e))?,
@@ -240,7 +216,7 @@ pub(crate) fn create_kapsl_package(
             project_name: project_name.clone(),
             framework: framework.clone(),
             version: version.clone(),
-            created_at: created_at.to_string(),
+            created_at,
             model_file: model_file_name.clone(),
             format: format_axis,
             model_type: model_type_axis,
@@ -249,58 +225,11 @@ pub(crate) fn create_kapsl_package(
             hardware_requirements,
             cron_jobs: Vec::new(),
         };
-        EngineKind::validate(&manifest)?;
-
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
-        let output_file = File::create(&output_path).map_err(|e| {
-            format!(
-                "Failed to create output package {}: {}",
-                output_path.display(),
-                e
-            )
-        })?;
-        // Model weights are binary float data — nearly incompressible. Use level 1
-        // (fast) instead of the default level 6 to avoid burning CPU for no gain.
-        // The 8 MiB BufWriter reduces syscall overhead from one call per 32 KiB
-        // GzEncoder output chunk to one call per 8 MiB.
-        let encoder = GzEncoder::new(
-            BufWriter::with_capacity(8 << 20, output_file),
-            Compression::fast(),
-        );
-        let mut archive = Builder::new(encoder);
-
-        append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
-
-        archive
-            .append_path_with_name(&model_path, &model_file_name)
-            .map_err(|e| format!("Failed to add model file to archive: {}", e))?;
-
-        let encoder = archive
-            .into_inner()
-            .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
-        let mut buf_writer = encoder
-            .finish()
-            .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
-        buf_writer
-            .flush()
-            .map_err(|e| format!("Failed to flush output package: {}", e))?;
-
-        let created_metadata_path = if should_create_source_metadata {
-            create_source_metadata_if_missing(&source_metadata_path, &manifest_bytes)?
-        } else {
-            None
-        };
-
-        let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
-
-        Ok(PackageKapslResponse {
-            status: "ok".to_string(),
-            kapsl_path: absolute_output_path.to_string_lossy().to_string(),
-            project_name,
-            framework,
-            version,
-            metadata_path: created_metadata_path.map(|path| path.to_string_lossy().to_string()),
+        write_package_archive(PackageArchivePlan {
+            output_path,
+            manifest,
+            entries: vec![(model_path, PathBuf::from(model_file_name))],
+            source_metadata_path: should_create_source_metadata.then_some(source_metadata_path),
         })
     };
 
@@ -316,6 +245,7 @@ pub(crate) fn create_kapsl_package(
 pub(crate) fn find_model_file_in_context(context_dir: &Path) -> Result<PathBuf, String> {
     let mut stack = vec![context_dir.to_path_buf()];
     let mut matches = Vec::new();
+    let mut unsupported_weights = Vec::new();
     while let Some(dir) = stack.pop() {
         let entries = fs::read_dir(&dir)
             .map_err(|e| format!("Failed to read context directory {}: {}", dir.display(), e))?;
@@ -337,17 +267,29 @@ pub(crate) fn find_model_file_in_context(context_dir: &Path) -> Result<PathBuf, 
                 .and_then(|v| v.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if matches!(
-                ext.as_str(),
-                "onnx" | "gguf" | "safetensors" | "pt" | "pth" | "pb"
-            ) {
-                matches.push(path);
+            match ext.as_str() {
+                "onnx" | "gguf" | "safetensors" => matches.push(path),
+                "pt" | "pth" | "pb" => unsupported_weights.push(path),
+                _ => {}
             }
         }
     }
 
     matches.sort();
     if matches.is_empty() {
+        unsupported_weights.sort();
+        if !unsupported_weights.is_empty() {
+            return Err(format!(
+                "Context {} contains unsupported model weights: {}. Export them to ONNX, GGUF, \
+                 or a supported SafeTensors deployment before building.",
+                context_dir.display(),
+                unsupported_weights
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         return Err(format!(
             "No model file found in context {}. Pass --model explicitly.",
             context_dir.display()

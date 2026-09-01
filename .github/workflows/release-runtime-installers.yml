@@ -18,11 +18,75 @@ env:
   APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
   WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
   WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+  KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
 
 jobs:
+  prepare-version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      numeric_version: ${{ steps.version.outputs.numeric_version }}
+      deb_version: ${{ steps.version.outputs.deb_version }}
+      is_release: ${{ steps.version.outputs.is_release }}
+      is_stable_release: ${{ steps.version.outputs.is_stable_release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version exactly once
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          is_stable_release=false
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$cargo_version" != "$version" ]; then
+              echo "Tag version ($version) does not match kapsl runtime version ($cargo_version)." >&2
+              exit 1
+            fi
+            is_release=true
+            if [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              is_stable_release=true
+            fi
+          else
+            version="${cargo_version}-dev.${GITHUB_RUN_NUMBER}"
+            is_release=false
+          fi
+          if [[ "$cargo_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+          else
+            echo "Cargo runtime version is not semantic: $cargo_version" >&2
+            exit 1
+          fi
+          deb_version="${version//-/~}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "numeric_version=$numeric_version" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
+          echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
+          echo "is_stable_release=$is_stable_release" >> "$GITHUB_OUTPUT"
+
+  stable-release-gpu-conformance:
+    name: Stable release GPU conformance
+    needs: prepare-version
+    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    uses: ./.github/workflows/gpu-device-pool-integration.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
+      cuda_visible_devices: "0"
+    secrets: inherit
+
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
+    needs: prepare-version
     runs-on: ${{ matrix.os }}
+    env:
+      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+      KAPSL_NUMERIC_VERSION: ${{ needs.prepare-version.outputs.numeric_version }}
+      KAPSL_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,32 +100,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate tag matches runtime version (Unix)
-        if: runner.os != 'Windows' && startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        run: |
-          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          tag_version="${GITHUB_REF_NAME#v}"
-          if [ "$manifest_version" != "$tag_version" ]; then
-            echo "Tag version ($tag_version) does not match kapsl runtime version ($manifest_version)."
-            exit 1
-          fi
-
-      - name: Validate tag matches runtime version (Windows)
-        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
-          $manifestVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
-          $tagVersion = $env:GITHUB_REF_NAME.TrimStart("v")
-          if ($manifestVersion -ne $tagVersion) {
-            throw "Tag version ($tagVersion) does not match kapsl runtime version ($manifestVersion)."
-          }
-
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
@@ -84,50 +124,6 @@ jobs:
         shell: pwsh
         run: |
           git config --global core.longpaths true
-
-      - name: Resolve runtime version (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          raw_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            raw_version="${GITHUB_REF_NAME#v}"
-          fi
-
-          if [[ "$raw_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
-          else
-            numeric_version="0.1.0"
-          fi
-
-          deb_version="$(echo "$raw_version" | sed 's/-/~/g')"
-
-          echo "KAPSL_VERSION=$raw_version" >> "$GITHUB_ENV"
-          echo "KAPSL_NUMERIC_VERSION=$numeric_version" >> "$GITHUB_ENV"
-          echo "KAPSL_DEB_VERSION=$deb_version" >> "$GITHUB_ENV"
-
-      - name: Resolve runtime version (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
-          $rawVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
-
-          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME) {
-            $rawVersion = $env:GITHUB_REF_NAME.TrimStart("v")
-          }
-
-          if ($rawVersion -match '^(\d+)\.(\d+)\.(\d+)') {
-            $numericVersion = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
-          } else {
-            $numericVersion = "0.1.0"
-          }
-
-          $debVersion = $rawVersion -replace '-', '~'
-
-          "KAPSL_VERSION=$rawVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "KAPSL_NUMERIC_VERSION=$numericVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "KAPSL_DEB_VERSION=$debVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kapsl
         if: runner.os != 'Windows'
@@ -358,6 +354,7 @@ jobs:
 
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
+    needs: prepare-version
     runs-on: ubuntu-22.04
     container:
       # The CUDA archive carries the complete GGUF + ONNX GPU runtime, like a
@@ -368,47 +365,100 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       CUDA_PATH: /usr/local/cuda
+      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
       LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
     steps:
       - name: Install CUDA build dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev patchelf pkg-config
+            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
-
-      - name: Resolve runtime version
+      - name: Validate certified vLLM SDK commit
         shell: bash
         run: |
-          runtime_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            tag_version="${GITHUB_REF_NAME#v}"
-            if [ "$runtime_version" != "$tag_version" ]; then
-              echo "Tag version ($tag_version) does not match kapsl runtime version ($runtime_version)." >&2
-              exit 1
-            fi
-            runtime_version="$tag_version"
+          set -euo pipefail
+          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Protected KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit." >&2
+            exit 1
           fi
-          echo "KAPSL_VERSION=$runtime_version" >> "$GITHUB_ENV"
+
+      - name: Checkout certified vLLM connector
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
+          path: sdk-vllm
+
+      - name: Verify certified vLLM SDK checkout
+        shell: bash
+        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
 
       - name: Collect ONNX Runtime sidecars
         shell: bash
         run: .github/scripts/collect-ort-sidecars.sh
 
+      - name: Collect TensorRT 10 user-space runtime
+        shell: bash
+        run: .github/scripts/collect-linux-tensorrt-runtime.sh
+
       - name: Package CUDA runtime bundle
         shell: bash
         run: .github/scripts/package-linux-cuda-runtime.sh
+
+      - name: Package split ONNX backend packs
+        shell: bash
+        run: .github/scripts/package-linux-onnx-backend-packs.sh
+
+      - name: Package llama.cpp backend packs from published SDK crates
+        shell: bash
+        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
+
+      - name: Reclaim CUDA build scratch before backend packaging
+        shell: bash
+        run: cargo clean --manifest-path kapsl-runtime/Cargo.toml
+
+      - name: Package certified managed-vLLM backend
+        shell: bash
+        env:
+          KAPSL_VLLM_SDK_DIR: sdk-vllm
+        run: .github/scripts/package-linux-vllm-backend.sh
+
+      - name: Generate signed backend index
+        shell: bash
+        env:
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_PUBLIC_KEYS" ]; then
+            echo "Backend signing key and embedded public key are required." >&2
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          trap 'rm -f "$key_file"' EXIT
+          .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" \
+            --artifacts-dir dist \
+            --output dist/backend-index.json \
+            --signing-key "$key_file" \
+            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
+            --channel stable
+          rm -f "$key_file" dist/*.manifest.json
+          trap - EXIT
 
       - name: Upload CUDA runtime artifact
         uses: actions/upload-artifact@v4
@@ -489,7 +539,7 @@ jobs:
           files: github-release-assets/**
 
   upload-r2:
-    needs: [build-runtime-installers, build-cuda-runtime]
+    needs: [prepare-version, build-runtime-installers, build-cuda-runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -501,22 +551,6 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Resolve upload version
-        id: version
-        shell: bash
-        run: |
-          # Always use the Cargo.toml version as the canonical version for
-          # binary naming and paths. On workflow_dispatch (non-tag) runs,
-          # prefix with "dev-" so test builds don't collide with releases.
-          cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=dev-${cargo_version}" >> "$GITHUB_OUTPUT"
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Upload installers to R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -524,10 +558,14 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/v${{ steps.version.outputs.version }}/ \
+            s3://kapsl-installer/runtime/v${{ needs.prepare-version.outputs.version }}/ \
             --recursive \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            https://downloads.kapsl.net/runtime/v${{ needs.prepare-version.outputs.version }}
 
       - name: Upload Linux installer scripts to R2 (stable URLs)
         env:
@@ -535,8 +573,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          for script in install.sh install-cuda.sh; do
-            aws s3 cp "$script" \
+          for script_path in installers/install.sh installers/install-cuda.sh; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
@@ -549,8 +588,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          for script in install.ps1 install-cuda.ps1 install-tensorrt.ps1; do
-            aws s3 cp "$script" \
+          for script_path in installers/install.ps1 installers/install-cuda.ps1 installers/install-tensorrt.ps1; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
@@ -558,13 +598,13 @@ jobs:
           done
 
       - name: Update latest.txt in R2 (tagged releases only)
-        if: steps.version.outputs.is_release == 'true'
+        if: needs.prepare-version.outputs.is_release == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          echo -n "${{ steps.version.outputs.version }}" \
+          echo -n "${{ needs.prepare-version.outputs.version }}" \
             | aws s3 cp - \
               s3://kapsl-installer/runtime/latest.txt \
               --content-type "text/plain" \

@@ -4,9 +4,14 @@ use super::*;
 fn test_state_dir_namespaces_runtime_state_paths() {
     let state_dir = PathBuf::from("state");
     let args = Args {
+        input: vec![],
         model: vec![],
+        offline: false,
         transport: "socket".to_string(),
         socket: "dummy.sock".to_string(),
+        kv_control_socket: None,
+        kv_control_lease_ttl_ms: 30_000,
+        kv_shared_pool_profile: Vec::new(),
         bind: "127.0.0.1".to_string(),
         port: 9096,
         batch_size: 4,
@@ -32,7 +37,7 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         kv_compression_bits: Some(3_u8),
     };
 
-    let layout = resolve_runtime_state_layout(&args);
+    let layout = resolve_runtime_state_layout(args.state_dir.as_deref());
     assert_eq!(layout.rag_root, state_dir.join("rag-data"));
     assert_eq!(layout.extensions_root, state_dir.join("extensions"));
     assert_eq!(

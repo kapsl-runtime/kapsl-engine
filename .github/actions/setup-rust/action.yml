@@ -1,0 +1,47 @@
+name: Set up Rust
+description: Install the Rust toolchain declared by this repository or its workspace MSRV
+
+inputs:
+  msrv:
+    description: Install the workspace minimum supported Rust version instead of the pinned toolchain
+    required: false
+    default: "false"
+  targets:
+    description: Comma-separated compilation targets to install
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve Rust toolchain
+      id: toolchain
+      shell: bash
+      env:
+        USE_MSRV: ${{ inputs.msrv }}
+      run: |
+        set -euo pipefail
+        repository_root="$(cd "$GITHUB_ACTION_PATH/../../.." && pwd)"
+        if [[ "$USE_MSRV" == "true" ]]; then
+          source_file="$repository_root/kapsl-runtime/Cargo.toml"
+          version="$(sed -nE 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$source_file" | head -n 1)"
+        else
+          source_file="$repository_root/rust-toolchain.toml"
+          version="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$source_file" | head -n 1)"
+        fi
+        if [[ -z "$version" ]]; then
+          echo "Could not resolve a Rust version from $source_file" >&2
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Install Rust ${{ steps.toolchain.outputs.version }}
+      id: install
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.toolchain.outputs.version }}
+        targets: ${{ inputs.targets }}
+
+    - name: Activate Rust ${{ steps.install.outputs.name }}
+      shell: bash
+      run: echo "RUSTUP_TOOLCHAIN=${{ steps.install.outputs.name }}" >> "$GITHUB_ENV"

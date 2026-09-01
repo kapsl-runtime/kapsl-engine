@@ -47,6 +47,9 @@ Commands:
 - `list`: list models loaded in an already-running runtime
 - `remove-model`: unload and unregister a model from a running runtime
 - `build`: build a `.aimod` package
+- `bundle`: create a verified model-plus-backend artifact for offline use
+- `backend-plan`: inspect backend, download, and admission decisions
+- `backend`: ensure, list, or prune the signed backend cache
 - `push`: upload a `.aimod` package
 - `pull`: download a `.aimod` package
 
@@ -59,7 +62,7 @@ kapsl --model models/mnist/mnist.aimod
 This is equivalent to:
 
 ```bash
-kapsl run --model models/mnist/mnist.aimod
+kapsl run models/mnist/mnist.aimod
 ```
 
 ## 1) Install
@@ -91,7 +94,7 @@ Test the script locally (without hitting the real server):
 cd /tmp/kapsl-test-serve && python3 -m http.server 8787
 
 # In another terminal — override the base URL
-KAPSL_BASE_URL=http://127.0.0.1:8787 KAPSL_INSTALL_DIR=/tmp/kapsl-out sh install.sh
+KAPSL_BASE_URL=http://127.0.0.1:8787 KAPSL_INSTALL_DIR=/tmp/kapsl-out sh installers/install.sh
 ```
 
 ### Build from source
@@ -112,15 +115,39 @@ kapsl run --model models/mnist/mnist.aimod
 Run multiple packages:
 
 ```bash
-kapsl run \
-  --model models/mnist/mnist.aimod \
-  --model models/squeezenet/squeezenet.aimod
+kapsl run models/mnist/mnist.aimod models/squeezenet/squeezenet.aimod
 ```
+
+The repeatable `--model` option remains supported for backward compatibility.
+For an offline host, run a bundle prepared on a connected machine:
+
+```bash
+kapsl bundle model.aimod --output model.kapsl-bundle
+kapsl run model.kapsl-bundle
+```
+
+On Linux x86_64, ONNX models resolve one signed `cpu`, `cuda12`, or
+`tensorrt10` native pack. Resolution happens before download, declared
+fallbacks are honored exactly, and TensorRT requires an explicit package
+declaration. Inspect or prefetch the decision with:
+
+```bash
+kapsl backend-plan model.aimod
+kapsl backend ensure model.aimod
+```
+
+GGUF models use the same flow for signed `llama-cpp/cpu` or
+`llama-cpp/cuda12` native packs. The shared library stays in the Kapsl process
+behind a versioned C ABI. The portable core enables lazy CPU packs; the stable
+CUDA build continues to use its certified eager shared-KV implementation while
+the lazy CUDA shared-pool adapter is certified.
 
 Useful run options:
 
 - `--transport <socket|tcp|shm|hybrid|auto>` (default: `socket`)
 - `--socket /tmp/kapsl.sock`
+- `--kv-control-socket /run/kapsl/kv-control.sock` (enables the local external-KV participant control plane)
+- `--kv-control-lease-ttl-ms 30000` (maximum heartbeat TTL for external KV leases)
 - `--bind 127.0.0.1`
 - `--port 9096`
 - `--http-bind 127.0.0.1`
@@ -131,6 +158,15 @@ Useful run options:
 `hybrid` means Unix socket plus shared-memory tensor transfer; it does not open
 a TCP listener. SHM and `auto` use the live model registry, so models added at
 runtime are immediately addressable through SHM.
+
+External backends such as vLLM use a separate versioned KV control socket. It
+is disabled by default and never shares the inference socket. When enabled,
+opaque backend reservations join Kapsl's process-wide memory authority before
+the backend allocates KV. Linux CUDA builds can also provision an isolated
+CUDA IPC backing for a backend that explicitly negotiates `shared_pool`; the
+backend's attention tensors must directly alias that allocation. See the
+[runtime configuration](../kapsl-runtime/docs/configuration.md#external-kv-participants)
+for placement, TTL, CUDA-build, and socket-permission requirements.
 
 Example with TCP transport:
 

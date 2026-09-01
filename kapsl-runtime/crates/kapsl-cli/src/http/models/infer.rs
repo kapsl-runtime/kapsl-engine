@@ -4,7 +4,7 @@ pub(crate) struct ModelInferRouteConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
     pub(crate) log_sensitive_ids: bool,
-    pub(crate) rag_state: RagRuntimeState,
+    pub(crate) rag: RagService,
 }
 
 pub(crate) fn build_model_infer_route(
@@ -14,7 +14,7 @@ pub(crate) fn build_model_infer_route(
         models,
         inference,
         log_sensitive_ids: log_sensitive_ids_for_api,
-        rag_state: rag_state_for_api,
+        rag,
     } = config;
 
     // POST /api/models/:id/infer - Synchronous inference
@@ -22,16 +22,17 @@ pub(crate) fn build_model_infer_route(
     let inference_for_infer = inference.clone();
     let request_adapters_for_infer = Arc::new(default_request_adapter_registry());
     let log_sensitive_ids_for_infer = log_sensitive_ids_for_api;
-    let rag_state_for_infer = rag_state_for_api.clone();
+    let rag_for_infer = rag.clone();
     let infer_route = warp::path!("api" / "models" / u32 / "infer")
     .and(warp::post())
+    .and(warp::header::optional::<String>("authorization"))
     .and(warp::body::bytes())
-    .and_then(move |model_id: u32, body: warp::hyper::body::Bytes| {
+    .and_then(move |model_id: u32, authorization: Option<String>, body: warp::hyper::body::Bytes| {
         let models = models_for_infer.clone();
         let inference = inference_for_infer.clone();
         let request_adapters = request_adapters_for_infer.clone();
         let log_sensitive_ids = log_sensitive_ids_for_infer;
-        let rag_state = rag_state_for_infer.clone();
+        let rag = rag_for_infer.clone();
         async move {
             use warp::http::StatusCode;
             let scheduler = models.pool(model_id);
@@ -187,12 +188,9 @@ pub(crate) fn build_model_infer_route(
                         }
                     }
                     if let Some(rag_options) = rag_options {
-                        match augment_inference_request_with_rag(
-                            &mut request,
-                            &rag_options,
-                            &rag_state,
-                        )
-                        .await
+                        match rag
+                            .augment_inference_request(&mut request, &rag_options)
+                            .await
                         {
                             Ok(chunks_used) => {
                                 if chunks_used > 0 {
@@ -222,12 +220,17 @@ pub(crate) fn build_model_infer_route(
                             }
                         }
                     }
+                    let client_session_id = request.session_id.clone();
+                    request.session_id = scope_session_id_for_authorization(
+                        client_session_id.as_deref(),
+                        authorization.as_deref(),
+                    );
                     let request_id = request
                         .metadata
                         .as_ref()
                         .and_then(|metadata| metadata.request_id.as_deref())
                         .unwrap_or("-");
-                    let session_id = request.session_id.as_deref().unwrap_or("-");
+                    let session_id = client_session_id.as_deref().unwrap_or("-");
                     let request_id_for_log =
                         redact_identifier_for_logs(request_id, log_sensitive_ids);
                     let session_id_for_log =

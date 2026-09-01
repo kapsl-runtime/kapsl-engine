@@ -8,9 +8,10 @@
 - GPU drivers and SDKs only if using a non-CPU backend:
   - A compatible NVIDIA display driver on Windows; the provider packs include
     the required CUDA 12, cuDNN 9, and TensorRT 10 user-space runtime libraries
-  - A compatible NVIDIA driver on Linux; the CUDA installer includes the CUDA
-    12, cuDNN 9, and NCCL user-space libraries. Bare-metal TensorRT installs
-    additionally require compatible TensorRT 10 system libraries
+  - A compatible NVIDIA driver on Linux. Signed lazy ONNX packs include their
+    CUDA 12/cuDNN 9 or TensorRT 10 user-space dependency closure, while the
+    temporary eager CUDA installer retains its merged GGUF compatibility
+    libraries. The driver must support CUDA 13.0 when serving through vLLM.
   - Xcode command line tools for Metal (macOS)
 
 ## Runtime and accelerator packages
@@ -31,15 +32,44 @@ Install the Linux x86_64 CUDA 12 runtime:
 curl -fsSL https://downloads.kapsl.net/install-cuda.sh | sh
 ```
 
-That single archive contains the CUDA-compiled GGUF runtime and the ONNX CUDA
-execution provider, plus their user-space CUDA dependencies. It requires only a
-compatible host NVIDIA driver, like a Triton GPU image.
+The command currently downloads the CUDA-compiled GGUF compatibility runtime.
+It does not download managed vLLM, ONNX accelerator packs, or portable
+llama.cpp CPU packs up front. The first eligible model run performs preliminary
+memory admission and installs the exact signed `vllm/cu130-flash-attn`,
+`onnx/cuda12`, `onnx/tensorrt10`, or `llama-cpp/cpu` pack in the
+runtime-versioned cache. Subsequent runs reuse it. Use
+`--prefetch-backends vllm` for the temporary eager vLLM compatibility flow.
+
+After packaging an explicit SafeTensors causal-LM deployment for vLLM, the
+serving command remains the same as every other Kapsl model:
+
+```bash
+kapsl run ./model.aimod
+```
+
+For a no-network deployment, create and transfer one file:
+
+```bash
+kapsl bundle ./model.aimod --output ./model.kapsl-bundle
+kapsl run ./model.kapsl-bundle
+```
+
+See [Lazy Backend Packs](./backend-packs.md) for cross-target and multi-model
+bundles.
 
 The stable CUDA runtime uses Kapsl's paged shared-KV path for supported GGUF
 architectures. Models rejected by its compatibility policy use llama.cpp's
 native KV path instead. Set `KAPSL_GGUF_DISABLE_SHARED_KV=1` to force that path
 for diagnosis or rollback. Source builds can instead select the explicit
 `gguf-cuda` feature to exclude shared-KV entirely.
+
+Native llama.cpp packs expose a stable C ABI and remain in-process, so they do
+not add an inference child process, tensor IPC, or a second CUDA context. The
+shared-pool `llama-cpp/cuda12` candidate obtains its KV storage and device block
+table from Kapsl core callbacks and is certified against the eager CUDA
+reference. A separately signed native-KV pack remains a guarded rollback; set
+`KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1` only when intentionally selecting that
+signed native mode.
 
 The same stable profile automatically sizes one process-owned CUDA backing
 pool on each device used by a pooled model. Startup packages are planned first,
@@ -89,8 +119,14 @@ PowerShell. A saved copy of the general installer also accepts explicit paramete
 The latest beta has equivalent entry points:
 
 ```bash
+curl -fsSL https://downloads.kapsl.net/install-beta.sh | sh
+# Explicit CUDA override:
 curl -fsSL https://downloads.kapsl.net/install-beta-cuda.sh | sh
 ```
+
+The generic beta installer selects the CUDA build on Linux x86_64 when
+`nvidia-smi` confirms a working NVIDIA driver; otherwise it selects the
+portable build. `KAPSL_ACCELERATOR` or `--accelerator` overrides detection.
 
 ```powershell
 irm https://downloads.kapsl.net/install-beta.ps1 | iex
@@ -98,11 +134,10 @@ irm https://downloads.kapsl.net/install-beta-cuda.ps1 | iex
 irm https://downloads.kapsl.net/install-beta-tensorrt.ps1 | iex
 ```
 
-Windows provider packs contain the calculated NVIDIA DLL dependency closure.
-The standalone Linux provider packs remain available for existing portable
-installations and require compatible NVIDIA system runtime libraries. The merged
-Linux CUDA installer does not require that extra provider step. macOS uses system
-Metal/CoreML frameworks and does not require an accelerator pack.
+Windows provider packs and the signed Linux ONNX backend packs contain their
+calculated user-space dependency closures. Legacy standalone Linux provider
+archives and the merged CUDA installer remain available during rollout. macOS
+uses system Metal/CoreML frameworks and does not require an accelerator pack.
 
 ## Docker images
 

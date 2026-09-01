@@ -5,6 +5,9 @@ pub(crate) type ContextManifest = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
     Option<kapsl_core::HardwareRequirements>,
     Option<serde_json::Value>,
 );
@@ -12,7 +15,7 @@ pub(crate) type ContextManifest = (
 pub(crate) fn parse_context_manifest(context_dir: &Path) -> Result<ContextManifest, String> {
     let metadata_path = context_dir.join("metadata.json");
     if !metadata_path.exists() {
-        return Ok((None, None, None, None, None, None));
+        return Ok((None, None, None, None, None, None, None, None, None));
     }
 
     let raw = fs::read_to_string(&metadata_path)
@@ -47,6 +50,15 @@ pub(crate) fn parse_context_manifest(context_dir: &Path) -> Result<ContextManife
         .get("model_file")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let format = obj
+        .get("format")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let model_type = obj
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let task = obj.get("task").and_then(|v| v.as_str()).map(str::to_string);
 
     let hardware_requirements = obj
         .get("hardware_requirements")
@@ -62,6 +74,9 @@ pub(crate) fn parse_context_manifest(context_dir: &Path) -> Result<ContextManife
         framework,
         version,
         model_file,
+        format,
+        model_type,
+        task,
         hardware_requirements,
         metadata,
     ))

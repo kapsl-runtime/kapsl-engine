@@ -8,6 +8,31 @@ The runtime serves an OpenAI-compatible API at `/v1` alongside its native
 `/api` routes, so existing OpenAI clients work by changing only their base URL.
 See [`docs/openai-compatible-api.md`](docs/openai-compatible-api.md).
 
+Online runs resolve, verify, and cache a required lazy backend automatically:
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install-beta.sh | sh
+kapsl run model.aimod
+```
+
+Managed vLLM and Linux x86_64 ONNX CPU/CUDA 12/TensorRT 10 and llama.cpp
+CPU/CUDA 12 profiles use the signed lazy cache. Provider fallback remains
+package-controlled, and TensorRT is selected only when the model contract
+explicitly permits it. The portable core lazily loads llama.cpp CPU; the
+certified eager CUDA shared-KV profile remains the default during CUDA pack
+certification.
+
+For a no-network host, prepare one verified bundle on a connected machine and
+run it directly after transfer:
+
+```bash
+kapsl bundle model.aimod --output model.kapsl-bundle
+kapsl run model.kapsl-bundle
+```
+
+See [Lazy Backend Packs](kapsl-runtime/docs/backend-packs.md) for the trust,
+cache, administration, and cross-target bundle model.
+
 Shared Rust libraries are maintained in [`kapsl-sdk`](https://github.com/kapsl-runtime/kapsl-sdk).
 The runtime binary depends on those crates through normal Cargo dependencies.
 
@@ -18,6 +43,7 @@ The runtime binary depends on those crates through normal Cargo dependencies.
 - `kapsl-runtime/ui/`: embedded web dashboard assets
 - `kapsl-runtime/docs/`: runtime-specific user and API docs
 - `kapsl-runtime/patches/`: active third-party crate patches used only by this workspace
+- `installers/`: source scripts published at the stable and beta installer URLs
 - `docker/`: Dockerfiles for CPU and CUDA images
 - `docs/`: runtime-specific documentation
 
@@ -34,7 +60,8 @@ RAG primitives, and Python packaging belong in `kapsl-sdk`.
 
 ## Requirements
 
-- Rust `1.92.0`
+- Rust `1.98.0` (pinned by `rust-toolchain.toml`); the runtime workspace MSRV
+  remains Rust `1.92.0`
 - platform build tools for your target OS
 - optional accelerator toolchains depending on which runtime backends you enable
 
@@ -76,6 +103,12 @@ Supported outputs:
 macOS and Windows signing are optional in CI. If the Apple or Windows
 certificate secrets are not configured, the workflow still produces
 unsigned installers instead of failing.
+
+Backend-pack publication is fail-closed and requires both
+`KAPSL_BACKEND_SIGNING_KEY_B64` (a base64-encoded Ed25519 PEM private key) and
+`KAPSL_BACKEND_PUBLIC_KEYS` (one or more raw 32-byte public keys in base64).
+The latter is embedded in every runtime binary; the release job proves the key
+pair matches before it signs or uploads `backend-index.json`.
 
 Publishing flow:
 

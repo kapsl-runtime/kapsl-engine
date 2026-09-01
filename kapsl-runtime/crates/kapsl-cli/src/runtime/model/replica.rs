@@ -46,6 +46,32 @@ pub(super) struct LoadedReplica {
     pub(super) model_info: ModelInfo,
 }
 
+struct ManagedVllmSchedulerMetrics {
+    metrics: kapsl_monitor::metrics::KapslMetrics,
+    model: String,
+    replica: String,
+}
+
+impl kapsl_scheduler::SchedulerObserver for ManagedVllmSchedulerMetrics {
+    fn observe_queue_wait(
+        &self,
+        _priority: kapsl_scheduler::Priority,
+        operation: &'static str,
+        elapsed: Duration,
+    ) {
+        self.metrics
+            .managed_vllm
+            .bridge_stage_seconds
+            .with_label_values(&[
+                self.model.as_str(),
+                self.replica.as_str(),
+                operation,
+                "scheduler_queue",
+            ])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
 /// Turn one immutable load plan into a fully loaded scheduler replica.
 ///
 /// Primary and autoscaled loads share backend construction, memory admission,
@@ -58,9 +84,28 @@ pub(super) async fn load_replica(
     device_info: &DeviceInfo,
     resources: Arc<RuntimeResources>,
     shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
-    onnx_tuning: &OnnxRuntimeTuning,
 ) -> Result<LoadedReplica, DynError> {
     log_package_plan(&plan);
+
+    if plan.serving_backend.selected == ResolvedServingBackend::Vllm {
+        return load_managed_vllm_replica(plan, role, device_info, resources, shared_metrics).await;
+    }
+
+    // Resolve and verify native packs before any backend library or model
+    // session is constructed. Preliminary admission runs before a download.
+    let memory_snapshot = resources.memory().snapshot();
+    ensure_llama_cpp_backend_pack(
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        device_info,
+        Some(&memory_snapshot),
+    )?;
+    ensure_onnx_backend_pack(
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        device_info,
+        Some(&memory_snapshot),
+    )?;
 
     let needs_mesh = role.is_primary() || plan.use_pipeline_backend;
     let (mut device_mesh, mut logical_provider) = if needs_mesh {
@@ -103,7 +148,7 @@ pub(super) async fn load_replica(
         (None, None)
     };
 
-    let worker = start_isolated_worker(&plan, onnx_tuning).await?;
+    let worker = start_isolated_worker(&plan).await?;
     let mut engines = if let Some(worker) = worker {
         let engine_count = if role.is_primary() && !plan.use_pipeline_backend {
             device_mesh
@@ -178,7 +223,7 @@ pub(super) async fn load_replica(
                 provider,
                 device.id,
                 device_info,
-                onnx_tuning,
+                plan.backend_tuning.onnx(),
                 &resources,
                 plan.base_model_id,
                 plan.replica_id,
@@ -217,16 +262,26 @@ pub(super) async fn load_replica(
             )
         })?;
         logical_provider = Some(selection.logical_provider.clone());
-        let device_id = plan
-            .loader
-            .manifest
-            .hardware_requirements
-            .device_id
-            .unwrap_or(0) as usize;
-        let backend = create_runtime_best_backend(
+        let device_id = selection
+            .devices
+            .first()
+            .map(|device| device.id)
+            .unwrap_or_else(|| {
+                plan.loader
+                    .manifest
+                    .hardware_requirements
+                    .device_id
+                    .unwrap_or(0) as usize
+            });
+        // Use the exact provider selected from the manifest/fallback policy.
+        // The generic factory's final CPU fallback would otherwise let an
+        // autoscaled CUDA/TensorRT replica silently change execution mode.
+        let backend = create_runtime_backend_for_device(
             &plan.loader.manifest,
+            &selection.logical_provider,
+            device_id,
             device_info,
-            onnx_tuning,
+            plan.backend_tuning.onnx(),
             &resources,
             plan.base_model_id,
             plan.replica_id,
@@ -288,6 +343,99 @@ pub(super) async fn load_replica(
     })
 }
 
+async fn load_managed_vllm_replica(
+    plan: ModelLoadPlan,
+    role: ReplicaLoadRole,
+    device_info: &DeviceInfo,
+    resources: Arc<RuntimeResources>,
+    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
+) -> Result<LoadedReplica, DynError> {
+    if plan.isolate_process {
+        log::info!(
+            "Ignoring generic process-isolation metadata for model {}: managed vLLM already runs in a supervised child process",
+            plan.base_model_id
+        );
+    }
+    if plan.use_pipeline_backend {
+        return Err("managed vLLM does not support pipeline topology".into());
+    }
+    let deployment = resources.managed_vllm().ok_or_else(|| {
+        "managed vLLM was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
+            .to_string()
+    })?;
+    let selection = select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
+        .map_err(|error| {
+        format!(
+            "Failed to select a CUDA device for {}: {}",
+            role.selection_context(&plan),
+            error
+        )
+    })?;
+    let device_ids =
+        select_managed_vllm_device_ids(&selection.devices, plan.worker_tp_degree, plan.replica_id)?;
+    let memory_domains = device_ids
+        .iter()
+        .map(|device_id| MemoryDomain::Cuda {
+            device_id: *device_id,
+        })
+        .collect::<Vec<_>>();
+    let backend = ManagedVllmEngine::create(
+        deployment,
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        plan.base_model_id,
+        plan.replica_id,
+        device_ids.clone(),
+        plan.worker_tp_degree,
+        plan.batch_size.max(1),
+        shared_metrics.clone(),
+    )?;
+    let backend = load_runtime_backend(
+        backend,
+        &plan.model_file_path,
+        &memory_domains,
+        &resources,
+        plan.base_model_id,
+        plan.replica_id,
+        EngineKind::Native,
+        plan.priority_weight,
+        &role.load_context(&plan, device_ids.first().copied()),
+    )
+    .await?;
+    let engine = monitor_runtime_backend(
+        backend,
+        plan.base_model_id,
+        &plan.loader.manifest.version,
+        shared_metrics,
+    );
+    let swap_handles = vec![engine.clone()];
+    let scheduler_metrics = Arc::new(ManagedVllmSchedulerMetrics {
+        metrics: shared_metrics.clone(),
+        model: plan.loader.manifest.project_name.clone(),
+        replica: plan.replica_id.to_string(),
+    });
+    let scheduler = Arc::new(
+        Scheduler::new(
+            vec![engine],
+            plan.batch_size,
+            1,
+            plan.scheduler_queue_size,
+            true,
+            plan.scheduler_max_micro_batch,
+            plan.scheduler_queue_delay_ms,
+            None,
+        )
+        .with_queue_overflow_policy(plan.queue_overflow_policy)
+        .with_observer(scheduler_metrics),
+    );
+    log::info!("✓ Loaded managed vLLM engine instance");
+    Ok(LoadedReplica {
+        scheduler,
+        swap_handles,
+        model_info: model_info_for_plan(&plan, role, "vllm"),
+    })
+}
+
 fn create_pipeline_backend(
     plan: &ModelLoadPlan,
     logical_provider: &str,
@@ -295,7 +443,9 @@ fn create_pipeline_backend(
     resources: &RuntimeResources,
 ) -> Box<dyn kapsl_engine_api::Engine> {
     let backend_device_ids: Vec<i32> = device_ids.iter().map(|&id| id as i32).collect();
-    let mut backend = if provider_policy() == "manifest" {
+    let mut backend = if EngineKind::resolve(&plan.loader.manifest).uses_onnx_session()
+        || provider_policy() == "manifest"
+    {
         LLMBackend::with_devices(logical_provider.to_owned(), backend_device_ids.clone())
     } else {
         LLMBackend::with_device_ids(backend_device_ids.clone())
@@ -341,10 +491,13 @@ fn model_info_for_plan(
         .graph_optimization_level
         .clone()
         .unwrap_or_else(|| "basic".to_string());
-    let path = plan.absolute_path.to_string_lossy().to_string();
+    // The registry's path is the persisted runtime asset, whose directory also
+    // contains package-side tokenizer/config files. ModelManager separately
+    // retains `absolute_path` for lifecycle reloads and autoscaling.
+    let path = plan.model_file_path.to_string_lossy().to_string();
     let device = selected_provider.to_string();
 
-    match role {
+    let model_info = match role {
         ReplicaLoadRole::Primary => ModelInfo::new(
             plan.base_model_id,
             manifest.project_name.clone(),
@@ -365,7 +518,14 @@ fn model_info_for_plan(
             optimization_level,
             path,
         ),
-    }
+    };
+
+    model_info.with_model_axes(
+        manifest.format.clone(),
+        manifest.model_type.clone(),
+        manifest.task.clone(),
+        manifest.preprocess_kind(),
+    )
 }
 
 fn log_package_plan(plan: &ModelLoadPlan) {
@@ -379,6 +539,11 @@ fn log_package_plan(plan: &ModelLoadPlan) {
     log::info!("  Project: {}", plan.loader.manifest.project_name);
     log::info!("  Framework: {}", plan.loader.manifest.framework);
     log::info!("  Version: {}", plan.loader.manifest.version);
+    log::info!(
+        "  Serving backend: {} ({})",
+        plan.serving_backend.selected.as_str(),
+        plan.serving_backend.reason
+    );
     log::info!(
         "  Queue overflow policy: {}",
         plan.queue_overflow_policy.as_str()
@@ -399,6 +564,11 @@ mod tests {
             absolute_path: model_path.clone(),
             loader: PackageLoader::from_raw_file(&model_path).expect("test package loader"),
             model_file_path: model_path,
+            serving_backend: ServingBackendDecision {
+                requested: None,
+                selected: ResolvedServingBackend::Builtin,
+                reason: "test",
+            },
             batch_size: 1,
             scheduler_queue_size: 1,
             scheduler_max_micro_batch: 1,
@@ -410,6 +580,7 @@ mod tests {
             worker_topology: "data-parallel",
             worker_tp_degree: 1,
             use_pipeline_backend: false,
+            backend_tuning: BackendLoadTuning::None,
             #[cfg(feature = "gpu-device-pool")]
             onnx_peak_concurrency: 1,
             isolate_process: false,
@@ -422,5 +593,22 @@ mod tests {
         let info = model_info_for_plan(&test_plan(), ReplicaLoadRole::Primary, "cpu");
 
         assert_eq!(info.device, "cpu");
+    }
+
+    #[test]
+    fn model_info_reports_runtime_assets_and_manifest_axes() {
+        let mut plan = test_plan();
+        plan.absolute_path = PathBuf::from("/source/model.aimod");
+        plan.model_file_path = PathBuf::from("/cache/model.onnx");
+        plan.loader.manifest.format = Some("onnx".to_string());
+        plan.loader.manifest.model_type = Some("embedding".to_string());
+        plan.loader.manifest.task = Some("embed".to_string());
+
+        let info = model_info_for_plan(&plan, ReplicaLoadRole::Primary, "cpu");
+
+        assert_eq!(info.model_path, "/cache/model.onnx");
+        assert_eq!(info.format.as_deref(), Some("onnx"));
+        assert_eq!(info.model_type.as_deref(), Some("embedding"));
+        assert_eq!(info.task.as_deref(), Some("embed"));
     }
 }

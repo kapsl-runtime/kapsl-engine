@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/kapsl-backend-abi",
+    "crates/kapsl-backend-llama-cpp",
     "crates/kapsl-cli",
 ]
 exclude = [
@@ -7,6 +9,9 @@ exclude = [
 ]
 
 resolver = "2"
+
+[workspace.package]
+rust-version = "1.92"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }

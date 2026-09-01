@@ -23,9 +23,53 @@ env:
   WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
 
 jobs:
+  prepare-version:
+    name: Resolve beta version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      numeric_version: ${{ steps.version.outputs.numeric_version }}
+      deb_version: ${{ steps.version.outputs.deb_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Resolve the date exactly once. The CUDA build can span UTC midnight, so
+      # recomputing it independently in each job can produce a release whose
+      # tag and artifact filenames disagree.
+      - name: Resolve beta version
+        id: version
+        shell: bash
+        run: |
+          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          short_sha="${GITHUB_SHA::8}"
+          date_str="$(date -u +%Y%m%d)"
+          version="${manifest_version}-beta.${date_str}.${short_sha}"
+
+          if [ "${GITHUB_RUN_NUMBER}" -gt 65535 ]; then
+            echo "GITHUB_RUN_NUMBER exceeds Windows Installer's 65535 build-version limit." >&2
+            exit 1
+          fi
+          if [[ "$manifest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${GITHUB_RUN_NUMBER}"
+          else
+            numeric_version="0.1.0"
+          fi
+
+          deb_version="${version/-/\~}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "numeric_version=$numeric_version" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
+
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
+    needs: prepare-version
     runs-on: ${{ matrix.os }}
+    env:
+      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+      KAPSL_NUMERIC_VERSION: ${{ needs.prepare-version.outputs.numeric_version }}
+      KAPSL_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,9 +83,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
@@ -64,56 +106,6 @@ jobs:
         shell: pwsh
         run: |
           git config --global core.longpaths true
-
-      - name: Resolve beta version (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          short_sha="${GITHUB_SHA::8}"
-          date_str="$(date -u +%Y%m%d)"
-          raw_version="${manifest_version}-beta.${date_str}.${short_sha}"
-
-          if [ "${GITHUB_RUN_NUMBER}" -gt 65535 ]; then
-            echo "GITHUB_RUN_NUMBER exceeds Windows Installer's 65535 build-version limit." >&2
-            exit 1
-          fi
-          if [[ "$manifest_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
-            numeric_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${GITHUB_RUN_NUMBER}"
-          else
-            numeric_version="0.1.0"
-          fi
-
-          deb_version="$(echo "$raw_version" | sed 's/-/~/g')"
-
-          echo "KAPSL_VERSION=$raw_version" >> "$GITHUB_ENV"
-          echo "KAPSL_NUMERIC_VERSION=$numeric_version" >> "$GITHUB_ENV"
-          echo "KAPSL_DEB_VERSION=$deb_version" >> "$GITHUB_ENV"
-
-      - name: Resolve beta version (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $cargoToml = Get-Content "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
-          $manifestVersion = ($cargoToml | Where-Object { $_ -match '^version\s*=\s*".+"' } | Select-Object -First 1) -replace '.*"(.+)".*', '$1'
-          $shortSha = $env:GITHUB_SHA.Substring(0, 8)
-          $dateStr = (Get-Date -Format "yyyyMMdd")
-          $rawVersion = "$manifestVersion-beta.$dateStr.$shortSha"
-
-          $runNumber = [int]$env:GITHUB_RUN_NUMBER
-          if ($runNumber -gt 65535) {
-            throw "GITHUB_RUN_NUMBER exceeds Windows Installer's 65535 build-version limit."
-          }
-          if ($manifestVersion -match '^(\d+)\.(\d+)\.(\d+)') {
-            $numericVersion = "$($Matches[1]).$($Matches[2]).$runNumber"
-          } else {
-            $numericVersion = "0.1.0"
-          }
-
-          $debVersion = $rawVersion -replace '-', '~'
-
-          "KAPSL_VERSION=$rawVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "KAPSL_NUMERIC_VERSION=$numericVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "KAPSL_DEB_VERSION=$debVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Build kapsl
         if: runner.os != 'Windows'
@@ -294,6 +286,7 @@ jobs:
 
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
+    needs: prepare-version
     runs-on: ubuntu-22.04
     container:
       # Match the stable release: this image supplies the CUDA/cuDNN libraries
@@ -303,41 +296,100 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       CUDA_PATH: /usr/local/cuda
+      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
       LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
     steps:
       - name: Install CUDA build dependencies
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl git libclang-dev libssl-dev patchelf pkg-config
+            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
           rm -rf /var/lib/apt/lists/*
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
-
-      - name: Resolve beta version
+      - name: Validate certified vLLM SDK commit
         shell: bash
         run: |
-          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          short_sha="${GITHUB_SHA::8}"
-          date_str="$(date -u +%Y%m%d)"
-          echo "KAPSL_VERSION=${manifest_version}-beta.${date_str}.${short_sha}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Protected KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit." >&2
+            exit 1
+          fi
+
+      - name: Checkout certified vLLM connector
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
+          path: sdk-vllm
+
+      - name: Verify certified vLLM SDK checkout
+        shell: bash
+        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
 
       - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
 
       - name: Collect ONNX Runtime sidecars
         shell: bash
         run: .github/scripts/collect-ort-sidecars.sh
 
+      - name: Collect TensorRT 10 user-space runtime
+        shell: bash
+        run: .github/scripts/collect-linux-tensorrt-runtime.sh
+
       - name: Package CUDA runtime bundle
         shell: bash
         run: .github/scripts/package-linux-cuda-runtime.sh
+
+      - name: Package split ONNX backend packs
+        shell: bash
+        run: .github/scripts/package-linux-onnx-backend-packs.sh
+
+      - name: Package llama.cpp backend packs from published SDK crates
+        shell: bash
+        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
+
+      - name: Reclaim CUDA build scratch before backend packaging
+        shell: bash
+        run: cargo clean --manifest-path kapsl-runtime/Cargo.toml
+
+      - name: Package certified managed-vLLM backend
+        shell: bash
+        env:
+          KAPSL_VLLM_SDK_DIR: sdk-vllm
+        run: .github/scripts/package-linux-vllm-backend.sh
+
+      - name: Generate signed backend index
+        shell: bash
+        env:
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_PUBLIC_KEYS" ]; then
+            echo "Backend signing key and embedded public key are required." >&2
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          trap 'rm -f "$key_file"' EXIT
+          .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" \
+            --artifacts-dir dist \
+            --output dist/backend-index.json \
+            --signing-key "$key_file" \
+            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
+            --channel beta
+          rm -f "$key_file" dist/*.manifest.json
+          trap - EXIT
 
       - name: Upload CUDA runtime artifact
         uses: actions/upload-artifact@v4
@@ -349,27 +401,47 @@ jobs:
           retention-days: 1
 
   publish-beta-release:
-    needs: [build-runtime-installers, build-cuda-runtime]
+    needs: [prepare-version, build-runtime-installers, build-cuda-runtime]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Resolve beta version
-        id: version
-        run: |
-          manifest_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
-          short_sha="${GITHUB_SHA::8}"
-          date_str="$(date -u +%Y%m%d)"
-          beta_version="${manifest_version}-beta.${date_str}.${short_sha}"
-          echo "version=$beta_version" >> "$GITHUB_OUTPUT"
-          echo "tag=v${beta_version}" >> "$GITHUB_OUTPUT"
 
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Verify installer artifact versions
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ needs.prepare-version.outputs.version }}
+          EXPECTED_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
+        run: |
+          set -euo pipefail
+
+          found=0
+          mismatch=0
+          while IFS= read -r -d '' file; do
+            found=1
+            name="$(basename "$file")"
+            case "$name" in
+              backend-index.json|backend-index.json.sig) continue ;;
+            esac
+            if [[ "$name" != *"$EXPECTED_VERSION"* && "$name" != *"$EXPECTED_DEB_VERSION"* ]]; then
+              echo "Artifact '$name' does not contain the run version '$EXPECTED_VERSION' (or Debian form '$EXPECTED_DEB_VERSION')." >&2
+              mismatch=1
+            fi
+          done < <(find release-assets -type f -print0)
+
+          if [ "$found" -eq 0 ]; then
+            echo "No installer artifacts were downloaded." >&2
+            exit 1
+          fi
+          if [ "$mismatch" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: Prepare GitHub release assets
         shell: bash
@@ -428,8 +500,8 @@ jobs:
       - name: Create GitHub pre-release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: "Beta ${{ steps.version.outputs.version }}"
+          tag_name: v${{ needs.prepare-version.outputs.version }}
+          name: "Beta ${{ needs.prepare-version.outputs.version }}"
           prerelease: true
           generate_release_notes: true
           files: github-release-assets/**
@@ -441,10 +513,14 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: |
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/beta/v${{ steps.version.outputs.version }}/ \
+            s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}/ \
             --recursive \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}
 
           # Keep the mutable latest directory as an exact mirror. Artifact names
           # contain their version, so --delete prevents old betas accumulating here.
@@ -454,46 +530,47 @@ jobs:
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          echo -n "${{ steps.version.outputs.version }}" \
+          echo -n "${{ needs.prepare-version.outputs.version }}" \
             | aws s3 cp - \
               s3://kapsl-installer/runtime/beta/latest.txt \
               --content-type "text/plain" \
               --no-progress \
               --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          aws s3 cp install.ps1 \
+          aws s3 cp installers/install.ps1 \
             s3://kapsl-installer/install-beta-base.ps1 \
             --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          aws s3 cp install.sh \
+          aws s3 cp installers/install.sh \
             s3://kapsl-installer/install-beta-base.sh \
             --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          for script in install-beta.ps1 install-beta-cuda.ps1 install-beta-tensorrt.ps1; do
-            aws s3 cp "$script" \
+          for script_path in \
+            installers/install-beta.ps1 \
+            installers/install-beta-cuda.ps1 \
+            installers/install-beta-tensorrt.ps1 \
+            installers/install-beta-cuda.sh \
+            installers/install-beta.sh; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
               --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
           done
 
-          aws s3 cp install-beta-cuda.sh \
-            s3://kapsl-installer/install-beta-cuda.sh \
-            --content-type "text/plain" \
-            --no-progress \
-            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
-
-      - name: Delete superseded beta installers from R2
+      - name: Retain current and rollback-compatible beta installers in R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
           R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
-          CURRENT_BETA_VERSION: v${{ steps.version.outputs.version }}
+          CURRENT_BETA_VERSION: v${{ needs.prepare-version.outputs.version }}
+          KEEP_LATEST: "3"
         shell: bash
         run: |
           set -euo pipefail
@@ -504,19 +581,23 @@ jobs:
             printf '%s\n' "$listing" \
               | awk '$NF ~ /^v.*\/$/ { sub(/\/$/, "", $NF); print $NF }'
           )
+          protected_versions="$(printf '%s\n' "${versions[@]}" | sort -V | tail -n "$KEEP_LATEST")"
 
           deleted=0
           for version in "${versions[@]}"; do
             if [ "$version" = "$CURRENT_BETA_VERSION" ]; then
               continue
             fi
+            if grep -Fxq "$version" <<< "$protected_versions"; then
+              continue
+            fi
 
-            echo "Deleting superseded beta s3://kapsl-installer/runtime/beta/$version/"
+            echo "Deleting beta outside rollback window s3://kapsl-installer/runtime/beta/$version/"
             aws s3 rm "s3://kapsl-installer/runtime/beta/$version/" \
               --recursive \
-              --no-progress \
+              --only-show-errors \
               --endpoint-url "$R2_ENDPOINT"
             deleted=$((deleted + 1))
           done
 
-          echo "Deleted $deleted superseded beta version(s); retained $CURRENT_BETA_VERSION."
+          echo "Deleted $deleted beta version(s); retained the newest $KEEP_LATEST plus $CURRENT_BETA_VERSION."

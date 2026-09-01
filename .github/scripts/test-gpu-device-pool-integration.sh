@@ -13,6 +13,7 @@
 #   KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES  one physical GPU/UUID (default: 0)
 #   KAPSL_GPU_TEST_VRAM_GROWTH_BYTES reload tolerance (default: 256 MiB)
 #   KAPSL_GPU_TEST_FRAGMENTATION_TOLERANCE allowed ratio increase (default: 0.01)
+#   KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK require signed lazy-pack markers
 #   KAPSL_GPU_TEST_OUTPUT_DIR        retained logs and snapshots
 #
 # The two model paths are startup arguments so pool registration necessarily
@@ -43,6 +44,8 @@ The GPU run fails unless all of these are observed in one process:
   * each owner disappears on unload and live/free state recovers on reload
   * stable pool capacity and external-memory accounting across both reloads
   * no process-isolation or native-KV fallback marker
+  * when KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK=1, exactly one lazy pack
+    download plus the signed ABI and core-owned shared-pool markers
 
 Without KAPSL_GPU_INTEGRATION=1 the script exits successfully with SKIP.
 EOF
@@ -119,6 +122,21 @@ assert_runtime_markers() {
   reject_log_marker "$log_file" "physical CUDA pooling disabled for this process" || return 1
   reject_log_marker "$log_file" "implicit parent CUDA pool suppressed" || return 1
   reject_log_marker "$log_file" "Process isolation enabled" || return 1
+
+  if is_true "${KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK:-0}"; then
+    local downloads
+    downloads="$(count_log_marker "$log_file" "Downloading Kapsl backend llama-cpp/cuda12")"
+    if [[ "$downloads" != "1" ]]; then
+      echo "Expected exactly one lazy llama.cpp pack download, observed $downloads" >&2
+      return 1
+    fi
+    require_log_marker "$log_file" \
+      "Activated signed llama.cpp backend pack llama-cpp/cuda12" 1 || return 1
+    require_log_marker "$log_file" \
+      "llama.cpp pack attached runtime-owned shared KV pool" "$minimum_shared_kv" || return 1
+    require_log_marker "$log_file" \
+      "Kapsl C-ABI runtime-owned KV pool active" "$minimum_shared_kv" || return 1
+  fi
 }
 
 metric_from_text() {

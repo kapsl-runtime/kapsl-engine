@@ -1,0 +1,181 @@
+# Lazy backend packs
+
+Kapsl resolves deployment backends from the model contract and the detected
+host. Clients do not install or start a backend directly, and an `.aimod`
+package cannot provide a download URL or executable path.
+
+## Online use
+
+```bash
+curl -fsSL https://downloads.kapsl.net/install-beta.sh | sh
+kapsl run model.aimod
+```
+
+Before model initialization, Kapsl validates the package contract, selects the
+backend, and performs preliminary memory admission. If the selected backend is
+a lazy pack, Kapsl then downloads its runtime-version-specific artifact,
+verifies the signed index, artifact signature, checksum, platform, accelerator,
+ABI, and installed files, and atomically activates it. A second run uses the
+validated cache.
+
+The beta rollout publishes managed vLLM, three in-process ONNX profiles, and
+two in-process llama.cpp profiles:
+
+```text
+llama-cpp/cpu
+llama-cpp/cuda12
+onnx/cpu
+onnx/cuda12
+onnx/tensorrt10
+vllm/cu130-flash-attn
+```
+
+An ONNX model downloads exactly one profile after provider policy and declared
+fallbacks are resolved. The CPU ONNX pack contains and activates no CUDA
+libraries. TensorRT is never an automatic fastest-provider upgrade: the
+package must name `tensorrt` as its preferred provider or an allowed fallback.
+GGUF models never trigger lazy ONNX or vLLM pack installation, and ONNX models
+never download vLLM.
+
+GGUF models resolve a llama.cpp pack only when requested. Kapsl loads its
+versioned C function table from a canonical pack-local absolute path; Rust
+trait objects never cross the library boundary. ABI v1 covers initialization,
+load/unload, inference and streaming, cancellation, memory/allocation reports,
+metrics, logging, shared-pool callbacks, and shutdown. The CPU pack is the
+default lazy profile for the portable Linux x86_64 core.
+
+During the CUDA beta transition, the established eager
+`gguf-cuda-shared-kv` build remains the certified reference and rollback path.
+The shared-pool `llama-cpp/cuda12` candidate calls the versioned host callback
+table and allocates KV blocks and its device block table from the same
+Kapsl-owned `GpuDevicePool` used by in-process ONNX. The pack wraps that raw
+descriptor inside llama.cpp; it does not create another pool, CUDA process, or
+tensor-IPC path. Its signed manifest declares `kv_mode: shared_pool`, and core
+and pack both fail closed if either the callbacks or capability bit are absent.
+
+A separately signed `kv_mode: native` CUDA pack remains available as the
+backend-owned-KV rollback. It is rejected unless an operator explicitly sets
+`KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1`; that override cannot authorize a pack
+whose signed mode is `shared_pool`. Release jobs build the shared candidate
+only from an exact certified `kapsl-sdk` commit. The public-candidate GPU gate
+then checks first-use download/cache reuse, allocation ownership and cleanup,
+single-process CUDA participation, and the 2% throughput / 5% latency budgets
+before the shared pack is promoted.
+The CUDA archive carries its resolved non-driver CUDA dependency closure and
+redistribution notices beside the entrypoint with an `$ORIGIN` runpath; host
+NVIDIA driver libraries are explicitly excluded.
+
+ONNX Runtime remains in the Kapsl process. Provider objects are opened from
+canonical pack-local absolute paths and retained for the process lifetime;
+Kapsl does not modify process-wide `LD_LIBRARY_PATH`. The pack carries a
+versioned native entrypoint descriptor, ORT libraries, the selected execution
+provider, its user-space accelerator dependency closure, compatibility/memory
+metadata, and license notices. Linux x86_64 is the first published ONNX pack
+platform; other platforms retain their eager in-process provider layout during
+the beta rollout.
+
+Inspect a decision without running the model:
+
+```bash
+kapsl backend-plan model.aimod
+```
+
+The JSON result includes `selected_backend`, `profile`, `installed`,
+`download_required`, `download_bytes`, `memory_admission`, and
+`execution_mode`. Obvious GPU overcapacity is reported without fetching the
+backend artifact or starting a backend process.
+
+Administrative commands are available for deterministic preparation and cache
+maintenance:
+
+```bash
+kapsl backend ensure model.aimod
+kapsl backend list
+kapsl backend list --json
+kapsl backend prune
+kapsl backend prune --old-versions
+```
+
+## Cache and installation safety
+
+The default cache is:
+
+```text
+~/.local/share/kapsl/backends/
+└── <runtime-version>/
+    └── <backend>/<profile>/
+```
+
+Installation is serialized by a filesystem lock. Downloads enter a staging
+directory, are bounded by their signed sizes, and are verified before an atomic
+rename makes the pack visible. Interrupted, corrupt, mismatched, or concurrent
+installs cannot leave a usable partial pack. Kapsl fails closed; it does not
+silently substitute a different backend.
+
+Official binaries embed one or more Ed25519 backend-index public keys. The
+release pipeline confirms that the private signing key matches an embedded
+public key before publishing an index. Only HTTPS artifact URLs from that
+signed index are accepted in production.
+
+## Offline bundles
+
+Prepare a bundle on a connected machine:
+
+```bash
+kapsl bundle model.aimod --output model.kapsl-bundle
+```
+
+Prepare for a different deployment target:
+
+```bash
+kapsl bundle model.aimod \
+  --target linux-x86_64-cuda \
+  --output model.kapsl-bundle
+```
+
+Multiple models share one copy of each required backend pack:
+
+```bash
+kapsl bundle model-a.aimod model-b.aimod \
+  --output production.kapsl-bundle
+```
+
+Copy the resulting file to the offline host and run it directly:
+
+```bash
+kapsl run model.kapsl-bundle
+```
+
+Kapsl verifies the bundle checksums, signed backend index, signed pack
+artifacts, runtime version, target, model contracts, and required-pack closure.
+It installs included packs through the same atomic backend manager, then passes
+the embedded `.aimod` paths to the normal memory-admission and startup flow.
+The bundle's verified index is anchored into the ordinary backend cache, so a
+subsequent offline validation never needs to fetch the index. A different
+signed index claiming the same immutable runtime release is rejected.
+There is no public export/import command pair.
+
+For an ordinary `.aimod` run that must not use the network, use `--offline` or
+set `KAPSL_OFFLINE=1`. If its pack is not already cached, Kapsl reports the
+missing backend and suggests `kapsl bundle` or `kapsl backend ensure` on a
+connected machine.
+
+## Operator overrides
+
+| Variable | Purpose |
+|----------|---------|
+| `KAPSL_BACKEND_CACHE_DIR` | Override the backend cache root. |
+| `KAPSL_BUNDLE_CACHE_DIR` | Override the verified extracted-bundle cache. |
+| `KAPSL_OFFLINE=1` | Disable backend-index and artifact network access. |
+| `KAPSL_LAZY_BACKENDS=0` | Disable automatic lazy installation and require a preinstalled backend. |
+| `KAPSL_LAZY_ONNX_PACKS=0` | Keep the eager/legacy ONNX provider layout during the compatibility window. Linux x86_64 defaults to lazy ONNX packs. |
+| `KAPSL_LAZY_LLAMA_CPP_PACKS=0` | Keep the eager/compiled llama.cpp layout. The portable Linux x86_64 core defaults to lazy CPU packs when no eager GGUF feature is compiled. |
+| `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1` | Explicitly allow a signed CUDA pack whose `kv_mode` is `native`. Shared-pool packs and the eager shared-KV profile do not require or consume this rollback override. |
+| `KAPSL_PROVIDER_PATH` | Additional Kapsl provider-manifest roots. Verified lazy ONNX pack roots are appended automatically; this is not a loader search path. |
+| `KAPSL_BACKEND_INDEX_URL` | Override the signed index URL for a private mirror. |
+| `KAPSL_BACKEND_INDEX_PATH` | Read a local signed index and adjacent `.sig` file. |
+| `KAPSL_BACKEND_PUBLIC_KEYS` | Add trusted raw Ed25519 public keys for development or controlled key rotation. Official release keys are embedded. |
+
+`KAPSL_VLLM_PYTHON` and `KAPSL_VLLM_BUNDLE` remain development and legacy
+layout overrides. Every discovered vLLM environment still has to match the
+certified Python, PyTorch, CUDA, vLLM, connector, and shared-pool profile tuple.

@@ -44,7 +44,7 @@ Shared Rust crates live in the separate `kapsl-sdk` repository:
 
 ### 3.1 Prerequisites
 
-- Rust 1.92.0.
+- Rust 1.98.0 is the pinned build toolchain; Rust 1.92.0 is the workspace MSRV.
 - Python 3.9+ for the SDK Python package.
 - Optional GPU/runtime dependencies depending on provider:
   - CUDA/TensorRT (NVIDIA),
@@ -169,7 +169,7 @@ kapsl build
 Context mode behavior:
 
 - Reads optional `metadata.json` in context.
-- Auto-finds model file (`.onnx`, `.gguf`, `.safetensors`, `.pt`, `.pth`, `.pb`) when unambiguous.
+- Auto-finds a supported model file (`.onnx`, `.gguf`, `.safetensors`) when unambiguous.
 - Includes context files in archive, excluding generated `metadata.json` and `.aimod` outputs.
 
 ### 4.3 Push / Pull Commands

@@ -1,19 +1,56 @@
+use super::super::archive::{write_package_archive, PackageArchivePlan};
 use super::*;
 
-// Package construction receives independently optional manifest overrides;
-// grouping them would obscure their precedence without reducing call state.
-#[allow(clippy::too_many_arguments)]
+/// Inputs and precedence overrides for a directory-context package build.
+///
+/// Keeping these values together prevents CLI arguments from being threaded as
+/// a long positional list while preserving their independent override meaning.
+#[derive(Clone, Copy)]
+pub(crate) struct ContextPackageRequest<'a> {
+    pub(crate) context_path: &'a Path,
+    pub(crate) model_override: Option<&'a Path>,
+    pub(crate) output_override: Option<&'a Path>,
+    pub(crate) project_name_override: Option<&'a str>,
+    pub(crate) framework_override: Option<&'a str>,
+    pub(crate) version_override: Option<&'a str>,
+    pub(crate) metadata_override: Option<&'a serde_json::Value>,
+    pub(crate) serving_backend_override: Option<ServingBackendPolicy>,
+    pub(crate) axes: AxisOverrides<'a>,
+    pub(crate) interactive_metadata_setup: bool,
+}
+
+impl<'a> ContextPackageRequest<'a> {
+    pub(crate) fn new(context_path: &'a Path) -> Self {
+        Self {
+            context_path,
+            model_override: None,
+            output_override: None,
+            project_name_override: None,
+            framework_override: None,
+            version_override: None,
+            metadata_override: None,
+            serving_backend_override: None,
+            axes: AxisOverrides::default(),
+            interactive_metadata_setup: false,
+        }
+    }
+}
+
 pub(crate) fn create_kapsl_package_from_context(
-    context_path: &Path,
-    model_override: Option<&Path>,
-    output_override: Option<&Path>,
-    project_name_override: Option<&str>,
-    framework_override: Option<&str>,
-    version_override: Option<&str>,
-    metadata_override: Option<&serde_json::Value>,
-    axes: AxisOverrides,
-    interactive_metadata_setup: bool,
+    request: ContextPackageRequest<'_>,
 ) -> Result<PackageKapslResponse, String> {
+    let ContextPackageRequest {
+        context_path,
+        model_override,
+        output_override,
+        project_name_override,
+        framework_override,
+        version_override,
+        metadata_override,
+        serving_backend_override,
+        axes,
+        interactive_metadata_setup,
+    } = request;
     let context_input = PathBuf::from(context_path);
     if !context_input.exists() {
         return Err(format!(
@@ -43,6 +80,9 @@ pub(crate) fn create_kapsl_package_from_context(
         framework_from_manifest,
         version_from_manifest,
         model_file_from_manifest,
+        format_from_manifest,
+        model_type_from_manifest,
+        task_from_manifest,
         hardware_requirements_from_manifest,
         metadata_from_manifest,
     ) = parse_context_manifest(&context_dir)?;
@@ -133,11 +173,11 @@ pub(crate) fn create_kapsl_package_from_context(
 
     let mut hardware_requirements = hardware_requirements_from_manifest.unwrap_or_default();
 
-    // Orthogonal model axes; populated from CLI overrides and/or the interactive
-    // flow, else None so the loader infers them from `framework`.
-    let mut format_axis: Option<String> = None;
-    let mut model_type_axis: Option<String> = None;
-    let mut task_axis: Option<String> = None;
+    // Orthogonal model axes; CLI overrides win, otherwise preserve the source
+    // manifest before falling back to legacy `framework` inference.
+    let mut format_axis = format_from_manifest;
+    let mut model_type_axis = model_type_from_manifest;
+    let mut task_axis = task_from_manifest;
 
     // Non-interactive: --format / --model-type / --task fill the axes.
     if axes.any() {
@@ -201,32 +241,21 @@ pub(crate) fn create_kapsl_package_from_context(
     let package = move || -> Result<PackageKapslResponse, String> {
         let output_path =
             normalize_output_path_for_context(&context_dir, output_override, &project_name);
-        if let Some(parent) = output_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!(
-                        "Failed to create parent directory {}: {}",
-                        parent.display(),
-                        e
-                    )
-                })?;
-            }
-        }
-
         let created_at = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| format!("System clock error: {}", e))?
             .as_secs()
             .to_string();
 
-        let metadata_value = metadata_override
-            .cloned()
-            .or(metadata_from_manifest)
-            .map(|value| {
-                serde_yaml::to_value(value)
-                    .map_err(|e| format!("Failed to convert metadata payload: {}", e))
-            })
-            .transpose()?;
+        let metadata_value = apply_serving_backend_override(
+            metadata_override.cloned().or(metadata_from_manifest),
+            serving_backend_override,
+        )?
+        .map(|value| {
+            serde_yaml::to_value(value)
+                .map_err(|e| format!("Failed to convert metadata payload: {}", e))
+        })
+        .transpose()?;
 
         let primary_model_ext = model_path
             .extension()
@@ -273,60 +302,17 @@ pub(crate) fn create_kapsl_package_from_context(
             hardware_requirements,
             cron_jobs: Vec::new(),
         };
-        EngineKind::validate(&manifest)?;
-
-        let output_file = File::create(&output_path).map_err(|e| {
-            format!(
-                "Failed to create output package {}: {}",
-                output_path.display(),
-                e
-            )
-        })?;
-        let encoder = GzEncoder::new(
-            BufWriter::with_capacity(8 << 20, output_file),
-            Compression::fast(),
-        );
-        let mut archive = Builder::new(encoder);
-
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| format!("Failed to encode metadata.json: {}", e))?;
-        append_tar_bytes_entry(&mut archive, "metadata.json", &manifest_bytes)?;
-
-        for (absolute, relative) in collect_context_files(
+        let entries = collect_context_files(
             &context_dir,
             &output_path,
             &primary_model_ext,
             &keep_primary_model_files,
-        )? {
-            archive
-                .append_path_with_name(&absolute, &relative)
-                .map_err(|e| format!("Failed to add {} to archive: {}", relative.display(), e))?;
-        }
-
-        let encoder = archive
-            .into_inner()
-            .map_err(|e| format!("Failed to finalize tar archive: {}", e))?;
-        let mut buf_writer = encoder
-            .finish()
-            .map_err(|e| format!("Failed to finalize gzip stream: {}", e))?;
-        buf_writer
-            .flush()
-            .map_err(|e| format!("Failed to flush output package: {}", e))?;
-
-        let created_metadata_path = if should_create_source_metadata {
-            create_source_metadata_if_missing(&source_metadata_path, &manifest_bytes)?
-        } else {
-            None
-        };
-
-        let absolute_output_path = output_path.canonicalize().unwrap_or(output_path);
-        Ok(PackageKapslResponse {
-            status: "ok".to_string(),
-            kapsl_path: absolute_output_path.to_string_lossy().to_string(),
-            project_name,
-            framework,
-            version,
-            metadata_path: created_metadata_path.map(|path| path.to_string_lossy().to_string()),
+        )?;
+        write_package_archive(PackageArchivePlan {
+            output_path,
+            manifest,
+            entries,
+            source_metadata_path: should_create_source_metadata.then_some(source_metadata_path),
         })
     };
 

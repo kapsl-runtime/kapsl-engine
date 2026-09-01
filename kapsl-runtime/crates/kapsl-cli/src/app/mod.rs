@@ -1,14 +1,13 @@
 use super::*;
-use clap::{Parser, Subcommand, ValueEnum};
 
 pub(crate) mod cli;
-pub(crate) mod constants;
-pub(crate) mod help;
-pub(crate) mod onnx_tuning;
-pub(crate) mod support;
+pub(crate) mod config;
+mod error;
+pub(crate) mod startup;
+pub(crate) mod terminal;
 
 pub(crate) use cli::*;
-pub(crate) use constants::*;
-pub(crate) use help::*;
-pub(crate) use onnx_tuning::*;
-pub(crate) use support::*;
+pub(crate) use config::*;
+pub(crate) use error::*;
+pub(crate) use startup::*;
+pub(crate) use terminal::*;

@@ -1,15 +1,18 @@
 //! OpenAI-compatible HTTP surface.
 //!
 //! These routes exist so an existing OpenAI client can be pointed at a Kapsl
-//! runtime by changing its base URL and nothing else. They are a thin
-//! translation layer: every request ends up on the same `ReplicaPool` paths as
-//! `/api/models/:id/infer`, with the same admission, runtime-pressure shedding
-//! and cancellation behaviour.
+//! runtime by changing its base URL and nothing else. Every request ends up on
+//! the same `ReplicaPool` paths as `/api/models/:id/infer`, with the same
+//! admission, runtime-pressure shedding, and cancellation behaviour. Managed
+//! vLLM may use a typed byte-relay path after those policies have run; other
+//! engines retain the tensor translation path.
 
 use super::*;
 
 mod chat;
-mod types;
+mod embeddings;
+mod responses;
+pub(crate) mod types;
 
 use types::openai_error;
 
@@ -180,6 +183,16 @@ pub(crate) fn build_openai_routes(
             );
 
     let chat_completions = chat::build_chat_completions_route(chat::ChatCompletionsConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+        log_sensitive_ids,
+    });
+    let embeddings = embeddings::build_embeddings_route(embeddings::EmbeddingsConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+        log_sensitive_ids,
+    });
+    let responses = responses::build_responses_route(responses::ResponsesConfig {
         models,
         inference,
         log_sensitive_ids,
@@ -189,6 +202,10 @@ pub(crate) fn build_openai_routes(
         .or(get_model)
         .unify()
         .or(chat_completions)
+        .unify()
+        .or(embeddings)
+        .unify()
+        .or(responses)
         .unify()
         .map(reply_into_response)
         .boxed()

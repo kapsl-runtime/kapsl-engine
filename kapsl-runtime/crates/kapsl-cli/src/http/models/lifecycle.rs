@@ -1,31 +1,14 @@
 use super::*;
 
 pub(crate) struct ModelLifecycleRoutesConfig {
-    pub(crate) models: Arc<ModelManager>,
-    pub(crate) device_info: Arc<DeviceInfo>,
-    pub(crate) batch_size: usize,
-    pub(crate) scheduler_queue_size: usize,
-    pub(crate) scheduler_max_micro_batch: usize,
-    pub(crate) scheduler_queue_delay_ms: u64,
-    pub(crate) shared_metrics: kapsl_monitor::metrics::KapslMetrics,
-    pub(crate) onnx_tuning_profile: Arc<OnnxTuningProfile>,
-    pub(crate) resources: Arc<RuntimeResources>,
+    pub(crate) model_runtime: Arc<ModelRuntime>,
 }
 
 pub(crate) fn build_model_lifecycle_routes(
     config: ModelLifecycleRoutesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let ModelLifecycleRoutesConfig {
-        models,
-        device_info: device_info_for_api,
-        batch_size,
-        scheduler_queue_size,
-        scheduler_max_micro_batch,
-        scheduler_queue_delay_ms,
-        shared_metrics: shared_metrics_clone,
-        onnx_tuning_profile: onnx_tuning_profile_for_api,
-        resources,
-    } = config;
+    let ModelLifecycleRoutesConfig { model_runtime } = config;
+    let models = model_runtime.models().clone();
 
     // POST /api/models/start - Start a new model
     #[derive(Deserialize)]
@@ -47,24 +30,14 @@ pub(crate) fn build_model_lifecycle_routes(
     }
 
     let models_for_start = models.clone();
-    let device_info_for_start = device_info_for_api.clone();
-    let batch_size_for_start = batch_size;
-    let scheduler_queue_size_for_start = scheduler_queue_size;
-    let scheduler_max_micro_batch_for_start = scheduler_max_micro_batch;
-    let scheduler_queue_delay_ms_for_start = scheduler_queue_delay_ms;
-    let shared_metrics_for_start = shared_metrics_clone.clone();
-    let onnx_tuning_profile_for_start = onnx_tuning_profile_for_api.clone();
-    let resources_for_start = resources.clone();
+    let model_runtime_for_start = model_runtime.clone();
 
     let start_model = warp::path!("api" / "models" / "start")
         .and(warp::post())
         .and(warp::body::json())
         .then(move |req: StartModelRequest| {
             let models = models_for_start.clone();
-            let device_info = device_info_for_start.clone();
-            let resources = resources_for_start.clone();
-            let shared_metrics = shared_metrics_for_start.clone();
-            let onnx_tuning_profile = onnx_tuning_profile_for_start.clone();
+            let model_runtime = model_runtime_for_start.clone();
 
             async move {
                 use warp::http::StatusCode;
@@ -86,7 +59,6 @@ pub(crate) fn build_model_lifecycle_routes(
                     None => (models.allocate_model_id(), true),
                 };
                 let lifecycle_guard = models.lock_lifecycle(model_id).await;
-                let onnx_tuning = onnx_tuning_profile.resolve(model_id);
 
                 // Check if model ID already exists
                 if models.contains_pool(model_id) {
@@ -199,13 +171,9 @@ pub(crate) fn build_model_lifecycle_routes(
                 tokio::spawn({
                     let models = models.clone();
                     let model_registry = models.registry().clone();
-                    let device_info = device_info.clone();
-                    let shared_metrics = shared_metrics.clone();
                     let model_path = model_path.clone();
-                    let topology = req.topology.clone();
-                    let tp_degree = req.tp_degree;
-                    let onnx_tuning = onnx_tuning.clone();
-                    let resources = resources.clone();
+                    let placement = ModelLoadPlacement::new(req.topology.clone(), req.tp_degree);
+                    let model_runtime = model_runtime.clone();
                     async move {
                         let _lifecycle_guard = lifecycle_guard;
                         // A typed authority rejection may reclaim one idle,
@@ -214,28 +182,14 @@ pub(crate) fn build_model_lifecycle_routes(
                         // never enter arbitration.
                         let mut reclaim_attempts = 0usize;
                         let res = loop {
-                            let model_registry_for_attempt = model_registry.clone();
-                            let device_info_for_attempt = device_info.clone();
-                            let shared_metrics_for_attempt = shared_metrics.clone();
                             let model_path_for_attempt = model_path.clone();
-                            let topology_for_attempt = topology.clone();
-                            let resources_for_attempt = resources.clone();
-                            let onnx_tuning_for_attempt = onnx_tuning.clone();
+                            let placement_for_attempt = placement.clone();
+                            let model_runtime_for_attempt = model_runtime.clone();
                             let attempt = tokio::task::spawn_blocking(move || {
-                                load_model_blocking(
+                                model_runtime_for_attempt.load_model_blocking(
                                     model_id,
                                     &model_path_for_attempt,
-                                    &device_info_for_attempt,
-                                    resources_for_attempt,
-                                    batch_size_for_start,
-                                    scheduler_queue_size_for_start,
-                                    scheduler_max_micro_batch_for_start,
-                                    scheduler_queue_delay_ms_for_start,
-                                    &model_registry_for_attempt,
-                                    &shared_metrics_for_attempt,
-                                    &topology_for_attempt,
-                                    tp_degree,
-                                    onnx_tuning_for_attempt,
+                                    &placement_for_attempt,
                                 )
                             })
                             .await;
@@ -253,12 +207,9 @@ pub(crate) fn build_model_lifecycle_routes(
                                 );
                                 break attempt;
                             }
-                            let Some(_reclaimed) = reclaim_one_lower_priority_model(
-                                failure,
-                                &models,
-                                &resources,
-                            )
-                            .await
+                            let Some(_reclaimed) = model_runtime
+                                .reclaim_one_lower_priority_model(failure)
+                                .await
                             else {
                                 break attempt;
                             };
@@ -305,13 +256,13 @@ pub(crate) fn build_model_lifecycle_routes(
 
     // POST /api/models/:id/stop - Stop a model
     let models_for_stop = models.clone();
-    let resources_for_stop = resources.clone();
+    let model_runtime_for_stop = model_runtime.clone();
 
     let stop_model = warp::path!("api" / "models" / u32 / "stop")
         .and(warp::post())
         .then(move |model_id: u32| {
             let models = models_for_stop.clone();
-            let resources = resources_for_stop.clone();
+            let model_runtime = model_runtime_for_stop.clone();
             async move {
                 use warp::http::StatusCode;
                 let _lifecycle_guard = models.lock_lifecycle(model_id).await;
@@ -336,7 +287,12 @@ pub(crate) fn build_model_lifecycle_routes(
                     );
                 }
 
-                stop_model_and_replicas(model_id, &models, &resources);
+                if let Err(error) = model_runtime.stop_model_and_replicas(model_id) {
+                    return warp::reply::with_status(
+                        warp::reply::json(&ErrorResponse { error }),
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                    );
+                }
 
                 warp::reply::with_status(
                     warp::reply::json(&SuccessResponse {
@@ -349,13 +305,13 @@ pub(crate) fn build_model_lifecycle_routes(
 
     // POST /api/models/:id/remove - Remove a model and its replicas
     let models_for_remove = models.clone();
-    let resources_for_remove = resources.clone();
+    let model_runtime_for_remove = model_runtime.clone();
 
     let remove_model = warp::path!("api" / "models" / u32 / "remove")
         .and(warp::post())
         .then(move |model_id: u32| {
             let models = models_for_remove.clone();
-            let resources = resources_for_remove.clone();
+            let model_runtime = model_runtime_for_remove.clone();
             async move {
                 use warp::http::StatusCode;
 
@@ -383,7 +339,15 @@ pub(crate) fn build_model_lifecycle_routes(
 
                 let base_model_id = model_info.base_model_id;
                 let _lifecycle_guard = models.lock_lifecycle(base_model_id).await;
-                let replicas = stop_model_and_replicas(base_model_id, &models, &resources);
+                let replicas = match model_runtime.stop_model_and_replicas(base_model_id) {
+                    Ok(replicas) => replicas,
+                    Err(error) => {
+                        return warp::reply::with_status(
+                            warp::reply::json(&ErrorResponse { error }),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        );
+                    }
+                };
                 models.remove(base_model_id);
 
                 for replica in replicas {
