@@ -114,10 +114,13 @@ SHA-256, plus its tiny ONNX model source, in
 `.github/ort-cpu-integration.lock` supplies both the adapter and that
 conformance contract. CI builds the pack, constructs a signed offline bundle,
 preinstalls that bundle through the normal backend manager, and runs an ABBA
-embedded/candidate comparison. This is a CPU-only forward-path smoke gate; it
-does not provision a GPU and does not by itself authorize removing embedded
-ORT. The broader retirement gate still requires every supported CPU task class
-plus the separate CUDA/TensorRT memory ownership and lifecycle suites.
+embedded/candidate comparison. The dedicated ORT CPU conformance workflow
+builds the adapter once for both release-handoff validation and the longer
+performance comparison; installer smoke remains a separate quick job with no
+performance thresholds. This CPU-only forward-path conformance does not
+provision a GPU and does not by itself authorize removing embedded ORT. The
+broader retirement gate still requires every supported CPU task class plus the
+separate CUDA/TensorRT memory ownership and lifecycle suites.
 
 When a native adapter advertises ABI v1 cancellation, Kapsl bridges each
 request's `CancellationToken` to the adapter's `cancel(request_id)` hook on one
