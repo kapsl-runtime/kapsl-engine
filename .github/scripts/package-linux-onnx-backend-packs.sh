@@ -72,6 +72,14 @@ copy_cuda_runtime_libraries() {
   while IFS= read -r -d '' source; do
     name="$(basename "$source")"
     case "$name" in
+      libonnxruntime_providers_*.so*)
+        # The full CUDA runtime bundle also carries ORT provider sidecars.
+        # Split backend packs must use the provider copies staged explicitly
+        # in core_dir/cuda_dir/tensorrt_provider_dir instead of treating those
+        # sidecars as CUDA runtime dependencies (and rejecting the duplicate
+        # basename when their bytes differ).
+        continue
+        ;;
       libcuda.so* | libnvidia-*.so*)
         echo "Refusing to bundle host NVIDIA driver library $name" >&2
         exit 1
