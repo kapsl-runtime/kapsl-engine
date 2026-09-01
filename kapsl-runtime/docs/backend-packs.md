@@ -85,10 +85,13 @@ device memory through the runtime-owned `GpuDevicePool` callbacks.
 This path stays in-process: tensor buffers cross the adapter boundary as
 borrowed views, and ORT's allocator forwards directly to the same Kapsl-owned
 pool. It introduces no backend RPC, CUDA IPC, tensor serialization, or second
-GPU allocation authority. The gate defaults off until the out-of-tree ORT
-adapter has passed CPU parity, GPU memory-ownership, unload/reload, and stable
-release conformance. An invalid gate value is an error rather than a request to
-fall back.
+GPU allocation authority. The host supplies the canonical signed-pack root and
+the resolved per-model ORT tuning in initialization options, so the adapter can
+resolve only pack-local runtime libraries and does not reread competing process
+configuration. The gate defaults off until the out-of-tree ORT adapter has
+passed CPU parity, GPU memory-ownership, unload/reload, and stable release
+conformance. An invalid gate value is an error rather than a request to fall
+back.
 
 Inspect a decision without running the model:
 

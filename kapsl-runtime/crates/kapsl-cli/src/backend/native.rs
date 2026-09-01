@@ -8,6 +8,7 @@
 use super::{BackendExecutionMode, BackendPackManifest};
 use crate::runtime::RuntimeResources;
 use kapsl_backend_abi::*;
+use kapsl_backends::OnnxRuntimeTuning;
 use kapsl_core::Manifest;
 use kapsl_engine_api::{
     BatchingMode, BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics,
@@ -17,7 +18,7 @@ use kapsl_engine_api::{
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::ffi::c_void;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -48,6 +49,8 @@ struct ActiveNativePack {
     manifest: BackendPackManifest,
     api: KapslBackendApiV1,
     descriptor: serde_json::Value,
+    root: PathBuf,
+    entrypoint: PathBuf,
     #[allow(dead_code)]
     library: libloading::Library,
 }
@@ -178,6 +181,8 @@ pub(crate) fn activate_native_backend_pack(
         manifest: manifest.clone(),
         api,
         descriptor,
+        root,
+        entrypoint,
         library,
     }));
     Ok(())
@@ -281,6 +286,7 @@ pub(crate) fn create_native_backend_pack_engine(
     device_id: usize,
     model_id: u32,
     replica_id: u32,
+    tuning: Option<&OnnxRuntimeTuning>,
 ) -> Result<Box<dyn Engine>, String> {
     let accelerator_profile = provider_accelerator_profile(provider)?;
     let pack = active_native_pack("onnx", accelerator_profile).ok_or_else(|| {
@@ -289,7 +295,7 @@ pub(crate) fn create_native_backend_pack_engine(
         )
     })?;
     let instance = NativePackInstance::initialize(
-        pack, manifest, provider, resources, device_id, model_id, replica_id,
+        pack, manifest, provider, resources, device_id, model_id, replica_id, tuning,
     )?;
     Ok(Box::new(NativePackedEngine { instance }))
 }
@@ -325,6 +331,7 @@ impl NativePackInstance {
         device_id: usize,
         model_id: u32,
         replica_id: u32,
+        tuning: Option<&OnnxRuntimeTuning>,
     ) -> Result<Arc<Self>, String> {
         let requires_governed_memory =
             pack.api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
@@ -344,6 +351,16 @@ impl NativePackInstance {
             "accelerator_profile": pack.manifest.accelerator_profile,
             "pack_version": pack.manifest.pack_version,
             "descriptor": pack.descriptor,
+            "pack_root": pack.root,
+            "entrypoint": pack.entrypoint,
+            "onnx_tuning": tuning.map(|tuning| serde_json::json!({
+                "memory_pattern": tuning.memory_pattern,
+                "disable_cpu_mem_arena": tuning.disable_cpu_mem_arena,
+                "session_buckets": tuning.session_buckets,
+                "bucket_dim_granularity": tuning.bucket_dim_granularity,
+                "bucket_max_dims": tuning.bucket_max_dims,
+                "peak_concurrency_hint": tuning.peak_concurrency_hint,
+            })),
         }))
         .map_err(|error| format!("encode native backend options: {error}"))?;
         let config = KapslBackendConfigV1 {

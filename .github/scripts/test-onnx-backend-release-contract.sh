@@ -32,6 +32,8 @@ require_literal "$native_host" 'const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GE
 require_literal "$native_host" 'KAPSL_BACKEND_ENTRYPOINT_SYMBOL'
 require_literal "$native_host" 'KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR'
 require_literal "$native_host" 'GpuDevicePool'
+require_literal "$native_host" '"pack_root": pack.root'
+require_literal "$native_host" '"onnx_tuning": tuning.map'
 require_literal "$native_host" 'pointer.cast::<KapslBackendApiPrefixV1>().read()'
 require_literal "$native_host" 'pack.api.shutdown'
 require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.1.0"'
