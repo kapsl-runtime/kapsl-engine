@@ -3,7 +3,7 @@ name: ORT CPU Conformance
 on:
   pull_request:
     paths:
-      - ".github/ort-cpu-integration.lock"
+      - ".github/ort-integration.lock"
       - ".github/ort-cpu-parity.lock.json"
       - ".github/licenses/ONNX-RUNTIME-LICENSE"
       - ".github/scripts/certify-ort-cpu-parity.sh"
@@ -49,9 +49,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          integrations_ref="$(tr -d '\r\n' < .github/ort-cpu-integration.lock)"
+          integrations_ref="$(tr -d '\r\n' < .github/ort-integration.lock)"
           if [[ ! "$integrations_ref" =~ ^[0-9a-f]{40}$ ]]; then
-            echo ".github/ort-cpu-integration.lock must contain one exact lowercase 40-hex commit." >&2
+            echo ".github/ort-integration.lock must contain one exact lowercase 40-hex commit." >&2
             exit 1
           fi
           version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"

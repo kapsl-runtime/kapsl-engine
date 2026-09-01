@@ -251,7 +251,9 @@ config = {
         "require_route_evidence": True,
         "require_startup_evidence": True,
     },
-    "sequence": ["baseline", "candidate", "candidate", "baseline"],
+    # Four samples per route keep a single host-scheduler startup outlier from
+    # controlling the median while preserving balanced ABBA ordering.
+    "sequence": ["baseline", "candidate", "candidate", "baseline"] * 2,
     "allowed_variant_env_differences": [
         "KAPSL_BACKEND_CACHE_DIR",
         "KAPSL_GENERIC_NATIVE_PACKS",

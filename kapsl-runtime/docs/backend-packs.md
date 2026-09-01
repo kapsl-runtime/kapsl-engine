@@ -109,20 +109,29 @@ conformance. An invalid gate value is an error rather than a request to fall
 back.
 
 Release jobs build the CPU candidate from the exact `kapsl-integrations`
-commit in `.github/ort-cpu-integration.lock`. The adapter's committed Rust
+commit in `.github/ort-integration.lock`. The adapter's committed Rust
 toolchain is installed and verified independently of the engine toolchain;
 the resulting archive records its source commit and is accepted only after the
 engine validates its payload, provenance, file hashes, and standard ABI marker.
+The same exact checkout now exposes a prepared accelerator handoff for
+`cuda12` and `tensorrt10`. It authenticates Microsoft's official ORT GPU
+archive, closes and normalizes every non-driver CUDA/TensorRT dependency, and
+emits the same standard-ABI manifest/provenance contract. Release workflows
+continue publishing the legacy accelerator rollback until an official stable
+release completes real GPU ownership, unload, reproducibility, and teardown
+qualification; preparing an archive does not promote it.
 The engine's existing Ed25519 backend-index publisher remains the sole owner of
 official release signing.
 
 Host CI pins the canonical integrations-owned parity entrypoint by path and
 SHA-256, plus its tiny ONNX model source, in
 `.github/ort-cpu-parity.lock.json`. The exact integrations commit in
-`.github/ort-cpu-integration.lock` supplies both the adapter and that
+`.github/ort-integration.lock` supplies both the adapter and that
 conformance contract. CI builds the pack, constructs a signed offline bundle,
-preinstalls that bundle through the normal backend manager, and runs an ABBA
-embedded/candidate comparison. The dedicated ORT CPU conformance workflow
+preinstalls that bundle through the normal backend manager, and runs two full
+ABBA embedded/candidate blocks. Four captures per route make the startup median
+resistant to one host-scheduler outlier without weakening its gate. The
+dedicated ORT CPU conformance workflow
 builds the adapter once for both release-handoff validation and the longer
 performance comparison; installer smoke remains a separate quick job with no
 performance thresholds. This CPU-only forward-path conformance does not
