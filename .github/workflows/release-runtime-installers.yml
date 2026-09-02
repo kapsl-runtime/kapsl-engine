@@ -380,6 +380,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Resolve certified ORT integrations commit
+        id: ort-integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '\r\n' < .github/ort-cpu-integration.lock)"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/ort-cpu-integration.lock must contain one exact lowercase 40-hex commit." >&2
+            exit 1
+          fi
+          echo "KAPSL_ORT_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout certified ORT adapter
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.ort-integrations.outputs.ref }}
+          path: kapsl-integrations-ort
+
+      - name: Verify certified ORT integrations checkout
+        shell: bash
+        run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
+
       - name: Validate certified vLLM SDK commit
         shell: bash
         run: |
@@ -403,6 +427,13 @@ jobs:
       - name: Install Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Install certified ORT packaging toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-ort/rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$toolchain" --profile minimal
+
       - name: Build kapsl with statically compiled GGUF CUDA
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
 
@@ -418,7 +449,11 @@ jobs:
         shell: bash
         run: .github/scripts/package-linux-cuda-runtime.sh
 
-      - name: Package split ONNX backend packs
+      - name: Package certified ORT CPU adapter
+        shell: bash
+        run: .github/scripts/package-linux-ort-cpu-backend.sh
+
+      - name: Package legacy ONNX accelerator packs
         shell: bash
         run: .github/scripts/package-linux-onnx-backend-packs.sh
 

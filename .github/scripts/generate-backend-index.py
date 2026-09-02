@@ -141,6 +141,7 @@ def validate_payload(template: dict[str, Any], payload: dict[str, Any], archive:
         "profile",
         "pack_version",
         "runtime_abi",
+        "adapter_abi",
         "platform",
         "execution_mode",
         "entrypoint",
@@ -234,6 +235,12 @@ def validate_template(template: dict[str, Any], source: pathlib.Path) -> None:
         raise SystemExit(f"{source}: unsupported accelerator_profile")
     if template.get("execution_mode") not in ("native", "external"):
         raise SystemExit(f"{source}: unsupported execution_mode")
+    adapter_abi = template.get("adapter_abi")
+    if adapter_abi is not None:
+        if template["execution_mode"] != "native":
+            raise SystemExit(f"{source}: only native packs may declare adapter_abi")
+        if adapter_abi != "kapsl-backend-v1":
+            raise SystemExit(f"{source}: unsupported adapter_abi")
     kv_mode = template.get("kv_mode")
     if template.get("backend") == "llama-cpp" and kv_mode not in (
         "native",

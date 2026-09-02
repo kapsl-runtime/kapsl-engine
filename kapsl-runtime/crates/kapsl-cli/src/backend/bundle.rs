@@ -111,6 +111,12 @@ fn create_bundle(
     let output_parent = args.output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_parent)?;
 
+    let local_artifacts_root = args
+        .backend_artifacts_dir
+        .as_deref()
+        .map(canonical_local_artifacts_root)
+        .transpose()?;
+
     let (target, target_manifest) = resolve_bundle_target(args.target.as_deref(), detected)?;
     let (index, index_bytes, index_signature) = manager.verified_index_material()?;
 
@@ -189,11 +195,16 @@ fn create_bundle(
 
     let mut prepared_packs = Vec::with_capacity(required_packs.len());
     for (position, (_, pack)) in required_packs.into_iter().enumerate() {
-        // Use a path owned by the surrounding TempDir rather than keeping an
-        // open NamedTempFile handle. Windows otherwise rejects the manager's
-        // create/truncate call during cross-platform bundle preparation.
-        let archive = scratch.path().join(format!("backend-{position}.tar.gz"));
-        manager.fetch_pack_archive(&pack, &archive)?;
+        let archive = if let Some(root) = local_artifacts_root.as_deref() {
+            local_backend_artifact(manager, &pack, root)?
+        } else {
+            // Use a path owned by the surrounding TempDir rather than keeping
+            // an open NamedTempFile handle. Windows otherwise rejects the
+            // manager's create/truncate call during cross-platform preparation.
+            let archive = scratch.path().join(format!("backend-{position}.tar.gz"));
+            manager.fetch_pack_archive(&pack, &archive)?;
+            archive
+        };
         let bundle_path = format!(
             "backends/{}/{}.tar.gz",
             sanitize_bundle_name(&pack.backend),
@@ -329,6 +340,68 @@ fn create_bundle(
         bundle_manifest.target.accelerator
     );
     Ok(())
+}
+
+fn canonical_local_artifacts_root(path: &Path) -> Result<PathBuf, DynError> {
+    let root = path.canonicalize().map_err(|error| {
+        format!(
+            "Invalid local backend artifacts directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if !root.is_dir() {
+        return Err(format!(
+            "Local backend artifacts path is not a directory: {}",
+            root.display()
+        )
+        .into());
+    }
+    Ok(root)
+}
+
+fn local_backend_artifact(
+    manager: &BackendManager,
+    pack: &BackendPackManifest,
+    root: &Path,
+) -> Result<PathBuf, DynError> {
+    let file_name = pack
+        .artifact
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Signed backend artifact URL has no filename for {}/{}: {}",
+                pack.backend, pack.profile, pack.artifact
+            )
+        })?;
+    let relative = Path::new(file_name);
+    if relative.components().count() != 1
+        || !matches!(relative.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(format!(
+            "Signed backend artifact URL has an unsafe filename for {}/{}: {}",
+            pack.backend, pack.profile, pack.artifact
+        )
+        .into());
+    }
+    let candidate = root.join(relative).canonicalize().map_err(|error| {
+        format!(
+            "Local backend artifact {} for {}/{} is unavailable: {error}",
+            root.join(relative).display(),
+            pack.backend,
+            pack.profile
+        )
+    })?;
+    if !candidate.starts_with(root) || !candidate.is_file() {
+        return Err(format!(
+            "Local backend artifact escapes its configured directory or is not a file: {}",
+            candidate.display()
+        )
+        .into());
+    }
+    manager.verify_pack_archive(pack, &candidate)?;
+    Ok(candidate)
 }
 
 /// Resolve any bundle arguments to persistent embedded `.aimod` paths. Bundle
@@ -1132,6 +1205,7 @@ mod tests {
             profile: MANAGED_VLLM_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: BACKEND_RUNTIME_ABI,
+            adapter_abi: None,
             compatible_kapsl: format!("={}", runtime_release_version()),
             platform: "linux-x86_64".to_string(),
             architecture: "x86_64".to_string(),
@@ -1141,7 +1215,7 @@ mod tests {
             execution_mode: BackendExecutionMode::External,
             kv_mode: None,
             entrypoint: "bin/python".to_string(),
-            artifact: format!("file://{}", artifact.display()),
+            artifact: "https://downloads.kapsl.test/vllm.tar.gz".to_string(),
             download_bytes: fs::metadata(&artifact).unwrap().len(),
             installed_bytes: 4096,
             sha256: digest.clone(),
@@ -1191,6 +1265,7 @@ mod tests {
             profile: crate::backend::ONNX_CPU_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: BACKEND_RUNTIME_ABI,
+            adapter_abi: None,
             compatible_kapsl: format!("={}", runtime_release_version()),
             platform: "linux-x86_64".to_string(),
             architecture: "x86_64".to_string(),
@@ -1200,7 +1275,7 @@ mod tests {
             execution_mode: BackendExecutionMode::Native,
             kv_mode: None,
             entrypoint: "libkapsl_backend_onnx.so".to_string(),
-            artifact: format!("file://{}", onnx_artifact.display()),
+            artifact: "https://downloads.kapsl.test/onnx-cpu.tar.gz".to_string(),
             download_bytes: fs::metadata(&onnx_artifact).unwrap().len(),
             installed_bytes: 4096,
             sha256: onnx_digest.clone(),
@@ -1254,6 +1329,7 @@ mod tests {
             profile: crate::backend::LLAMA_CPP_CPU_PACK_PROFILE.to_string(),
             pack_version: "test".to_string(),
             runtime_abi: BACKEND_RUNTIME_ABI,
+            adapter_abi: None,
             compatible_kapsl: format!("={}", runtime_release_version()),
             platform: "linux-x86_64".to_string(),
             architecture: "x86_64".to_string(),
@@ -1263,7 +1339,7 @@ mod tests {
             execution_mode: BackendExecutionMode::Native,
             kv_mode: Some("native".to_string()),
             entrypoint: "lib/libkapsl_backend_llama_cpp.so".to_string(),
-            artifact: format!("file://{}", llama_artifact.display()),
+            artifact: "https://downloads.kapsl.test/llama-cpp-cpu.tar.gz".to_string(),
             download_bytes: fs::metadata(&llama_artifact).unwrap().len(),
             installed_bytes: 4096,
             sha256: llama_digest.clone(),
@@ -1404,6 +1480,27 @@ mod tests {
     }
 
     #[test]
+    fn local_bundle_artifact_must_match_its_signed_index_entry() {
+        let (root, manager) = bundle_manager_fixture();
+        let index = manager.load_index().unwrap();
+        let pack = index
+            .packs
+            .iter()
+            .find(|pack| pack.backend == "onnx" && pack.profile == "cpu")
+            .unwrap();
+        let artifacts = root.path().join("tampered-artifacts");
+        fs::create_dir(&artifacts).unwrap();
+        let artifacts = artifacts.canonicalize().unwrap();
+        let file_name = pack.artifact.rsplit('/').next().unwrap();
+        fs::write(artifacts.join(file_name), b"not the signed archive").unwrap();
+
+        let error = local_backend_artifact(&manager, pack, &artifacts)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("size mismatch") || error.contains("checksum mismatch"));
+    }
+
+    #[test]
     fn single_model_offline_bundle_round_trips_from_cache() {
         let (root, manager) = bundle_manager_fixture();
         let model = package_model(root.path(), "model", false, None);
@@ -1413,6 +1510,7 @@ mod tests {
             model: vec![model],
             output: output.clone(),
             target: Some(format!("{}-cpu", current_platform())),
+            backend_artifacts_dir: Some(root.path().to_path_buf()),
         };
         create_bundle(&args, &info, &manager).unwrap();
 
@@ -1439,6 +1537,7 @@ mod tests {
                 model: vec![model_a, model_b],
                 output: output.clone(),
                 target: Some("linux-x86_64-cpu".to_string()),
+                backend_artifacts_dir: Some(root.path().to_path_buf()),
             },
             &DeviceInfo::probe(),
             &manager,
@@ -1466,6 +1565,7 @@ mod tests {
                 model: vec![model_a, model_b],
                 output: output.clone(),
                 target: Some("linux-x86_64-cpu".to_string()),
+                backend_artifacts_dir: Some(root.path().to_path_buf()),
             },
             &DeviceInfo::probe(),
             &manager,
@@ -1494,6 +1594,7 @@ mod tests {
                 model: vec![model],
                 output: output.clone(),
                 target: Some("linux-x86_64-cpu".to_string()),
+                backend_artifacts_dir: Some(root.path().to_path_buf()),
             },
             &info,
             &manager,
@@ -1538,6 +1639,7 @@ mod tests {
             model: vec![model_a, model_b],
             output: output.clone(),
             target: Some("linux-x86_64-cuda".to_string()),
+            backend_artifacts_dir: Some(root.path().to_path_buf()),
         };
         create_bundle(&args, &DeviceInfo::probe(), &manager).unwrap();
 
@@ -1559,6 +1661,7 @@ mod tests {
                 model: vec![model],
                 output: output.clone(),
                 target: Some(format!("{}-cpu", current_platform())),
+                backend_artifacts_dir: Some(root.path().to_path_buf()),
             },
             &info,
             &manager,

@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "conformance": {
+    "repository": "kapsl-runtime/kapsl-integrations",
+    "path": "integrations/ort/conformance/parity.py",
+    "entrypoint_sha256": "fe03da5c49e70957e022b8983936a0228221914860557b65da5f5f5f8268ea3c"
+  },
+  "model": {
+    "repository": "kapsl-runtime/kapsl-sdk",
+    "commit": "676720d168d8c7eb2ed1e4fe5786d331bd76b6dc",
+    "path": "crates/kapsl-backends/tests/fixtures/identity_logits.onnx",
+    "sha256": "3f5d32c1415ef48416a9d7745f51d30a663af119151cd9eaf548747dbd94bd70"
+  }
+}

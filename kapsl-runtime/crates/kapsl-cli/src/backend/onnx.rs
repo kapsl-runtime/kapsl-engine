@@ -5,8 +5,8 @@
 //! pack-local absolute path. It deliberately never mutates `LD_LIBRARY_PATH`.
 
 use crate::backend::{
-    activate_native_backend_pack, generic_native_backend_packs_enabled, BackendAccelerator,
-    BackendManager, BackendPackManifest, BackendTarget, OnnxBackendPackProfile,
+    activate_native_backend_pack, generic_native_backend_packs_enabled, guarded_host_memory_bytes,
+    BackendAccelerator, BackendManager, BackendPackManifest, BackendTarget, OnnxBackendPackProfile,
     ONNX_CPU_PACK_PROFILE, ONNX_CUDA12_PACK_PROFILE, ONNX_TENSORRT10_PACK_PROFILE,
 };
 use crate::runtime::{provider_policy, select_mesh_devices, MemoryDomain, MemorySnapshot};
@@ -247,6 +247,16 @@ pub(crate) fn ensure_onnx_backend_pack(
     let pack_plan = manager
         .plan_onnx(profile, &target)
         .map_err(|error| error.to_string())?;
+    let standard_adapter = pack_plan.manifest.adapter_abi.as_deref()
+        == Some(crate::backend::STANDARD_NATIVE_ADAPTER_ABI);
+    if standard_adapter && !generic_native_backend_packs_enabled()? {
+        log::debug!(
+            "Signed standard-ABI ONNX pack {}/{} is available, but generic native packs are disabled; using the embedded ORT rollback",
+            pack_plan.manifest.backend,
+            pack_plan.manifest.profile
+        );
+        return Ok(None);
+    }
     preliminary_memory_admission(
         profile,
         model_path,
@@ -258,7 +268,7 @@ pub(crate) fn ensure_onnx_backend_pack(
     let installed = manager
         .ensure_pack(&pack_plan.manifest)
         .map_err(|error| error.to_string())?;
-    if generic_native_backend_packs_enabled()? {
+    if standard_adapter {
         activate_native_backend_pack(&pack_plan.manifest, &installed)?;
     } else {
         activate_onnx_pack(&pack_plan.manifest, &installed)?;
@@ -296,10 +306,9 @@ fn preliminary_memory_admission(
         .saturating_add(estimated_workspace)
         .saturating_add(fixed);
     let physical_available = match profile {
-        OnnxBackendPackProfile::Cpu => device_info
-            .total_memory
-            .saturating_mul(100 - PRELIMINARY_MEMORY_GUARD_PERCENT)
-            .saturating_div(100),
+        OnnxBackendPackProfile::Cpu => {
+            guarded_host_memory_bytes(device_info.total_memory, PRELIMINARY_MEMORY_GUARD_PERCENT)
+        }
         OnnxBackendPackProfile::Cuda12 | OnnxBackendPackProfile::TensorRt10 => device_info
             .devices
             .iter()
@@ -616,6 +625,36 @@ mod tests {
         }
     }
 
+    fn backend_pack(profile: &str, accelerator_profile: &str) -> BackendPackManifest {
+        BackendPackManifest {
+            schema_version: 1,
+            backend: "onnx".to_string(),
+            profile: profile.to_string(),
+            pack_version: "test".to_string(),
+            runtime_abi: 1,
+            adapter_abi: None,
+            compatible_kapsl: "=0.2.3".to_string(),
+            platform: crate::backend::current_platform(),
+            architecture: std::env::consts::ARCH.to_string(),
+            accelerator_profile: accelerator_profile.to_string(),
+            minimum_cuda: None,
+            minimum_driver: None,
+            execution_mode: crate::backend::BackendExecutionMode::Native,
+            kv_mode: None,
+            entrypoint: "libkapsl_backend_onnx.so".to_string(),
+            artifact: "https://downloads.kapsl.net/fixture.tar.gz".to_string(),
+            download_bytes: 1,
+            installed_bytes: 1,
+            sha256: "0".repeat(64),
+            signature: "fixture".to_string(),
+            memory: crate::backend::BackendMemoryManifest::default(),
+            installer: crate::backend::BackendInstaller::Extract,
+            files: std::collections::BTreeMap::new(),
+            licenses: Vec::new(),
+            priority: 0,
+        }
+    }
+
     #[test]
     fn target_resolution_never_auto_selects_tensorrt() {
         let automatic = onnx_manifest(None, &[]);
@@ -666,38 +705,42 @@ mod tests {
     }
 
     #[test]
+    fn preliminary_cpu_admission_treats_host_capacity_as_kib() {
+        let model = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(model.path(), vec![0_u8; 1024]).unwrap();
+        let pack = backend_pack(crate::backend::ONNX_CPU_PACK_PROFILE, "cpu");
+        let info = DeviceInfo {
+            cpu_cores: 4,
+            // DeviceInfo reports host capacity in KiB: this is one GiB.
+            total_memory: 1024 * 1024,
+            os_type: "linux".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: false,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: Vec::new(),
+        };
+
+        preliminary_memory_admission(
+            OnnxBackendPackProfile::Cpu,
+            model.path(),
+            &info,
+            &pack,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn preliminary_gpu_rejection_happens_before_pack_installation() {
         let model = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(model.path(), vec![0_u8; 1024]).unwrap();
-        let pack = BackendPackManifest {
-            schema_version: 1,
-            backend: "onnx".to_string(),
-            profile: crate::backend::ONNX_CUDA12_PACK_PROFILE.to_string(),
-            pack_version: "test".to_string(),
-            runtime_abi: 1,
-            compatible_kapsl: "=0.2.3".to_string(),
-            platform: crate::backend::current_platform(),
-            architecture: std::env::consts::ARCH.to_string(),
-            accelerator_profile: "cuda".to_string(),
-            minimum_cuda: None,
-            minimum_driver: None,
-            execution_mode: crate::backend::BackendExecutionMode::Native,
-            kv_mode: None,
-            entrypoint: "libkapsl_backend_onnx.so".to_string(),
-            artifact: "https://downloads.kapsl.net/fixture.tar.gz".to_string(),
-            download_bytes: 1,
-            installed_bytes: 1,
-            sha256: "0".repeat(64),
-            signature: "fixture".to_string(),
-            memory: crate::backend::BackendMemoryManifest::default(),
-            installer: crate::backend::BackendInstaller::Extract,
-            files: std::collections::BTreeMap::new(),
-            licenses: Vec::new(),
-            priority: 0,
-        };
+        let pack = backend_pack(crate::backend::ONNX_CUDA12_PACK_PROFILE, "cuda");
         let info = DeviceInfo {
             cpu_cores: 4,
-            total_memory: 8 * 1024 * 1024 * 1024,
+            total_memory: 8 * 1024 * 1024,
             os_type: "linux".to_string(),
             os_release: "test".to_string(),
             has_cuda: true,

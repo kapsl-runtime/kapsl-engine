@@ -10,7 +10,10 @@ mod shared_pool;
 use self::shared_pool::host_log_bridge;
 #[cfg(feature = "gpu-device-pool")]
 use self::shared_pool::LlamaCppSharedPoolHost;
-use super::{inspect_model_weight_bytes, MemoryAdmissionStatus, PreliminaryMemoryAdmission};
+use super::{
+    guarded_host_memory_bytes, inspect_model_weight_bytes, MemoryAdmissionStatus,
+    PreliminaryMemoryAdmission,
+};
 use super::{
     BackendAccelerator, BackendManager, BackendPackManifest, BackendTarget,
     LlamaCppBackendPackProfile,
@@ -236,10 +239,9 @@ pub(crate) fn preliminary_llama_cpp_memory_admission(
             .saturating_add(fixed)
     });
     let physical_available = match profile {
-        LlamaCppBackendPackProfile::Cpu => device_info
-            .total_memory
-            .saturating_mul(100 - PRELIMINARY_MEMORY_GUARD_PERCENT)
-            .saturating_div(100),
+        LlamaCppBackendPackProfile::Cpu => {
+            guarded_host_memory_bytes(device_info.total_memory, PRELIMINARY_MEMORY_GUARD_PERCENT)
+        }
         LlamaCppBackendPackProfile::Cuda12 => device_info
             .devices
             .iter()
@@ -1131,6 +1133,36 @@ mod tests {
         }
     }
 
+    fn cpu_backend_pack() -> BackendPackManifest {
+        BackendPackManifest {
+            schema_version: 1,
+            backend: "llama_cpp".to_string(),
+            profile: crate::backend::LLAMA_CPP_CPU_PACK_PROFILE.to_string(),
+            pack_version: "test".to_string(),
+            runtime_abi: 1,
+            adapter_abi: None,
+            compatible_kapsl: "=0.2.3".to_string(),
+            platform: crate::backend::current_platform(),
+            architecture: std::env::consts::ARCH.to_string(),
+            accelerator_profile: "cpu".to_string(),
+            minimum_cuda: None,
+            minimum_driver: None,
+            execution_mode: crate::backend::BackendExecutionMode::Native,
+            kv_mode: Some("native".to_string()),
+            entrypoint: "libkapsl_backend_llama_cpp.so".to_string(),
+            artifact: "https://downloads.kapsl.net/fixture.tar.gz".to_string(),
+            download_bytes: 1,
+            installed_bytes: 1,
+            sha256: "0".repeat(64),
+            signature: "fixture".to_string(),
+            memory: crate::backend::BackendMemoryManifest::default(),
+            installer: crate::backend::BackendInstaller::Extract,
+            files: std::collections::BTreeMap::new(),
+            licenses: Vec::new(),
+            priority: 0,
+        }
+    }
+
     #[test]
     fn portable_build_selects_cpu_pack_for_gguf() {
         let manifest = manifest("gguf");
@@ -1151,6 +1183,39 @@ mod tests {
             llama_cpp_pack_profile_for_target(&manifest, BackendAccelerator::Cpu),
             None
         );
+    }
+
+    #[test]
+    fn preliminary_cpu_admission_treats_host_capacity_as_kib() {
+        let model = tempfile::Builder::new()
+            .suffix(".safetensors")
+            .tempfile()
+            .unwrap();
+        std::fs::write(model.path(), vec![0_u8; 1024]).unwrap();
+        let info = DeviceInfo {
+            cpu_cores: 4,
+            // DeviceInfo reports host capacity in KiB: this is one GiB.
+            total_memory: 1024 * 1024,
+            os_type: "linux".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: false,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: Vec::new(),
+        };
+
+        let admission = preliminary_llama_cpp_memory_admission(
+            LlamaCppBackendPackProfile::Cpu,
+            model.path(),
+            &manifest("safetensors"),
+            &info,
+            &cpu_backend_pack(),
+            None,
+        )
+        .unwrap();
+        assert_ne!(admission.status, MemoryAdmissionStatus::Rejected);
+        assert_eq!(admission.available_bytes, Some(1024 * 1024 * 1024 * 9 / 10));
     }
 
     #[test]
