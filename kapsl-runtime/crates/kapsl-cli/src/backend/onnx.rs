@@ -5,7 +5,8 @@
 //! pack-local absolute path. It deliberately never mutates `LD_LIBRARY_PATH`.
 
 use crate::backend::{
-    BackendAccelerator, BackendManager, BackendPackManifest, BackendTarget, OnnxBackendPackProfile,
+    activate_native_backend_pack, generic_native_backend_packs_enabled, BackendAccelerator,
+    BackendManager, BackendPackManifest, BackendTarget, OnnxBackendPackProfile,
     ONNX_CPU_PACK_PROFILE, ONNX_CUDA12_PACK_PROFILE, ONNX_TENSORRT10_PACK_PROFILE,
 };
 use crate::runtime::{provider_policy, select_mesh_devices, MemoryDomain, MemorySnapshot};
@@ -257,7 +258,11 @@ pub(crate) fn ensure_onnx_backend_pack(
     let installed = manager
         .ensure_pack(&pack_plan.manifest)
         .map_err(|error| error.to_string())?;
-    activate_onnx_pack(&pack_plan.manifest, &installed)?;
+    if generic_native_backend_packs_enabled()? {
+        activate_native_backend_pack(&pack_plan.manifest, &installed)?;
+    } else {
+        activate_onnx_pack(&pack_plan.manifest, &installed)?;
+    }
     Ok(Some(installed))
 }
 

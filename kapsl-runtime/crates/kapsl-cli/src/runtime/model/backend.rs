@@ -422,6 +422,12 @@ pub(super) fn create_runtime_backend_for_device(
         }
     }
 
+    if engine_kind.uses_onnx_session() && generic_native_backend_packs_enabled()? {
+        return create_native_backend_pack_engine(
+            manifest, provider, resources, device_id, model_id, replica_id, tuning,
+        );
+    }
+
     if engine_kind.is_onnx_generate() {
         // The SDK's automatic ONNX-generate constructor may fall back to CPU.
         // Bind the exact provider chosen by Kapsl policy so a missing CUDA or

@@ -74,6 +74,25 @@ metadata, and license notices. Linux x86_64 is the first published ONNX pack
 platform; other platforms retain their eager in-process provider layout during
 the beta rollout.
 
+The backend-neutral native-pack host is available as a migration and
+certification gate through `KAPSL_GENERIC_NATIVE_PACKS=1`. With that gate on,
+an ONNX pack must export the published `kapsl-backend-abi` v1 entrypoint and
+Kapsl will not construct the embedded ORT backend if loading or initialization
+fails. The signed accelerator profile must exactly match the adapter's CPU,
+CUDA, or TensorRT capability bits. CUDA and TensorRT adapters must allocate
+device memory through the runtime-owned `GpuDevicePool` callbacks.
+
+This path stays in-process: tensor buffers cross the adapter boundary as
+borrowed views, and ORT's allocator forwards directly to the same Kapsl-owned
+pool. It introduces no backend RPC, CUDA IPC, tensor serialization, or second
+GPU allocation authority. The host supplies the canonical signed-pack root and
+the resolved per-model ORT tuning in initialization options, so the adapter can
+resolve only pack-local runtime libraries and does not reread competing process
+configuration. The gate defaults off until the out-of-tree ORT adapter has
+passed CPU parity, GPU memory-ownership, unload/reload, and stable release
+conformance. An invalid gate value is an error rather than a request to fall
+back.
+
 Inspect a decision without running the model:
 
 ```bash
@@ -169,6 +188,7 @@ connected machine.
 | `KAPSL_OFFLINE=1` | Disable backend-index and artifact network access. |
 | `KAPSL_LAZY_BACKENDS=0` | Disable automatic lazy installation and require a preinstalled backend. |
 | `KAPSL_LAZY_ONNX_PACKS=0` | Keep the eager/legacy ONNX provider layout during the compatibility window. Linux x86_64 defaults to lazy ONNX packs. |
+| `KAPSL_GENERIC_NATIVE_PACKS=1` | Certification-only gate for backend-neutral ABI v1 ONNX packs. It defaults off and fails closed; it does not fall back to embedded ORT. |
 | `KAPSL_LAZY_LLAMA_CPP_PACKS=0` | Keep the eager/compiled llama.cpp layout. The portable Linux x86_64 core defaults to lazy CPU packs when no eager GGUF feature is compiled. |
 | `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1` | Explicitly allow a signed CUDA pack whose `kv_mode` is `native`. Shared-pool packs and the eager shared-KV profile do not require or consume this rollback override. |
 | `KAPSL_PROVIDER_PATH` | Additional Kapsl provider-manifest roots. Verified lazy ONNX pack roots are appended automatically; this is not a loader search path. |
