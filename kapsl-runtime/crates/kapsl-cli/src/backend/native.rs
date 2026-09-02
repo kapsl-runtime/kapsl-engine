@@ -35,6 +35,7 @@ const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";
 const MAX_JSON_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESULT_TENSORS: usize = 1024;
 const MAX_TENSOR_RANK: usize = 32;
+const NATIVE_STREAM_BUFFER_CHUNKS: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -488,15 +489,88 @@ impl Drop for NativeCancellationWatches {
     }
 }
 
-fn native_cancellation_runtime() -> Result<tokio::runtime::Handle, String> {
+struct NativeStreamCallbackContext {
+    sender: async_channel::Sender<Result<BinaryTensorPacket, EngineError>>,
+    callback_error: Option<EngineError>,
+    consumer_closed: bool,
+}
+
+unsafe extern "C" fn native_stream_chunk(
+    user_data: *mut c_void,
+    _request_id: u64,
+    result: *const KapslInferenceResultV1,
+) -> i32 {
+    if user_data.is_null() {
+        return KAPSL_STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: dispatch_stream retains this context until infer_stream returns.
+    let context = unsafe { &mut *user_data.cast::<NativeStreamCallbackContext>() };
+    if context.consumer_closed {
+        return KAPSL_STATUS_CANCELLED;
+    }
+    if context.callback_error.is_some() {
+        return KAPSL_STATUS_BACKEND_ERROR;
+    }
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let packet = if result.is_null() {
+            Err(EngineError::backend(
+                "native backend stream callback received a null result",
+            ))
+        } else {
+            // SAFETY: stream chunks are borrowed for this callback invocation.
+            copy_single_result(unsafe { &*result })
+        };
+        match packet {
+            Ok(packet) => match context.sender.send_blocking(Ok(packet)) {
+                Ok(()) => KAPSL_STATUS_OK,
+                Err(_) => {
+                    context.consumer_closed = true;
+                    KAPSL_STATUS_CANCELLED
+                }
+            },
+            Err(error) => {
+                context.callback_error = Some(error);
+                KAPSL_STATUS_BACKEND_ERROR
+            }
+        }
+    }))
+    .unwrap_or_else(|_| {
+        context.callback_error = Some(EngineError::backend(
+            "native backend stream callback panicked",
+        ));
+        KAPSL_STATUS_PANIC
+    })
+}
+
+struct NativeStreamDropGuard {
+    target: Arc<NativeCancelTarget>,
+    request_id: u64,
+    completed: Arc<AtomicBool>,
+}
+
+impl Drop for NativeStreamDropGuard {
+    fn drop(&mut self) {
+        if !self.completed.load(Ordering::Acquire) {
+            let _ = self.target.cancel(self.request_id);
+        }
+    }
+}
+
+struct NativeStreamReceiver {
+    receiver: async_channel::Receiver<Result<BinaryTensorPacket, EngineError>>,
+    _drop_guard: NativeStreamDropGuard,
+}
+
+fn native_bridge_runtime() -> Result<tokio::runtime::Handle, String> {
     static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     match RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
-            .thread_name("kapsl-native-cancel")
+            .thread_name("kapsl-native-bridge")
             .build()
-            .map_err(|error| format!("create native backend cancellation runtime: {error}"))
+            .map_err(|error| format!("create native backend bridge runtime: {error}"))
     }) {
         Ok(runtime) => Ok(runtime.handle().clone()),
         Err(error) => Err(error.clone()),
@@ -519,7 +593,7 @@ impl NativePackInstance {
             pack.api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
         let supports_cancellation = pack.api.capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0;
         let cancellation_runtime = supports_cancellation
-            .then(native_cancellation_runtime)
+            .then(native_bridge_runtime)
             .transpose()?;
         let host = NativeBackendHost::new(
             resources,
@@ -793,6 +867,133 @@ impl NativePackInstance {
         copy_single_result(&result)
     }
 
+    fn infer_stream(self: &Arc<Self>, request: InferenceRequest) -> EngineStream {
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Box::pin(futures::stream::once(async {
+                Err(EngineError::cancelled(
+                    "native backend stream was cancelled before dispatch",
+                ))
+            }));
+        }
+        let request_id = match self.next_request_id() {
+            Ok(request_id) => request_id,
+            Err(error) => return Box::pin(futures::stream::once(async move { Err(error) })),
+        };
+        let runtime = match native_bridge_runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return Box::pin(futures::stream::once(async move {
+                    Err(EngineError::backend(error))
+                }))
+            }
+        };
+        let (sender, receiver) = async_channel::bounded(NATIVE_STREAM_BUFFER_CHUNKS);
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let instance = Arc::clone(self);
+        runtime.spawn_blocking(move || {
+            // Keep this sender alive until completion is published. Otherwise
+            // the receiver can observe a closed channel in the small window
+            // between dispatch_stream returning and the flag store, and its
+            // drop guard would issue a late cancellation for completed work.
+            instance.dispatch_stream(request_id, &request, sender.clone());
+            worker_completed.store(true, Ordering::Release);
+        });
+
+        let state = NativeStreamReceiver {
+            receiver,
+            _drop_guard: NativeStreamDropGuard {
+                target: Arc::clone(&self.cancel_target),
+                request_id,
+                completed,
+            },
+        };
+        Box::pin(futures::stream::unfold(state, |state| async move {
+            state.receiver.recv().await.ok().map(|item| (item, state))
+        }))
+    }
+
+    fn dispatch_stream(
+        &self,
+        request_id: u64,
+        request: &InferenceRequest,
+        sender: async_channel::Sender<Result<BinaryTensorPacket, EngineError>>,
+    ) {
+        let terminal = (|| -> Result<(), EngineError> {
+            let mut bridge = RequestBridge::new(request)?;
+            let wire = bridge.wire(request_id);
+            let _guard = self.inference_guard();
+            let _cancellation_watches = self.watch_cancellations(
+                request
+                    .cancellation
+                    .clone()
+                    .map(|cancellation| (request_id, cancellation)),
+            );
+            let mut context = NativeStreamCallbackContext {
+                sender: sender.clone(),
+                callback_error: None,
+                consumer_closed: false,
+            };
+            let mut error = KapslOwnedBuffer::empty();
+            // SAFETY: the request bridge and callback context remain live until
+            // the synchronous stream call returns. Every chunk is copied in the
+            // callback before the adapter may reuse its borrowed storage.
+            let status = unsafe {
+                self.pack
+                    .api
+                    .infer_stream
+                    .expect("streaming capability validated infer-stream function")(
+                    self.handle,
+                    &wire,
+                    (&mut context as *mut NativeStreamCallbackContext).cast(),
+                    Some(native_stream_chunk),
+                    &mut error,
+                )
+            };
+            let status_error = if status == KAPSL_STATUS_OK {
+                if !error.ptr.is_null() {
+                    let _ = take_owned_buffer(
+                        &self.pack.api,
+                        error,
+                        "unexpected successful stream error",
+                    );
+                }
+                None
+            } else {
+                Some(status_engine_error(
+                    status,
+                    read_ffi_error(&self.pack.api, status, error),
+                ))
+            };
+            if context.consumer_closed {
+                return Ok(());
+            }
+            if let Some(error) = context.callback_error {
+                return Err(error);
+            }
+            if let Some(error) = status_error {
+                return Err(error);
+            }
+            if request
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                return Err(EngineError::cancelled(
+                    "native backend stream was cancelled during execution",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = terminal {
+            let _ = sender.send_blocking(Err(error));
+        }
+    }
+
     fn infer_batch(
         &self,
         requests: &[InferenceRequest],
@@ -1055,8 +1256,12 @@ impl Engine for NativePackedEngine {
     }
 
     fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
-        let result = self.infer(request);
-        Box::pin(futures::stream::once(async move { result }))
+        if self.instance.pack.api.capabilities & KAPSL_BACKEND_CAP_STREAMING != 0 {
+            self.instance.infer_stream(request.clone())
+        } else {
+            let result = self.infer(request);
+            Box::pin(futures::stream::once(async move { result }))
+        }
     }
 
     fn unload(&mut self) {
@@ -1989,6 +2194,16 @@ mod tests {
         KAPSL_STATUS_OK
     }
 
+    unsafe extern "C" fn infer_stream(
+        _handle: *mut c_void,
+        _request: *const KapslInferenceRequestV1,
+        _user_data: *mut c_void,
+        _on_chunk: Option<KapslBackendStreamChunkFn>,
+        _error: *mut KapslOwnedBuffer,
+    ) -> i32 {
+        KAPSL_STATUS_OK
+    }
+
     unsafe extern "C" fn cancel(handle: *mut c_void, request_id: u64) -> i32 {
         if handle.is_null() {
             return KAPSL_STATUS_OK;
@@ -2046,7 +2261,11 @@ mod tests {
             planned_request_memory: Some(request_report),
             infer: Some(infer),
             infer_batch: None,
-            infer_stream: None,
+            infer_stream: if capabilities & KAPSL_BACKEND_CAP_STREAMING != 0 {
+                Some(infer_stream)
+            } else {
+                None
+            },
             cancel: if capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0 {
                 Some(cancel)
             } else {
@@ -2186,8 +2405,21 @@ mod tests {
     }
 
     #[test]
+    fn streaming_capability_requires_and_accepts_the_stream_hook() {
+        let capabilities = KAPSL_BACKEND_CAP_CPU
+            | KAPSL_BACKEND_CAP_MEMORY_REPORTING
+            | KAPSL_BACKEND_CAP_STREAMING;
+        let streaming = complete_api(capabilities);
+        assert!(validate_native_backend_api(&test_manifest("cpu"), &streaming).is_ok());
+
+        let mut contradictory = streaming;
+        contradictory.infer_stream = None;
+        assert!(validate_native_backend_api(&test_manifest("cpu"), &contradictory).is_err());
+    }
+
+    #[test]
     fn cancellation_token_invokes_native_hook_on_dedicated_runtime() {
-        let runtime = native_cancellation_runtime().unwrap();
+        let runtime = native_bridge_runtime().unwrap();
         let probe = Box::new(CancelProbe::default());
         let handle = (&*probe as *const CancelProbe).cast_mut().cast::<c_void>();
         let target = Arc::new(NativeCancelTarget::new(handle, Some(cancel)));
@@ -2213,6 +2445,48 @@ mod tests {
         drop(watches);
         target.deactivate();
         assert_eq!(target.cancel(92), None);
+    }
+
+    #[test]
+    fn dropping_an_unfinished_native_stream_invokes_the_cancel_hook() {
+        let probe = Box::new(CancelProbe::default());
+        let handle = (&*probe as *const CancelProbe).cast_mut().cast::<c_void>();
+        let target = Arc::new(NativeCancelTarget::new(handle, Some(cancel)));
+        let completed = Arc::new(AtomicBool::new(false));
+        drop(NativeStreamDropGuard {
+            target: Arc::clone(&target),
+            request_id: 93,
+            completed,
+        });
+        assert_eq!(
+            *probe
+                .request_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(93)
+        );
+        target.deactivate();
+    }
+
+    #[test]
+    fn dropping_a_completed_native_stream_does_not_cancel_it() {
+        let probe = Box::new(CancelProbe::default());
+        let handle = (&*probe as *const CancelProbe).cast_mut().cast::<c_void>();
+        let target = Arc::new(NativeCancelTarget::new(handle, Some(cancel)));
+        let completed = Arc::new(AtomicBool::new(true));
+        drop(NativeStreamDropGuard {
+            target: Arc::clone(&target),
+            request_id: 94,
+            completed,
+        });
+        assert_eq!(
+            *probe
+                .request_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None
+        );
+        target.deactivate();
     }
 
     #[test]
@@ -2290,6 +2564,173 @@ mod tests {
         assert!(copy_output_tensor(&output).is_ok());
         output.tensor.flags = KAPSL_TENSOR_FLAG_CONTIGUOUS | (1 << 31);
         assert!(copy_output_tensor(&output).is_err());
+    }
+
+    #[test]
+    fn stream_callback_copies_borrowed_chunks_into_the_bounded_bridge() {
+        let (sender, receiver) = async_channel::bounded(1);
+        let mut context = NativeStreamCallbackContext {
+            sender,
+            callback_error: None,
+            consumer_closed: false,
+        };
+        let shape = [1_i64, 5_i64];
+        let mut data = b"hello".to_vec();
+        let output = KapslNamedTensorViewV1 {
+            struct_size: std::mem::size_of::<KapslNamedTensorViewV1>() as u32,
+            reserved: 0,
+            name: KapslSlice::from_bytes(b"token"),
+            tensor: KapslTensorViewV1 {
+                struct_size: std::mem::size_of::<KapslTensorViewV1>() as u32,
+                dtype: KAPSL_DTYPE_UTF8,
+                memory_kind: KAPSL_MEMORY_HOST,
+                flags: KAPSL_TENSOR_FLAG_CONTIGUOUS | KAPSL_TENSOR_FLAG_READ_ONLY,
+                device_id: -1,
+                rank: shape.len() as u32,
+                shape: shape.as_ptr(),
+                strides: std::ptr::null(),
+                data: data.as_ptr().cast(),
+                byte_len: data.len() as u64,
+            },
+        };
+        let result = KapslInferenceResultV1 {
+            struct_size: std::mem::size_of::<KapslInferenceResultV1>() as u32,
+            output_count: 1,
+            outputs: &output,
+            metadata_json: KapslSlice::empty(),
+            owner_context: std::ptr::null_mut(),
+        };
+        // SAFETY: every borrowed callback value remains live for this call.
+        assert_eq!(
+            unsafe {
+                native_stream_chunk(
+                    (&mut context as *mut NativeStreamCallbackContext).cast(),
+                    9,
+                    &result,
+                )
+            },
+            KAPSL_STATUS_OK
+        );
+        data.fill(b'x');
+        let packet = receiver.recv_blocking().expect("stream chunk").unwrap();
+        assert_eq!(packet.dtype, TensorDtype::Utf8);
+        assert_eq!(packet.shape, vec![1, 5]);
+        assert_eq!(packet.data, b"hello");
+    }
+
+    #[test]
+    fn stream_callback_applies_backpressure_when_the_bounded_bridge_is_full() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender
+            .send_blocking(Err(EngineError::backend("occupied")))
+            .unwrap();
+        let producer = std::thread::spawn(move || {
+            let mut context = NativeStreamCallbackContext {
+                sender,
+                callback_error: None,
+                consumer_closed: false,
+            };
+            let shape = [1_i64];
+            let data = *b"x";
+            let output = KapslNamedTensorViewV1 {
+                struct_size: std::mem::size_of::<KapslNamedTensorViewV1>() as u32,
+                reserved: 0,
+                name: KapslSlice::from_bytes(b"token"),
+                tensor: KapslTensorViewV1 {
+                    struct_size: std::mem::size_of::<KapslTensorViewV1>() as u32,
+                    dtype: KAPSL_DTYPE_UTF8,
+                    memory_kind: KAPSL_MEMORY_HOST,
+                    flags: KAPSL_TENSOR_FLAG_CONTIGUOUS,
+                    device_id: -1,
+                    rank: 1,
+                    shape: shape.as_ptr(),
+                    strides: std::ptr::null(),
+                    data: data.as_ptr().cast(),
+                    byte_len: 1,
+                },
+            };
+            let result = KapslInferenceResultV1 {
+                struct_size: std::mem::size_of::<KapslInferenceResultV1>() as u32,
+                output_count: 1,
+                outputs: &output,
+                metadata_json: KapslSlice::empty(),
+                owner_context: std::ptr::null_mut(),
+            };
+            // SAFETY: every borrowed callback value remains live for this call.
+            let status = unsafe {
+                native_stream_chunk(
+                    (&mut context as *mut NativeStreamCallbackContext).cast(),
+                    10,
+                    &result,
+                )
+            };
+            (
+                status,
+                context.consumer_closed,
+                context.callback_error.is_none(),
+            )
+        });
+
+        assert!(receiver.recv_blocking().expect("occupied slot").is_err());
+        let (status, consumer_closed, callback_clean) = producer.join().unwrap();
+        assert_eq!(status, KAPSL_STATUS_OK);
+        assert!(!consumer_closed);
+        assert!(callback_clean);
+        let packet = receiver
+            .recv_blocking()
+            .expect("backpressured stream chunk")
+            .unwrap();
+        assert_eq!(packet.data, b"x");
+    }
+
+    #[test]
+    fn stream_callback_cancels_when_the_bounded_bridge_is_closed() {
+        let (sender, receiver) = async_channel::bounded(1);
+        drop(receiver);
+        let mut context = NativeStreamCallbackContext {
+            sender,
+            callback_error: None,
+            consumer_closed: false,
+        };
+        let shape = [1_i64];
+        let data = *b"x";
+        let output = KapslNamedTensorViewV1 {
+            struct_size: std::mem::size_of::<KapslNamedTensorViewV1>() as u32,
+            reserved: 0,
+            name: KapslSlice::from_bytes(b"token"),
+            tensor: KapslTensorViewV1 {
+                struct_size: std::mem::size_of::<KapslTensorViewV1>() as u32,
+                dtype: KAPSL_DTYPE_UTF8,
+                memory_kind: KAPSL_MEMORY_HOST,
+                flags: KAPSL_TENSOR_FLAG_CONTIGUOUS,
+                device_id: -1,
+                rank: 1,
+                shape: shape.as_ptr(),
+                strides: std::ptr::null(),
+                data: data.as_ptr().cast(),
+                byte_len: 1,
+            },
+        };
+        let result = KapslInferenceResultV1 {
+            struct_size: std::mem::size_of::<KapslInferenceResultV1>() as u32,
+            output_count: 1,
+            outputs: &output,
+            metadata_json: KapslSlice::empty(),
+            owner_context: std::ptr::null_mut(),
+        };
+        // SAFETY: every borrowed callback value remains live for this call.
+        assert_eq!(
+            unsafe {
+                native_stream_chunk(
+                    (&mut context as *mut NativeStreamCallbackContext).cast(),
+                    10,
+                    &result,
+                )
+            },
+            KAPSL_STATUS_CANCELLED
+        );
+        assert!(context.consumer_closed);
+        assert!(context.callback_error.is_none());
     }
 
     #[test]
