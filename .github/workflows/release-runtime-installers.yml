@@ -68,6 +68,12 @@ jobs:
           echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
           echo "is_stable_release=$is_stable_release" >> "$GITHUB_OUTPUT"
 
+  stable-release-cpu-conformance:
+    name: Stable release CPU performance parity
+    needs: prepare-version
+    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    uses: ./.github/workflows/ort-cpu-conformance.yml
+
   stable-release-gpu-conformance:
     name: Stable release GPU conformance
     needs: prepare-version
@@ -78,6 +84,44 @@ jobs:
       sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
       cuda_visible_devices: "0"
     secrets: inherit
+
+  release-conformance-gate:
+    name: Gate publication on stable conformance and teardown
+    needs:
+      - prepare-version
+      - stable-release-cpu-conformance
+      - stable-release-gpu-conformance
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the appropriate qualification results
+        shell: bash
+        env:
+          PREPARE_RESULT: ${{ needs.prepare-version.result }}
+          IS_STABLE_RELEASE: ${{ needs.prepare-version.outputs.is_stable_release }}
+          CPU_CONFORMANCE_RESULT: ${{ needs.stable-release-cpu-conformance.result }}
+          GPU_CONFORMANCE_AND_TEARDOWN_RESULT: ${{ needs.stable-release-gpu-conformance.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$PREPARE_RESULT" != "success" ]]; then
+            echo "Release version preparation did not succeed." >&2
+            exit 1
+          fi
+          if [[ "$IS_STABLE_RELEASE" == "true" ]]; then
+            if [[ "$CPU_CONFORMANCE_RESULT" != "success" ]]; then
+              echo "Stable CPU performance parity did not succeed." >&2
+              exit 1
+            fi
+            if [[ "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "success" ]]; then
+              echo "Stable GPU conformance or its unconditional teardown did not succeed." >&2
+              exit 1
+            fi
+          else
+            if [[ "$CPU_CONFORMANCE_RESULT" != "skipped" || "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "skipped" ]]; then
+              echo "Prerelease and development workflows must not invoke stable conformance." >&2
+              exit 1
+            fi
+          fi
 
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
@@ -505,7 +549,7 @@ jobs:
 
   upload-release-assets:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-runtime-installers, build-cuda-runtime]
+    needs: [build-runtime-installers, build-cuda-runtime, release-conformance-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Download installer artifacts
@@ -574,7 +618,7 @@ jobs:
           files: github-release-assets/**
 
   upload-r2:
-    needs: [prepare-version, build-runtime-installers, build-cuda-runtime]
+    needs: [prepare-version, build-runtime-installers, build-cuda-runtime, release-conformance-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

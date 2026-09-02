@@ -143,6 +143,68 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
         self.assertIn("sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}", stable_release)
         self.assertNotIn("gpu-device-pool-integration.yml", beta_release)
 
+    def test_cpu_performance_parity_is_not_a_pull_request_gate(self) -> None:
+        root = MODULE_PATH.parent.parent
+        workflows = root / "workflows"
+        cpu = (workflows / "ort-cpu-conformance.yml").read_text(encoding="utf-8")
+        release = (workflows / "release-runtime-installers.yml").read_text(
+            encoding="utf-8"
+        )
+        beta = (workflows / "beta-runtime-installers.yml").read_text(
+            encoding="utf-8"
+        )
+        harness = (root / "scripts" / "certify-ort-cpu-parity.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("pull_request:", cpu)
+        self.assertIn("workflow_call:", cpu)
+        self.assertIn("workflow_dispatch:", cpu)
+        self.assertIn('if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]', cpu)
+        self.assertIn("mode=smoke", cpu)
+        self.assertIn("mode=performance", cpu)
+        self.assertIn("validate_stable_gpu_release.py", cpu)
+        self.assertIn("KAPSL_ORT_CONFORMANCE_MODE:", cpu)
+        self.assertIn(
+            'conformance_mode="${KAPSL_ORT_CONFORMANCE_MODE:-performance}"',
+            harness,
+        )
+        self.assertIn('"requests_per_payload": 1', harness)
+        self.assertIn('"requests_per_payload": 1000', harness)
+        self.assertIn('"not_enforced_on_pull_requests"', harness)
+        self.assertIn("stable-release-cpu-conformance:", release)
+        self.assertIn("./.github/workflows/ort-cpu-conformance.yml", release)
+        self.assertNotIn("ort-cpu-conformance.yml", beta)
+
+    def test_release_publication_waits_for_conformance_and_teardown(self) -> None:
+        release = (
+            MODULE_PATH.parent.parent / "workflows" / "release-runtime-installers.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("release-conformance-gate:", release)
+        self.assertIn("if: always()", release)
+        self.assertIn("stable-release-cpu-conformance", release)
+        self.assertIn("stable-release-gpu-conformance", release)
+        self.assertIn("GPU_CONFORMANCE_AND_TEARDOWN_RESULT", release)
+        self.assertEqual(release.count("release-conformance-gate]"), 2)
+
+    def test_pull_request_workflows_cancel_obsolete_runs_per_pr(self) -> None:
+        workflows = MODULE_PATH.parent.parent / "workflows"
+        for name in (
+            "ci.yml",
+            "docker-smoke.yml",
+            "installer-smoke.yml",
+            "ort-cpu-conformance.yml",
+        ):
+            with self.subTest(workflow=name):
+                workflow = (workflows / name).read_text(encoding="utf-8")
+                self.assertIn("pull_request:", workflow)
+                self.assertIn("github.event.pull_request.number || github.ref", workflow)
+                self.assertIn(
+                    "cancel-in-progress: ${{ github.event_name == 'pull_request' }}",
+                    workflow,
+                )
+
 
 class ProvisionTests(unittest.TestCase):
     def setUp(self) -> None:
