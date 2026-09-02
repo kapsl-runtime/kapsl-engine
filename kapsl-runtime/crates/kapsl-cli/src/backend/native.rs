@@ -11,9 +11,9 @@ use kapsl_backend_abi::*;
 use kapsl_backends::OnnxRuntimeTuning;
 use kapsl_core::Manifest;
 use kapsl_engine_api::{
-    BatchingMode, BatchingPolicy, BinaryTensorPacket, Engine, EngineError, EngineMetrics,
-    EngineModelInfo, EngineStream, InferenceRequest, KvBackendCapabilities, KvTopology,
-    MemoryReport, TensorDtype,
+    BatchingMode, BatchingPolicy, BinaryTensorPacket, CancellationToken, Engine, EngineError,
+    EngineMetrics, EngineModelInfo, EngineStream, InferenceRequest, KvBackendCapabilities,
+    KvTopology, MemoryReport, TensorDtype,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -304,6 +304,8 @@ struct NativePackInstance {
     pack: Arc<ActiveNativePack>,
     handle: *mut c_void,
     host: NativeBackendHost,
+    cancellation_runtime: Option<tokio::runtime::Handle>,
+    cancel_target: Arc<NativeCancelTarget>,
     next_request_id: AtomicU64,
     loaded: AtomicBool,
     call_lock: RwLock<()>,
@@ -321,6 +323,105 @@ struct NativeCallGuard<'a> {
     _write: Option<RwLockWriteGuard<'a, ()>>,
 }
 
+#[derive(Clone, Copy)]
+struct LiveNativeCancelTarget {
+    handle: usize,
+    function: KapslBackendCancelFn,
+}
+
+struct NativeCancelTarget {
+    live: RwLock<Option<LiveNativeCancelTarget>>,
+}
+
+impl NativeCancelTarget {
+    fn new(handle: *mut c_void, function: Option<KapslBackendCancelFn>) -> Self {
+        Self {
+            live: RwLock::new(function.map(|function| LiveNativeCancelTarget {
+                handle: handle as usize,
+                function,
+            })),
+        }
+    }
+
+    fn cancel(&self, request_id: u64) -> Option<i32> {
+        let live = self
+            .live
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let target = *live.as_ref()?;
+        // SAFETY: the read guard prevents instance shutdown from invalidating
+        // the adapter handle until this cancellation call returns.
+        Some(unsafe { (target.function)(target.handle as *mut c_void, request_id) })
+    }
+
+    fn pause(&self) -> RwLockWriteGuard<'_, Option<LiveNativeCancelTarget>> {
+        self.live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn deactivate(&self) {
+        *self.pause() = None;
+    }
+}
+
+#[derive(Default)]
+struct NativeCancellationWatches {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl NativeCancellationWatches {
+    fn spawn(
+        runtime: Option<&tokio::runtime::Handle>,
+        target: &Arc<NativeCancelTarget>,
+        cancellations: impl IntoIterator<Item = (u64, CancellationToken)>,
+    ) -> Self {
+        let Some(runtime) = runtime else {
+            return Self::default();
+        };
+        let tasks = cancellations
+            .into_iter()
+            .map(|(request_id, cancellation)| {
+                let target = Arc::clone(target);
+                runtime.spawn(async move {
+                    cancellation.cancelled().await;
+                    if let Some(status) = target.cancel(request_id) {
+                        if status != KAPSL_STATUS_OK {
+                            log::warn!(
+                                "native backend cancellation for request {request_id} returned status {status}"
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self { tasks }
+    }
+}
+
+impl Drop for NativeCancellationWatches {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn native_cancellation_runtime() -> Result<tokio::runtime::Handle, String> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("kapsl-native-cancel")
+            .build()
+            .map_err(|error| format!("create native backend cancellation runtime: {error}"))
+    }) {
+        Ok(runtime) => Ok(runtime.handle().clone()),
+        Err(error) => Err(error.clone()),
+    }
+}
+
 impl NativePackInstance {
     #[allow(clippy::too_many_arguments)]
     fn initialize(
@@ -335,6 +436,10 @@ impl NativePackInstance {
     ) -> Result<Arc<Self>, String> {
         let requires_governed_memory =
             pack.api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
+        let supports_cancellation = pack.api.capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0;
+        let cancellation_runtime = supports_cancellation
+            .then(native_cancellation_runtime)
+            .transpose()?;
         let host = NativeBackendHost::new(
             resources,
             &pack.manifest.backend,
@@ -403,10 +508,21 @@ impl NativePackInstance {
         if !error.ptr.is_null() {
             let _ = take_owned_buffer(&pack.api, error, "unexpected initialize error");
         }
+        let cancel_function = if supports_cancellation {
+            Some(
+                pack.api
+                    .cancel
+                    .expect("cancellation capability validated cancel function"),
+            )
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
             pack,
             handle,
             host,
+            cancellation_runtime,
+            cancel_target: Arc::new(NativeCancelTarget::new(handle, cancel_function)),
             next_request_id: AtomicU64::new(1),
             loaded: AtomicBool::new(false),
             call_lock: RwLock::new(()),
@@ -419,6 +535,17 @@ impl NativePackInstance {
                 next.checked_add(1)
             })
             .map_err(|_| EngineError::backend("native backend request ID space exhausted"))
+    }
+
+    fn watch_cancellations(
+        &self,
+        cancellations: impl IntoIterator<Item = (u64, CancellationToken)>,
+    ) -> NativeCancellationWatches {
+        NativeCancellationWatches::spawn(
+            self.cancellation_runtime.as_ref(),
+            &self.cancel_target,
+            cancellations,
+        )
     }
 
     fn inference_guard(&self) -> NativeCallGuard<'_> {
@@ -533,10 +660,25 @@ impl NativePackInstance {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(EngineError::cancelled(
+                "native backend request was cancelled before dispatch",
+            ));
+        }
         let request_id = self.next_request_id()?;
         let mut bridge = RequestBridge::new(request)?;
         let wire = bridge.wire(request_id);
         let _guard = self.inference_guard();
+        let _cancellation_watches = self.watch_cancellations(
+            request
+                .cancellation
+                .clone()
+                .map(|cancellation| (request_id, cancellation)),
+        );
         let mut result = KapslInferenceResultV1::empty();
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: request and result storage follows the synchronous ABI lifetime.
@@ -558,6 +700,15 @@ impl NativePackInstance {
             let _ = take_owned_buffer(&self.pack.api, error, "unexpected infer error");
         }
         let _release = ResultReleaseGuard::single(&self.pack.api, self.handle, &mut result);
+        if request
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(EngineError::cancelled(
+                "native backend request was cancelled during execution",
+            ));
+        }
         copy_single_result(&result)
     }
 
@@ -568,6 +719,16 @@ impl NativePackInstance {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        if requests.iter().any(|request| {
+            request
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        }) {
+            return Err(EngineError::cancelled(
+                "native backend batch was cancelled before dispatch",
+            ));
+        }
         if self.pack.api.capabilities & KAPSL_BACKEND_CAP_BATCHING == 0 {
             return requests.iter().map(|request| self.infer(request)).collect();
         }
@@ -576,13 +737,14 @@ impl NativePackInstance {
             .iter()
             .map(RequestBridge::new)
             .collect::<Result<Vec<_>, _>>()?;
+        let request_ids = (0..bridges.len())
+            .map(|_| self.next_request_id())
+            .collect::<Result<Vec<_>, _>>()?;
         let wires = bridges
             .iter_mut()
-            .map(|bridge| {
-                self.next_request_id()
-                    .map(|request_id| bridge.wire(request_id))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .zip(&request_ids)
+            .map(|(bridge, request_id)| bridge.wire(*request_id))
+            .collect::<Vec<_>>();
         let batch = KapslInferenceBatchV1 {
             struct_size: std::mem::size_of::<KapslInferenceBatchV1>() as u32,
             request_count: u32::try_from(wires.len())
@@ -590,6 +752,15 @@ impl NativePackInstance {
             requests: wires.as_ptr(),
         };
         let _guard = self.inference_guard();
+        let _cancellation_watches =
+            self.watch_cancellations(requests.iter().zip(&request_ids).filter_map(
+                |(request, request_id)| {
+                    request
+                        .cancellation
+                        .clone()
+                        .map(|cancellation| (*request_id, cancellation))
+                },
+            ));
         let mut result = KapslInferenceBatchResultV1::empty();
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: every request bridge and output slot remains live through the call.
@@ -614,6 +785,16 @@ impl NativePackInstance {
             let _ = take_owned_buffer(&self.pack.api, error, "unexpected batch error");
         }
         let _release = ResultReleaseGuard::batch(&self.pack.api, self.handle, &mut result);
+        if requests.iter().any(|request| {
+            request
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        }) {
+            return Err(EngineError::cancelled(
+                "native backend batch was cancelled during execution",
+            ));
+        }
         copy_batch_results(&result, requests.len())
     }
 
@@ -622,6 +803,7 @@ impl NativePackInstance {
             return Ok(());
         }
         let _guard = self.exclusive_guard();
+        let _cancel_pause = self.cancel_target.pause();
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: lifecycle ownership guarantees no request is active here.
         let status = unsafe {
@@ -643,6 +825,10 @@ impl NativePackInstance {
 
 impl Drop for NativePackInstance {
     fn drop(&mut self) {
+        // Prevent an already-woken cancellation task from reaching the handle
+        // once terminal lifecycle teardown begins. Any call already in flight
+        // completes before this write lock is acquired.
+        self.cancel_target.deactivate();
         if self.loaded.load(Ordering::Acquire) {
             if let Err(error) = self.unload() {
                 log::error!("native backend unload during shutdown failed: {error}");
@@ -709,6 +895,7 @@ impl Engine for NativePackedEngine {
             EngineError::invalid_input(format!("model path is not UTF-8: {}", model_path.display()))
         })?;
         let _guard = self.instance.exclusive_guard();
+        let _cancel_pause = self.instance.cancel_target.pause();
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: path bytes remain valid through this synchronous call.
         let status = unsafe {
@@ -1654,6 +1841,12 @@ fn status_engine_error(status: i32, message: String) -> EngineError {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CancelProbe {
+        request_id: Mutex<Option<u64>>,
+        changed: std::sync::Condvar,
+    }
+
     unsafe extern "C" fn describe(
         output: *mut KapslOwnedBuffer,
         _error: *mut KapslOwnedBuffer,
@@ -1715,6 +1908,21 @@ mod tests {
         KAPSL_STATUS_OK
     }
 
+    unsafe extern "C" fn cancel(handle: *mut c_void, request_id: u64) -> i32 {
+        if handle.is_null() {
+            return KAPSL_STATUS_OK;
+        }
+        // SAFETY: cancellation tests retain this probe until the target is
+        // deactivated and every watcher has been dropped.
+        let probe = unsafe { &*handle.cast::<CancelProbe>() };
+        *probe
+            .request_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(request_id);
+        probe.changed.notify_all();
+        KAPSL_STATUS_OK
+    }
+
     unsafe extern "C" fn json_report(
         _handle: *mut c_void,
         _output: *mut KapslOwnedBuffer,
@@ -1758,7 +1966,11 @@ mod tests {
             infer: Some(infer),
             infer_batch: None,
             infer_stream: None,
-            cancel: None,
+            cancel: if capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0 {
+                Some(cancel)
+            } else {
+                None
+            },
             actual_memory: Some(json_report),
             metrics: Some(json_report),
             model_info: Some(json_report),
@@ -1826,6 +2038,49 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_capability_requires_and_accepts_the_cancel_hook() {
+        let capabilities = KAPSL_BACKEND_CAP_CPU
+            | KAPSL_BACKEND_CAP_MEMORY_REPORTING
+            | KAPSL_BACKEND_CAP_CANCELLATION;
+        let cancellable = complete_api(capabilities);
+        assert!(validate_native_backend_api(&test_manifest("cpu"), &cancellable).is_ok());
+
+        let mut contradictory = cancellable;
+        contradictory.cancel = None;
+        assert!(validate_native_backend_api(&test_manifest("cpu"), &contradictory).is_err());
+    }
+
+    #[test]
+    fn cancellation_token_invokes_native_hook_on_dedicated_runtime() {
+        let runtime = native_cancellation_runtime().unwrap();
+        let probe = Box::new(CancelProbe::default());
+        let handle = (&*probe as *const CancelProbe).cast_mut().cast::<c_void>();
+        let target = Arc::new(NativeCancelTarget::new(handle, Some(cancel)));
+        let cancellation = CancellationToken::new();
+        let watches =
+            NativeCancellationWatches::spawn(Some(&runtime), &target, [(91, cancellation.clone())]);
+
+        cancellation.cancel();
+
+        let observed = probe
+            .request_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (observed, timeout) = probe
+            .changed
+            .wait_timeout_while(observed, std::time::Duration::from_secs(2), |value| {
+                value.is_none()
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!timeout.timed_out());
+        assert_eq!(*observed, Some(91));
+        drop(observed);
+        drop(watches);
+        target.deactivate();
+        assert_eq!(target.cancel(92), None);
+    }
+
+    #[test]
     fn request_bridge_borrows_contiguous_tensor_views_without_json_payloads() {
         let input = BinaryTensorPacket::new(
             vec![1, 2],
@@ -1833,7 +2088,9 @@ mod tests {
             vec![0; 2 * std::mem::size_of::<f32>()],
         )
         .unwrap();
-        let request = InferenceRequest::new(input);
+        let cancellation = CancellationToken::new();
+        let mut request = InferenceRequest::new(input);
+        request.cancellation = Some(cancellation.clone());
         let mut bridge = RequestBridge::new(&request).unwrap();
         let wire = bridge.wire(7);
         assert_eq!(wire.request_id, 7);
@@ -1846,6 +2103,27 @@ mod tests {
         assert_ne!(named.tensor.flags & KAPSL_TENSOR_FLAG_CONTIGUOUS, 0);
         // Only small request metadata is JSON; tensor bytes are direct views.
         assert!(bridge.metadata_json.len() < request.input.data.len() + 128);
+        // The borrowed callback covers cancellation that races adapter dispatch
+        // before the explicit cancel hook can find the request ID.
+        assert_eq!(
+            unsafe {
+                wire.is_cancelled.expect("request cancellation callback")(
+                    wire.cancellation_context,
+                    wire.request_id,
+                )
+            },
+            0
+        );
+        cancellation.cancel();
+        assert_eq!(
+            unsafe {
+                wire.is_cancelled.expect("request cancellation callback")(
+                    wire.cancellation_context,
+                    wire.request_id,
+                )
+            },
+            1
+        );
     }
 
     #[test]
