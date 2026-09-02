@@ -43,4 +43,3 @@ export them to a supported serving format first.
 | [Extensions & RAG](./extensions.md) | Extension connectors and RAG ingestion |
 | [Web Dashboard](./web-dashboard.md) | Using the browser interface |
 | [Configuration](./configuration.md) | CLI flags and environment variables |
-| [Backend-neutral Removal Inventory](./backend-neutral-removal-inventory.md) | Classified migration inventory and dependency gates |
