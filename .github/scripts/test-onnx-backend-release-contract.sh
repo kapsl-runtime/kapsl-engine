@@ -14,11 +14,14 @@ manager="kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
 activator="kapsl-runtime/crates/kapsl-cli/src/backend/onnx.rs"
 packager=".github/scripts/package-linux-onnx-backend-packs.sh"
 cpu_packager=".github/scripts/package-linux-ort-cpu-backend.sh"
+accelerator_packager=".github/scripts/package-linux-ort-accelerator-backends.sh"
 integration_verifier=".github/scripts/verify-ort-integration-checkout.sh"
 index_generator=".github/scripts/generate-backend-index.py"
-integration_lock=".github/ort-cpu-integration.lock"
+integration_lock=".github/ort-integration.lock"
 parity_lock=".github/ort-cpu-parity.lock.json"
 parity_certifier=".github/scripts/certify-ort-cpu-parity.sh"
+parity_workflow=".github/workflows/ort-cpu-conformance.yml"
+installer_workflow=".github/workflows/installer-smoke.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
 bundle="kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
@@ -59,6 +62,15 @@ require_literal "$cpu_packager" 'v1.23.2/onnxruntime-linux-x64-1.23.2.tgz'
 require_literal "$cpu_packager" '1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b'
 require_literal "$cpu_packager" 'maximum_permitted_glibc'
 require_literal "$cpu_packager" 'engine index publisher owns the release key'
+require_literal "$accelerator_packager" ': "${KAPSL_ORT_INTEGRATIONS_REF:?'
+require_literal "$accelerator_packager" 'verify-ort-integration-checkout.sh'
+require_literal "$accelerator_packager" 'integrations/ort/packaging/build_accelerator_packs.sh'
+require_literal "$accelerator_packager" 'for profile in cuda12 tensorrt10'
+require_literal "$accelerator_packager" '"adapter_abi": "kapsl-backend-v1"'
+require_literal "$accelerator_packager" 'v1.23.2/onnxruntime-linux-x64-gpu-1.23.2.tgz'
+require_literal "$accelerator_packager" '2083e361072a79ce16a90dcd5f5cb3ab92574a82a3ce0ac01e5cfa3158176f53'
+require_literal "$accelerator_packager" 'pack contains host driver libraries'
+require_literal "$accelerator_packager" 'engine index publisher owns the release key'
 require_literal "$integration_verifier" '^[0-9a-f]{40}$'
 require_literal "$integration_verifier" '--untracked-files=all'
 require_literal "$integration_verifier" '--ignored=matching'
@@ -127,7 +139,7 @@ for workflow in \
   .github/workflows/release-runtime-installers.yml; do
   require_literal "$workflow" '.github/scripts/package-linux-onnx-backend-packs.sh'
   require_literal "$workflow" '.github/scripts/package-linux-ort-cpu-backend.sh'
-  require_literal "$workflow" '.github/ort-cpu-integration.lock'
+  require_literal "$workflow" '.github/ort-integration.lock'
   require_literal "$workflow" 'ref: ${{ steps.ort-integrations.outputs.ref }}'
   require_literal "$workflow" 'repository: kapsl-runtime/kapsl-integrations'
   require_literal "$workflow" 'verify-ort-integration-checkout.sh'
@@ -136,11 +148,19 @@ for workflow in \
   require_literal "$workflow" '.github/scripts/collect-linux-tensorrt-runtime.sh'
 done
 
-require_literal ".github/workflows/installer-smoke.yml" '.github/ort-cpu-parity.lock.json'
-require_literal ".github/workflows/installer-smoke.yml" 'repository: kapsl-runtime/kapsl-sdk'
-require_literal ".github/workflows/installer-smoke.yml" '.github/scripts/certify-ort-cpu-parity.sh'
+require_literal "$parity_workflow" 'name: ORT CPU Conformance'
+require_literal "$parity_workflow" 'cancel-in-progress: true'
+require_literal "$parity_workflow" '.github/ort-cpu-parity.lock.json'
+require_literal "$parity_workflow" 'repository: kapsl-runtime/kapsl-sdk'
+require_literal "$parity_workflow" '.github/scripts/certify-ort-cpu-parity.sh'
+require_literal "$parity_certifier" '"sequence": ["baseline", "candidate", "candidate", "baseline"] * 2'
+require_literal "$installer_workflow" '.github/scripts/test-package-linux-ort-accelerator-backends.sh'
+if grep -Fq 'Certify embedded versus packaged ORT CPU parity' "$installer_workflow"; then
+  echo "$installer_workflow must not run ORT performance conformance." >&2
+  exit 1
+fi
 
-python3 - "$parity_lock" ".github/workflows/installer-smoke.yml" <<'PY'
+python3 - "$parity_lock" "$parity_workflow" <<'PY'
 import json
 import pathlib
 import sys
@@ -150,7 +170,7 @@ workflow = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 conformance_dir = pathlib.PurePosixPath(lock["conformance"]["path"]).parent
 expected = f"uses: ./kapsl-integrations-ort/{conformance_dir}"
 if expected not in workflow:
-    raise SystemExit("installer smoke must use parity from the locked integrations checkout")
+    raise SystemExit("ORT CPU conformance must use parity from the locked integrations checkout")
 if "kapsl-runtime/kapsl-benchmarks" in workflow:
     raise SystemExit("public engine CI must not depend on a private benchmark action")
 PY

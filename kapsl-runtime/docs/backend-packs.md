@@ -89,6 +89,14 @@ signed accelerator profile must exactly match the adapter's CPU, CUDA, or
 TensorRT capability bits. CUDA and TensorRT adapters must allocate device
 memory through the runtime-owned `GpuDevicePool` callbacks.
 
+The standard-ABI ORT family also binds the versioned pack identity exactly:
+`cpu` maps to accelerator `cpu`, `cuda12` maps to `cuda`, and `tensorrt10`
+maps to `tensorrt`. Provider aliases are normalized only at the engine policy
+boundary. The adapter receives the signed canonical provider, and activation
+rejects a descriptor unless its one compiled profile, ABI, wire format,
+execution mode, and governed-memory declaration match the signed manifest and
+static function table.
+
 This path stays in-process: tensor buffers cross the adapter boundary as
 borrowed views, and ORT's allocator forwards directly to the same Kapsl-owned
 pool. It introduces no backend RPC, CUDA IPC, tensor serialization, or second
@@ -101,23 +109,35 @@ conformance. An invalid gate value is an error rather than a request to fall
 back.
 
 Release jobs build the CPU candidate from the exact `kapsl-integrations`
-commit in `.github/ort-cpu-integration.lock`. The adapter's committed Rust
+commit in `.github/ort-integration.lock`. The adapter's committed Rust
 toolchain is installed and verified independently of the engine toolchain;
 the resulting archive records its source commit and is accepted only after the
 engine validates its payload, provenance, file hashes, and standard ABI marker.
+The same exact checkout now exposes a prepared accelerator handoff for
+`cuda12` and `tensorrt10`. It authenticates Microsoft's official ORT GPU
+archive, closes and normalizes every non-driver CUDA/TensorRT dependency, and
+emits the same standard-ABI manifest/provenance contract. Release workflows
+continue publishing the legacy accelerator rollback until an official stable
+release completes real GPU ownership, unload, reproducibility, and teardown
+qualification; preparing an archive does not promote it.
 The engine's existing Ed25519 backend-index publisher remains the sole owner of
 official release signing.
 
 Host CI pins the canonical integrations-owned parity entrypoint by path and
 SHA-256, plus its tiny ONNX model source, in
 `.github/ort-cpu-parity.lock.json`. The exact integrations commit in
-`.github/ort-cpu-integration.lock` supplies both the adapter and that
+`.github/ort-integration.lock` supplies both the adapter and that
 conformance contract. CI builds the pack, constructs a signed offline bundle,
-preinstalls that bundle through the normal backend manager, and runs an ABBA
-embedded/candidate comparison. This is a CPU-only forward-path smoke gate; it
-does not provision a GPU and does not by itself authorize removing embedded
-ORT. The broader retirement gate still requires every supported CPU task class
-plus the separate CUDA/TensorRT memory ownership and lifecycle suites.
+preinstalls that bundle through the normal backend manager, and runs two full
+ABBA embedded/candidate blocks. Four captures per route make the startup median
+resistant to one host-scheduler outlier without weakening its gate. The
+dedicated ORT CPU conformance workflow
+builds the adapter once for both release-handoff validation and the longer
+performance comparison; installer smoke remains a separate quick job with no
+performance thresholds. This CPU-only forward-path conformance does not
+provision a GPU and does not by itself authorize removing embedded ORT. The
+broader retirement gate still requires every supported CPU task class plus the
+separate CUDA/TensorRT memory ownership and lifecycle suites.
 
 When a native adapter advertises ABI v1 cancellation, Kapsl bridges each
 request's `CancellationToken` to the adapter's `cancel(request_id)` hook on one

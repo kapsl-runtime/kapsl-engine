@@ -385,9 +385,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ref="$(tr -d '\r\n' < .github/ort-cpu-integration.lock)"
+          ref="$(tr -d '\r\n' < .github/ort-integration.lock)"
           if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-            echo ".github/ort-cpu-integration.lock must contain one exact lowercase 40-hex commit." >&2
+            echo ".github/ort-integration.lock must contain one exact lowercase 40-hex commit." >&2
             exit 1
           fi
           echo "KAPSL_ORT_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"

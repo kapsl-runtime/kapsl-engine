@@ -1,0 +1,207 @@
+name: ORT CPU Conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/ort-integration.lock"
+      - ".github/ort-cpu-parity.lock.json"
+      - ".github/licenses/ONNX-RUNTIME-LICENSE"
+      - ".github/scripts/certify-ort-cpu-parity.sh"
+      - ".github/scripts/generate-backend-index.py"
+      - ".github/scripts/package-linux-ort-cpu-backend.sh"
+      - ".github/scripts/test-generate-backend-index.sh"
+      - ".github/scripts/test-onnx-backend-release-contract.sh"
+      - ".github/scripts/test-package-linux-ort-cpu-backend.sh"
+      - ".github/scripts/test-verify-ort-integration-checkout.sh"
+      - ".github/scripts/verify-ort-integration-checkout.sh"
+      - ".github/workflows/ort-cpu-conformance.yml"
+      - "kapsl-runtime/Cargo.lock"
+      - "kapsl-runtime/Cargo.toml"
+      - "kapsl-runtime/crates/kapsl-backends/**"
+      - "kapsl-runtime/crates/kapsl-cli/Cargo.toml"
+      - "kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
+      - "kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
+      - "kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
+      - "kapsl-runtime/crates/kapsl-cli/src/backend/onnx.rs"
+      - "kapsl-runtime/crates/kapsl-cli/src/http/models/**"
+      - "kapsl-runtime/crates/kapsl-cli/src/runtime/model/**"
+      - "kapsl-runtime/crates/kapsl-cli/src/runtime/serving/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ort-cpu-conformance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ort-cpu-release-handoff:
+    name: ORT CPU release handoff and conformance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout engine
+        uses: actions/checkout@v4
+
+      - name: Resolve exact release inputs
+        id: release-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          integrations_ref="$(tr -d '\r\n' < .github/ort-integration.lock)"
+          if [[ ! "$integrations_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/ort-integration.lock must contain one exact lowercase 40-hex commit." >&2
+            exit 1
+          fi
+          version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          echo "KAPSL_ORT_INTEGRATIONS_REF=$integrations_ref" >> "$GITHUB_ENV"
+          echo "KAPSL_VERSION=$version" >> "$GITHUB_ENV"
+          echo "integrations_ref=$integrations_ref" >> "$GITHUB_OUTPUT"
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          lock = json.loads(pathlib.Path(".github/ort-cpu-parity.lock.json").read_text())
+          if lock.get("schema_version") != 1:
+              raise SystemExit("ORT CPU parity lock schema must be 1")
+          conformance = lock.get("conformance", {})
+          model = lock.get("model", {})
+          expected_repositories = {
+              "conformance": "kapsl-runtime/kapsl-integrations",
+              "model": "kapsl-runtime/kapsl-sdk",
+          }
+          if conformance.get("repository") != expected_repositories["conformance"]:
+              raise SystemExit("ORT CPU parity conformance repository is not approved")
+          if model.get("repository") != expected_repositories["model"]:
+              raise SystemExit("ORT CPU parity model repository is not approved")
+          model_ref = model.get("commit")
+          if not isinstance(model_ref, str) or not re.fullmatch(r"[0-9a-f]{40}", model_ref):
+              raise SystemExit("ORT CPU parity model commit must be an exact lowercase commit")
+          conformance_path = conformance.get("path")
+          if (
+              not isinstance(conformance_path, str)
+              or not conformance_path
+              or pathlib.PurePosixPath(conformance_path).is_absolute()
+              or ".." in pathlib.PurePosixPath(conformance_path).parts
+          ):
+              raise SystemExit("ORT CPU parity conformance path must be a safe relative path")
+          conformance_entrypoint_sha256 = conformance.get("entrypoint_sha256")
+          if not isinstance(conformance_entrypoint_sha256, str) or not re.fullmatch(
+              r"[0-9a-f]{64}", conformance_entrypoint_sha256
+          ):
+              raise SystemExit("ORT CPU parity harness SHA-256 is invalid")
+          model_path = model.get("path")
+          if (
+              not isinstance(model_path, str)
+              or not model_path
+              or pathlib.PurePosixPath(model_path).is_absolute()
+              or ".." in pathlib.PurePosixPath(model_path).parts
+          ):
+              raise SystemExit("ORT CPU parity model path must be a safe relative path")
+          model_sha256 = model.get("sha256")
+          if not isinstance(model_sha256, str) or not re.fullmatch(
+              r"[0-9a-f]{64}", model_sha256
+          ):
+              raise SystemExit("ORT CPU parity model SHA-256 is invalid")
+          outputs = {
+              "conformance_path": conformance_path,
+              "conformance_entrypoint_sha256": conformance_entrypoint_sha256,
+              "model_ref": model_ref,
+              "model_path": model_path,
+              "model_sha256": model_sha256,
+          }
+          with pathlib.Path(sys.argv[1]).open("a", encoding="utf-8") as stream:
+              for name, value in outputs.items():
+                  stream.write(f"{name}={value}\n")
+          PY
+
+      - name: Checkout exact ORT integration
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.release-inputs.outputs.integrations_ref }}
+          path: kapsl-integrations-ort
+
+      - name: Resolve exact ORT parity harness
+        id: ort-parity-harness
+        uses: ./kapsl-integrations-ort/integrations/ort/conformance
+
+      - name: Checkout exact ORT parity model source
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ steps.release-inputs.outputs.model_ref }}
+          path: kapsl-sdk-ort-model
+          persist-credentials: false
+
+      - name: Verify exact integrations checkout
+        run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils build-essential libssl-dev openssl pkg-config
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install exact ORT packaging toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-ort/rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$toolchain" --profile minimal
+
+      - name: Build and validate release handoff
+        run: .github/scripts/package-linux-ort-cpu-backend.sh
+
+      - name: Validate handoff through the signed index publisher
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/ort-cpu-test-key.pem"
+          openssl genpkey -algorithm ED25519 -out "$key_file"
+          public_key="$(openssl pkey -in "$key_file" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+          echo "KAPSL_ORT_PARITY_PUBLIC_KEY=$public_key" >> "$GITHUB_ENV"
+          .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" \
+            --artifacts-dir dist \
+            --output dist/backend-index.json \
+            --signing-key "$key_file" \
+            --expected-public-key "$public_key"
+          rm -f "$key_file"
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          index = json.loads(pathlib.Path("dist/backend-index.json").read_text())
+          packs = [
+              pack
+              for pack in index["packs"]
+              if pack["backend"] == "onnx" and pack["profile"] == "cpu"
+          ]
+          if len(packs) != 1 or packs[0].get("adapter_abi") != "kapsl-backend-v1":
+              raise SystemExit("signed index does not contain exactly one standard-ABI ORT CPU pack")
+          PY
+
+      - name: Certify embedded versus packaged ORT CPU parity
+        env:
+          KAPSL_ORT_PARITY_HARNESS: ${{ steps.ort-parity-harness.outputs.harness_path }}
+          KAPSL_ORT_PARITY_HARNESS_PATH: ${{ steps.release-inputs.outputs.conformance_path }}
+          KAPSL_ORT_PARITY_HARNESS_SHA256: ${{ steps.release-inputs.outputs.conformance_entrypoint_sha256 }}
+          KAPSL_ORT_PARITY_MODEL_REF: ${{ steps.release-inputs.outputs.model_ref }}
+          KAPSL_ORT_PARITY_MODEL_PATH: ${{ steps.release-inputs.outputs.model_path }}
+          KAPSL_ORT_PARITY_MODEL_SHA256: ${{ steps.release-inputs.outputs.model_sha256 }}
+        run: .github/scripts/certify-ort-cpu-parity.sh
+
+      - name: Upload ORT CPU parity evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ort-cpu-parity-${{ github.run_id }}
+          path: dist/ort-cpu-parity
+          if-no-files-found: ignore
+          retention-days: 14
