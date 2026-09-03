@@ -10,8 +10,11 @@ on:
       - ".github/scripts/package-linux-onnx-backend-packs.sh"
       - ".github/scripts/package-linux-ort-cpu-backend.sh"
       - ".github/scripts/package-linux-ort-accelerator-backends.sh"
+      - ".github/scripts/import-signed-backend-release.py"
+      - ".github/scripts/test_import_signed_backend_release.py"
       - ".github/scripts/verify-ort-integration-checkout.sh"
       - ".github/ort-integration.lock"
+      - ".github/ort-release.lock.json"
       - ".github/ort-cpu-parity.lock.json"
       - ".github/scripts/certify-ort-cpu-parity.sh"
       - ".github/scripts/collect-linux-tensorrt-runtime.sh"
@@ -122,6 +125,8 @@ jobs:
           bash -n .github/scripts/test-generate-backend-index.sh
           bash -n .github/scripts/verify-public-backend-release.sh
           python3 -m py_compile .github/scripts/generate-backend-index.py
+          python3 -m py_compile .github/scripts/import-signed-backend-release.py
+          python3 -m py_compile .github/scripts/test_import_signed_backend_release.py
           python3 -m py_compile .github/scripts/benchmark-llama-cpp-backend-pack.py
           python3 -m py_compile .github/scripts/verify-managed-vllm-connector-wheel.py
           python3 -m py_compile .github/scripts/managed_vllm_gpu_conformance.py
@@ -154,6 +159,9 @@ jobs:
 
       - name: Test certified ORT accelerator release handoff
         run: .github/scripts/test-package-linux-ort-accelerator-backends.sh
+
+      - name: Test immutable signed backend-release import
+        run: python3 .github/scripts/test_import_signed_backend_release.py
 
       - name: Test exact ORT integrations checkout verification
         run: .github/scripts/test-verify-ort-integration-checkout.sh
