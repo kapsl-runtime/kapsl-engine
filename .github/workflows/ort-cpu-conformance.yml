@@ -13,6 +13,7 @@ on:
       - ".github/scripts/test-onnx-backend-release-contract.sh"
       - ".github/scripts/test-package-linux-ort-cpu-backend.sh"
       - ".github/scripts/test-verify-ort-integration-checkout.sh"
+      - ".github/scripts/validate_stable_gpu_release.py"
       - ".github/scripts/verify-ort-integration-checkout.sh"
       - ".github/workflows/ort-cpu-conformance.yml"
       - "kapsl-runtime/Cargo.lock"
@@ -26,6 +27,7 @@ on:
       - "kapsl-runtime/crates/kapsl-cli/src/http/models/**"
       - "kapsl-runtime/crates/kapsl-cli/src/runtime/model/**"
       - "kapsl-runtime/crates/kapsl-cli/src/runtime/serving/**"
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -33,16 +35,37 @@ permissions:
 
 concurrency:
   group: ort-cpu-conformance-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ort-cpu-release-handoff:
-    name: ORT CPU release handoff and conformance
+    name: ORT CPU release handoff and ${{ github.event_name == 'pull_request' && 'correctness smoke' || 'performance parity' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - name: Checkout engine
         uses: actions/checkout@v4
+
+      - name: Resolve and authorize conformance mode
+        id: conformance-mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            mode=smoke
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            mode=performance
+            echo "Full CPU performance parity was deliberately dispatched."
+          else
+            mode=performance
+            python3 .github/scripts/validate_stable_gpu_release.py \
+              --event-name "$GITHUB_EVENT_NAME" \
+              --ref-type "$GITHUB_REF_TYPE" \
+              --ref-name "$GITHUB_REF_NAME" \
+              --release-tag "$GITHUB_REF_NAME" \
+              --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
 
       - name: Resolve exact release inputs
         id: release-inputs
@@ -187,8 +210,9 @@ jobs:
               raise SystemExit("signed index does not contain exactly one standard-ABI ORT CPU pack")
           PY
 
-      - name: Certify embedded versus packaged ORT CPU parity
+      - name: Run embedded versus packaged ORT CPU conformance
         env:
+          KAPSL_ORT_CONFORMANCE_MODE: ${{ steps.conformance-mode.outputs.mode }}
           KAPSL_ORT_PARITY_HARNESS: ${{ steps.ort-parity-harness.outputs.harness_path }}
           KAPSL_ORT_PARITY_HARNESS_PATH: ${{ steps.release-inputs.outputs.conformance_path }}
           KAPSL_ORT_PARITY_HARNESS_SHA256: ${{ steps.release-inputs.outputs.conformance_entrypoint_sha256 }}
@@ -197,11 +221,11 @@ jobs:
           KAPSL_ORT_PARITY_MODEL_SHA256: ${{ steps.release-inputs.outputs.model_sha256 }}
         run: .github/scripts/certify-ort-cpu-parity.sh
 
-      - name: Upload ORT CPU parity evidence
+      - name: Upload ORT CPU conformance evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ort-cpu-parity-${{ github.run_id }}
-          path: dist/ort-cpu-parity
+          name: ort-cpu-${{ steps.conformance-mode.outputs.mode }}-${{ github.run_id }}
+          path: dist/ort-cpu-${{ steps.conformance-mode.outputs.mode }}
           if-no-files-found: ignore
           retention-days: 14
