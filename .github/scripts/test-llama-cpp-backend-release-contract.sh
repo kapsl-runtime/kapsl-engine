@@ -17,8 +17,8 @@ packager=".github/scripts/package-linux-llama-cpp-backend-packs.sh"
 manifest="kapsl-runtime/crates/kapsl-backend-llama-cpp/Cargo.toml"
 cli_manifest="kapsl-runtime/crates/kapsl-cli/Cargo.toml"
 
-require_literal "$manifest" 'kapsl-backend-abi = "=0.1.0"'
-require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.1.0"'
+require_literal "$manifest" 'kapsl-backend-abi = "=0.2.0"'
+require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.2.0"'
 require_literal "$header" '#define KAPSL_LLAMA_CPP_ABI_VERSION 1u'
 require_literal "$header" 'const kapsl_llama_cpp_api_v1 *kapsl_llama_cpp_backend_v1(void);'
 require_literal "$manager" 'pub(crate) const LLAMA_CPP_CPU_PACK_PROFILE: &str = "cpu";'
