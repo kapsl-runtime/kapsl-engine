@@ -7,6 +7,7 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -76,11 +77,12 @@ jobs:
 
   stable-release-gpu-conformance:
     name: Stable release GPU conformance
-    needs: prepare-version
+    needs: [prepare-version, build-cuda-runtime]
     if: needs.prepare-version.outputs.is_stable_release == 'true'
     uses: ./.github/workflows/gpu-device-pool-integration.yml
     with:
       release_tag: ${{ github.ref_name }}
+      candidate_artifact: runtime-cuda-linux-x86_64
       sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
       cuda_visible_devices: "0"
     secrets: inherit

@@ -4,11 +4,14 @@
 #
 # Required when KAPSL_GPU_INTEGRATION=1:
 #   KAPSL_GPU_TEST_BINARY      CUDA + gguf-cuda-shared-kv kapsl binary
-#   KAPSL_GPU_TEST_ORT_MODEL   ONNX or AIMOD model path
-#   KAPSL_GPU_TEST_GGUF_MODEL  uniform-KV causal GGUF or AIMOD model path
+#   Either KAPSL_GPU_TEST_BUNDLE plus KAPSL_BUNDLE_CACHE_DIR, or both:
+#     KAPSL_GPU_TEST_ORT_MODEL   ONNX or AIMOD model path
+#     KAPSL_GPU_TEST_GGUF_MODEL  uniform-KV causal GGUF or AIMOD model path
 #
 # Useful optional inputs:
+#   KAPSL_GPU_TEST_BUNDLE            verified offline bundle containing ORT then GGUF
 #   KAPSL_GPU_TEST_ORT_REQUEST       JSON inference request for the ONNX model
+#   KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE expected response from another certified profile
 #   KAPSL_GPU_TEST_POOL_BYTES        exact fixed backing size (default: strict auto)
 #   KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES  one physical GPU/UUID (default: 0)
 #   KAPSL_GPU_TEST_VRAM_GROWTH_BYTES reload tolerance (default: 256 MiB)
@@ -17,10 +20,11 @@
 #   KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK require the generic signed ORT route
 #   KAPSL_GPU_TEST_ORT_PROFILE       expected signed profile (cuda12/tensorrt10)
 #   KAPSL_GPU_TEST_ORT_PACK_VERSION  expected immutable ORT pack version
+#   KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE require pack activation without network access
 #   KAPSL_GPU_TEST_OUTPUT_DIR        retained logs and snapshots
 #
-# The two model paths are startup arguments so pool registration necessarily
-# precedes both backend/session constructions. Positive model/replica-scoped
+# Both models are startup arguments so pool registration necessarily precedes
+# both backend/session constructions. Positive model/replica-scoped
 # `owner="onnx:<model>:<replica>:persistent-weights"` bytes prove that ORT
 # actually suballocated from it. Each model is then stopped and started again
 # under the same id while the other remains resident.
@@ -38,6 +42,12 @@ Usage:
     KAPSL_GPU_TEST_BINARY=/path/to/kapsl \\
     KAPSL_GPU_TEST_ORT_MODEL=/models/model.onnx \\
     KAPSL_GPU_TEST_GGUF_MODEL=/models/model.gguf \\
+    $script_name
+
+  KAPSL_GPU_INTEGRATION=1 \\
+    KAPSL_GPU_TEST_BINARY=/path/to/kapsl \\
+    KAPSL_GPU_TEST_BUNDLE=/release/profile.kapsl-bundle \\
+    KAPSL_BUNDLE_CACHE_DIR=/tmp/kapsl-bundles \\
     $script_name
 
 The GPU run fails unless all of these are observed in one process:
@@ -145,6 +155,9 @@ assert_runtime_markers() {
       "initializing ORT $version $profile_label" "$minimum_signed_ort" || return 1
     reject_log_marker "$log_file" "Using embedded ORT rollback" || return 1
     reject_log_marker "$log_file" "Activating embedded ORT rollback route" || return 1
+    if is_true "${KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE:-0}"; then
+      reject_log_marker "$log_file" "Downloading Kapsl backend" || return 1
+    fi
   elif [[ "$registered" != "1" ]]; then
     echo "Expected exactly one embedded ORT pool registration, observed $registered" >&2
     return 1
@@ -456,6 +469,16 @@ run_self_test() {
     assert_runtime_markers "$fixture/signed-ort-rollback.log" 2 2 >/dev/null 2>&1; then
     die "self-test accepted embedded ORT rollback during signed-pack certification"
   fi
+  cp "$fixture/signed-ort.log" "$fixture/signed-ort-download.log"
+  printf '%s\n' 'Downloading Kapsl backend onnx/cuda12 (123 bytes)...' \
+    >>"$fixture/signed-ort-download.log"
+  if KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+    KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE=1 \
+    KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+    KAPSL_GPU_TEST_ORT_PACK_VERSION=0.2.0 \
+    assert_runtime_markers "$fixture/signed-ort-download.log" 2 2 >/dev/null 2>&1; then
+    die "self-test accepted a backend download during offline-bundle certification"
+  fi
 
   local value
   cat >"$fixture/metrics.txt" <<'EOF'
@@ -573,6 +596,26 @@ EOF
   ort_reloaded_pool_snapshot_matches \
     "$fixture/ort-reloaded-external-reused.txt" 2000 1500 3221225472 7 1073741824 4294967296 \
     || die "self-test rejected lower ORT external CUDA state after reload"
+
+  printf '%s\n' '{"shape":[1,1],"dtype":"string","data_base64":"Q1VEQQ=="}' \
+    >"$fixture/onnx-response.json"
+  assert_onnx_response_correct "$fixture/onnx-response.json"
+  printf '%s\n' '{"shape":[1,1],"dtype":"string","data_base64":""}' \
+    >"$fixture/empty-onnx-response.json"
+  if (assert_onnx_response_correct "$fixture/empty-onnx-response.json") >/dev/null 2>&1; then
+    die "self-test accepted an empty ONNX generation response"
+  fi
+
+  mkdir -p "$fixture/bundle-source"
+  printf '%s\n' \
+    '{"schema_version":1,"models":[{"path":"models/000-ort.aimod"},{"path":"models/001-gguf.aimod"}]}' \
+    >"$fixture/bundle-source/bundle-manifest.json"
+  tar -C "$fixture/bundle-source" -czf "$fixture/test.kapsl-bundle" bundle-manifest.json
+  resolve_bundle_model_paths "$fixture/test.kapsl-bundle" "$fixture/bundle-cache"
+  [[ "$ort_model" == "$fixture/bundle-cache/"*/models/000-ort.aimod ]] \
+    || die "self-test resolved the wrong bundled ORT model path: $ort_model"
+  [[ "$gguf_model" == "$fixture/bundle-cache/"*/models/001-gguf.aimod ]] \
+    || die "self-test resolved the wrong bundled GGUF model path: $gguf_model"
   rm -rf "$fixture"
   note "harness contract self-test passed"
 }
@@ -823,11 +866,55 @@ run_onnx_inference_if_configured() {
   api_post "/api/models/$onnx_model_id/infer" \
     -H 'Content-Type: application/json' \
     --data-binary "@$request_file" >"$destination"
+  assert_onnx_response_correct "$destination"
+}
+
+assert_onnx_response_correct() {
+  local response_file="$1"
+  local decoded
+  decoded="$(jq -er 'select(.dtype == "string") | .data_base64 | @base64d' "$response_file")" \
+    || die "ONNX response is not a valid UTF-8 tensor: $response_file"
+  [[ -n "$decoded" ]] || die "ONNX response decoded to an empty string: $response_file"
+
+  local baseline="${KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE:-}"
+  if [[ -n "$baseline" ]]; then
+    [[ -s "$baseline" ]] || die "ONNX baseline response is missing or empty: $baseline"
+    local expected
+    expected="$(jq -er 'select(.dtype == "string") | .data_base64 | @base64d' "$baseline")" \
+      || die "ONNX baseline response is not a valid UTF-8 tensor: $baseline"
+    [[ "$decoded" == "$expected" ]] \
+      || die "ONNX output differs from the certified baseline: $response_file"
+  fi
+}
+
+resolve_bundle_model_paths() {
+  local bundle_path="$1"
+  local cache_root="$2"
+  local manifest digest model_count relative
+  manifest="$(tar -xOzf "$bundle_path" bundle-manifest.json)" \
+    || die "cannot read bundle-manifest.json from $bundle_path"
+  jq -e '
+    .schema_version == 1 and
+    (.models | length) == 2 and
+    (.models[0].path | startswith("models/") and endswith(".aimod")) and
+    (.models[1].path | startswith("models/") and endswith(".aimod")) and
+    ([.models[].path | split("/")[]] | all(. != ".." and . != "." and . != ""))
+  ' <<<"$manifest" >/dev/null \
+    || die "offline bundle must contain exactly two safe AIMOD paths (ORT first, GGUF second)"
+  model_count="$(jq -r '.models | length' <<<"$manifest")"
+  [[ "$model_count" == "2" ]] || die "offline bundle contains $model_count models, expected 2"
+  digest="$(sha256sum "$bundle_path" | awk '{print $1}')"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "could not compute offline bundle SHA-256"
+
+  relative="$(jq -er '.models[0].path' <<<"$manifest")"
+  ort_model="$cache_root/$digest/$relative"
+  relative="$(jq -er '.models[1].path' <<<"$manifest")"
+  gguf_model="$cache_root/$digest/$relative"
 }
 
 main() {
   if ! is_true "${KAPSL_GPU_INTEGRATION:-0}"; then
-    echo "SKIP: set KAPSL_GPU_INTEGRATION=1 and provide the binary plus ORT/GGUF model paths"
+    echo "SKIP: set KAPSL_GPU_INTEGRATION=1 and provide the binary plus an offline bundle or ORT/GGUF model paths"
     return 0
   fi
 
@@ -837,12 +924,27 @@ main() {
   require_command awk
 
   binary="${KAPSL_GPU_TEST_BINARY:-}"
-  ort_model="${KAPSL_GPU_TEST_ORT_MODEL:-}"
-  gguf_model="${KAPSL_GPU_TEST_GGUF_MODEL:-}"
+  bundle="${KAPSL_GPU_TEST_BUNDLE:-}"
   [[ -n "$binary" ]] || die "KAPSL_GPU_TEST_BINARY is required"
   [[ -x "$binary" ]] || die "Kapsl binary is not executable: $binary"
-  [[ -s "$ort_model" ]] || die "ORT model is missing or empty: $ort_model"
-  [[ -s "$gguf_model" ]] || die "GGUF model is missing or empty: $gguf_model"
+  if [[ -n "$bundle" ]]; then
+    require_command tar
+    require_command sha256sum
+    [[ -s "$bundle" ]] || die "offline bundle is missing or empty: $bundle"
+    [[ -n "${KAPSL_BUNDLE_CACHE_DIR:-}" ]] \
+      || die "KAPSL_BUNDLE_CACHE_DIR is required with KAPSL_GPU_TEST_BUNDLE"
+    mkdir -p "$KAPSL_BUNDLE_CACHE_DIR"
+    resolve_bundle_model_paths "$bundle" "$KAPSL_BUNDLE_CACHE_DIR"
+  else
+    ort_model="${KAPSL_GPU_TEST_ORT_MODEL:-}"
+    gguf_model="${KAPSL_GPU_TEST_GGUF_MODEL:-}"
+    [[ -s "$ort_model" ]] || die "ORT model is missing or empty: $ort_model"
+    [[ -s "$gguf_model" ]] || die "GGUF model is missing or empty: $gguf_model"
+  fi
+
+  if is_true "${KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE:-0}" && [[ -z "$bundle" ]]; then
+    die "KAPSL_GPU_TEST_BUNDLE is required for offline-bundle certification"
+  fi
 
   if is_true "${KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK:-0}"; then
     case "${KAPSL_GPU_TEST_ORT_PROFILE:-}" in
@@ -855,10 +957,10 @@ main() {
       || die "KAPSL_BACKEND_PUBLIC_KEYS is required for signed ORT certification"
     [[ -n "${KAPSL_BACKEND_CACHE_DIR:-}" ]] \
       || die "KAPSL_BACKEND_CACHE_DIR is required for signed ORT certification"
-    if [[ -z "${KAPSL_BACKEND_INDEX_PATH:-}" && -z "${KAPSL_BACKEND_INDEX_URL:-}" ]]; then
+    if [[ -z "$bundle" && -z "${KAPSL_BACKEND_INDEX_PATH:-}" && -z "${KAPSL_BACKEND_INDEX_URL:-}" ]]; then
       die "KAPSL_BACKEND_INDEX_PATH or KAPSL_BACKEND_INDEX_URL is required for signed ORT certification"
     fi
-    if [[ -n "${KAPSL_BACKEND_INDEX_PATH:-}" ]]; then
+    if [[ -z "$bundle" && -n "${KAPSL_BACKEND_INDEX_PATH:-}" ]]; then
       [[ -s "$KAPSL_BACKEND_INDEX_PATH" ]] \
         || die "signed backend index is missing or empty: $KAPSL_BACKEND_INDEX_PATH"
       [[ -s "${KAPSL_BACKEND_INDEX_PATH}.sig" ]] \
@@ -965,10 +1067,20 @@ main() {
       "KAPSL_LAZY_ONNX_PACKS=1"
     )
   fi
+  if [[ -n "$bundle" ]]; then
+    env_args+=(
+      "KAPSL_LAZY_BACKENDS=1"
+      "KAPSL_LAZY_LLAMA_CPP_PACKS=1"
+      "KAPSL_BUNDLE_CACHE_DIR=$KAPSL_BUNDLE_CACHE_DIR"
+    )
+  fi
 
+  model_args=(--model "$ort_model" --model "$gguf_model")
+  if [[ -n "$bundle" ]]; then
+    model_args=("$bundle" --offline)
+  fi
   env "${env_args[@]}" "$binary" run \
-    --model "$ort_model" \
-    --model "$gguf_model" \
+    "${model_args[@]}" \
     --transport socket \
     --socket "$socket_path" \
     --metrics-port "$port" \
@@ -983,15 +1095,19 @@ main() {
   fi
   wait_for_model_status "$onnx_model_id" active || die "ORT model did not become active"
   wait_for_model_status "$gguf_model_id" active || die "GGUF model did not become active"
+  if [[ -n "$bundle" ]]; then
+    [[ -s "$ort_model" ]] || die "offline bundle did not expose the ORT AIMOD: $ort_model"
+    [[ -s "$gguf_model" ]] || die "offline bundle did not expose the GGUF AIMOD: $gguf_model"
+  fi
   api_get /api/models >"$output_dir/models-initial.json"
 
-  if [[ "${ort_model,,}" == *.onnx ]]; then
+  if [[ -n "$bundle" || "${ort_model,,}" == *.onnx ]]; then
     jq -e --argjson id "$onnx_model_id" \
       '.[] | select(.id == $id and ((.format // .framework) == "onnx"))' \
       "$output_dir/models-initial.json" >/dev/null \
       || die "raw model 0 is not reported as ONNX"
   fi
-  if [[ "${gguf_model,,}" == *.gguf ]]; then
+  if [[ -n "$bundle" || "${gguf_model,,}" == *.gguf ]]; then
     jq -e --argjson id "$gguf_model_id" \
       '.[] | select(.id == $id and ((.format // .framework) == "gguf"))' \
       "$output_dir/models-initial.json" >/dev/null \
@@ -1124,6 +1240,12 @@ main() {
   wait_for_model_status "$onnx_model_id" active || die "ORT model did not become active after reload"
   wait_for_model_status "$gguf_model_id" active || die "GGUF model stopped during ORT reload"
   run_onnx_inference_if_configured "$output_dir/onnx-inference-reloaded.json"
+  if [[ -n "${KAPSL_GPU_TEST_ORT_REQUEST:-}" ]]; then
+    initial_onnx_output="$(jq -er '.data_base64' "$output_dir/onnx-inference-initial.json")"
+    reloaded_onnx_output="$(jq -er '.data_base64' "$output_dir/onnx-inference-reloaded.json")"
+    [[ "$initial_onnx_output" == "$reloaded_onnx_output" ]] \
+      || die "ONNX output changed across unload and reload"
+  fi
   sleep "$settle_seconds"
   wait_for_ort_reloaded_pool_snapshot \
     "$initial_external" "$ort_stopped_external" \

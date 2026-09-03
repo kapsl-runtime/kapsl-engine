@@ -25,6 +25,8 @@ parity_certifier=".github/scripts/certify-ort-cpu-parity.sh"
 parity_workflow=".github/workflows/ort-cpu-conformance.yml"
 gpu_pool_certifier=".github/scripts/test-gpu-device-pool-integration.sh"
 gpu_pack_workflow=".github/workflows/lazy-llama-cpp-backend-pack-gpu-certification.yml"
+gpu_entry_workflow=".github/workflows/gpu-device-pool-integration.yml"
+stable_gpu_workflow=".github/workflows/vllm-shared-pool-conformance.yml"
 installer_workflow=".github/workflows/installer-smoke.yml"
 release_workflow=".github/workflows/release-runtime-installers.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
@@ -112,11 +114,29 @@ require_literal "$parity_certifier" 'Activating signed backend route onnx/cpu'
 require_literal "$parity_certifier" 'Activating embedded ORT rollback route'
 require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK'
 require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_ORT_PACK_VERSION'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_BUNDLE'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE'
 require_literal "$gpu_pool_certifier" 'onnx:$onnx_model_id:0:'
 require_literal "$gpu_pool_certifier" 'gguf:$gguf_model_id:0:'
 require_literal "$gpu_pool_certifier" 'Using embedded ORT rollback'
 require_literal "$gpu_pack_workflow" 'KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK: "1"'
 require_literal "$gpu_pack_workflow" 'KAPSL_GENERIC_NATIVE_PACKS: "1"'
+require_literal "$gpu_entry_workflow" 'candidate_artifact:'
+require_literal "$gpu_entry_workflow" 'candidate_artifact: ${{ needs.authorize-stable-release.outputs.candidate_artifact }}'
+require_literal "$gpu_entry_workflow" 'KAPSL_GPU_CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}'
+require_literal "$gpu_entry_workflow" '[[ "$KAPSL_GPU_CANDIDATE_ARTIFACT" != "runtime-cuda-linux-x86_64" ]]'
+require_literal "$gpu_entry_workflow" 'KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}'
+require_literal "$stable_gpu_workflow" 'name: Download the exact CUDA release candidate'
+require_literal "$stable_gpu_workflow" 'KAPSL_GPU_CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}'
+require_literal "$stable_gpu_workflow" '[[ "$KAPSL_GPU_CANDIDATE_ARTIFACT" != "runtime-cuda-linux-x86_64" ]]'
+require_literal "$stable_gpu_workflow" 'engine/.github/ort-release.lock.json'
+require_literal "$stable_gpu_workflow" '90f61e71d6fa8e571d0ab0f95a637a5d7d8ed52f'
+require_literal "$stable_gpu_workflow" 'KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE=1'
+require_literal "$stable_gpu_workflow" 'KAPSL_GPU_TEST_ORT_PROFILE=cuda12'
+require_literal "$stable_gpu_workflow" 'KAPSL_GPU_TEST_ORT_PROFILE=tensorrt10'
+require_literal "$stable_gpu_workflow" 'KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE='
+require_literal "$stable_gpu_workflow" 'engine/.github/scripts/test-gpu-device-pool-integration.sh'
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
@@ -209,6 +229,8 @@ require_literal "$release_workflow" '.github/scripts/import-signed-backend-relea
 require_literal "$release_workflow" '--lock .github/ort-release.lock.json'
 require_literal "$release_workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
 require_literal "$release_workflow" "if: needs.prepare-version.outputs.is_stable_release != 'true'"
+require_literal "$release_workflow" 'needs: [prepare-version, build-cuda-runtime]'
+require_literal "$release_workflow" 'candidate_artifact: runtime-cuda-linux-x86_64'
 
 require_literal "$parity_workflow" 'name: ORT CPU Conformance'
 require_literal "$parity_workflow" "cancel-in-progress: \${{ github.event_name == 'pull_request' }}"
