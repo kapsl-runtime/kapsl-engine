@@ -16,12 +16,15 @@ packager=".github/scripts/package-linux-onnx-backend-packs.sh"
 cpu_packager=".github/scripts/package-linux-ort-cpu-backend.sh"
 accelerator_packager=".github/scripts/package-linux-ort-accelerator-backends.sh"
 integration_verifier=".github/scripts/verify-ort-integration-checkout.sh"
+release_importer=".github/scripts/import-signed-backend-release.py"
 index_generator=".github/scripts/generate-backend-index.py"
 integration_lock=".github/ort-integration.lock"
+release_lock=".github/ort-release.lock.json"
 parity_lock=".github/ort-cpu-parity.lock.json"
 parity_certifier=".github/scripts/certify-ort-cpu-parity.sh"
 parity_workflow=".github/workflows/ort-cpu-conformance.yml"
 installer_workflow=".github/workflows/installer-smoke.yml"
+release_workflow=".github/workflows/release-runtime-installers.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
 bundle="kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
@@ -74,6 +77,10 @@ require_literal "$accelerator_packager" 'engine index publisher owns the release
 require_literal "$integration_verifier" '^[0-9a-f]{40}$'
 require_literal "$integration_verifier" '--untracked-files=all'
 require_literal "$integration_verifier" '--ignored=matching'
+require_literal "$release_importer" 'kapsl-backend-artifact-v1\0'
+require_literal "$release_importer" 'release catalog profiles do not exactly match the pinned required profiles'
+require_literal "$release_importer" 'reconstructed archive failed integrity verification'
+require_literal "$release_importer" 'signature does not match a trusted release key'
 require_literal "$index_generator" 'adapter_abi != "kapsl-backend-v1"'
 require_literal "$bundle" 'backend_artifacts_dir'
 require_literal "$bundle" 'manager.verify_pack_archive(pack, &candidate)?;'
@@ -111,6 +118,32 @@ for entry in (lock["conformance"], lock["model"]):
     assert not path.is_absolute() and ".." not in path.parts
 PY
 
+python3 - "$release_lock" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+lock = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert lock.get("schema_version") == 1
+assert lock.get("repository") == "kapsl-runtime/kapsl-integrations"
+assert lock.get("backend") == "onnx"
+assert lock.get("platform") == "linux-x86_64"
+assert lock.get("profiles") == ["cpu", "cuda12", "tensorrt10"]
+assert re.fullmatch(r"[0-9a-f]{40}", lock["source_commit"])
+assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", lock["pack_version"])
+kapsl_version = lock["compatible_kapsl"].removeprefix("=")
+assert re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", kapsl_version)
+assert lock["release_tag"] == (
+    f"kapsl-ort-packs-v{lock['pack_version']}-kapsl-v{kapsl_version}"
+)
+catalog = lock["catalog"]
+assert re.fullmatch(r"[A-Za-z0-9._-]+\.release\.json", catalog["name"])
+assert re.fullmatch(r"[0-9a-f]{64}", catalog["sha256"])
+assert catalog["signature"].startswith("ed25519:")
+assert re.fullmatch(r"[0-9a-f]{64}", catalog["signature_asset"]["sha256"])
+PY
+
 if grep -Fq 'package_profile cpu ' "$packager"; then
   echo "$packager must not publish the legacy provider-only CPU bundle" >&2
   exit 1
@@ -136,7 +169,7 @@ fi
 
 for workflow in \
   .github/workflows/beta-runtime-installers.yml \
-  .github/workflows/release-runtime-installers.yml; do
+  "$release_workflow"; do
   require_literal "$workflow" '.github/scripts/package-linux-onnx-backend-packs.sh'
   require_literal "$workflow" '.github/scripts/package-linux-ort-cpu-backend.sh'
   require_literal "$workflow" '.github/ort-integration.lock'
@@ -148,6 +181,13 @@ for workflow in \
   require_literal "$workflow" '.github/scripts/collect-linux-tensorrt-runtime.sh'
 done
 
+require_literal "$release_workflow" 'name: Import immutable signed ORT backend packs'
+require_literal "$release_workflow" "if: needs.prepare-version.outputs.is_stable_release == 'true'"
+require_literal "$release_workflow" '.github/scripts/import-signed-backend-release.py'
+require_literal "$release_workflow" '--lock .github/ort-release.lock.json'
+require_literal "$release_workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
+require_literal "$release_workflow" "if: needs.prepare-version.outputs.is_stable_release != 'true'"
+
 require_literal "$parity_workflow" 'name: ORT CPU Conformance'
 require_literal "$parity_workflow" "cancel-in-progress: \${{ github.event_name == 'pull_request' }}"
 require_literal "$parity_workflow" '.github/ort-cpu-parity.lock.json'
@@ -157,6 +197,7 @@ require_literal "$parity_workflow" 'KAPSL_ORT_CONFORMANCE_MODE:'
 require_literal "$parity_certifier" 'not_enforced_on_pull_requests'
 require_literal "$parity_certifier" 'sequence = ["baseline", "candidate", "candidate", "baseline"] * 2'
 require_literal "$installer_workflow" '.github/scripts/test-package-linux-ort-accelerator-backends.sh'
+require_literal "$installer_workflow" '.github/scripts/test_import_signed_backend_release.py'
 if grep -Fq 'Certify embedded versus packaged ORT CPU parity' "$installer_workflow"; then
   echo "$installer_workflow must not run ORT performance conformance." >&2
   exit 1

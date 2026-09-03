@@ -1,0 +1,26 @@
+{
+  "backend": "onnx",
+  "catalog": {
+    "name": "kapsl-ort-packs-v0.2.0-kapsl-v0.2.4-linux-x86_64.release.json",
+    "sha256": "3ec5b4483504cbede901b4e1dc0e78c603a02c9f895aa8d01bade2b877bd714e",
+    "signature": "ed25519:VEG5oWx7ILDGtpa5CLWTMeRmOKxunsc/hWwZjAVYjiI//RLONn1eoyLH3URNiy7Vpj2THwr7BGH5Rk0YiDi7Bw==",
+    "signature_asset": {
+      "name": "kapsl-ort-packs-v0.2.0-kapsl-v0.2.4-linux-x86_64.release.json.sig",
+      "sha256": "ff635311151f1845592c4d94e81ba339c6e1396fceaaf205a98244b861e0ac11",
+      "size": 97
+    },
+    "size": 6755
+  },
+  "compatible_kapsl": "=0.2.4",
+  "pack_version": "0.2.0",
+  "platform": "linux-x86_64",
+  "profiles": [
+    "cpu",
+    "cuda12",
+    "tensorrt10"
+  ],
+  "release_tag": "kapsl-ort-packs-v0.2.0-kapsl-v0.2.4",
+  "repository": "kapsl-runtime/kapsl-integrations",
+  "schema_version": 1,
+  "source_commit": "0b7a10f4ffcc8347f161c1fa3015802d9acd2695"
+}

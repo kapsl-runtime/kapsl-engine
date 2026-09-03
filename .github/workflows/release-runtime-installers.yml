@@ -425,6 +425,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Resolve certified ORT integrations commit
+        if: needs.prepare-version.outputs.is_stable_release != 'true'
         id: ort-integrations
         shell: bash
         run: |
@@ -438,6 +439,7 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Checkout certified ORT adapter
+        if: needs.prepare-version.outputs.is_stable_release != 'true'
         uses: actions/checkout@v4
         with:
           repository: kapsl-runtime/kapsl-integrations
@@ -445,6 +447,7 @@ jobs:
           path: kapsl-integrations-ort
 
       - name: Verify certified ORT integrations checkout
+        if: needs.prepare-version.outputs.is_stable_release != 'true'
         shell: bash
         run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
 
@@ -472,6 +475,7 @@ jobs:
         uses: ./.github/actions/setup-rust
 
       - name: Install certified ORT packaging toolchain
+        if: needs.prepare-version.outputs.is_stable_release != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -494,10 +498,12 @@ jobs:
         run: .github/scripts/package-linux-cuda-runtime.sh
 
       - name: Package certified ORT CPU adapter
+        if: needs.prepare-version.outputs.is_stable_release != 'true'
         shell: bash
         run: .github/scripts/package-linux-ort-cpu-backend.sh
 
       - name: Package legacy ONNX accelerator packs
+        if: needs.prepare-version.outputs.is_stable_release != 'true'
         shell: bash
         run: .github/scripts/package-linux-onnx-backend-packs.sh
 
@@ -514,6 +520,16 @@ jobs:
         env:
           KAPSL_VLLM_SDK_DIR: sdk-vllm
         run: .github/scripts/package-linux-vllm-backend.sh
+
+      - name: Import immutable signed ORT backend packs
+        if: needs.prepare-version.outputs.is_stable_release == 'true'
+        shell: bash
+        run: |
+          .github/scripts/import-signed-backend-release.py \
+            --version "$KAPSL_VERSION" \
+            --lock .github/ort-release.lock.json \
+            --artifacts-dir dist \
+            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"
 
       - name: Generate signed backend index
         shell: bash
