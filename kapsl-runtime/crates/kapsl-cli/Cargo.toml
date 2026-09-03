@@ -48,7 +48,7 @@ kapsl-kv-abi = "0.6.0"
 kapsl-loader = "0.3.0"
 kapsl-rag = "0.3.0"
 kapsl-rag-sdk = "0.3.0"
-kapsl-backend-abi = "=0.1.0"
+kapsl-backend-abi = "=0.2.0"
 warp = "0.3"
 hyper = { version = "0.14", features = ["client", "http1", "stream", "tcp"] }
 prometheus = "0.14"

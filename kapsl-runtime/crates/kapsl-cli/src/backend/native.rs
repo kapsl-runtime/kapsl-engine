@@ -31,7 +31,7 @@ use std::collections::HashMap;
 #[cfg(feature = "gpu-device-pool")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";
+pub(crate) const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";
 const MAX_JSON_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESULT_TENSORS: usize = 1024;
 const MAX_TENSOR_RANK: usize = 32;
@@ -56,25 +56,46 @@ struct ActiveNativePack {
     library: libloading::Library,
 }
 
+/// Immutable identity selected from the signed index before adapter loading.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NativeBackendPackIdentity {
+    pub(crate) backend: String,
+    pub(crate) profile: String,
+    pub(crate) pack_version: String,
+}
+
+impl NativeBackendPackIdentity {
+    pub(crate) fn from_manifest(manifest: &BackendPackManifest) -> Self {
+        Self {
+            backend: manifest.backend.clone(),
+            profile: manifest.profile.clone(),
+            pack_version: manifest.pack_version.clone(),
+        }
+    }
+}
+
 fn active_native_packs() -> &'static Mutex<Vec<Arc<ActiveNativePack>>> {
     static ACTIVE: OnceLock<Mutex<Vec<Arc<ActiveNativePack>>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Opt-in while the packed ORT path is being certified against the embedded
-/// rollback. Once parity is proven, release policy can change the default
-/// without adding another loader.
+/// Signed native packs are the bridge-release default. Setting this switch to
+/// false is the explicit rollback that permits the embedded ORT path.
 pub(crate) fn generic_native_backend_packs_enabled() -> Result<bool, String> {
     let value = match std::env::var(GENERIC_NATIVE_PACKS_ENV) {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err(format!(
                 "{GENERIC_NATIVE_PACKS_ENV} must be valid UTF-8 and set to 0 or 1"
             ))
         }
     };
-    parse_generic_native_packs_switch(&value)
+    resolve_generic_native_packs_switch(value.as_deref())
+}
+
+fn resolve_generic_native_packs_switch(value: Option<&str>) -> Result<bool, String> {
+    value.map_or(Ok(true), parse_generic_native_packs_switch)
 }
 
 fn parse_generic_native_packs_switch(value: &str) -> Result<bool, String> {
@@ -203,24 +224,12 @@ fn validate_native_backend_api(
     if !api.capabilities_are_consistent() {
         return Err("native pack ABI v1 capability table is contradictory".to_string());
     }
-
-    if manifest.backend == "onnx" {
-        let expected_accelerator = match manifest.profile.as_str() {
-            crate::backend::ONNX_CPU_PACK_PROFILE => "cpu",
-            crate::backend::ONNX_CUDA12_PACK_PROFILE => "cuda",
-            crate::backend::ONNX_TENSORRT10_PACK_PROFILE => "tensorrt",
-            profile => {
-                return Err(format!(
-                    "standard-ABI ONNX pack declares unsupported fixed profile `{profile}`"
-                ))
-            }
-        };
-        if manifest.accelerator_profile != expected_accelerator {
-            return Err(format!(
-                "signed ONNX pack profile `{}` requires accelerator profile `{expected_accelerator}`, received `{}`",
-                manifest.profile, manifest.accelerator_profile
-            ));
-        }
+    let callable_capabilities = pack_capabilities_from_abi(api.capabilities);
+    if manifest.capabilities != callable_capabilities {
+        return Err(format!(
+            "native {}/{} ABI capabilities do not match its signed pack capabilities",
+            manifest.backend, manifest.profile
+        ));
     }
 
     let execution = api.capabilities & KAPSL_BACKEND_CAP_EXECUTION_MASK;
@@ -251,17 +260,31 @@ fn validate_native_backend_api(
     Ok(())
 }
 
+fn pack_capabilities_from_abi(capabilities: u64) -> super::BackendPackCapabilities {
+    super::BackendPackCapabilities {
+        batching: capabilities & KAPSL_BACKEND_CAP_BATCHING != 0,
+        streaming: capabilities & KAPSL_BACKEND_CAP_STREAMING != 0,
+        cancellation: capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0,
+        memory_reporting: capabilities & KAPSL_BACKEND_CAP_MEMORY_REPORTING != 0,
+        governed_device_allocator: capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0,
+        scoped_device_allocator: capabilities & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR != 0,
+        kv_participation: capabilities & KAPSL_BACKEND_CAP_KV_PARTICIPANT != 0,
+        concurrent_inference: capabilities & KAPSL_BACKEND_CAP_CONCURRENT_INFERENCE != 0,
+    }
+}
+
 fn validate_native_backend_descriptor(
     manifest: &BackendPackManifest,
     api: &KapslBackendApiV1,
     descriptor: &serde_json::Value,
 ) -> Result<(), String> {
-    if manifest.backend != "onnx" {
-        return Ok(());
-    }
     let expected_profiles = serde_json::json!([manifest.profile]);
-    let expected_governed = api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
     let checks = [
+        (
+            descriptor.get("schema_version")
+                == Some(&serde_json::json!(KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1)),
+            "schema version",
+        ),
         (
             descriptor.get("backend") == Some(&serde_json::json!(manifest.backend)),
             "backend identity",
@@ -283,18 +306,67 @@ fn validate_native_backend_descriptor(
             descriptor.get("execution_mode") == Some(&serde_json::json!("native")),
             "execution mode",
         ),
-        (
-            descriptor.get("governed_device_memory") == Some(&serde_json::json!(expected_governed)),
-            "governed-device-memory declaration",
-        ),
     ];
     if let Some((_, label)) = checks.into_iter().find(|(matches, _)| !matches) {
         return Err(format!(
-            "native ONNX descriptor {label} does not match signed {}/{} pack and ABI table",
+            "native descriptor {label} does not match signed {}/{} pack and ABI table",
             manifest.backend, manifest.profile
         ));
     }
+    if let Some(governed) = descriptor.get("governed_device_memory") {
+        let expected = api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
+        if governed != &serde_json::json!(expected) {
+            return Err(format!(
+                "native descriptor governed-device-memory declaration does not match signed {}/{} pack and ABI table",
+                manifest.backend, manifest.profile
+            ));
+        }
+    }
+    for (field, signed) in [("formats", &manifest.formats), ("tasks", &manifest.tasks)] {
+        let described = descriptor_contract_values(descriptor, field)?;
+        let mut signed = signed
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        signed.sort();
+        if described != signed {
+            return Err(format!(
+                "native descriptor {field} does not match signed {}/{} pack",
+                manifest.backend, manifest.profile
+            ));
+        }
+    }
     Ok(())
+}
+
+fn descriptor_contract_values(
+    descriptor: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let values = descriptor
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("native backend descriptor `{field}` must be an array"))?;
+    let mut result = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    format!("native backend descriptor `{field}` contains a non-string value")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    result.sort();
+    result.dedup();
+    if result.len() != values.len() {
+        return Err(format!(
+            "native backend descriptor `{field}` contains duplicate values"
+        ));
+    }
+    Ok(result)
 }
 
 fn describe_backend(api: &KapslBackendApiV1) -> Result<serde_json::Value, String> {
@@ -321,50 +393,36 @@ fn describe_backend(api: &KapslBackendApiV1) -> Result<serde_json::Value, String
     Ok(descriptor)
 }
 
-fn active_native_pack(backend: &str, pack_profile: &str) -> Option<Arc<ActiveNativePack>> {
+fn active_native_pack(identity: &NativeBackendPackIdentity) -> Option<Arc<ActiveNativePack>> {
     active_native_packs()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .rev()
-        .find(|pack| pack.manifest.backend == backend && pack.manifest.profile == pack_profile)
+        .find(|pack| {
+            pack.manifest.backend == identity.backend
+                && pack.manifest.profile == identity.profile
+                && pack.manifest.pack_version == identity.pack_version
+        })
         .cloned()
-}
-
-pub(crate) fn native_backend_pack_active_for_provider(
-    backend: &str,
-    provider: &str,
-) -> Result<bool, String> {
-    let pack_profile = provider_pack_profile(provider)?;
-    Ok(active_native_pack(backend, pack_profile).is_some())
-}
-
-fn provider_pack_profile(provider: &str) -> Result<&'static str, String> {
-    match provider.trim().to_ascii_lowercase().as_str() {
-        "cpu" | "cpuexecutionprovider" => Ok(crate::backend::ONNX_CPU_PACK_PROFILE),
-        "cuda" | "cudaexecutionprovider" => Ok(crate::backend::ONNX_CUDA12_PACK_PROFILE),
-        "tensorrt" | "tensorrtexecutionprovider" => {
-            Ok(crate::backend::ONNX_TENSORRT10_PACK_PROFILE)
-        }
-        other => Err(format!(
-            "generic native backend host does not recognize provider `{other}`"
-        )),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_native_backend_pack_engine(
+    identity: &NativeBackendPackIdentity,
     manifest: &Manifest,
-    provider: &str,
     resources: &RuntimeResources,
     device_id: usize,
     model_id: u32,
     replica_id: u32,
     tuning: Option<&OnnxRuntimeTuning>,
 ) -> Result<Box<dyn Engine>, String> {
-    let pack_profile = provider_pack_profile(provider)?;
-    let pack = active_native_pack("onnx", pack_profile)
-        .ok_or_else(|| format!("no signed standard-ABI onnx/{pack_profile} pack was activated"))?;
+    let pack = active_native_pack(identity).ok_or_else(|| {
+        format!(
+            "selected signed native backend pack {}/{} version {} is not active",
+            identity.backend, identity.profile, identity.pack_version
+        )
+    })?;
     // Pass the signed canonical accelerator name into the adapter. Provider
     // aliases are accepted only at the engine policy boundary and cannot
     // weaken the pack's exact initialization contract.
@@ -2286,7 +2344,7 @@ mod tests {
         }
     }
 
-    fn test_manifest(accelerator_profile: &str) -> BackendPackManifest {
+    fn test_manifest(accelerator_profile: &str, capabilities: u64) -> BackendPackManifest {
         let profile = match accelerator_profile {
             "cpu" => crate::backend::ONNX_CPU_PACK_PROFILE,
             "cuda" => crate::backend::ONNX_CUDA12_PACK_PROFILE,
@@ -2304,10 +2362,32 @@ mod tests {
             platform: "linux-x86_64".to_string(),
             architecture: "x86_64".to_string(),
             accelerator_profile: accelerator_profile.to_string(),
+            accelerator_requirements: super::super::BackendAcceleratorRequirements {
+                kind: Some(accelerator_profile.to_string()),
+                execution_providers: vec![accelerator_profile.to_string()],
+                implicit_cpu_fallback: Some(false),
+            },
             minimum_cuda: None,
             minimum_driver: None,
             execution_mode: BackendExecutionMode::Native,
             kv_mode: None,
+            formats: vec!["onnx".to_string()],
+            model_types: Vec::new(),
+            tasks: vec!["forward".to_string()],
+            capabilities: pack_capabilities_from_abi(capabilities),
+            memory_behavior: super::super::BackendMemoryBehavior {
+                allocation_scope: (capabilities & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR != 0)
+                    .then(|| "kapsl-scoped-device-allocator-v1".to_string()),
+                device_allocation: Some(if accelerator_profile == "cpu" {
+                    "none".to_string()
+                } else {
+                    "host-governed-scoped".to_string()
+                }),
+                planned_reporting: true,
+                live_reporting: true,
+                request_reporting: true,
+                synchronize_before_free: accelerator_profile != "cpu",
+            },
             entrypoint: "lib/libbackend.so".to_string(),
             artifact: "artifact.tar.gz".to_string(),
             download_bytes: 1,
@@ -2325,40 +2405,53 @@ mod tests {
     #[test]
     fn signed_profile_and_execution_capabilities_must_match_exactly() {
         let cpu = complete_api(KAPSL_BACKEND_CAP_CPU | KAPSL_BACKEND_CAP_MEMORY_REPORTING);
-        assert!(validate_native_backend_api(&test_manifest("cpu"), &cpu).is_ok());
+        assert!(validate_native_backend_api(&test_manifest("cpu", cpu.capabilities), &cpu).is_ok());
 
         let mixed = complete_api(
             KAPSL_BACKEND_CAP_CPU | KAPSL_BACKEND_CAP_CUDA | KAPSL_BACKEND_CAP_MEMORY_REPORTING,
         );
-        assert!(validate_native_backend_api(&test_manifest("cpu"), &mixed).is_err());
+        assert!(
+            validate_native_backend_api(&test_manifest("cpu", mixed.capabilities), &mixed).is_err()
+        );
 
         let unmanaged_cuda =
             complete_api(KAPSL_BACKEND_CAP_CUDA | KAPSL_BACKEND_CAP_MEMORY_REPORTING);
-        assert!(validate_native_backend_api(&test_manifest("cuda"), &unmanaged_cuda).is_err());
+        assert!(validate_native_backend_api(
+            &test_manifest("cuda", unmanaged_cuda.capabilities),
+            &unmanaged_cuda
+        )
+        .is_err());
 
         let governed_cuda = complete_api(
             KAPSL_BACKEND_CAP_CUDA
                 | KAPSL_BACKEND_CAP_MEMORY_REPORTING
                 | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR,
         );
-        assert!(validate_native_backend_api(&test_manifest("cuda"), &governed_cuda).is_ok());
+        assert!(validate_native_backend_api(
+            &test_manifest("cuda", governed_cuda.capabilities),
+            &governed_cuda
+        )
+        .is_ok());
 
-        let mut mismatched = test_manifest("cuda");
-        mismatched.profile = crate::backend::ONNX_TENSORRT10_PACK_PROFILE.to_string();
+        let mut mismatched = test_manifest("cuda", governed_cuda.capabilities);
+        mismatched.accelerator_profile = "tensorrt".to_string();
         assert!(validate_native_backend_api(&mismatched, &governed_cuda).is_err());
     }
 
     #[test]
-    fn descriptor_must_match_the_signed_fixed_profile_and_capability_table() {
+    fn descriptor_must_match_the_signed_identity_and_capability_table() {
         let api = complete_api(
             KAPSL_BACKEND_CAP_CUDA
                 | KAPSL_BACKEND_CAP_MEMORY_REPORTING
                 | KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR,
         );
-        let manifest = test_manifest("cuda");
+        let manifest = test_manifest("cuda", api.capabilities);
         let descriptor = serde_json::json!({
+            "schema_version": KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1,
             "backend": "onnx",
             "profiles": ["cuda12"],
+            "formats": ["onnx"],
+            "tasks": ["forward"],
             "backend_abi": KAPSL_BACKEND_ABI_VERSION,
             "wire_format": KAPSL_BACKEND_WIRE_FORMAT_TENSORS_V1,
             "execution_mode": "native",
@@ -2378,30 +2471,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_aliases_resolve_to_fixed_pack_profiles() {
-        assert_eq!(provider_pack_profile("cpu").unwrap(), "cpu");
-        assert_eq!(
-            provider_pack_profile("CUDAExecutionProvider").unwrap(),
-            "cuda12"
-        );
-        assert_eq!(
-            provider_pack_profile("TensorRTExecutionProvider").unwrap(),
-            "tensorrt10"
-        );
-        assert!(provider_pack_profile("rocm").is_err());
-    }
-
-    #[test]
     fn cancellation_capability_requires_and_accepts_the_cancel_hook() {
         let capabilities = KAPSL_BACKEND_CAP_CPU
             | KAPSL_BACKEND_CAP_MEMORY_REPORTING
             | KAPSL_BACKEND_CAP_CANCELLATION;
         let cancellable = complete_api(capabilities);
-        assert!(validate_native_backend_api(&test_manifest("cpu"), &cancellable).is_ok());
+        assert!(validate_native_backend_api(
+            &test_manifest("cpu", cancellable.capabilities),
+            &cancellable
+        )
+        .is_ok());
 
         let mut contradictory = cancellable;
         contradictory.cancel = None;
-        assert!(validate_native_backend_api(&test_manifest("cpu"), &contradictory).is_err());
+        assert!(validate_native_backend_api(
+            &test_manifest("cpu", contradictory.capabilities),
+            &contradictory
+        )
+        .is_err());
     }
 
     #[test]
@@ -2410,11 +2497,19 @@ mod tests {
             | KAPSL_BACKEND_CAP_MEMORY_REPORTING
             | KAPSL_BACKEND_CAP_STREAMING;
         let streaming = complete_api(capabilities);
-        assert!(validate_native_backend_api(&test_manifest("cpu"), &streaming).is_ok());
+        assert!(validate_native_backend_api(
+            &test_manifest("cpu", streaming.capabilities),
+            &streaming
+        )
+        .is_ok());
 
         let mut contradictory = streaming;
         contradictory.infer_stream = None;
-        assert!(validate_native_backend_api(&test_manifest("cpu"), &contradictory).is_err());
+        assert!(validate_native_backend_api(
+            &test_manifest("cpu", contradictory.capabilities),
+            &contradictory
+        )
+        .is_err());
     }
 
     #[test]
@@ -2742,6 +2837,7 @@ mod tests {
 
     #[test]
     fn migration_switch_is_strict_and_explicit() {
+        assert!(resolve_generic_native_packs_switch(None).unwrap());
         assert!(parse_generic_native_packs_switch("1").unwrap());
         assert!(!parse_generic_native_packs_switch("off").unwrap());
         assert!(parse_generic_native_packs_switch("enabled").is_err());

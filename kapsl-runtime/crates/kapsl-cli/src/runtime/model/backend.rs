@@ -350,6 +350,7 @@ fn estimated_model_memory(model_path: &Path) -> Result<EstimatedModelMemory, Str
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_runtime_backend_for_device(
     manifest: &Manifest,
+    onnx_route: Option<&OnnxBackendRoute>,
     provider: &str,
     device_id: usize,
     device_info: &DeviceInfo,
@@ -422,11 +423,39 @@ pub(super) fn create_runtime_backend_for_device(
         }
     }
 
-    if engine_kind.uses_onnx_session() && native_backend_pack_active_for_provider("onnx", provider)?
-    {
-        return create_native_backend_pack_engine(
-            manifest, provider, resources, device_id, model_id, replica_id, tuning,
-        );
+    if engine_kind.uses_onnx_session() {
+        match onnx_route.ok_or_else(|| {
+            format!(
+                "ONNX model `{}` reached backend construction without an immutable route decision",
+                manifest.project_name
+            )
+        })? {
+            OnnxBackendRoute::SignedPack { identity, reason } => {
+                log::info!(
+                    "Activating signed backend route {}/{} version {} for model `{}`: {}",
+                    identity.backend,
+                    identity.profile,
+                    identity.pack_version,
+                    manifest.project_name,
+                    reason
+                );
+                return create_native_backend_pack_engine(
+                    identity, manifest, resources, device_id, model_id, replica_id, tuning,
+                );
+            }
+            OnnxBackendRoute::EmbeddedRollback { reason } => {
+                log::warn!(
+                    "Activating embedded ORT rollback route for model `{}`: {}",
+                    manifest.project_name,
+                    reason
+                );
+            }
+        }
+    } else if onnx_route.is_some() {
+        return Err(format!(
+            "non-ONNX model `{}` received an ONNX backend route",
+            manifest.project_name
+        ));
     }
 
     if engine_kind.is_onnx_generate() {
