@@ -21,6 +21,8 @@ integration_lock=".github/ort-integration.lock"
 parity_lock=".github/ort-cpu-parity.lock.json"
 parity_certifier=".github/scripts/certify-ort-cpu-parity.sh"
 parity_workflow=".github/workflows/ort-cpu-conformance.yml"
+gpu_pool_certifier=".github/scripts/test-gpu-device-pool-integration.sh"
+gpu_pack_workflow=".github/workflows/lazy-llama-cpp-backend-pack-gpu-certification.yml"
 installer_workflow=".github/workflows/installer-smoke.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
@@ -97,6 +99,17 @@ require_literal "$parity_certifier" '"requests_per_payload": 1000'
 require_literal "$parity_certifier" 'certification_status=0'
 require_literal "$parity_certifier" 'rm -f "$evidence_dir/kapsl.sock"'
 require_literal "$parity_certifier" 'exit "$certification_status"'
+require_literal "$parity_certifier" 'Using embedded ORT rollback for model `ort-cpu-parity`'
+require_literal "$parity_certifier" 'Selected signed native backend route onnx/cpu'
+require_literal "$parity_certifier" 'Activating signed backend route onnx/cpu'
+require_literal "$parity_certifier" 'Activating embedded ORT rollback route'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_ORT_PACK_VERSION'
+require_literal "$gpu_pool_certifier" 'onnx:$onnx_model_id:0:'
+require_literal "$gpu_pool_certifier" 'gguf:$gguf_model_id:0:'
+require_literal "$gpu_pool_certifier" 'Using embedded ORT rollback'
+require_literal "$gpu_pack_workflow" 'KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK: "1"'
+require_literal "$gpu_pack_workflow" 'KAPSL_GENERIC_NATIVE_PACKS: "1"'
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
