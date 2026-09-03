@@ -23,6 +23,8 @@ release_lock=".github/ort-release.lock.json"
 parity_lock=".github/ort-cpu-parity.lock.json"
 parity_certifier=".github/scripts/certify-ort-cpu-parity.sh"
 parity_workflow=".github/workflows/ort-cpu-conformance.yml"
+gpu_pool_certifier=".github/scripts/test-gpu-device-pool-integration.sh"
+gpu_pack_workflow=".github/workflows/lazy-llama-cpp-backend-pack-gpu-certification.yml"
 installer_workflow=".github/workflows/installer-smoke.yml"
 release_workflow=".github/workflows/release-runtime-installers.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
@@ -33,25 +35,29 @@ cli_manifest="kapsl-runtime/crates/kapsl-cli/Cargo.toml"
 require_literal "$manager" 'pub(crate) const ONNX_CPU_PACK_PROFILE: &str = "cpu";'
 require_literal "$manager" 'pub(crate) const ONNX_CUDA12_PACK_PROFILE: &str = "cuda12";'
 require_literal "$manager" 'pub(crate) const ONNX_TENSORRT10_PACK_PROFILE: &str = "tensorrt10";'
-require_literal "$activator" 'libloading::os::unix::Library::open'
-require_literal "$activator" 'libc::RTLD_NOW | libc::RTLD_GLOBAL'
 require_literal "$activator" 'TensorRT may only be selected when the .aimod explicitly declares it'
 require_literal "$activator" '!generic_native_backend_packs_enabled()?'
+require_literal "$activator" 'embedded_onnx_rollback_reason(manifest)?'
+require_literal "$activator" 'onnx_backend_pack_requirements('
+require_literal "$activator" '.plan_compatible_backend(&requirements, &target)'
 require_literal "$activator" 'pack_plan.manifest.adapter_abi.as_deref()'
 require_literal "$activator" 'STANDARD_NATIVE_ADAPTER_ABI'
 require_literal "$activator" 'activate_native_backend_pack(&pack_plan.manifest, &installed)?;'
 require_literal "$runtime_backend" 'LLMBackend::with_device(provider.to_owned(), device_id as i32)'
-require_literal "$runtime_backend" 'native_backend_pack_active_for_provider("onnx", provider)?'
+require_literal "$runtime_backend" 'OnnxBackendRoute::SignedPack { identity, reason }'
+require_literal "$runtime_backend" 'OnnxBackendRoute::EmbeddedRollback { reason }'
 require_literal "$runtime_backend" 'return create_native_backend_pack_engine('
-require_literal "$native_host" 'const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";'
+require_literal "$native_host" 'pub(crate) const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";'
 require_literal "$native_host" 'KAPSL_BACKEND_ENTRYPOINT_SYMBOL'
 require_literal "$native_host" 'KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR'
+require_literal "$native_host" 'KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR'
+require_literal "$native_host" 'KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1'
 require_literal "$native_host" 'GpuDevicePool'
 require_literal "$native_host" '"pack_root": pack.root'
 require_literal "$native_host" '"onnx_tuning": tuning.map'
 require_literal "$native_host" 'pointer.cast::<KapslBackendApiPrefixV1>().read()'
 require_literal "$native_host" 'pack.api.shutdown'
-require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.1.0"'
+require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.2.0"'
 require_literal "$packager" 'package_profile cuda12 cuda 2'
 require_literal "$packager" 'package_profile tensorrt10 tensorrt 3'
 require_literal "$packager" '"execution_mode": "native"'
@@ -82,6 +88,12 @@ require_literal "$release_importer" 'release catalog profiles do not exactly mat
 require_literal "$release_importer" 'reconstructed archive failed integrity verification'
 require_literal "$release_importer" 'signature does not match a trusted release key'
 require_literal "$index_generator" 'adapter_abi != "kapsl-backend-v1"'
+require_literal "$index_generator" 'validate_standard_native_contract(template, source)'
+require_literal "$index_generator" 'standard native packs must explicitly disable implicit CPU fallback'
+require_literal "$manager" 'pub(crate) fn select_compatible_pack('
+require_literal "$manager" 'backend selection is ambiguous between equally ranked signed packs'
+require_literal "$manager" 'execution_provider: Option<String>'
+require_literal "$manager" 'synchronize_before_free: bool'
 require_literal "$bundle" 'backend_artifacts_dir'
 require_literal "$bundle" 'manager.verify_pack_archive(pack, &candidate)?;'
 require_literal "$manager" 'let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;'
@@ -94,6 +106,17 @@ require_literal "$parity_certifier" '"requests_per_payload": 1000'
 require_literal "$parity_certifier" 'certification_status=0'
 require_literal "$parity_certifier" 'rm -f "$evidence_dir/kapsl.sock"'
 require_literal "$parity_certifier" 'exit "$certification_status"'
+require_literal "$parity_certifier" 'Using embedded ORT rollback for model `ort-cpu-parity`'
+require_literal "$parity_certifier" 'Selected signed native backend route onnx/cpu'
+require_literal "$parity_certifier" 'Activating signed backend route onnx/cpu'
+require_literal "$parity_certifier" 'Activating embedded ORT rollback route'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK'
+require_literal "$gpu_pool_certifier" 'KAPSL_GPU_TEST_ORT_PACK_VERSION'
+require_literal "$gpu_pool_certifier" 'onnx:$onnx_model_id:0:'
+require_literal "$gpu_pool_certifier" 'gguf:$gguf_model_id:0:'
+require_literal "$gpu_pool_certifier" 'Using embedded ORT rollback'
+require_literal "$gpu_pack_workflow" 'KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK: "1"'
+require_literal "$gpu_pack_workflow" 'KAPSL_GENERIC_NATIVE_PACKS: "1"'
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
@@ -154,12 +177,11 @@ import pathlib
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-generic = source.index(
-    'native_backend_pack_active_for_provider("onnx", provider)?'
-)
+generic = source.index("OnnxBackendRoute::SignedPack { identity, reason }")
+rollback = source.index("OnnxBackendRoute::EmbeddedRollback { reason }")
 embedded = source.index("if engine_kind.is_onnx_generate()")
-if generic >= embedded:
-    raise SystemExit("generic native ONNX selection must precede every embedded ORT constructor")
+if generic >= embedded or rollback >= embedded:
+    raise SystemExit("the immutable ONNX route decision must precede every embedded ORT constructor")
 PY
 
 if grep -Fq 'LD_LIBRARY_PATH' "$packager"; then

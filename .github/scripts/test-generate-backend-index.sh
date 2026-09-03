@@ -124,4 +124,88 @@ if .github/scripts/generate-backend-index.py \
 fi
 grep -q 'does not match any public key' "$root/wrong-key.log"
 
+python3 - <<'PY'
+import copy
+import importlib.util
+import pathlib
+
+script = pathlib.Path(".github/scripts/generate-backend-index.py")
+spec = importlib.util.spec_from_file_location("generate_backend_index", script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+source = pathlib.Path("standard-native-fixture.json")
+
+accelerator = {
+    "formats": ["onnx"],
+    "model_types": [],
+    "tasks": ["forward", "generate"],
+    "accelerator_profile": "cuda",
+    "capabilities": {
+        "batching": True,
+        "streaming": True,
+        "cancellation": True,
+        "memory_reporting": True,
+        "governed_device_allocator": True,
+        "scoped_device_allocator": True,
+        "kv_participation": False,
+        "concurrent_inference": True,
+    },
+    "accelerator_requirements": {
+        "kind": "cuda",
+        "execution_providers": ["cuda"],
+        "implicit_cpu_fallback": False,
+    },
+    "memory_behavior": {
+        "allocation_scope": "kapsl-scoped-device-allocator-v1",
+        "device_allocation": "host-governed-scoped",
+        "planned_reporting": True,
+        "live_reporting": True,
+        "request_reporting": True,
+        "synchronize_before_free": True,
+    },
+}
+module.validate_standard_native_contract(accelerator, source)
+
+cpu = copy.deepcopy(accelerator)
+cpu["accelerator_profile"] = "cpu"
+cpu["accelerator_requirements"] = {
+    "kind": "cpu",
+    "execution_providers": ["cpu"],
+    "implicit_cpu_fallback": False,
+}
+cpu["capabilities"]["governed_device_allocator"] = False
+cpu["capabilities"]["scoped_device_allocator"] = False
+cpu["memory_behavior"]["allocation_scope"] = None
+cpu["memory_behavior"]["device_allocation"] = "none"
+cpu["memory_behavior"]["synchronize_before_free"] = False
+module.validate_standard_native_contract(cpu, source)
+
+
+def expect_failure(template, message):
+    try:
+        module.validate_standard_native_contract(template, source)
+    except SystemExit as error:
+        assert message in str(error), error
+    else:
+        raise AssertionError(f"standard native contract unexpectedly accepted: {message}")
+
+
+fallback = copy.deepcopy(accelerator)
+fallback["accelerator_requirements"]["implicit_cpu_fallback"] = True
+expect_failure(fallback, "disable implicit CPU fallback")
+
+unscoped = copy.deepcopy(accelerator)
+unscoped["memory_behavior"]["allocation_scope"] = None
+expect_failure(unscoped, "name their allocation scope")
+
+unreported = copy.deepcopy(accelerator)
+unreported["memory_behavior"]["request_reporting"] = False
+expect_failure(unreported, "planned, live, and request memory reporting")
+
+unspecified_allocation = copy.deepcopy(accelerator)
+unspecified_allocation["memory_behavior"]["device_allocation"] = None
+expect_failure(unspecified_allocation, "device allocation behavior")
+PY
+
 echo "backend index generation tests passed"

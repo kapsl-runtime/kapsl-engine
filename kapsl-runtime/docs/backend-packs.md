@@ -18,8 +18,8 @@ verifies the signed index, artifact signature, checksum, platform, accelerator,
 ABI, and installed files, and atomically activates it. A second run uses the
 validated cache.
 
-The beta rollout publishes managed vLLM, one standard-ABI ORT CPU candidate,
-two legacy ONNX accelerator profiles, and two in-process llama.cpp profiles:
+The bridge rollout publishes managed vLLM, three standard-ABI ORT profiles,
+and two in-process llama.cpp profiles:
 
 ```text
 llama-cpp/cpu
@@ -30,12 +30,13 @@ onnx/tensorrt10
 vllm/cu130-flash-attn
 ```
 
-An ONNX model resolves exactly one profile after provider policy and declared
-fallbacks are resolved. The CPU candidate contains and activates no CUDA
-libraries. Its signed manifest declares `adapter_abi: kapsl-backend-v1`; the
-legacy CUDA/TensorRT provider bundles omit that field and cannot be routed to
-the generic host accidentally. While the candidate gate is off, the standard
-CPU pack remains dormant and the embedded ORT implementation is the rollback.
+An ONNX model resolves exactly one execution provider after provider policy and
+declared fallbacks are resolved. The CPU pack contains and activates no CUDA
+libraries. Every ORT pack declares `adapter_abi: kapsl-backend-v1`, model and
+task support, execution-provider requirements, memory behavior, and callable
+capabilities in its signed manifest. Signed packs are the primary ONNX route;
+the embedded ORT implementation is selected only by the explicit
+`KAPSL_GENERIC_NATIVE_PACKS=0` rollback.
 TensorRT is never an automatic fastest-provider upgrade: the package must name
 `tensorrt` as its preferred provider or an allowed fallback.
 GGUF models never trigger lazy ONNX or vLLM pack installation, and ONNX models
@@ -69,33 +70,31 @@ The CUDA archive carries its resolved non-driver CUDA dependency closure and
 redistribution notices beside the entrypoint with an `$ORIGIN` runpath; host
 NVIDIA driver libraries are explicitly excluded.
 
-ONNX Runtime remains in the Kapsl process. Provider objects are opened from
-canonical pack-local absolute paths and retained for the process lifetime;
-Kapsl does not modify process-wide `LD_LIBRARY_PATH`. The pack carries a
-versioned native entrypoint descriptor, ORT libraries, the selected execution
-provider, its user-space accelerator dependency closure, compatibility/memory
-metadata, and license notices. Linux x86_64 is the first published ONNX pack
-platform; other platforms retain their eager in-process provider layout during
-the beta rollout.
+ONNX Runtime remains in the Kapsl process. The generic native host opens the
+verified entrypoint from a canonical pack-local absolute path and retains it
+for the process lifetime; Kapsl does not modify process-wide
+`LD_LIBRARY_PATH`. The pack carries a versioned native entrypoint, ORT
+libraries, the selected execution provider, its user-space accelerator
+dependency closure, compatibility and memory metadata, and license notices.
+Linux x86_64 is the first published ONNX pack platform. ONNX loads on other
+platforms fail closed unless the operator explicitly selects embedded rollback.
 
-The backend-neutral native-pack host is available as a migration and
-certification gate through `KAPSL_GENERIC_NATIVE_PACKS=1`. Only a pack whose
-signed `adapter_abi` is `kapsl-backend-v1` is eligible. With that gate on, the
-pack must export the published ABI v1 entrypoint and Kapsl will not construct
-the embedded ORT backend if loading or initialization fails. A legacy pack
-continues through its provider loader even when CPU certification enables the
-generic gate, so the CPU migration cannot change CUDA/TensorRT routing. The
-signed accelerator profile must exactly match the adapter's CPU, CUDA, or
-TensorRT capability bits. CUDA and TensorRT adapters must allocate device
-memory through the runtime-owned `GpuDevicePool` callbacks.
+The backend-neutral native-pack host is the default ONNX route. Only a pack
+whose signed `adapter_abi` is `kapsl-backend-v1` is eligible. The resolver
+matches model format, model type, task, selected execution provider, target
+platform and architecture, ABI, and required capabilities before download. It
+fails unresolved equal-rank choices and unsupported explicit backend pins. The
+pack must export the published ABI v1 entrypoint, and Kapsl will not construct
+the embedded ORT backend if selection, loading, or initialization fails. CUDA
+and TensorRT adapters must use scoped runtime-owned `GpuDevicePool` callbacks
+and synchronize governed allocations before release.
 
-The standard-ABI ORT family also binds the versioned pack identity exactly:
-`cpu` maps to accelerator `cpu`, `cuda12` maps to `cuda`, and `tensorrt10`
-maps to `tensorrt`. Provider aliases are normalized only at the engine policy
-boundary. The adapter receives the signed canonical provider, and activation
-rejects a descriptor unless its one compiled profile, ABI, wire format,
-execution mode, and governed-memory declaration match the signed manifest and
-static function table.
+The selected signed identity includes backend ID, profile, and pack version and
+is carried unchanged from model admission to every replica constructor. No
+request can re-resolve onto embedded ORT. Provider aliases are normalized only
+at the engine policy boundary. Activation rejects a descriptor unless its
+identity, profiles, formats, tasks, ABI, wire format, execution mode, and
+capability table match the signed manifest and static function table.
 
 This path stays in-process: tensor buffers cross the adapter boundary as
 borrowed views, and ORT's allocator forwards directly to the same Kapsl-owned
@@ -103,10 +102,10 @@ pool. It introduces no backend RPC, CUDA IPC, tensor serialization, or second
 GPU allocation authority. The host supplies the canonical signed-pack root and
 the resolved per-model ORT tuning in initialization options, so the adapter can
 resolve only pack-local runtime libraries and does not reread competing process
-configuration. The gate defaults off until the out-of-tree ORT adapter has
-passed CPU parity, GPU memory-ownership, unload/reload, and stable release
-conformance. An invalid gate value is an error rather than a request to fall
-back.
+configuration. The signed route defaults on. Embedded ORT remains available
+only through the explicit rollback switch until the packaged accelerator route
+passes official stable-release qualification. An invalid switch value is an
+error rather than a request to fall back.
 
 Release jobs build the CPU candidate from the exact `kapsl-integrations`
 commit in `.github/ort-integration.lock`. The adapter's committed Rust
@@ -267,8 +266,8 @@ connected machine.
 | `KAPSL_BUNDLE_CACHE_DIR` | Override the verified extracted-bundle cache. |
 | `KAPSL_OFFLINE=1` | Disable backend-index and artifact network access. |
 | `KAPSL_LAZY_BACKENDS=0` | Disable automatic lazy installation and require a preinstalled backend. |
-| `KAPSL_LAZY_ONNX_PACKS=0` | Keep the eager/legacy ONNX provider layout during the compatibility window. Linux x86_64 defaults to lazy ONNX packs. |
-| `KAPSL_GENERIC_NATIVE_PACKS=1` | Enable a signed `kapsl-backend-v1` ONNX candidate. It defaults off, leaving that pack dormant and embedded ORT active; once enabled, candidate load/initialization failures are fail-closed. |
+| `KAPSL_LAZY_ONNX_PACKS=0` | Disable automatic ONNX pack activation. This does not authorize embedded fallback; ONNX loads fail closed while the signed route is selected. |
+| `KAPSL_GENERIC_NATIVE_PACKS=0` | Explicitly select the embedded ORT rollback. The signed `kapsl-backend-v1` route is enabled by default, and failures never cross to embedded ORT. |
 | `KAPSL_LAZY_LLAMA_CPP_PACKS=0` | Keep the eager/compiled llama.cpp layout. The portable Linux x86_64 core defaults to lazy CPU packs when no eager GGUF feature is compiled. |
 | `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1` | Explicitly allow a signed CUDA pack whose `kv_mode` is `native`. Shared-pool packs and the eager shared-KV profile do not require or consume this rollback override. |
 | `KAPSL_PROVIDER_PATH` | Additional Kapsl provider-manifest roots. Verified lazy ONNX pack roots are appended automatically; this is not a loader search path. |

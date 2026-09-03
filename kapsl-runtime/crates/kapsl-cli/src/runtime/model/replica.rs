@@ -100,7 +100,7 @@ pub(super) async fn load_replica(
         device_info,
         Some(&memory_snapshot),
     )?;
-    ensure_onnx_backend_pack(
+    let onnx_route = ensure_onnx_backend_pack(
         &plan.loader.manifest,
         &plan.model_file_path,
         device_info,
@@ -220,6 +220,7 @@ pub(super) async fn load_replica(
             };
             let backend = create_runtime_backend_for_device(
                 &plan.loader.manifest,
+                onnx_route.as_ref(),
                 provider,
                 device.id,
                 device_info,
@@ -278,6 +279,7 @@ pub(super) async fn load_replica(
         // autoscaled CUDA/TensorRT replica silently change execution mode.
         let backend = create_runtime_backend_for_device(
             &plan.loader.manifest,
+            onnx_route.as_ref(),
             &selection.logical_provider,
             device_id,
             device_info,

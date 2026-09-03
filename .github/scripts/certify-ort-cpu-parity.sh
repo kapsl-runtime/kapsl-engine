@@ -320,9 +320,14 @@ config = {
             "KAPSL_LAZY_ONNX_PACKS": "0",
         },
         "required_log_markers": [
-            "Lazy ONNX packs are disabled; using the runtime's eager provider deployment"
+            "Using embedded ORT rollback for model `ort-cpu-parity`",
+            "Activating embedded ORT rollback route for model `ort-cpu-parity`",
         ],
-        "forbidden_log_markers": ["Activated signed native backend pack onnx/cpu"],
+        "forbidden_log_markers": [
+            "Activated signed native backend pack onnx/cpu",
+            "Selected signed native backend route onnx/cpu",
+            "Activating signed backend route onnx/cpu",
+        ],
     },
     "candidate": {
         "base_url": "http://127.0.0.1:19095",
@@ -334,9 +339,14 @@ config = {
             "KAPSL_GENERIC_NATIVE_PACKS": "1",
             "KAPSL_LAZY_ONNX_PACKS": "1",
         },
-        "required_log_markers": ["Activated signed native backend pack onnx/cpu"],
+        "required_log_markers": [
+            "Activated signed native backend pack onnx/cpu",
+            "Selected signed native backend route onnx/cpu",
+            "Activating signed backend route onnx/cpu",
+        ],
         "forbidden_log_markers": [
-            "Lazy ONNX packs are disabled; using the runtime's eager provider deployment"
+            "Using embedded ORT rollback",
+            "Activating embedded ORT rollback route",
         ],
     },
 }
