@@ -35,6 +35,33 @@ output_dir.mkdir(parents=True, exist_ok=True)
 adapter_abi = "invalid-adapter" if os.environ.get("FIXTURE_BAD_ADAPTER") else "kapsl-backend-v1"
 entrypoint_bytes = b"fixture standard ABI entrypoint\n"
 runtime_bytes = b"fixture pack-local ONNX Runtime\n"
+contract = {
+    "formats": ["onnx"],
+    "tasks": ["forward", "embed", "classify", "detect", "transcribe", "generate"],
+    "capabilities": {
+        "batching": True,
+        "streaming": True,
+        "cancellation": True,
+        "memory_reporting": True,
+        "governed_device_allocator": False,
+        "scoped_device_allocator": False,
+        "kv_participation": False,
+        "concurrent_inference": True,
+    },
+    "accelerator_requirements": {
+        "kind": "cpu",
+        "execution_providers": ["cpu"],
+        "implicit_cpu_fallback": False,
+    },
+    "memory_behavior": {
+        "allocation_scope": None,
+        "device_allocation": "none",
+        "planned_reporting": True,
+        "live_reporting": True,
+        "request_reporting": True,
+        "synchronize_before_free": False,
+    },
+}
 payload = {
     "schema_version": 1,
     "backend": "onnx",
@@ -45,6 +72,7 @@ payload = {
     "platform": "linux-x86_64",
     "execution_mode": "native",
     "entrypoint": "libkapsl_backend_ort.so",
+    **contract,
 }
 provenance = {
     "schema_version": 1,
@@ -163,6 +191,9 @@ pack = index["packs"][0]
 assert pack["adapter_abi"] == "kapsl-backend-v1"
 assert pack["backend"] == "onnx" and pack["profile"] == "cpu"
 assert pack["entrypoint"] == "libkapsl_backend_ort.so"
+assert pack["formats"] == ["onnx"]
+assert pack["accelerator_requirements"]["implicit_cpu_fallback"] is False
+assert pack["memory_behavior"]["request_reporting"] is True
 PY
 
 if run_packager >/dev/null 2>&1; then

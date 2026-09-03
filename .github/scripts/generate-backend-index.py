@@ -217,6 +217,113 @@ def validate_relative_path(value: Any, label: str, source: pathlib.Path) -> str:
     return value
 
 
+def validate_contract_values(
+    value: Any, label: str, source: pathlib.Path, *, allow_empty: bool = False
+) -> list[str]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        qualifier = "an array" if allow_empty else "a non-empty array"
+        raise SystemExit(f"{source}: {label} must be {qualifier}")
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise SystemExit(f"{source}: {label} values must be non-empty strings")
+        normalized.append(item.strip().lower())
+    if len(normalized) != len(set(normalized)):
+        raise SystemExit(f"{source}: {label} values must be unique")
+    return normalized
+
+
+def validate_standard_native_contract(template: dict[str, Any], source: pathlib.Path) -> None:
+    validate_contract_values(template.get("formats"), "formats", source)
+    validate_contract_values(
+        template.get("model_types", []), "model_types", source, allow_empty=True
+    )
+    validate_contract_values(template.get("tasks"), "tasks", source)
+
+    capabilities = template.get("capabilities")
+    if not isinstance(capabilities, dict):
+        raise SystemExit(f"{source}: capabilities must be an object")
+    capability_fields = (
+        "batching",
+        "streaming",
+        "cancellation",
+        "memory_reporting",
+        "governed_device_allocator",
+        "scoped_device_allocator",
+        "kv_participation",
+        "concurrent_inference",
+    )
+    for field in capability_fields:
+        if not isinstance(capabilities.get(field), bool):
+            raise SystemExit(f"{source}: capabilities.{field} must be a boolean")
+    if not capabilities["memory_reporting"]:
+        raise SystemExit(f"{source}: standard native packs must report memory")
+    if capabilities["scoped_device_allocator"] and not capabilities["governed_device_allocator"]:
+        raise SystemExit(
+            f"{source}: scoped_device_allocator requires governed_device_allocator"
+        )
+    if template["accelerator_profile"] != "cpu" and not capabilities["governed_device_allocator"]:
+        raise SystemExit(
+            f"{source}: standard native accelerator packs must use the governed allocator"
+        )
+
+    accelerator = template.get("accelerator_requirements")
+    if not isinstance(accelerator, dict):
+        raise SystemExit(f"{source}: accelerator_requirements must be an object")
+    if accelerator.get("kind") != template["accelerator_profile"]:
+        raise SystemExit(
+            f"{source}: accelerator_requirements.kind must match accelerator_profile"
+        )
+    validate_contract_values(
+        accelerator.get("execution_providers"),
+        "accelerator_requirements.execution_providers",
+        source,
+    )
+    if accelerator.get("implicit_cpu_fallback") is not False:
+        raise SystemExit(
+            f"{source}: standard native packs must explicitly disable implicit CPU fallback"
+        )
+
+    behavior = template.get("memory_behavior")
+    if not isinstance(behavior, dict):
+        raise SystemExit(f"{source}: memory_behavior must be an object")
+    for field in (
+        "planned_reporting",
+        "live_reporting",
+        "request_reporting",
+        "synchronize_before_free",
+    ):
+        if not isinstance(behavior.get(field), bool):
+            raise SystemExit(f"{source}: memory_behavior.{field} must be a boolean")
+    if not all(
+        behavior[field]
+        for field in ("planned_reporting", "live_reporting", "request_reporting")
+    ):
+        raise SystemExit(
+            f"{source}: standard native packs must declare planned, live, and request memory reporting"
+        )
+    if capabilities["scoped_device_allocator"] and not (
+        isinstance(behavior.get("allocation_scope"), str)
+        and behavior["allocation_scope"].strip()
+    ):
+        raise SystemExit(
+            f"{source}: scoped native packs must name their allocation scope"
+        )
+    if not (
+        isinstance(behavior.get("device_allocation"), str)
+        and behavior["device_allocation"].strip()
+    ):
+        raise SystemExit(
+            f"{source}: standard native packs must declare device allocation behavior"
+        )
+    if behavior["synchronize_before_free"] and not capabilities[
+        "governed_device_allocator"
+    ]:
+        raise SystemExit(
+            f"{source}: host synchronization requires a governed device allocator"
+        )
+
+
 def validate_template(template: dict[str, Any], source: pathlib.Path) -> None:
     if template.get("schema_version") != 1 or template.get("runtime_abi") != 1:
         raise SystemExit(f"{source}: only backend schema/ABI version 1 is publishable")
@@ -241,6 +348,7 @@ def validate_template(template: dict[str, Any], source: pathlib.Path) -> None:
             raise SystemExit(f"{source}: only native packs may declare adapter_abi")
         if adapter_abi != "kapsl-backend-v1":
             raise SystemExit(f"{source}: unsupported adapter_abi")
+        validate_standard_native_contract(template, source)
     kv_mode = template.get("kv_mode")
     if template.get("backend") == "llama-cpp" and kv_mode not in (
         "native",

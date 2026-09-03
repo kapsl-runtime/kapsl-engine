@@ -2217,9 +2217,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-backend-abi"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4dde887e1515f7ab261972e77b944c5c24d48d6c117e8abce9cbdb957c06f4b"
+checksum = "f85d199a812ee32c69fdee932f57ddd25677bab5ddbf82b12535af2544091338"
 
 [[package]]
 name = "kapsl-backend-llama-cpp"

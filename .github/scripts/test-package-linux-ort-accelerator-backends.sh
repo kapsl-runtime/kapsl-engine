@@ -55,6 +55,36 @@ for profile, (accelerator, include_tensorrt) in profiles.items():
             }
         )
     adapter_abi = "invalid" if os.environ.get("FIXTURE_BAD_ADAPTER") else "kapsl-backend-v1"
+    execution_providers = ["cuda"]
+    if include_tensorrt:
+        execution_providers = ["tensorrt", "cuda"]
+    contract = {
+        "formats": ["onnx"],
+        "tasks": ["forward", "embed", "classify", "detect", "transcribe", "generate"],
+        "capabilities": {
+            "batching": True,
+            "streaming": True,
+            "cancellation": True,
+            "memory_reporting": True,
+            "governed_device_allocator": True,
+            "scoped_device_allocator": True,
+            "kv_participation": False,
+            "concurrent_inference": True,
+        },
+        "accelerator_requirements": {
+            "kind": accelerator,
+            "execution_providers": execution_providers,
+            "implicit_cpu_fallback": False,
+        },
+        "memory_behavior": {
+            "allocation_scope": "kapsl-scoped-device-allocator-v1",
+            "device_allocation": "host-governed-scoped",
+            "planned_reporting": True,
+            "live_reporting": True,
+            "request_reporting": True,
+            "synchronize_before_free": True,
+        },
+    }
     payload = {
         "schema_version": 1,
         "backend": "onnx",
@@ -65,6 +95,7 @@ for profile, (accelerator, include_tensorrt) in profiles.items():
         "platform": "linux-x86_64",
         "execution_mode": "native",
         "entrypoint": "libkapsl_backend_ort.so",
+        **contract,
     }
     provenance_libraries = {
         name: {
@@ -193,6 +224,9 @@ index = json.loads(pathlib.Path(sys.argv[1]).read_text())
 packs = {(pack["backend"], pack["profile"]): pack for pack in index["packs"]}
 assert set(packs) == {("onnx", "cuda12"), ("onnx", "tensorrt10")}
 assert all(pack["adapter_abi"] == "kapsl-backend-v1" for pack in packs.values())
+assert all(pack["capabilities"]["scoped_device_allocator"] for pack in packs.values())
+assert all(pack["memory_behavior"]["synchronize_before_free"] for pack in packs.values())
+assert packs[("onnx", "tensorrt10")]["accelerator_requirements"]["execution_providers"][0] == "tensorrt"
 PY
 
 if run_packager >/dev/null 2>&1; then
