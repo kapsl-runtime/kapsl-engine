@@ -74,6 +74,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: installer-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   install-script:
     name: Test install.sh

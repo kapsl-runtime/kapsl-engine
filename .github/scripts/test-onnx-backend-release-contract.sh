@@ -149,11 +149,13 @@ for workflow in \
 done
 
 require_literal "$parity_workflow" 'name: ORT CPU Conformance'
-require_literal "$parity_workflow" 'cancel-in-progress: true'
+require_literal "$parity_workflow" "cancel-in-progress: \${{ github.event_name == 'pull_request' }}"
 require_literal "$parity_workflow" '.github/ort-cpu-parity.lock.json'
 require_literal "$parity_workflow" 'repository: kapsl-runtime/kapsl-sdk'
 require_literal "$parity_workflow" '.github/scripts/certify-ort-cpu-parity.sh'
-require_literal "$parity_certifier" '"sequence": ["baseline", "candidate", "candidate", "baseline"] * 2'
+require_literal "$parity_workflow" 'KAPSL_ORT_CONFORMANCE_MODE:'
+require_literal "$parity_certifier" 'not_enforced_on_pull_requests'
+require_literal "$parity_certifier" 'sequence = ["baseline", "candidate", "candidate", "baseline"] * 2'
 require_literal "$installer_workflow" '.github/scripts/test-package-linux-ort-accelerator-backends.sh'
 if grep -Fq 'Certify embedded versus packaged ORT CPU parity' "$installer_workflow"; then
   echo "$installer_workflow must not run ORT performance conformance." >&2
