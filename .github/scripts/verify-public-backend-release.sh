@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-  echo "usage: verify-public-backend-release.sh LOCAL_INDEX PUBLIC_RELEASE_ROOT" >&2
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ] || { [ "$#" -eq 3 ] && [ "$3" != "--artifacts-only" ]; }; then
+  echo "usage: verify-public-backend-release.sh LOCAL_INDEX PUBLIC_RELEASE_ROOT [--artifacts-only]" >&2
   exit 2
 fi
 
 local_index="$1"
 public_root="${2%/}"
+mode="${3:-}"
 local_signature="${local_index}.sig"
 if [ ! -f "$local_index" ] || [ ! -f "$local_signature" ]; then
   echo "Local backend index and signature are required." >&2
@@ -20,13 +21,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for name in backend-index.json backend-index.json.sig; do
+wait_for_public_object() {
+  local url="$1"
+  shift
+  echo "Waiting for public release object: $url" >&2
   curl --fail --silent --show-error --location \
-    --retry 8 --retry-delay 5 --retry-all-errors \
-    --output "$scratch/$name" "$public_root/$name"
-done
-cmp "$local_index" "$scratch/backend-index.json"
-cmp "$local_signature" "$scratch/backend-index.json.sig"
+    --retry 60 --retry-delay 10 --retry-max-time 600 --retry-all-errors \
+    --connect-timeout 15 \
+    "$@" "$url"
+}
+
+if [ "$mode" != "--artifacts-only" ]; then
+  for name in backend-index.json backend-index.json.sig; do
+    wait_for_public_object \
+      "$public_root/$name" \
+      --output "$scratch/$name"
+  done
+  cmp "$local_index" "$scratch/backend-index.json"
+  cmp "$local_signature" "$scratch/backend-index.json.sig"
+fi
 
 python3 - "$local_index" "$public_root" <<'PY' > "$scratch/artifact-urls"
 import json
@@ -59,9 +72,11 @@ if [ ! -s "$scratch/artifact-urls" ]; then
   exit 1
 fi
 while IFS= read -r artifact; do
-  curl --fail --silent --show-error --location --head \
-    --retry 8 --retry-delay 5 --retry-all-errors \
-    "$artifact" >/dev/null
+  wait_for_public_object "$artifact" --head >/dev/null
 done < "$scratch/artifact-urls"
 
-echo "Verified signed backend release through $public_root"
+if [ "$mode" = "--artifacts-only" ]; then
+  echo "Verified backend artifacts through $public_root"
+else
+  echo "Verified signed backend release through $public_root"
+fi

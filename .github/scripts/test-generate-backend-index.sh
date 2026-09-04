@@ -91,13 +91,11 @@ public_release="$root/public/runtime/beta/v1.2.3"
 mkdir -p "$public_release"
 cp "$root/artifacts/pack.tar.gz" "$public_release/pack.tar.gz"
 cp "$root/artifacts/pack-macos.tar.gz" "$public_release/pack-macos.tar.gz"
-cp "$root/artifacts/backend-index.json" "$public_release/backend-index.json"
-cp "$root/artifacts/backend-index.json.sig" "$public_release/backend-index.json.sig"
 python3 -m http.server 18082 --bind 127.0.0.1 --directory "$root/public" \
   >"$root/http.log" 2>&1 &
 server_pid="$!"
 attempt=1
-while ! curl -fsSI "$public_base/runtime/beta/v1.2.3/backend-index.json" >/dev/null; do
+while ! curl -fsSI "$public_base/runtime/beta/v1.2.3/pack.tar.gz" >/dev/null; do
   if [ "$attempt" -ge 20 ]; then
     cat "$root/http.log" >&2
     echo "Timed out waiting for backend release fixture server." >&2
@@ -106,6 +104,12 @@ while ! curl -fsSI "$public_base/runtime/beta/v1.2.3/backend-index.json" >/dev/n
   attempt=$((attempt + 1))
   sleep 1
 done
+.github/scripts/verify-public-backend-release.sh \
+  "$root/artifacts/backend-index.json" \
+  "$public_base/runtime/beta/v1.2.3" \
+  --artifacts-only
+cp "$root/artifacts/backend-index.json" "$public_release/backend-index.json"
+cp "$root/artifacts/backend-index.json.sig" "$public_release/backend-index.json.sig"
 .github/scripts/verify-public-backend-release.sh \
   "$root/artifacts/backend-index.json" \
   "$public_base/runtime/beta/v1.2.3"
