@@ -296,6 +296,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       CUDA_PATH: /usr/local/cuda
+      KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE
       KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}

@@ -176,9 +176,13 @@ package_profile() {
     cp "$gcc_license" "$root/licenses/GCC-RUNTIME-COPYRIGHT"
   fi
   if [ "$accelerator" = "cuda" ]; then
-    nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-${KAPSL_CUDA_RUNTIME_ROOT:-}/NVIDIA-CONTAINER-LICENSE}"
-    if [ -z "$nvidia_license" ] || [ ! -f "$nvidia_license" ]; then
-      echo "Missing NVIDIA redistribution license for llama.cpp CUDA pack." >&2
+    nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-}"
+    if [ -z "$nvidia_license" ] && [ -n "${KAPSL_CUDA_RUNTIME_ROOT:-}" ]; then
+      nvidia_license="${KAPSL_CUDA_RUNTIME_ROOT%/}/NVIDIA-CONTAINER-LICENSE"
+    fi
+    nvidia_license="${nvidia_license:-/NGC-DL-CONTAINER-LICENSE}"
+    if [ ! -f "$nvidia_license" ]; then
+      echo "Missing NVIDIA redistribution license for llama.cpp CUDA pack: $nvidia_license" >&2
       exit 1
     fi
     cp "$nvidia_license" "$root/licenses/NVIDIA-CONTAINER-LICENSE"
