@@ -34,6 +34,7 @@ require_literal "$packager" '"kv_mode": kv_mode'
 require_literal "$packager" 'KAPSL_LLAMA_CPP_KV_MODE=$kv_mode'
 require_literal "$packager" 'copy_runtime_dependencies "$library" "$root/lib" "$accelerator"'
 require_literal "$packager" 'NVIDIA-CONTAINER-LICENSE'
+require_literal "$packager" 'nvidia_license="${nvidia_license:-/NGC-DL-CONTAINER-LICENSE}"'
 require_literal "$packager" 'NVIDIA driver libraries must not be bundled'
 require_literal "$packager" '"execution_mode": "native"'
 require_literal "$packager" '"entrypoint": "lib/libkapsl_backend_llama_cpp.so"'
@@ -44,6 +45,7 @@ for workflow in \
   require_literal "$workflow" '.github/scripts/package-linux-llama-cpp-backend-packs.sh'
   require_literal "$workflow" 'Package llama.cpp backend packs from published SDK crates'
   require_literal "$workflow" 'cargo build --manifest-path kapsl-runtime/Cargo.toml --locked'
+  require_literal "$workflow" 'KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE'
 done
 
 if grep -Eq 'KAPSL_LLAMA_SDK_(DIR|REF)|sdk-llama|patch\.crates-io\.kapsl-(llm|engine-api)' \
