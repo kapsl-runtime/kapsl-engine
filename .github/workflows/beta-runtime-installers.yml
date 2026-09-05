@@ -548,15 +548,32 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
+          release_root="s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}"
+          public_root="https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}"
+
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}/ \
+            "$release_root/" \
             --recursive \
+            --exclude "backend-index.json" \
+            --exclude "backend-index.json.sig" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
           .github/scripts/verify-public-backend-release.sh \
             release-assets/backend-index.json \
-            https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}
+            "$public_root" \
+            --artifacts-only
+
+          for name in backend-index.json.sig backend-index.json; do
+            aws s3 cp "release-assets/$name" \
+              "$release_root/$name" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done
+
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            "$public_root"
 
           # Keep the mutable latest directory as an exact mirror. Artifact names
           # contain their version, so --delete prevents old betas accumulating here.
