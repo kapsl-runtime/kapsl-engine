@@ -296,6 +296,7 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CMAKE_BUILD_PARALLEL_LEVEL: "2"
       CUDA_PATH: /usr/local/cuda
+      KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE
       KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
@@ -310,6 +311,30 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Resolve certified ORT integrations commit
+        id: ort-integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '\r\n' < .github/ort-integration.lock)"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/ort-integration.lock must contain one exact lowercase 40-hex commit." >&2
+            exit 1
+          fi
+          echo "KAPSL_ORT_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout certified ORT adapter
+        uses: actions/checkout@v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.ort-integrations.outputs.ref }}
+          path: kapsl-integrations-ort
+
+      - name: Verify certified ORT integrations checkout
+        shell: bash
+        run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
 
       - name: Validate certified vLLM SDK commit
         shell: bash
@@ -334,6 +359,13 @@ jobs:
       - name: Install Rust
         uses: ./.github/actions/setup-rust
 
+      - name: Install certified ORT packaging toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-ort/rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$toolchain" --profile minimal
+
       - name: Build kapsl with statically compiled GGUF CUDA
         run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
 
@@ -349,7 +381,11 @@ jobs:
         shell: bash
         run: .github/scripts/package-linux-cuda-runtime.sh
 
-      - name: Package split ONNX backend packs
+      - name: Package certified ORT CPU adapter
+        shell: bash
+        run: .github/scripts/package-linux-ort-cpu-backend.sh
+
+      - name: Package legacy ONNX accelerator packs
         shell: bash
         run: .github/scripts/package-linux-onnx-backend-packs.sh
 
@@ -512,15 +548,32 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
+          release_root="s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}"
+          public_root="https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}"
+
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}/ \
+            "$release_root/" \
             --recursive \
+            --exclude "backend-index.json" \
+            --exclude "backend-index.json.sig" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
           .github/scripts/verify-public-backend-release.sh \
             release-assets/backend-index.json \
-            https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}
+            "$public_root" \
+            --artifacts-only
+
+          for name in backend-index.json.sig backend-index.json; do
+            aws s3 cp "release-assets/$name" \
+              "$release_root/$name" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done
+
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            "$public_root"
 
           # Keep the mutable latest directory as an exact mirror. Artifact names
           # contain their version, so --delete prevents old betas accumulating here.

@@ -16,11 +16,14 @@ kapsl run model.aimod
 ```
 
 Managed vLLM and Linux x86_64 ONNX CPU/CUDA 12/TensorRT 10 and llama.cpp
-CPU/CUDA 12 profiles use the signed lazy cache. Provider fallback remains
-package-controlled, and TensorRT is selected only when the model contract
-explicitly permits it. The portable core lazily loads llama.cpp CPU; the
-certified eager CUDA shared-KV profile remains the default during CUDA pack
-certification.
+CPU/CUDA 12 profiles use the signed lazy cache. The ORT CPU candidate is built
+from an exact out-of-tree integrations commit and is distinguished from the
+legacy accelerator bundles by its signed standard-ABI marker. Embedded ORT
+remains the default CPU rollback during parity certification. Provider
+fallback remains package-controlled, and TensorRT is selected only when the
+model contract explicitly permits it. The portable core lazily loads llama.cpp
+CPU; the certified eager CUDA shared-KV profile remains the default during
+CUDA pack certification.
 
 For a no-network host, prepare one verified bundle on a connected machine and
 run it directly after transfer:
@@ -29,6 +32,11 @@ run it directly after transfer:
 kapsl bundle model.aimod --output model.kapsl-bundle
 kapsl run model.kapsl-bundle
 ```
+
+Release engineers can build the same bundle from an already-downloaded,
+signed release directory with `--backend-artifacts-dir`. Kapsl still verifies
+the signed index entry, archive size, SHA-256 digest, and Ed25519 signature;
+the option does not enable `file://` artifacts in ordinary runtime startup.
 
 See [Lazy Backend Packs](kapsl-runtime/docs/backend-packs.md) for the trust,
 cache, administration, and cross-target bundle model.

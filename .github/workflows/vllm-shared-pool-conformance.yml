@@ -7,6 +7,10 @@ on:
         description: Official stable engine release tag (vMAJOR.MINOR.PATCH)
         required: true
         type: string
+      candidate_artifact:
+        description: Exact CUDA release artifact produced earlier in this workflow run
+        required: true
+        type: string
       sdk_ref:
         description: Exact lowercase 40-hex kapsl-sdk commit containing the adapter
         required: true
@@ -20,8 +24,13 @@ on:
         required: false
         default: gpu
         type: string
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS:
+        description: Trusted raw Base64 Ed25519 backend index public key set
+        required: true
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
@@ -35,14 +44,20 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
-        run: >-
-          python3 .github/scripts/validate_stable_gpu_release.py
-          --event-name "$GITHUB_EVENT_NAME"
-          --ref-type "$GITHUB_REF_TYPE"
-          --ref-name "$GITHUB_REF_NAME"
-          --release-tag "$RELEASE_TAG"
-          --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml
-          --sdk-ref "$KAPSL_VLLM_SDK_REF"
+          KAPSL_GPU_CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
+        run: |
+          set -Eeuo pipefail
+          if [[ "$KAPSL_GPU_CANDIDATE_ARTIFACT" != "runtime-cuda-linux-x86_64" ]]; then
+            echo "Stable GPU certification requires runtime-cuda-linux-x86_64 from this release run." >&2
+            exit 1
+          fi
+          python3 .github/scripts/validate_stable_gpu_release.py \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --ref-type "$GITHUB_REF_TYPE" \
+            --ref-name "$GITHUB_REF_NAME" \
+            --release-tag "$RELEASE_TAG" \
+            --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml \
+            --sdk-ref "$KAPSL_VLLM_SDK_REF"
 
   flash-attn:
     needs: authorize-stable-release
@@ -52,7 +67,7 @@ jobs:
     container:
       image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
       options: --runtime=nvidia --gpus all
-    timeout-minutes: 240
+    timeout-minutes: 360
     env:
       CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
       CUDA_LAUNCH_BLOCKING: "1"
@@ -73,6 +88,7 @@ jobs:
       EXPECTED_RUST_SDK_VERSION: "0.3.0"
       EXPECTED_RUST_KV_ABI_VERSION: "0.6.0"
       KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
       VLLM_WHEEL_URL: https://wheels.vllm.ai/2ec6f0d71ea3b350952630e310efcda1c744ff4d/vllm-0.26.1rc1.dev1130%2Bg2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl
@@ -1339,6 +1355,307 @@ jobs:
             fi
           fi
 
+      - name: Download the exact CUDA release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.candidate_artifact }}
+          path: ${{ runner.temp }}/kapsl-release-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Verify the immutable ORT bridge candidate
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -Eeuo pipefail
+          candidate_artifacts="$RUNNER_TEMP/kapsl-release-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          candidate_root="$RUNNER_TEMP/kapsl-release-runtime-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bridge_work="$RUNNER_TEMP/kapsl-ort-bridge-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bridge_evidence="$OUTPUT_DIR/ort-bridge"
+          version="${RELEASE_TAG#v}"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ -n "$KAPSL_BACKEND_PUBLIC_KEYS" ]] || {
+            echo "KAPSL_BACKEND_PUBLIC_KEYS is required for stable signed-pack qualification." >&2
+            exit 1
+          }
+          test -s "$candidate_artifacts/backend-index.json"
+          test -s "$candidate_artifacts/backend-index.json.sig"
+          runtime_archive="$candidate_artifacts/kapsl-$version-linux-x86_64-cuda12.tar.gz"
+          runtime_checksum="${runtime_archive}.sha256"
+          test -s "$runtime_archive"
+          test -s "$runtime_checksum"
+          expected_runtime_sha=$(awk 'NR == 1 { print $1 }' "$runtime_checksum")
+          actual_runtime_sha=$(sha256sum "$runtime_archive" | awk '{ print $1 }')
+          [[ "$actual_runtime_sha" == "$expected_runtime_sha" ]] || {
+            echo "CUDA release candidate archive failed its published checksum." >&2
+            exit 1
+          }
+          mkdir -p "$candidate_root" "$bridge_work" "$bridge_evidence"
+          tar -xzf "$runtime_archive" -C "$candidate_root"
+          test -x "$candidate_root/kapsl"
+          "$candidate_root/kapsl" --version | tee "$bridge_evidence/candidate-version.txt"
+          grep -Eq "(^|[[:space:]])$version([[:space:]]|$)" \
+            "$bridge_evidence/candidate-version.txt"
+
+          python3 - "$candidate_artifacts/backend-index.json" \
+            engine/.github/ort-release.lock.json "$version" \
+            "$bridge_evidence/candidate-index-contract.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          index_path, lock_path, version, output_path = map(pathlib.Path, sys.argv[1:])
+          index = json.loads(index_path.read_text(encoding="utf-8"))
+          lock = json.loads(lock_path.read_text(encoding="utf-8"))
+          version_text = str(version)
+          if index.get("schema_version") != 1 or index.get("runtime_version") != version_text:
+              raise SystemExit("candidate backend index does not target the stable runtime")
+          expected_profiles = lock.get("profiles")
+          packs = [pack for pack in index.get("packs", []) if pack.get("backend") == "onnx"]
+          actual_profiles = sorted(pack.get("profile") for pack in packs)
+          if actual_profiles != sorted(expected_profiles):
+              raise SystemExit(
+                  f"candidate ORT profiles differ from the immutable release lock: {actual_profiles!r}"
+              )
+          for pack in packs:
+              if pack.get("pack_version") != lock.get("pack_version"):
+                  raise SystemExit("candidate ORT pack version differs from the release lock")
+              if pack.get("compatible_kapsl") != f"={version_text}":
+                  raise SystemExit("candidate ORT pack does not exactly target this runtime")
+              if pack.get("execution_mode") != "native":
+                  raise SystemExit("candidate ORT pack is not an in-process native adapter")
+              if pack.get("accelerator_requirements", {}).get("implicit_cpu_fallback") is not False:
+                  raise SystemExit("candidate ORT pack permits implicit CPU fallback")
+          report = {
+              "schema_version": 1,
+              "runtime_version": version_text,
+              "release_tag": lock["release_tag"],
+              "source_commit": lock["source_commit"],
+              "pack_version": lock["pack_version"],
+              "profiles": actual_profiles,
+          }
+          pathlib.Path(output_path).write_text(
+              json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+          sha256sum "$candidate_artifacts/backend-index.json" \
+            "$candidate_artifacts/backend-index.json.sig" \
+            "$runtime_archive" > "$bridge_evidence/candidate-artifacts.sha256"
+          ort_pack_version=$(jq -er .pack_version engine/.github/ort-release.lock.json)
+          {
+            echo "CANDIDATE_ARTIFACTS_DIR=$candidate_artifacts"
+            echo "CANDIDATE_RUNTIME_BINARY=$candidate_root/kapsl"
+            echo "ORT_BRIDGE_WORK_DIR=$bridge_work"
+            echo "ORT_BRIDGE_EVIDENCE_DIR=$bridge_evidence"
+            echo "ORT_PACK_VERSION=$ort_pack_version"
+          } >> "$GITHUB_ENV"
+
+      - name: Download and verify the pinned ORT generation model
+        shell: bash
+        env:
+          ORT_MODEL_REVISION: 90f61e71d6fa8e571d0ab0f95a637a5d7d8ed52f
+        run: |
+          set -Eeuo pipefail
+          model_dir="$ORT_BRIDGE_WORK_DIR/tiny-random-gpt2-onnx"
+          "$VENV_DIR/bin/python" - "$model_dir" "$ORT_MODEL_REVISION" <<'PY'
+          import sys
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id="onnx-community/tiny-random-gpt2-ONNX",
+              revision=sys.argv[2],
+              local_dir=sys.argv[1],
+              allow_patterns=[
+                  "config.json",
+                  "generation_config.json",
+                  "merges.txt",
+                  "onnx/model.onnx",
+                  "special_tokens_map.json",
+                  "tokenizer.json",
+                  "tokenizer_config.json",
+                  "vocab.json",
+              ],
+          )
+          PY
+          (
+            cd "$model_dir"
+            sha256sum --check <<'EOF'
+          935121200917262375ee8a179461219005d4992767823a4f7460dbd4b648023b  config.json
+          e7f6144153c0e1c0ccd6c327134b1bcc8f4e36e164d903935b08753947126636  generation_config.json
+          1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5  merges.txt
+          e18370ba6247c564a4aef7b6a83aa86d5d036f47a73c0935e51bbcfe178141a1  onnx/model.onnx
+          98412137ae43c77f8af52eb51b19c3536d3242cb55339167d841005fa94a23b7  special_tokens_map.json
+          1fe93b6152957cf9cfd6d89002467f789ce8b3f3e000b3a2edf27c808ddd0b9e  tokenizer.json
+          70049a392a6fd4dd1343d076e1f0e64d98ae821287c80638f603364ae21e64d7  tokenizer_config.json
+          3ba3c3109ff33976c4bd966589c11ee14fcaa1f4c9e5e154c2ed7f99d80709e7  vocab.json
+          EOF
+          )
+          printf '%s\n' "$ORT_MODEL_REVISION" \
+            > "$ORT_BRIDGE_EVIDENCE_DIR/model-revision.txt"
+          (
+            cd "$model_dir"
+            sha256sum config.json generation_config.json merges.txt onnx/model.onnx \
+              special_tokens_map.json tokenizer.json tokenizer_config.json vocab.json
+          ) > "$ORT_BRIDGE_EVIDENCE_DIR/model-files.sha256"
+          echo "ORT_MODEL_DIR=$model_dir" >> "$GITHUB_ENV"
+
+      - name: Build exact CUDA and TensorRT offline qualification bundles
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          "$VENV_DIR/bin/python" - "$ORT_MODEL_DIR" "$ORT_BRIDGE_WORK_DIR" <<'PY'
+          import json
+          import pathlib
+          import shutil
+          import sys
+
+          source = pathlib.Path(sys.argv[1])
+          root = pathlib.Path(sys.argv[2])
+          files = [
+              "config.json",
+              "generation_config.json",
+              "merges.txt",
+              "onnx/model.onnx",
+              "special_tokens_map.json",
+              "tokenizer.json",
+              "tokenizer_config.json",
+              "vocab.json",
+          ]
+          for profile, provider in (("cuda12", "cuda"), ("tensorrt10", "tensorrt")):
+              context = root / f"context-{profile}"
+              context.mkdir(parents=True, exist_ok=False)
+              for relative in files:
+                  destination = context / relative
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(source / relative, destination)
+              metadata = {
+                  "project_name": f"ort-bridge-{profile}",
+                  "version": "1.0.0",
+                  "model_file": "onnx/model.onnx",
+                  "format": "onnx",
+                  "model_type": "causal-lm",
+                  "task": "generate",
+                  "hardware_requirements": {
+                      "preferred_provider": provider,
+                      "fallback_providers": [],
+                      "device_id": 0,
+                  },
+                  "metadata": {"serving": {"backend_pack": "onnx"}},
+              }
+              (context / "metadata.json").write_text(
+                  json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+              )
+          PY
+          cuda_aimod="$ORT_BRIDGE_WORK_DIR/ort-bridge-cuda12.aimod"
+          tensorrt_aimod="$ORT_BRIDGE_WORK_DIR/ort-bridge-tensorrt10.aimod"
+          "$CANDIDATE_RUNTIME_BINARY" build "$ORT_BRIDGE_WORK_DIR/context-cuda12" \
+            --output "$cuda_aimod"
+          "$CANDIDATE_RUNTIME_BINARY" build "$ORT_BRIDGE_WORK_DIR/context-tensorrt10" \
+            --output "$tensorrt_aimod"
+          test -s "$cuda_aimod"
+          test -s "$tensorrt_aimod"
+
+          cuda_bundle="$ORT_BRIDGE_WORK_DIR/ort-bridge-cuda12.kapsl-bundle"
+          tensorrt_bundle="$ORT_BRIDGE_WORK_DIR/ort-bridge-tensorrt10.kapsl-bundle"
+          bundle_cache="$ORT_BRIDGE_WORK_DIR/bundle-build-backends"
+          KAPSL_GENERIC_NATIVE_PACKS=1 \
+          KAPSL_LAZY_BACKENDS=1 \
+          KAPSL_LAZY_ONNX_PACKS=1 \
+          KAPSL_LAZY_LLAMA_CPP_PACKS=1 \
+          KAPSL_BACKEND_INDEX_PATH="$CANDIDATE_ARTIFACTS_DIR/backend-index.json" \
+          KAPSL_BACKEND_CACHE_DIR="$bundle_cache" \
+            "$CANDIDATE_RUNTIME_BINARY" bundle "$cuda_aimod" "$LLAMA_PACKAGE" \
+              --target linux-x86_64-cuda \
+              --backend-artifacts-dir "$CANDIDATE_ARTIFACTS_DIR" \
+              --output "$cuda_bundle"
+          KAPSL_GENERIC_NATIVE_PACKS=1 \
+          KAPSL_LAZY_BACKENDS=1 \
+          KAPSL_LAZY_ONNX_PACKS=1 \
+          KAPSL_LAZY_LLAMA_CPP_PACKS=1 \
+          KAPSL_BACKEND_INDEX_PATH="$CANDIDATE_ARTIFACTS_DIR/backend-index.json" \
+          KAPSL_BACKEND_CACHE_DIR="$bundle_cache" \
+            "$CANDIDATE_RUNTIME_BINARY" bundle "$tensorrt_aimod" "$LLAMA_PACKAGE" \
+              --target linux-x86_64-tensorrt \
+              --backend-artifacts-dir "$CANDIDATE_ARTIFACTS_DIR" \
+              --output "$tensorrt_bundle"
+          test -s "$cuda_bundle"
+          test -s "$tensorrt_bundle"
+          for profile in cuda12 tensorrt10; do
+            bundle="$ORT_BRIDGE_WORK_DIR/ort-bridge-$profile.kapsl-bundle"
+            accelerator=cuda
+            [[ "$profile" == tensorrt10 ]] && accelerator=tensorrt
+            tar -xOzf "$bundle" bundle-manifest.json \
+              > "$ORT_BRIDGE_EVIDENCE_DIR/bundle-$profile.json"
+            jq -e --arg version "${{ inputs.release_tag }}" \
+              --arg profile "$profile" --arg accelerator "$accelerator" '
+                .schema_version == 1 and
+                .runtime_version == ($version | ltrimstr("v")) and
+                .target.accelerator == $accelerator and
+                (.models | length) == 2 and
+                ([.backends[] | select(.backend == "onnx") | .profile] == [$profile]) and
+                ([.backends[] | select(.backend == "llama-cpp") | .profile] == ["cuda12"])
+              ' "$ORT_BRIDGE_EVIDENCE_DIR/bundle-$profile.json" >/dev/null
+          done
+          jq -cn --arg prompt "The bridge release uses signed backend packs." \
+            '{input:{shape:[1,1],dtype:"string",data_base64:($prompt|@base64)},session_id:"ort-stable-qualification",metadata:{max_new_tokens:8,min_new_tokens:8,temperature:0.0,seed:7}}' \
+            > "$ORT_BRIDGE_WORK_DIR/ort-request.json"
+          sha256sum "$cuda_aimod" "$tensorrt_aimod" "$cuda_bundle" "$tensorrt_bundle" \
+            > "$ORT_BRIDGE_EVIDENCE_DIR/qualification-inputs.sha256"
+          {
+            echo "ORT_CUDA_BUNDLE=$cuda_bundle"
+            echo "ORT_TENSORRT_BUNDLE=$tensorrt_bundle"
+            echo "ORT_QUALIFICATION_REQUEST=$ORT_BRIDGE_WORK_DIR/ort-request.json"
+          } >> "$GITHUB_ENV"
+
+      - name: Qualify the exact signed ORT CUDA 12 pack
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          KAPSL_GPU_INTEGRATION=1 \
+          KAPSL_GPU_TEST_BINARY="$CANDIDATE_RUNTIME_BINARY" \
+          KAPSL_GPU_TEST_BUNDLE="$ORT_CUDA_BUNDLE" \
+          KAPSL_GPU_TEST_ORT_REQUEST="$ORT_QUALIFICATION_REQUEST" \
+          KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+          KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE=1 \
+          KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+          KAPSL_GPU_TEST_ORT_PACK_VERSION="$ORT_PACK_VERSION" \
+          KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+          KAPSL_GPU_TEST_LOAD_TIMEOUT_SECONDS=900 \
+          KAPSL_GPU_TEST_PORT=19095 \
+          KAPSL_BACKEND_CACHE_DIR="$ORT_BRIDGE_WORK_DIR/cache-cuda12" \
+          KAPSL_BUNDLE_CACHE_DIR="$ORT_BRIDGE_WORK_DIR/bundles-cuda12" \
+          KAPSL_GPU_TEST_OUTPUT_DIR="$ORT_BRIDGE_EVIDENCE_DIR/cuda12" \
+            engine/.github/scripts/test-gpu-device-pool-integration.sh
+
+      - name: Qualify the exact signed ORT TensorRT 10 pack
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          KAPSL_GPU_INTEGRATION=1 \
+          KAPSL_GPU_TEST_BINARY="$CANDIDATE_RUNTIME_BINARY" \
+          KAPSL_GPU_TEST_BUNDLE="$ORT_TENSORRT_BUNDLE" \
+          KAPSL_GPU_TEST_ORT_REQUEST="$ORT_QUALIFICATION_REQUEST" \
+          KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE="$ORT_BRIDGE_EVIDENCE_DIR/cuda12/onnx-inference-initial.json" \
+          KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+          KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE=1 \
+          KAPSL_GPU_TEST_ORT_PROFILE=tensorrt10 \
+          KAPSL_GPU_TEST_ORT_PACK_VERSION="$ORT_PACK_VERSION" \
+          KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" \
+          KAPSL_GPU_TEST_LOAD_TIMEOUT_SECONDS=900 \
+          KAPSL_GPU_TEST_PORT=19096 \
+          KAPSL_BACKEND_CACHE_DIR="$ORT_BRIDGE_WORK_DIR/cache-tensorrt10" \
+          KAPSL_BUNDLE_CACHE_DIR="$ORT_BRIDGE_WORK_DIR/bundles-tensorrt10" \
+          KAPSL_GPU_TEST_OUTPUT_DIR="$ORT_BRIDGE_EVIDENCE_DIR/tensorrt10" \
+            engine/.github/scripts/test-gpu-device-pool-integration.sh
+
+      - name: Remove signed ORT qualification scratch
+        if: always()
+        shell: bash
+        run: |
+          candidate_artifacts="$RUNNER_TEMP/kapsl-release-candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          candidate_root="$RUNNER_TEMP/kapsl-release-runtime-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          bridge_work="$RUNNER_TEMP/kapsl-ort-bridge-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          rm -rf "$candidate_artifacts" "$candidate_root" "$bridge_work"
+
       - name: Upload conformance evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -1350,4 +1667,5 @@ jobs:
             ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt
             ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256
             ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/wheels/*.whl
+            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/ort-bridge/**
           if-no-files-found: error

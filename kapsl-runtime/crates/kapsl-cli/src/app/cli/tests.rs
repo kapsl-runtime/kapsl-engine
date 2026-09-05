@@ -39,6 +39,8 @@ fn bundle_accepts_multiple_models_and_cross_target() {
         "model-b.aimod",
         "--target",
         "linux-x86_64-cuda",
+        "--backend-artifacts-dir",
+        "signed-backends",
         "--output",
         "production.kapsl-bundle",
     ])
@@ -48,5 +50,9 @@ fn bundle_accepts_multiple_models_and_cross_target() {
     };
     assert_eq!(args.model.len(), 2);
     assert_eq!(args.target.as_deref(), Some("linux-x86_64-cuda"));
+    assert_eq!(
+        args.backend_artifacts_dir,
+        Some(PathBuf::from("signed-backends"))
+    );
     assert_eq!(args.output, PathBuf::from("production.kapsl-bundle"));
 }

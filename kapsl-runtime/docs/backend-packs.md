@@ -18,8 +18,8 @@ verifies the signed index, artifact signature, checksum, platform, accelerator,
 ABI, and installed files, and atomically activates it. A second run uses the
 validated cache.
 
-The beta rollout publishes managed vLLM, three in-process ONNX profiles, and
-two in-process llama.cpp profiles:
+The bridge rollout publishes managed vLLM, three standard-ABI ORT profiles,
+and two in-process llama.cpp profiles:
 
 ```text
 llama-cpp/cpu
@@ -30,10 +30,15 @@ onnx/tensorrt10
 vllm/cu130-flash-attn
 ```
 
-An ONNX model downloads exactly one profile after provider policy and declared
-fallbacks are resolved. The CPU ONNX pack contains and activates no CUDA
-libraries. TensorRT is never an automatic fastest-provider upgrade: the
-package must name `tensorrt` as its preferred provider or an allowed fallback.
+An ONNX model resolves exactly one execution provider after provider policy and
+declared fallbacks are resolved. The CPU pack contains and activates no CUDA
+libraries. Every ORT pack declares `adapter_abi: kapsl-backend-v1`, model and
+task support, execution-provider requirements, memory behavior, and callable
+capabilities in its signed manifest. Signed packs are the primary ONNX route;
+the embedded ORT implementation is selected only by the explicit
+`KAPSL_GENERIC_NATIVE_PACKS=0` rollback.
+TensorRT is never an automatic fastest-provider upgrade: the package must name
+`tensorrt` as its preferred provider or an allowed fallback.
 GGUF models never trigger lazy ONNX or vLLM pack installation, and ONNX models
 never download vLLM.
 
@@ -65,14 +70,82 @@ The CUDA archive carries its resolved non-driver CUDA dependency closure and
 redistribution notices beside the entrypoint with an `$ORIGIN` runpath; host
 NVIDIA driver libraries are explicitly excluded.
 
-ONNX Runtime remains in the Kapsl process. Provider objects are opened from
-canonical pack-local absolute paths and retained for the process lifetime;
-Kapsl does not modify process-wide `LD_LIBRARY_PATH`. The pack carries a
-versioned native entrypoint descriptor, ORT libraries, the selected execution
-provider, its user-space accelerator dependency closure, compatibility/memory
-metadata, and license notices. Linux x86_64 is the first published ONNX pack
-platform; other platforms retain their eager in-process provider layout during
-the beta rollout.
+ONNX Runtime remains in the Kapsl process. The generic native host opens the
+verified entrypoint from a canonical pack-local absolute path and retains it
+for the process lifetime; Kapsl does not modify process-wide
+`LD_LIBRARY_PATH`. The pack carries a versioned native entrypoint, ORT
+libraries, the selected execution provider, its user-space accelerator
+dependency closure, compatibility and memory metadata, and license notices.
+Linux x86_64 is the first published ONNX pack platform. ONNX loads on other
+platforms fail closed unless the operator explicitly selects embedded rollback.
+
+The backend-neutral native-pack host is the default ONNX route. Only a pack
+whose signed `adapter_abi` is `kapsl-backend-v1` is eligible. The resolver
+matches model format, model type, task, selected execution provider, target
+platform and architecture, ABI, and required capabilities before download. It
+fails unresolved equal-rank choices and unsupported explicit backend pins. The
+pack must export the published ABI v1 entrypoint, and Kapsl will not construct
+the embedded ORT backend if selection, loading, or initialization fails. CUDA
+and TensorRT adapters must use scoped runtime-owned `GpuDevicePool` callbacks
+and synchronize governed allocations before release.
+
+The selected signed identity includes backend ID, profile, and pack version and
+is carried unchanged from model admission to every replica constructor. No
+request can re-resolve onto embedded ORT. Provider aliases are normalized only
+at the engine policy boundary. Activation rejects a descriptor unless its
+identity, profiles, formats, tasks, ABI, wire format, execution mode, and
+capability table match the signed manifest and static function table.
+
+This path stays in-process: tensor buffers cross the adapter boundary as
+borrowed views, and ORT's allocator forwards directly to the same Kapsl-owned
+pool. It introduces no backend RPC, CUDA IPC, tensor serialization, or second
+GPU allocation authority. The host supplies the canonical signed-pack root and
+the resolved per-model ORT tuning in initialization options, so the adapter can
+resolve only pack-local runtime libraries and does not reread competing process
+configuration. The signed route defaults on. Embedded ORT remains available
+only through the explicit rollback switch until the packaged accelerator route
+passes official stable-release qualification. An invalid switch value is an
+error rather than a request to fall back.
+
+Release jobs build the CPU candidate from the exact `kapsl-integrations`
+commit in `.github/ort-integration.lock`. The adapter's committed Rust
+toolchain is installed and verified independently of the engine toolchain;
+the resulting archive records its source commit and is accepted only after the
+engine validates its payload, provenance, file hashes, and standard ABI marker.
+The same exact checkout now exposes a prepared accelerator handoff for
+`cuda12` and `tensorrt10`. It authenticates Microsoft's official ORT GPU
+archive, closes and normalizes every non-driver CUDA/TensorRT dependency, and
+emits the same standard-ABI manifest/provenance contract. Release workflows
+continue publishing the legacy accelerator rollback until an official stable
+release completes real GPU ownership, unload, reproducibility, and teardown
+qualification; preparing an archive does not promote it.
+The engine's existing Ed25519 backend-index publisher remains the sole owner of
+official release signing.
+
+Host CI pins the canonical integrations-owned parity entrypoint by path and
+SHA-256, plus its tiny ONNX model source, in
+`.github/ort-cpu-parity.lock.json`. The exact integrations commit in
+`.github/ort-integration.lock` supplies both the adapter and that
+conformance contract. CI builds the pack, constructs a signed offline bundle,
+preinstalls that bundle through the normal backend manager, and runs two full
+ABBA embedded/candidate blocks. Four captures per route make the startup median
+resistant to one host-scheduler outlier without weakening its gate. The
+dedicated ORT CPU conformance workflow
+builds the adapter once for both release-handoff validation and the longer
+performance comparison; installer smoke remains a separate quick job with no
+performance thresholds. This CPU-only forward-path conformance does not
+provision a GPU and does not by itself authorize removing embedded ORT. The
+broader retirement gate still requires every supported CPU task class plus the
+separate CUDA/TensorRT memory ownership and lifecycle suites.
+
+When a native adapter advertises ABI v1 cancellation, Kapsl bridges each
+request's `CancellationToken` to the adapter's `cancel(request_id)` hook on one
+process-wide event-driven cancellation runtime. This does not poll and does not
+create an operating-system thread per request. The borrowed request callback
+remains available for cancellation that races initial dispatch, while the
+explicit hook can interrupt a backend run already in progress. Model load,
+unload, and shutdown take an exclusive cancellation guard so a late task
+cannot race lifecycle mutation or call a retired adapter handle.
 
 Inspect a decision without running the model:
 
@@ -140,10 +213,35 @@ kapsl bundle model-a.aimod model-b.aimod \
   --output production.kapsl-bundle
 ```
 
+If the signed release files are already on the preparation host, bundle them
+without downloading the archives again:
+
+```bash
+KAPSL_BACKEND_INDEX_PATH=/release/backend-index.json \
+KAPSL_BACKEND_PUBLIC_KEYS="$PUBLIC_KEYS" \
+kapsl bundle model.aimod \
+  --backend-artifacts-dir /release \
+  --target linux-x86_64-cpu \
+  --output model.kapsl-bundle
+```
+
+The local directory is only a source for offline-bundle creation. Kapsl maps
+the filename from the signed HTTPS index entry, confines it to that directory,
+and verifies the signed size and digest before copying it into the bundle. It
+does not permit local artifacts during an ordinary online or offline model
+run.
+
 Copy the resulting file to the offline host and run it directly:
 
 ```bash
 kapsl run model.kapsl-bundle
+```
+
+To populate and validate the backend cache without starting a server, use the
+same verified activation path:
+
+```bash
+kapsl backend ensure model.kapsl-bundle --offline
 ```
 
 Kapsl verifies the bundle checksums, signed backend index, signed pack
@@ -153,7 +251,7 @@ the embedded `.aimod` paths to the normal memory-admission and startup flow.
 The bundle's verified index is anchored into the ordinary backend cache, so a
 subsequent offline validation never needs to fetch the index. A different
 signed index claiming the same immutable runtime release is rejected.
-There is no public export/import command pair.
+There is no weaker raw-archive import path.
 
 For an ordinary `.aimod` run that must not use the network, use `--offline` or
 set `KAPSL_OFFLINE=1`. If its pack is not already cached, Kapsl reports the
@@ -168,7 +266,8 @@ connected machine.
 | `KAPSL_BUNDLE_CACHE_DIR` | Override the verified extracted-bundle cache. |
 | `KAPSL_OFFLINE=1` | Disable backend-index and artifact network access. |
 | `KAPSL_LAZY_BACKENDS=0` | Disable automatic lazy installation and require a preinstalled backend. |
-| `KAPSL_LAZY_ONNX_PACKS=0` | Keep the eager/legacy ONNX provider layout during the compatibility window. Linux x86_64 defaults to lazy ONNX packs. |
+| `KAPSL_LAZY_ONNX_PACKS=0` | Disable automatic ONNX pack activation. This does not authorize embedded fallback; ONNX loads fail closed while the signed route is selected. |
+| `KAPSL_GENERIC_NATIVE_PACKS=0` | Explicitly select the embedded ORT rollback. The signed `kapsl-backend-v1` route is enabled by default, and failures never cross to embedded ORT. |
 | `KAPSL_LAZY_LLAMA_CPP_PACKS=0` | Keep the eager/compiled llama.cpp layout. The portable Linux x86_64 core defaults to lazy CPU packs when no eager GGUF feature is compiled. |
 | `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1` | Explicitly allow a signed CUDA pack whose `kv_mode` is `native`. Shared-pool packs and the eager shared-KV profile do not require or consume this rollback override. |
 | `KAPSL_PROVIDER_PATH` | Additional Kapsl provider-manifest roots. Verified lazy ONNX pack roots are appended automatically; this is not a loader search path. |

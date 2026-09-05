@@ -97,7 +97,7 @@ chmod +x "$test_root/bin/patchelf"
   RUNNER_ARCH=X64 \
   RUNNER_TEMP="$test_root/runner" \
   KAPSL_VERSION=1.2.3 \
-  KAPSL_NVIDIA_LICENSE_FILE="$test_root/NVIDIA-CONTAINER-LICENSE" \
+  KAPSL_CUDA_RUNTIME_ROOT="$test_root" \
   KAPSL_LLAMA_CPU_LIBRARY="$test_root/libllama-cpu.so" \
   KAPSL_LLAMA_CUDA_LIBRARY="$test_root/libllama-cuda.so" \
   .github/scripts/package-linux-llama-cpp-backend-packs.sh

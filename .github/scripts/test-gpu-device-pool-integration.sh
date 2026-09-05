@@ -4,23 +4,30 @@
 #
 # Required when KAPSL_GPU_INTEGRATION=1:
 #   KAPSL_GPU_TEST_BINARY      CUDA + gguf-cuda-shared-kv kapsl binary
-#   KAPSL_GPU_TEST_ORT_MODEL   ONNX or AIMOD model path
-#   KAPSL_GPU_TEST_GGUF_MODEL  uniform-KV causal GGUF or AIMOD model path
+#   Either KAPSL_GPU_TEST_BUNDLE plus KAPSL_BUNDLE_CACHE_DIR, or both:
+#     KAPSL_GPU_TEST_ORT_MODEL   ONNX or AIMOD model path
+#     KAPSL_GPU_TEST_GGUF_MODEL  uniform-KV causal GGUF or AIMOD model path
 #
 # Useful optional inputs:
+#   KAPSL_GPU_TEST_BUNDLE            verified offline bundle containing ORT then GGUF
 #   KAPSL_GPU_TEST_ORT_REQUEST       JSON inference request for the ONNX model
+#   KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE expected response from another certified profile
 #   KAPSL_GPU_TEST_POOL_BYTES        exact fixed backing size (default: strict auto)
 #   KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES  one physical GPU/UUID (default: 0)
 #   KAPSL_GPU_TEST_VRAM_GROWTH_BYTES reload tolerance (default: 256 MiB)
 #   KAPSL_GPU_TEST_FRAGMENTATION_TOLERANCE allowed ratio increase (default: 0.01)
 #   KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK require signed lazy-pack markers
+#   KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK require the generic signed ORT route
+#   KAPSL_GPU_TEST_ORT_PROFILE       expected signed profile (cuda12/tensorrt10)
+#   KAPSL_GPU_TEST_ORT_PACK_VERSION  expected immutable ORT pack version
+#   KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE require pack activation without network access
 #   KAPSL_GPU_TEST_OUTPUT_DIR        retained logs and snapshots
 #
-# The two model paths are startup arguments so pool registration necessarily
-# precedes both backend/session constructions. Positive `owner="onnx"` bytes
-# prove that ORT actually suballocated from it even for generative ONNX paths
-# that do not emit the generic OnnxBackend log marker. Each model is then
-# stopped and started again under the same id while the other remains resident.
+# Both models are startup arguments so pool registration necessarily precedes
+# both backend/session constructions. Positive model/replica-scoped
+# `owner="onnx:<model>:<replica>:persistent-weights"` bytes prove that ORT
+# actually suballocated from it. Each model is then stopped and started again
+# under the same id while the other remains resident.
 set -Eeuo pipefail
 
 script_name="$(basename "$0")"
@@ -37,15 +44,23 @@ Usage:
     KAPSL_GPU_TEST_GGUF_MODEL=/models/model.gguf \\
     $script_name
 
+  KAPSL_GPU_INTEGRATION=1 \\
+    KAPSL_GPU_TEST_BINARY=/path/to/kapsl \\
+    KAPSL_GPU_TEST_BUNDLE=/release/profile.kapsl-bundle \\
+    KAPSL_BUNDLE_CACHE_DIR=/tmp/kapsl-bundles \\
+    $script_name
+
 The GPU run fails unless all of these are observed in one process:
-  * exactly one runtime GPU backing allocation and ORT registration
-  * positive live owner="onnx" bytes from the registered ORT allocator
+  * exactly one runtime GPU backing allocation
+  * positive model/replica-scoped ONNX and GGUF owner bytes
   * GGUF reporting kv_path=shared-kv, both before and after reload
   * each owner disappears on unload and live/free state recovers on reload
   * stable pool capacity and external-memory accounting across both reloads
   * no process-isolation or native-KV fallback marker
   * when KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK=1, exactly one lazy pack
     download plus the signed ABI and core-owned shared-pool markers
+  * when KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1, the exact signed ORT pack
+    profile/version is selected and activated, with no embedded rollback
 
 Without KAPSL_GPU_INTEGRATION=1 the script exits successfully with SKIP.
 EOF
@@ -101,6 +116,7 @@ reject_log_marker() {
 assert_runtime_markers() {
   local log_file="$1"
   local minimum_shared_kv="$2"
+  local minimum_signed_ort="${3:-1}"
   local allocated registered
 
   allocated="$(count_log_marker "$log_file" "GPU device pool allocated:")"
@@ -109,8 +125,41 @@ assert_runtime_markers() {
     echo "Expected exactly one GPU backing allocation, observed $allocated" >&2
     return 1
   fi
-  if [[ "$registered" != "1" ]]; then
-    echo "Expected exactly one ORT pool registration, observed $registered" >&2
+  if is_true "${KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK:-0}"; then
+    local profile version profile_label
+    profile="${KAPSL_GPU_TEST_ORT_PROFILE:-}"
+    version="${KAPSL_GPU_TEST_ORT_PACK_VERSION:-}"
+    case "$profile" in
+      cuda12) profile_label="CUDA 12" ;;
+      tensorrt10) profile_label="TensorRT 10" ;;
+      *)
+        echo "KAPSL_GPU_TEST_ORT_PROFILE must be cuda12 or tensorrt10 for signed ORT certification" >&2
+        return 1
+        ;;
+    esac
+    if [[ -z "$version" ]]; then
+      echo "KAPSL_GPU_TEST_ORT_PACK_VERSION is required for signed ORT certification" >&2
+      return 1
+    fi
+    if [[ "$registered" != "0" ]]; then
+      echo "Signed ORT route unexpectedly used embedded ORT pool registration" >&2
+      return 1
+    fi
+    require_log_marker "$log_file" \
+      "Activated signed native backend pack onnx/$profile version $version" 1 || return 1
+    require_log_marker "$log_file" \
+      "Selected signed native backend route onnx/$profile version $version" 1 || return 1
+    require_log_marker "$log_file" \
+      "Activating signed backend route onnx/$profile version $version" "$minimum_signed_ort" || return 1
+    require_log_marker "$log_file" \
+      "initializing ORT $version $profile_label" "$minimum_signed_ort" || return 1
+    reject_log_marker "$log_file" "Using embedded ORT rollback" || return 1
+    reject_log_marker "$log_file" "Activating embedded ORT rollback route" || return 1
+    if is_true "${KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE:-0}"; then
+      reject_log_marker "$log_file" "Downloading Kapsl backend" || return 1
+    fi
+  elif [[ "$registered" != "1" ]]; then
+    echo "Expected exactly one embedded ORT pool registration, observed $registered" >&2
     return 1
   fi
 
@@ -236,6 +285,19 @@ require_owner_absent() {
   ! grep -F -q -- "owner=\"$owner\"" "$file"
 }
 
+require_owner_prefix_absent() {
+  local file="$1"
+  local owner_prefix="$2"
+  ! grep -F -q -- "owner=\"$owner_prefix" "$file"
+}
+
+require_active_workload_owners() {
+  local file="$1"
+  require_active_owner "$file" "$onnx_allocation_owner" \
+    && require_admitted_owner "$file" "$gguf_admission_owner" \
+    && require_active_owner "$file" "$gguf_kv_owner"
+}
+
 assert_fragmentation_not_worse() {
   local baseline="$1"
   local current="$2"
@@ -265,8 +327,8 @@ stopped_pool_snapshot_matches() {
     && (( live <= initial_live )) \
     && (( free >= initial_free )) \
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
-    && require_active_owner "$candidate" onnx \
-    && require_owner_absent "$candidate" "gguf_kv:$gguf_model_id"
+    && require_active_owner "$candidate" "$onnx_allocation_owner" \
+    && require_owner_prefix_absent "$candidate" "$gguf_owner_prefix"
 }
 
 reloaded_pool_snapshot_matches() {
@@ -288,8 +350,7 @@ reloaded_pool_snapshot_matches() {
     && [[ "$live" == "$initial_live" ]] \
     && [[ "$free" == "$initial_free" ]] \
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
-    && require_active_owner "$candidate" onnx \
-    && require_admitted_owner "$candidate" "gguf_kv:$gguf_model_id"
+    && require_active_workload_owners "$candidate"
 }
 
 ort_reloaded_pool_snapshot_matches() {
@@ -314,8 +375,7 @@ ort_reloaded_pool_snapshot_matches() {
     && [[ "$live" == "$initial_live" ]] \
     && [[ "$free" == "$initial_free" ]] \
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
-    && require_active_owner "$candidate" onnx \
-    && require_admitted_owner "$candidate" "gguf_kv:$gguf_model_id"
+    && require_active_workload_owners "$candidate"
 }
 
 ort_stopped_pool_snapshot_matches() {
@@ -344,8 +404,9 @@ ort_stopped_pool_snapshot_matches() {
     && (( live < initial_live )) \
     && (( free > initial_free )) \
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
-    && require_owner_absent "$candidate" onnx \
-    && require_admitted_owner "$candidate" "gguf_kv:$gguf_model_id"
+    && require_owner_prefix_absent "$candidate" "$onnx_owner_prefix" \
+    && require_admitted_owner "$candidate" "$gguf_admission_owner" \
+    && require_active_owner "$candidate" "$gguf_kv_owner"
 }
 
 run_self_test() {
@@ -372,6 +433,53 @@ run_self_test() {
     die "self-test accepted a second GPU backing allocation"
   fi
 
+  printf '%s\n' \
+    'GPU device pool allocated: 4096 MiB' \
+    'Activated signed native backend pack onnx/cuda12 version 0.2.0 from /tmp/pack' \
+    'Selected signed native backend route onnx/cuda12 version 0.2.0 for model `ort-gpu`' \
+    'Activating signed backend route onnx/cuda12 version 0.2.0 for model `ort-gpu`' \
+    'initializing ORT 0.2.0 CUDA 12 generation adapter with identity input from /tmp/pack' \
+    '[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device 0' \
+    '[gguf] kv_path=shared-kv Kapsl paged external KV pool active on device 0' \
+    >"$fixture/signed-ort.log"
+  KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+    KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+    KAPSL_GPU_TEST_ORT_PACK_VERSION=0.2.0 \
+    assert_runtime_markers "$fixture/signed-ort.log" 2
+  if KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+    KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+    KAPSL_GPU_TEST_ORT_PACK_VERSION=0.2.0 \
+    assert_runtime_markers "$fixture/signed-ort.log" 2 2 >/dev/null 2>&1; then
+    die "self-test accepted one signed ORT activation as proof of reload"
+  fi
+  printf '%s\n' \
+    'Activating signed backend route onnx/cuda12 version 0.2.0 for model `ort-gpu`' \
+    'initializing ORT 0.2.0 CUDA 12 generation adapter with identity input from /tmp/pack' \
+    >>"$fixture/signed-ort.log"
+  KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+    KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+    KAPSL_GPU_TEST_ORT_PACK_VERSION=0.2.0 \
+    assert_runtime_markers "$fixture/signed-ort.log" 2 2
+  cp "$fixture/signed-ort.log" "$fixture/signed-ort-rollback.log"
+  printf '%s\n' 'Activating embedded ORT rollback route for model `ort-gpu`' \
+    >>"$fixture/signed-ort-rollback.log"
+  if KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+    KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+    KAPSL_GPU_TEST_ORT_PACK_VERSION=0.2.0 \
+    assert_runtime_markers "$fixture/signed-ort-rollback.log" 2 2 >/dev/null 2>&1; then
+    die "self-test accepted embedded ORT rollback during signed-pack certification"
+  fi
+  cp "$fixture/signed-ort.log" "$fixture/signed-ort-download.log"
+  printf '%s\n' 'Downloading Kapsl backend onnx/cuda12 (123 bytes)...' \
+    >>"$fixture/signed-ort-download.log"
+  if KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK=1 \
+    KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE=1 \
+    KAPSL_GPU_TEST_ORT_PROFILE=cuda12 \
+    KAPSL_GPU_TEST_ORT_PACK_VERSION=0.2.0 \
+    assert_runtime_markers "$fixture/signed-ort-download.log" 2 2 >/dev/null 2>&1; then
+    die "self-test accepted a backend download during offline-bundle certification"
+  fi
+
   local value
   cat >"$fixture/metrics.txt" <<'EOF'
 # HELP kapsl_device_memory_pooled_bytes test
@@ -383,32 +491,44 @@ kapsl_gpu_device_pool_free_bytes{device="0"} 1073741824
 kapsl_gpu_device_pool_free_ranges{device="0"} 2
 kapsl_gpu_device_pool_largest_free_range_bytes{device="0"} 805306368
 kapsl_gpu_device_pool_fragmentation_ratio{device="0"} 0.25
-kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="onnx"} 2147483648
-kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="onnx"} 1073741824
-kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="onnx"} 4294967296
-kapsl_gpu_device_pool_owner_admitted{device="0",owner="onnx"} 1
-kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="onnx"} 1073741824
-kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="gguf_kv:1"} 1073741824
-kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="gguf_kv:1"} 0
-kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf_kv:1"} 4294967296
-kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf_kv:1"} 1
-kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf_kv:1"} 1073741824
+kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="onnx:0:0:persistent-weights"} 2147483648
+kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="onnx:0:0:persistent-weights"} 1073741824
+kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="onnx:0:0:persistent-weights"} 4294967296
+kapsl_gpu_device_pool_owner_admitted{device="0",owner="onnx:0:0:persistent-weights"} 1
+kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="onnx:0:0:persistent-weights"} 1073741824
+kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="gguf:1:0:persistent-weights"} 0
+kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="gguf:1:0:persistent-weights"} 0
+kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf:1:0:persistent-weights"} 4294967296
+kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf:1:0:persistent-weights"} 1
+kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf:1:0:persistent-weights"} 2147483648
+kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="gguf:1:0:kv-cache"} 1073741824
+kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="gguf:1:0:kv-cache"} 0
+kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf:1:0:kv-cache"} 4294967296
+kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf:1:0:kv-cache"} 1
+kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf:1:0:kv-cache"} 1073741824
 EOF
+  onnx_model_id=0
+  gguf_model_id=1
+  onnx_owner_prefix="onnx:$onnx_model_id:0:"
+  onnx_allocation_owner="${onnx_owner_prefix}persistent-weights"
+  gguf_owner_prefix="gguf:$gguf_model_id:0:"
+  gguf_admission_owner="${gguf_owner_prefix}persistent-weights"
+  gguf_kv_owner="${gguf_owner_prefix}kv-cache"
   logical_device_id=0
   value="$(metric_from_file kapsl_device_memory_pooled_bytes "$fixture/metrics.txt")"
   [[ "$value" == "4294967296" ]] || die "metric parser returned: $value"
   assert_pool_snapshot_consistent "$fixture/metrics.txt" "$value" \
     || die "self-test rejected a consistent live pool snapshot"
-  require_active_owner "$fixture/metrics.txt" onnx \
+  require_active_owner "$fixture/metrics.txt" "$onnx_allocation_owner" \
     || die "self-test did not find active ONNX ownership"
-  require_active_owner "$fixture/metrics.txt" gguf_kv:1 \
+  require_active_owner "$fixture/metrics.txt" "$gguf_kv_owner" \
     || die "self-test did not find active GGUF ownership"
-  sed 's/owner="onnx"} 2147483648/owner="onnx"} 0/' \
+  sed 's/owner="onnx:0:0:persistent-weights"} 2147483648/owner="onnx:0:0:persistent-weights"} 0/' \
     "$fixture/metrics.txt" >"$fixture/no-onnx-usage.txt"
-  if require_active_owner "$fixture/no-onnx-usage.txt" onnx; then
+  if require_active_owner "$fixture/no-onnx-usage.txt" "$onnx_allocation_owner"; then
     die "self-test accepted an ONNX owner without a live allocation"
   fi
-  if require_owner_absent "$fixture/metrics.txt" gguf_kv:1; then
+  if require_owner_prefix_absent "$fixture/metrics.txt" "$gguf_owner_prefix"; then
     die "self-test treated a live GGUF owner as absent"
   fi
 
@@ -421,13 +541,12 @@ kapsl_gpu_device_pool_free_bytes{device="0"} 2147483648
 kapsl_gpu_device_pool_free_ranges{device="0"} 1
 kapsl_gpu_device_pool_largest_free_range_bytes{device="0"} 2147483648
 kapsl_gpu_device_pool_fragmentation_ratio{device="0"} 0
-kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="onnx"} 2147483648
-kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="onnx"} 1073741824
-kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="onnx"} 4294967296
-kapsl_gpu_device_pool_owner_admitted{device="0",owner="onnx"} 1
-kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="onnx"} 2147483648
+kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="onnx:0:0:persistent-weights"} 2147483648
+kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="onnx:0:0:persistent-weights"} 1073741824
+kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="onnx:0:0:persistent-weights"} 4294967296
+kapsl_gpu_device_pool_owner_admitted{device="0",owner="onnx:0:0:persistent-weights"} 1
+kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="onnx:0:0:persistent-weights"} 2147483648
 EOF
-  gguf_model_id=1
   stopped_pool_snapshot_matches \
     "$fixture/stopped-metrics.txt" 2000 3221225472 7 1073741824 4294967296 \
     || die "self-test rejected a valid unload snapshot"
@@ -453,11 +572,16 @@ kapsl_gpu_device_pool_free_bytes{device="0"} 3221225472
 kapsl_gpu_device_pool_free_ranges{device="0"} 1
 kapsl_gpu_device_pool_largest_free_range_bytes{device="0"} 3221225472
 kapsl_gpu_device_pool_fragmentation_ratio{device="0"} 0
-kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="gguf_kv:1"} 1073741824
-kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="gguf_kv:1"} 0
-kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf_kv:1"} 4294967296
-kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf_kv:1"} 1
-kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf_kv:1"} 3221225472
+kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="gguf:1:0:persistent-weights"} 0
+kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="gguf:1:0:persistent-weights"} 0
+kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf:1:0:persistent-weights"} 4294967296
+kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf:1:0:persistent-weights"} 1
+kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf:1:0:persistent-weights"} 3221225472
+kapsl_gpu_device_pool_owner_usage_bytes{device="0",owner="gguf:1:0:kv-cache"} 1073741824
+kapsl_gpu_device_pool_owner_quota_guaranteed_bytes{device="0",owner="gguf:1:0:kv-cache"} 0
+kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf:1:0:kv-cache"} 4294967296
+kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf:1:0:kv-cache"} 1
+kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf:1:0:kv-cache"} 3221225472
 EOF
   ort_stopped_pool_snapshot_matches \
     "$fixture/ort-stopped-metrics.txt" 2000 3221225472 7 1073741824 4294967296 \
@@ -472,6 +596,26 @@ EOF
   ort_reloaded_pool_snapshot_matches \
     "$fixture/ort-reloaded-external-reused.txt" 2000 1500 3221225472 7 1073741824 4294967296 \
     || die "self-test rejected lower ORT external CUDA state after reload"
+
+  printf '%s\n' '{"shape":[1,1],"dtype":"string","data_base64":"Q1VEQQ=="}' \
+    >"$fixture/onnx-response.json"
+  assert_onnx_response_correct "$fixture/onnx-response.json"
+  printf '%s\n' '{"shape":[1,1],"dtype":"string","data_base64":""}' \
+    >"$fixture/empty-onnx-response.json"
+  if (assert_onnx_response_correct "$fixture/empty-onnx-response.json") >/dev/null 2>&1; then
+    die "self-test accepted an empty ONNX generation response"
+  fi
+
+  mkdir -p "$fixture/bundle-source"
+  printf '%s\n' \
+    '{"schema_version":1,"models":[{"path":"models/000-ort.aimod"},{"path":"models/001-gguf.aimod"}]}' \
+    >"$fixture/bundle-source/bundle-manifest.json"
+  tar -C "$fixture/bundle-source" -czf "$fixture/test.kapsl-bundle" bundle-manifest.json
+  resolve_bundle_model_paths "$fixture/test.kapsl-bundle" "$fixture/bundle-cache"
+  [[ "$ort_model" == "$fixture/bundle-cache/"*/models/000-ort.aimod ]] \
+    || die "self-test resolved the wrong bundled ORT model path: $ort_model"
+  [[ "$gguf_model" == "$fixture/bundle-cache/"*/models/001-gguf.aimod ]] \
+    || die "self-test resolved the wrong bundled GGUF model path: $gguf_model"
   rm -rf "$fixture"
   note "harness contract self-test passed"
 }
@@ -722,11 +866,55 @@ run_onnx_inference_if_configured() {
   api_post "/api/models/$onnx_model_id/infer" \
     -H 'Content-Type: application/json' \
     --data-binary "@$request_file" >"$destination"
+  assert_onnx_response_correct "$destination"
+}
+
+assert_onnx_response_correct() {
+  local response_file="$1"
+  local decoded
+  decoded="$(jq -er 'select(.dtype == "string") | .data_base64 | @base64d' "$response_file")" \
+    || die "ONNX response is not a valid UTF-8 tensor: $response_file"
+  [[ -n "$decoded" ]] || die "ONNX response decoded to an empty string: $response_file"
+
+  local baseline="${KAPSL_GPU_TEST_ORT_BASELINE_RESPONSE:-}"
+  if [[ -n "$baseline" ]]; then
+    [[ -s "$baseline" ]] || die "ONNX baseline response is missing or empty: $baseline"
+    local expected
+    expected="$(jq -er 'select(.dtype == "string") | .data_base64 | @base64d' "$baseline")" \
+      || die "ONNX baseline response is not a valid UTF-8 tensor: $baseline"
+    [[ "$decoded" == "$expected" ]] \
+      || die "ONNX output differs from the certified baseline: $response_file"
+  fi
+}
+
+resolve_bundle_model_paths() {
+  local bundle_path="$1"
+  local cache_root="$2"
+  local manifest digest model_count relative
+  manifest="$(tar -xOzf "$bundle_path" bundle-manifest.json)" \
+    || die "cannot read bundle-manifest.json from $bundle_path"
+  jq -e '
+    .schema_version == 1 and
+    (.models | length) == 2 and
+    (.models[0].path | startswith("models/") and endswith(".aimod")) and
+    (.models[1].path | startswith("models/") and endswith(".aimod")) and
+    ([.models[].path | split("/")[]] | all(. != ".." and . != "." and . != ""))
+  ' <<<"$manifest" >/dev/null \
+    || die "offline bundle must contain exactly two safe AIMOD paths (ORT first, GGUF second)"
+  model_count="$(jq -r '.models | length' <<<"$manifest")"
+  [[ "$model_count" == "2" ]] || die "offline bundle contains $model_count models, expected 2"
+  digest="$(sha256sum "$bundle_path" | awk '{print $1}')"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "could not compute offline bundle SHA-256"
+
+  relative="$(jq -er '.models[0].path' <<<"$manifest")"
+  ort_model="$cache_root/$digest/$relative"
+  relative="$(jq -er '.models[1].path' <<<"$manifest")"
+  gguf_model="$cache_root/$digest/$relative"
 }
 
 main() {
   if ! is_true "${KAPSL_GPU_INTEGRATION:-0}"; then
-    echo "SKIP: set KAPSL_GPU_INTEGRATION=1 and provide the binary plus ORT/GGUF model paths"
+    echo "SKIP: set KAPSL_GPU_INTEGRATION=1 and provide the binary plus an offline bundle or ORT/GGUF model paths"
     return 0
   fi
 
@@ -736,12 +924,49 @@ main() {
   require_command awk
 
   binary="${KAPSL_GPU_TEST_BINARY:-}"
-  ort_model="${KAPSL_GPU_TEST_ORT_MODEL:-}"
-  gguf_model="${KAPSL_GPU_TEST_GGUF_MODEL:-}"
+  bundle="${KAPSL_GPU_TEST_BUNDLE:-}"
   [[ -n "$binary" ]] || die "KAPSL_GPU_TEST_BINARY is required"
   [[ -x "$binary" ]] || die "Kapsl binary is not executable: $binary"
-  [[ -s "$ort_model" ]] || die "ORT model is missing or empty: $ort_model"
-  [[ -s "$gguf_model" ]] || die "GGUF model is missing or empty: $gguf_model"
+  if [[ -n "$bundle" ]]; then
+    require_command tar
+    require_command sha256sum
+    [[ -s "$bundle" ]] || die "offline bundle is missing or empty: $bundle"
+    [[ -n "${KAPSL_BUNDLE_CACHE_DIR:-}" ]] \
+      || die "KAPSL_BUNDLE_CACHE_DIR is required with KAPSL_GPU_TEST_BUNDLE"
+    mkdir -p "$KAPSL_BUNDLE_CACHE_DIR"
+    resolve_bundle_model_paths "$bundle" "$KAPSL_BUNDLE_CACHE_DIR"
+  else
+    ort_model="${KAPSL_GPU_TEST_ORT_MODEL:-}"
+    gguf_model="${KAPSL_GPU_TEST_GGUF_MODEL:-}"
+    [[ -s "$ort_model" ]] || die "ORT model is missing or empty: $ort_model"
+    [[ -s "$gguf_model" ]] || die "GGUF model is missing or empty: $gguf_model"
+  fi
+
+  if is_true "${KAPSL_GPU_TEST_REQUIRE_OFFLINE_BUNDLE:-0}" && [[ -z "$bundle" ]]; then
+    die "KAPSL_GPU_TEST_BUNDLE is required for offline-bundle certification"
+  fi
+
+  if is_true "${KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK:-0}"; then
+    case "${KAPSL_GPU_TEST_ORT_PROFILE:-}" in
+      cuda12|tensorrt10) ;;
+      *) die "KAPSL_GPU_TEST_ORT_PROFILE must be cuda12 or tensorrt10" ;;
+    esac
+    [[ -n "${KAPSL_GPU_TEST_ORT_PACK_VERSION:-}" ]] \
+      || die "KAPSL_GPU_TEST_ORT_PACK_VERSION is required"
+    [[ -n "${KAPSL_BACKEND_PUBLIC_KEYS:-}" ]] \
+      || die "KAPSL_BACKEND_PUBLIC_KEYS is required for signed ORT certification"
+    [[ -n "${KAPSL_BACKEND_CACHE_DIR:-}" ]] \
+      || die "KAPSL_BACKEND_CACHE_DIR is required for signed ORT certification"
+    if [[ -z "$bundle" && -z "${KAPSL_BACKEND_INDEX_PATH:-}" && -z "${KAPSL_BACKEND_INDEX_URL:-}" ]]; then
+      die "KAPSL_BACKEND_INDEX_PATH or KAPSL_BACKEND_INDEX_URL is required for signed ORT certification"
+    fi
+    if [[ -z "$bundle" && -n "${KAPSL_BACKEND_INDEX_PATH:-}" ]]; then
+      [[ -s "$KAPSL_BACKEND_INDEX_PATH" ]] \
+        || die "signed backend index is missing or empty: $KAPSL_BACKEND_INDEX_PATH"
+      [[ -s "${KAPSL_BACKEND_INDEX_PATH}.sig" ]] \
+        || die "signed backend index signature is missing or empty: ${KAPSL_BACKEND_INDEX_PATH}.sig"
+    fi
+  fi
 
   if is_true "${KAPSL_GPU_DEVICE_POOL_DISABLED:-0}"; then
     die "KAPSL_GPU_DEVICE_POOL_DISABLED is an isolated-worker safeguard and cannot be enabled for this in-process sharing test"
@@ -784,6 +1009,11 @@ main() {
   logical_device_id=0
   onnx_model_id=0
   gguf_model_id=1
+  onnx_owner_prefix="onnx:$onnx_model_id:0:"
+  onnx_allocation_owner="${onnx_owner_prefix}persistent-weights"
+  gguf_owner_prefix="gguf:$gguf_model_id:0:"
+  gguf_admission_owner="${gguf_owner_prefix}persistent-weights"
+  gguf_kv_owner="${gguf_owner_prefix}kv-cache"
 
   nvidia-smi -L >"$output_dir/nvidia-smi.txt"
   "$binary" --version >"$output_dir/kapsl-version.txt" 2>&1 || true
@@ -831,10 +1061,26 @@ main() {
       "KAPSL_GPU_DEVICE_POOL_BYTES_0="
     )
   fi
+  if is_true "${KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK:-0}"; then
+    env_args+=(
+      "KAPSL_GENERIC_NATIVE_PACKS=1"
+      "KAPSL_LAZY_ONNX_PACKS=1"
+    )
+  fi
+  if [[ -n "$bundle" ]]; then
+    env_args+=(
+      "KAPSL_LAZY_BACKENDS=1"
+      "KAPSL_LAZY_LLAMA_CPP_PACKS=1"
+      "KAPSL_BUNDLE_CACHE_DIR=$KAPSL_BUNDLE_CACHE_DIR"
+    )
+  fi
 
+  model_args=(--model "$ort_model" --model "$gguf_model")
+  if [[ -n "$bundle" ]]; then
+    model_args=("$bundle" --offline)
+  fi
   env "${env_args[@]}" "$binary" run \
-    --model "$ort_model" \
-    --model "$gguf_model" \
+    "${model_args[@]}" \
     --transport socket \
     --socket "$socket_path" \
     --metrics-port "$port" \
@@ -849,15 +1095,19 @@ main() {
   fi
   wait_for_model_status "$onnx_model_id" active || die "ORT model did not become active"
   wait_for_model_status "$gguf_model_id" active || die "GGUF model did not become active"
+  if [[ -n "$bundle" ]]; then
+    [[ -s "$ort_model" ]] || die "offline bundle did not expose the ORT AIMOD: $ort_model"
+    [[ -s "$gguf_model" ]] || die "offline bundle did not expose the GGUF AIMOD: $gguf_model"
+  fi
   api_get /api/models >"$output_dir/models-initial.json"
 
-  if [[ "${ort_model,,}" == *.onnx ]]; then
+  if [[ -n "$bundle" || "${ort_model,,}" == *.onnx ]]; then
     jq -e --argjson id "$onnx_model_id" \
       '.[] | select(.id == $id and ((.format // .framework) == "onnx"))' \
       "$output_dir/models-initial.json" >/dev/null \
       || die "raw model 0 is not reported as ONNX"
   fi
-  if [[ "${gguf_model,,}" == *.gguf ]]; then
+  if [[ -n "$bundle" || "${gguf_model,,}" == *.gguf ]]; then
     jq -e --argjson id "$gguf_model_id" \
       '.[] | select(.id == $id and ((.format // .framework) == "gguf"))' \
       "$output_dir/models-initial.json" >/dev/null \
@@ -884,14 +1134,17 @@ main() {
   [[ "$initial_external" =~ ^[1-9][0-9]*$ ]] || die "GGUF weights did not produce positive external-memory accounting: $initial_external"
   assert_pool_snapshot_consistent "$output_dir/metrics-initial.txt" "$initial_pool" \
     || die "initial live allocator snapshot is missing or inconsistent"
-  require_active_owner "$output_dir/metrics-initial.txt" onnx \
+  require_active_owner "$output_dir/metrics-initial.txt" "$onnx_allocation_owner" \
     || die "ONNX has no positive live allocation/admission in the shared pool"
-  require_admitted_owner "$output_dir/metrics-initial.txt" "gguf_kv:$gguf_model_id" \
-    || die "GGUF shared-KV owner is not admitted with a valid quota snapshot"
-  initial_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes onnx "$output_dir/metrics-initial.txt")"
-  initial_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "gguf_kv:$gguf_model_id" "$output_dir/metrics-initial.txt")"
-  if grep -F -q -- 'owner="native_kv:' "$output_dir/metrics-initial.txt"; then
-    die "native-KV owner unexpectedly appeared in a shared-KV integration run"
+  require_admitted_owner "$output_dir/metrics-initial.txt" "$gguf_admission_owner" \
+    || die "GGUF model/replica admission owner is missing or invalid"
+  require_active_owner "$output_dir/metrics-initial.txt" "$gguf_kv_owner" \
+    || die "GGUF shared-KV allocation owner is missing or inactive"
+  initial_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-initial.txt")"
+  initial_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-initial.txt")"
+  if grep -F -q -- 'owner="native:unattributed:' "$output_dir/metrics-initial.txt" \
+    || grep -F -q -- 'owner="onnx:unattributed:' "$output_dir/metrics-initial.txt"; then
+    die "unattributed native/ONNX allocation unexpectedly appeared in the shared-pool run"
   fi
   initial_vram="$(process_vram_bytes || true)"
 
@@ -910,7 +1163,7 @@ main() {
   stopped_allocated="$(metric_from_file kapsl_gpu_device_pool_allocated_bytes "$output_dir/metrics-stopped.txt")"
   stopped_live="$(metric_from_file kapsl_gpu_device_pool_live_allocations "$output_dir/metrics-stopped.txt")"
   stopped_free="$(metric_from_file kapsl_gpu_device_pool_free_bytes "$output_dir/metrics-stopped.txt")"
-  stopped_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes onnx "$output_dir/metrics-stopped.txt")"
+  stopped_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-stopped.txt")"
   [[ "$stopped_pool" == "$initial_pool" ]] \
     || die "pool backing changed during unload: $initial_pool -> $stopped_pool"
   api_get /api/models >"$output_dir/models-stopped.json"
@@ -940,8 +1193,8 @@ main() {
   reloaded_free_ranges="$(metric_from_file kapsl_gpu_device_pool_free_ranges "$output_dir/metrics-reloaded.txt")"
   reloaded_largest_free="$(metric_from_file kapsl_gpu_device_pool_largest_free_range_bytes "$output_dir/metrics-reloaded.txt")"
   reloaded_fragmentation="$(metric_from_file kapsl_gpu_device_pool_fragmentation_ratio "$output_dir/metrics-reloaded.txt")"
-  reloaded_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes onnx "$output_dir/metrics-reloaded.txt")"
-  reloaded_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "gguf_kv:$gguf_model_id" "$output_dir/metrics-reloaded.txt")"
+  reloaded_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-reloaded.txt")"
+  reloaded_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-reloaded.txt")"
   reloaded_vram="$(process_vram_bytes || true)"
 
   [[ "$reloaded_pool" == "$initial_pool" ]] \
@@ -975,7 +1228,7 @@ main() {
   ort_stopped_live="$(metric_from_file kapsl_gpu_device_pool_live_allocations "$output_dir/metrics-ort-stopped.txt")"
   ort_stopped_free="$(metric_from_file kapsl_gpu_device_pool_free_bytes "$output_dir/metrics-ort-stopped.txt")"
   ort_stopped_external="$(metric_from_file kapsl_device_memory_external_bytes "$output_dir/metrics-ort-stopped.txt")"
-  ort_stopped_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "gguf_kv:$gguf_model_id" "$output_dir/metrics-ort-stopped.txt")"
+  ort_stopped_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-ort-stopped.txt")"
   api_get /api/models >"$output_dir/models-ort-stopped.json"
 
   note "reloading ORT model id $onnx_model_id"
@@ -987,6 +1240,12 @@ main() {
   wait_for_model_status "$onnx_model_id" active || die "ORT model did not become active after reload"
   wait_for_model_status "$gguf_model_id" active || die "GGUF model stopped during ORT reload"
   run_onnx_inference_if_configured "$output_dir/onnx-inference-reloaded.json"
+  if [[ -n "${KAPSL_GPU_TEST_ORT_REQUEST:-}" ]]; then
+    initial_onnx_output="$(jq -er '.data_base64' "$output_dir/onnx-inference-initial.json")"
+    reloaded_onnx_output="$(jq -er '.data_base64' "$output_dir/onnx-inference-reloaded.json")"
+    [[ "$initial_onnx_output" == "$reloaded_onnx_output" ]] \
+      || die "ONNX output changed across unload and reload"
+  fi
   sleep "$settle_seconds"
   wait_for_ort_reloaded_pool_snapshot \
     "$initial_external" "$ort_stopped_external" \
@@ -1002,8 +1261,8 @@ main() {
   final_free_ranges="$(metric_from_file kapsl_gpu_device_pool_free_ranges "$output_dir/metrics-final.txt")"
   final_largest_free="$(metric_from_file kapsl_gpu_device_pool_largest_free_range_bytes "$output_dir/metrics-final.txt")"
   final_fragmentation="$(metric_from_file kapsl_gpu_device_pool_fragmentation_ratio "$output_dir/metrics-final.txt")"
-  final_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes onnx "$output_dir/metrics-final.txt")"
-  final_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "gguf_kv:$gguf_model_id" "$output_dir/metrics-final.txt")"
+  final_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-final.txt")"
+  final_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-final.txt")"
   final_vram="$(process_vram_bytes || true)"
 
   [[ "$final_pool" == "$initial_pool" ]] || die "ORT reload replaced the pool backing"
@@ -1012,7 +1271,8 @@ main() {
   assert_fragmentation_not_worse \
     "$initial_fragmentation" "$final_fragmentation" "$fragmentation_tolerance" \
     || die "fragmentation grew after ORT reload: $initial_fragmentation -> $final_fragmentation"
-  assert_runtime_markers "$runtime_log" 2 || die "ORT reload allocated another pool or changed GGUF path"
+  assert_runtime_markers "$runtime_log" 2 2 \
+    || die "ORT reload did not reactivate the exact route or changed the shared-pool path"
   if [[ "$initial_vram" =~ ^[0-9]+$ ]] && [[ "$final_vram" =~ ^[0-9]+$ ]]; then
     max_vram=$((initial_vram + vram_growth_bytes))
     (( final_vram <= max_vram )) \

@@ -23,6 +23,14 @@ on:
         description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
         required: true
         type: string
+      ort_profile:
+        description: Exact signed ORT accelerator profile under qualification (cuda12 or tensorrt10)
+        required: true
+        type: string
+      ort_pack_version:
+        description: Exact immutable signed ORT pack version under qualification
+        required: true
+        type: string
       ort_request_path:
         description: Optional absolute path to a model-specific ONNX inference JSON request
         required: false
@@ -78,12 +86,19 @@ jobs:
         shell: bash
         env:
           BACKEND_INDEX_URL: ${{ inputs.backend_index_url }}
+          ORT_PROFILE: ${{ inputs.ort_profile }}
+          ORT_PACK_VERSION: ${{ inputs.ort_pack_version }}
         run: |
           set -euo pipefail
           [[ "$BACKEND_INDEX_URL" == https://* ]]
+          [[ "$ORT_PROFILE" == "cuda12" || "$ORT_PROFILE" == "tensorrt10" ]]
+          [[ -n "$ORT_PACK_VERSION" ]]
           curl -fsS "$BACKEND_INDEX_URL" -o "${RUNNER_TEMP}/backend-index.json"
           curl -fsS "${BACKEND_INDEX_URL}.sig" -o "${RUNNER_TEMP}/backend-index.json.sig"
           jq -e '.packs | map(select(.backend == "llama-cpp" and .profile == "cuda12" and .kv_mode == "shared_pool")) | length > 0' \
+            "${RUNNER_TEMP}/backend-index.json"
+          jq -e --arg profile "$ORT_PROFILE" --arg version "$ORT_PACK_VERSION" \
+            '.packs | map(select(.backend == "onnx" and .profile == $profile and .pack_version == $version)) | length == 1' \
             "${RUNNER_TEMP}/backend-index.json"
 
       - name: Build eager shared-KV reference runtime
@@ -102,6 +117,9 @@ jobs:
         env:
           KAPSL_GPU_INTEGRATION: "1"
           KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK: "1"
+          KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK: "1"
+          KAPSL_GPU_TEST_ORT_PROFILE: ${{ inputs.ort_profile }}
+          KAPSL_GPU_TEST_ORT_PACK_VERSION: ${{ inputs.ort_pack_version }}
           KAPSL_GPU_TEST_BINARY: ${{ github.workspace }}/kapsl-runtime/target-cert-lazy/release/kapsl
           KAPSL_GPU_TEST_ORT_MODEL: ${{ inputs.ort_model_path }}
           KAPSL_GPU_TEST_GGUF_MODEL: ${{ inputs.gguf_model_path }}
@@ -111,6 +129,8 @@ jobs:
           KAPSL_GPU_TEST_OUTPUT_DIR: ${{ runner.temp }}/lazy-llama-integration-${{ github.run_id }}-${{ github.run_attempt }}
           KAPSL_LAZY_LLAMA_CPP_PACKS: "1"
           KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV: "0"
+          KAPSL_GENERIC_NATIVE_PACKS: "1"
+          KAPSL_LAZY_ONNX_PACKS: "1"
           KAPSL_BACKEND_INDEX_URL: ${{ inputs.backend_index_url }}
           KAPSL_BACKEND_PUBLIC_KEYS: ${{ inputs.backend_public_keys }}
           KAPSL_BACKEND_CACHE_DIR: ${{ runner.temp }}/lazy-llama-integration-cache-${{ github.run_id }}-${{ github.run_attempt }}

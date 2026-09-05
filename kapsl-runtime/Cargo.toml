@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/kapsl-backend-abi",
     "crates/kapsl-backend-llama-cpp",
     "crates/kapsl-cli",
 ]

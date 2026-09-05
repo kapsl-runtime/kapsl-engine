@@ -9,6 +9,10 @@ on:
         description: Official stable engine release tag (vMAJOR.MINOR.PATCH)
         required: true
         type: string
+      candidate_artifact:
+        description: Exact CUDA release artifact produced earlier in this workflow run
+        required: true
+        type: string
       sdk_ref:
         description: Exact kapsl-sdk commit certified for the stable release
         required: true
@@ -18,8 +22,16 @@ on:
         required: false
         default: "0"
         type: string
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS:
+        description: Trusted raw Base64 Ed25519 backend index public key set
+        required: true
+      GPU_RUNNER_GITHUB_APP_PRIVATE_KEY:
+        description: GitHub App private key used only to create and delete the ephemeral JIT runner
+        required: true
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -33,6 +45,7 @@ jobs:
     outputs:
       release_tag: ${{ steps.policy.outputs.release_tag }}
       sdk_ref: ${{ steps.policy.outputs.sdk_ref }}
+      candidate_artifact: ${{ steps.policy.outputs.candidate_artifact }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -42,8 +55,13 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+          KAPSL_GPU_CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
         run: |
           set -Eeuo pipefail
+          if [[ "$KAPSL_GPU_CANDIDATE_ARTIFACT" != "runtime-cuda-linux-x86_64" ]]; then
+            echo "Stable GPU certification requires runtime-cuda-linux-x86_64 from this release run." >&2
+            exit 1
+          fi
           python3 .github/scripts/validate_stable_gpu_release.py \
             --event-name "$GITHUB_EVENT_NAME" \
             --ref-type "$GITHUB_REF_TYPE" \
@@ -53,6 +71,7 @@ jobs:
             --sdk-ref "$KAPSL_VLLM_SDK_REF"
           echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "sdk_ref=$KAPSL_VLLM_SDK_REF" >> "$GITHUB_OUTPUT"
+          echo "candidate_artifact=$KAPSL_GPU_CANDIDATE_ARTIFACT" >> "$GITHUB_OUTPUT"
 
   prepare-vllm-gcp-runner:
     needs: authorize-stable-release
@@ -285,9 +304,12 @@ jobs:
     uses: ./.github/workflows/vllm-shared-pool-conformance.yml
     with:
       release_tag: ${{ needs.authorize-stable-release.outputs.release_tag }}
+      candidate_artifact: ${{ needs.authorize-stable-release.outputs.candidate_artifact }}
       sdk_ref: ${{ needs.authorize-stable-release.outputs.sdk_ref }}
       cuda_visible_devices: ${{ inputs.cuda_visible_devices }}
       runner_label: ${{ needs.prepare-vllm-gcp-runner.outputs.runner_label }}
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
 
   cleanup-vllm-gcp-runner:
     needs: [authorize-stable-release, prepare-vllm-gcp-runner, vllm-shared-pool-gcp]
