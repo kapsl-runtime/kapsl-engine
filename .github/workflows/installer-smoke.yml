@@ -73,6 +73,12 @@ on:
       - ".github/workflows/installer-smoke.yml"
       - ".github/workflows/ort-cpu-conformance.yml"
   workflow_dispatch:
+    inputs:
+      public_release_version:
+        description: "Diagnose public downloads for an existing version (without v); empty runs smoke tests"
+        type: string
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -82,8 +88,74 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  public-download-diagnostic:
+    name: Diagnose public release downloads
+    if: github.event_name == 'workflow_dispatch' && inputs.public_release_version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check public responses from the hosted runner
+        env:
+          RELEASE_VERSION: ${{ inputs.public_release_version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+
+          version = os.environ["RELEASE_VERSION"]
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?", version):
+              raise SystemExit("Invalid release version")
+          channel = "runtime/beta" if "-" in version else "runtime"
+          root = f"https://downloads.kapsl.net/{channel}/v{version}"
+          failures = []
+          subprocess.run(["curl", "--version"], check=True)
+          with tempfile.TemporaryDirectory() as directory:
+              headers = pathlib.Path(directory) / "headers"
+              body = pathlib.Path(directory) / "body"
+
+              def probe(url, head=False):
+                  command = ["curl", "--silent", "--show-error", "--proto", "=https",
+                             "--connect-timeout", "15", "--max-time", "30",
+                             "--dump-header", str(headers), "--output", str(body),
+                             "--write-out", "%{http_code}"]
+                  if head:
+                      command.append("--head")
+                  result = subprocess.run(command + [url], capture_output=True, text=True)
+                  print(f"{'HEAD' if head else 'GET'} {url}: HTTP {result.stdout}, curl exit {result.returncode}", flush=True)
+                  if headers.exists():
+                      for line in headers.read_text(errors="replace").splitlines():
+                          if line.lower().startswith(("http/", "server:", "content-type:", "cf-ray:",
+                                                      "cf-mitigated:", "cf-cache-status:", "location:")):
+                              print(repr(line), flush=True)
+                  if result.returncode != 0 or result.stdout != "200":
+                      failures.append(url)
+                      print(repr(result.stderr[:1024]), flush=True)
+                      if not head and body.exists():
+                          with body.open("rb") as response:
+                              print(repr(response.read(2048).decode(errors="replace")), flush=True)
+                      return None
+                  return None if head else body.read_bytes()
+
+              probe("https://downloads.kapsl.net/install.sh", head=True)
+              index_bytes = probe(f"{root}/backend-index.json")
+              probe(f"{root}/backend-index.json.sig")
+              if index_bytes:
+                  for pack in json.loads(index_bytes)["packs"]:
+                      url = pack["artifact"]
+                      if not url.startswith(root + "/") or "?" in url or "#" in url:
+                          raise SystemExit("Artifact is outside the public release root")
+                      probe(url, head=True)
+          if failures:
+              raise SystemExit(f"Public download verification failed for {len(failures)} object(s)")
+          PY
+
   install-script:
     name: Test install.sh
+    if: github.event_name != 'workflow_dispatch' || inputs.public_release_version == ''
     # Must be Linux x86_64: install.sh gates the CUDA runtime on that platform,
     # so nothing else exercises the paths this covers.
     runs-on: ubuntu-latest
