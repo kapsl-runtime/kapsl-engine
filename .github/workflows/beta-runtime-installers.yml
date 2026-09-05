@@ -564,7 +564,7 @@ jobs:
             "$public_root" \
             --artifacts-only
 
-          for name in backend-index.json backend-index.json.sig; do
+          for name in backend-index.json.sig backend-index.json; do
             aws s3 cp "release-assets/$name" \
               "$release_root/$name" \
               --no-progress \

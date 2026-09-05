@@ -24,11 +24,51 @@ trap cleanup EXIT INT TERM
 wait_for_public_object() {
   local url="$1"
   shift
+  local deadline=$((SECONDS + 600))
+  local http_status curl_exit remaining request_timeout
   echo "Waiting for public release object: $url" >&2
-  curl --fail --silent --show-error --location \
-    --retry 60 --retry-delay 10 --retry-max-time 600 --retry-all-errors \
-    --connect-timeout 15 \
-    "$@" "$url"
+  while true; do
+    remaining=$((deadline - SECONDS))
+    if [ "$remaining" -le 0 ]; then
+      echo "Timed out waiting for public release object: $url" >&2
+      return 1
+    fi
+    request_timeout=30
+    if [ "$remaining" -lt "$request_timeout" ]; then
+      request_timeout="$remaining"
+    fi
+    : > "$scratch/http-headers"
+    if http_status="$(curl --fail --silent --show-error --location \
+      --connect-timeout 15 --max-time "$request_timeout" \
+      --dump-header "$scratch/http-headers" --write-out '%{http_code}' \
+      "$@" "$url")"; then
+      curl_exit=0
+    else
+      curl_exit=$?
+    fi
+
+    if grep -Eiq '^cf-mitigated:[[:space:]]*challenge[[:space:]]*$' "$scratch/http-headers"; then
+      echo "Cloudflare browser challenge blocked public release object: $url" >&2
+      grep -Ei '^(HTTP/|cf-ray:|cf-mitigated:|server:|content-type:)' "$scratch/http-headers" >&2 || true
+      echo "Check the matching Ray ID in Cloudflare Security Events and exempt intended public downloads from the triggering challenge rule. Automated release clients cannot complete browser challenges." >&2
+      return 1
+    fi
+    if [ "$curl_exit" -eq 0 ] && [ "$http_status" = 200 ]; then
+      return 0
+    fi
+
+    echo "Public release object failed: $url (HTTP $http_status, curl exit $curl_exit)" >&2
+    grep -Ei '^(HTTP/|cf-ray:|cf-mitigated:|server:|content-type:)' "$scratch/http-headers" >&2 || true
+    case "$http_status" in
+      000|404|408|429|5??) ;;
+      *) return 1 ;;
+    esac
+    if [ "$((deadline - SECONDS))" -le 30 ]; then
+      echo "Public release object did not become available within the retry budget: $url" >&2
+      return 1
+    fi
+    sleep 30
+  done
 }
 
 if [ "$mode" != "--artifacts-only" ]; then
@@ -72,7 +112,7 @@ if [ ! -s "$scratch/artifact-urls" ]; then
   exit 1
 fi
 while IFS= read -r artifact; do
-  wait_for_public_object "$artifact" --head >/dev/null
+  wait_for_public_object "$artifact" --head --output /dev/null
 done < "$scratch/artifact-urls"
 
 if [ "$mode" = "--artifacts-only" ]; then
