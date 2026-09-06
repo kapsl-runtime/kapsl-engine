@@ -42,6 +42,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lock", type=pathlib.Path, required=True)
     parser.add_argument("--artifacts-dir", type=pathlib.Path, required=True)
     parser.add_argument(
+        "--metadata-only", action="store_true",
+        help="Authenticate catalogs/manifests and check archive-part availability without downloading binaries.",
+    )
+    parser.add_argument(
         "--expected-public-key",
         action="append",
         default=[],
@@ -352,6 +356,7 @@ def import_profile(
     base_url: str,
     keys: list[bytes],
     stage: pathlib.Path,
+    metadata_only: bool = False,
 ) -> None:
     profile_entry = require_mapping(profile_value, f"profile {profile}")
     catalog_metadata = require_mapping(profile_entry.get("catalog"), f"{profile} catalog")
@@ -396,34 +401,49 @@ def import_profile(
         base_url,
     )
     archive_name = str(archive["name"])
-    assembled = stage / f".{archive_name}.assembling"
-    archive_digest = hashlib.sha256()
-    archive_size = 0
-    parts_dir = stage / ".parts"
-    parts_dir.mkdir(exist_ok=True)
-    with assembled.open("xb") as output:
-        for number, part in enumerate(parts):
-            part_name = str(part["name"])
-            part_path = parts_dir / part_name
-            download(str(part["url"]), part_path)
-            verify_bound_file(
-                part_path,
-                int(part["size"]),
-                str(part["sha256"]),
-                f"{profile} part {number}",
-            )
-            with part_path.open("rb") as source:
-                while block := source.read(READ_BLOCK_BYTES):
-                    output.write(block)
-                    archive_digest.update(block)
-                    archive_size += len(block)
-            part_path.unlink()
-        output.flush()
-        os.fsync(output.fileno())
-    if archive_size != archive["size"] or archive_digest.hexdigest() != archive["sha256"]:
-        raise ReleaseImportError(f"{profile} reconstructed archive failed integrity verification")
     verify_signature(keys, str(archive["sha256"]), str(archive["signature"]), f"{profile} archive")
-    assembled.replace(stage / archive_name)
+    if metadata_only:
+        for number, part in enumerate(parts):
+            request = urllib.request.Request(
+                str(part["url"]), method="HEAD",
+                headers={"User-Agent": "kapsl-release-preflight/1"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    length = response.headers.get("Content-Length")
+                    if length is not None and length != str(part["size"]):
+                        raise ReleaseImportError(f"{profile} part {number} size differs from signed catalog")
+            except urllib.error.HTTPError as error:
+                error.close()
+                raise ReleaseImportError(
+                    f"{profile} part {number} is unavailable (HTTP {error.code})"
+                ) from error
+    else:
+        assembled = stage / f".{archive_name}.assembling"
+        archive_digest = hashlib.sha256()
+        archive_size = 0
+        parts_dir = stage / ".parts"
+        parts_dir.mkdir(exist_ok=True)
+        with assembled.open("xb") as output:
+            for number, part in enumerate(parts):
+                part_name = str(part["name"])
+                part_path = parts_dir / part_name
+                download(str(part["url"]), part_path)
+                verify_bound_file(
+                    part_path, int(part["size"]), str(part["sha256"]),
+                    f"{profile} part {number}",
+                )
+                with part_path.open("rb") as source:
+                    while block := source.read(READ_BLOCK_BYTES):
+                        output.write(block)
+                        archive_digest.update(block)
+                        archive_size += len(block)
+                part_path.unlink()
+            output.flush()
+            os.fsync(output.fileno())
+        if archive_size != archive["size"] or archive_digest.hexdigest() != archive["sha256"]:
+            raise ReleaseImportError(f"{profile} reconstructed archive failed integrity verification")
+        assembled.replace(stage / archive_name)
 
     manifest_path = bound_asset(
         archive.get("manifest"), f"{profile} manifest", base_url, stage
@@ -509,7 +529,16 @@ def import_release(args: argparse.Namespace) -> None:
                 base_url,
                 keys,
                 stage,
+                metadata_only=getattr(args, "metadata_only", False),
             )
+
+        if getattr(args, "metadata_only", False):
+            print(
+                f"Verified signed {identity['backend']} metadata and part availability "
+                f"for Kapsl {version}: {', '.join(profiles)}. "
+                "Full binary integrity remains mandatory during import."
+            )
+            return
 
         staged_files = sorted(path for path in stage.iterdir() if path.is_file())
         if not staged_files:

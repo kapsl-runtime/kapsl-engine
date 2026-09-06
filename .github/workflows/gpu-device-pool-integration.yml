@@ -309,7 +309,7 @@ jobs:
       cuda_visible_devices: ${{ inputs.cuda_visible_devices }}
       runner_label: ${{ needs.prepare-vllm-gcp-runner.outputs.runner_label }}
     secrets:
-      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }} ${{ vars.KAPSL_ORT_BACKEND_PUBLIC_KEY }}
 
   cleanup-vllm-gcp-runner:
     needs: [authorize-stable-release, prepare-vllm-gcp-runner, vllm-shared-pool-gcp]

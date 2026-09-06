@@ -1,0 +1,28 @@
+name: Release Preflight
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preflight-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ort-release-preflight:
+    name: Signed ORT release readiness (host only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test release preflight and immutable import contracts
+        run: |
+          python3 .github/scripts/test_import_signed_backend_release.py
+          python3 .github/scripts/test_preflight_ort_release.py
+      - name: Verify published ORT metadata, signatures, compatibility and availability
+        run: python3 .github/scripts/preflight-ort-release.py
