@@ -7,8 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-import unittest
-from unittest import mock
+from unittest import TestCase, main, mock
 
 from test_import_signed_backend_release import ReleaseFixture
 
@@ -22,7 +21,7 @@ SPEC.loader.exec_module(preflight)
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class PreflightTests(unittest.TestCase):
+class PreflightTests(TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -99,4 +98,4 @@ class PreflightTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()

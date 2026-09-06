@@ -14,8 +14,7 @@ import subprocess
 import tempfile
 import threading
 import types
-import unittest
-from unittest import mock
+from unittest import TestCase, main, mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("import-signed-backend-release.py")
@@ -247,7 +246,7 @@ class ReleaseFixture:
             raise AssertionError(f"invalid fixture path {path}")
 
 
-class SignedBackendReleaseImportTests(unittest.TestCase):
+class SignedBackendReleaseImportTests(TestCase):
     def with_fixture(self) -> tuple[tempfile.TemporaryDirectory[str], ReleaseFixture]:
         temporary = tempfile.TemporaryDirectory(prefix="kapsl-release-import-test-")
         fixture = ReleaseFixture(pathlib.Path(temporary.name))
@@ -368,4 +367,4 @@ class SignedBackendReleaseImportTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
