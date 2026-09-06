@@ -1917,6 +1917,7 @@ mod tests {
                         name: "test_direct".to_string(),
                     },
                     descriptor: "test-shared-backing".to_string(),
+                    elastic: None,
                 }],
                 backing: self.backing.clone(),
             })
@@ -1971,6 +1972,7 @@ mod tests {
             },
             adapter_profile: None,
             topology: None,
+            provisioning_grant: None,
         }
     }
 
@@ -2022,6 +2024,7 @@ mod tests {
                     policy: KvCachePolicy::FullAttention,
                 }],
             }),
+            provisioning_grant: None,
         }
     }
 
@@ -2055,6 +2058,7 @@ mod tests {
                 profile_id: "test-direct-v1".to_string(),
             },
             imported_bytes: binding.block_count * binding.bytes_per_block,
+            mapped_bytes: None,
             views: vec![KvAttachmentView {
                 group_id: "vllm.group.0".to_string(),
                 layer: KvLayerId::indexed(0),

@@ -147,6 +147,7 @@ fn plan_bindings(
                     allocation_mode,
                     transport: KvTransport::CudaIpc,
                     descriptor: String::new(),
+                    elastic: None,
                 },
                 device_id: runtime_device_id,
                 allocation_bytes,
