@@ -54,6 +54,12 @@ impl RuntimeBootstrap {
         }
 
         preflight_http_bind(self.config.http_bind_addr, self.config.http_port)?;
+        #[cfg(feature = "grpc-server")]
+        if let Some(grpc) = &self.config.grpc {
+            std::net::TcpListener::bind(grpc.bind_addr).map_err(|error| {
+                format!("Cannot bind gRPC listener {}: {error}", grpc.bind_addr)
+            })?;
+        }
         self.config.transport.preflight()?;
 
         let registry = Arc::new(Registry::new());
@@ -160,6 +166,21 @@ impl PreparedServerRuntime {
         let runtime_samples = monitor.samples();
         let telemetry = monitor.telemetry();
         let runtime_pressure_state = resources.pressure().state();
+        #[cfg(feature = "grpc-server")]
+        let grpc_server = match config.grpc {
+            Some(grpc) => Some(
+                kapsl_grpc::start_server(
+                    grpc,
+                    Arc::new(GrpcEngine {
+                        models: model_runtime.models().clone(),
+                        inference: inference.clone(),
+                    }),
+                    Arc::new(GrpcAuthorizer(config.auth_state.clone())),
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let http_server = start_http_server(
             HttpServerConfig {
                 bind_addr: config.http_bind_addr,
@@ -195,6 +216,8 @@ impl PreparedServerRuntime {
             transport,
             kv_control_task,
             http_server,
+            #[cfg(feature = "grpc-server")]
+            grpc_server,
             monitor,
             autoscaler_task,
             resources,

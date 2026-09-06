@@ -12,6 +12,8 @@ pub(crate) struct ResolvedRuntimeConfig {
     pub(crate) log_sensitive_ids: bool,
     pub(crate) http_bind_addr: IpAddr,
     pub(crate) http_port: u16,
+    #[cfg(feature = "grpc-server")]
+    pub(crate) grpc: Option<kapsl_grpc::GrpcServerConfig>,
     pub(crate) transport: RuntimeTransportConfig,
     pub(crate) kv_control: KvControlConfig,
     pub(crate) model_loading: ModelLoadingConfig,
@@ -49,6 +51,15 @@ impl ResolvedRuntimeConfig {
             );
         }
         self.transport.validate_tcp_exposure()?;
+        #[cfg(feature = "grpc-server")]
+        if let Some(grpc) = &self.grpc {
+            if !grpc.bind_addr.ip().is_loopback() && !env_flag("KAPSL_ALLOW_INSECURE_GRPC") {
+                return Err("Non-loopback gRPC requires KAPSL_ALLOW_INSECURE_GRPC=1 and a TLS-terminating HTTP/2 proxy".into());
+            }
+            if grpc.max_message_bytes == 0 {
+                return Err("--grpc-max-message-bytes must be positive".into());
+            }
+        }
 
         let summary = &self.startup_summary;
         if let Some(rationale) = &summary.applied_tuning.auto_tune_rationale {
@@ -181,6 +192,12 @@ pub(crate) fn resolve_runtime_config(
         log_sensitive_ids,
         http_bind_addr,
         http_port: args.metrics_port,
+        #[cfg(feature = "grpc-server")]
+        grpc: args.grpc_port.map(|port| kapsl_grpc::GrpcServerConfig {
+            bind_addr: std::net::SocketAddr::new(args.grpc_bind, port),
+            max_message_bytes: args.grpc_max_message_bytes,
+            server_version: env!("CARGO_PKG_VERSION").into(),
+        }),
         transport,
         kv_control,
         model_loading,
