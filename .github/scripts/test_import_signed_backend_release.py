@@ -15,6 +15,7 @@ import tempfile
 import threading
 import types
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("import-signed-backend-release.py")
@@ -315,6 +316,55 @@ class SignedBackendReleaseImportTests(unittest.TestCase):
             release_import.import_release(fixture.args())
 
         self.assertEqual(list(fixture.output_dir.iterdir()), [])
+
+    def test_preflight_checks_metadata_without_downloading_binary_parts(self) -> None:
+        _, fixture = self.with_fixture()
+        fixture.build()
+        args = fixture.args()
+        args.metadata_only = True
+        with mock.patch.object(release_import, "download", wraps=release_import.download) as download:
+            release_import.import_release(args)
+        self.assertTrue(download.called)
+        self.assertTrue(all(".part-" not in call.args[0] for call in download.call_args_list))
+        self.assertEqual(list(fixture.output_dir.iterdir()), [])
+
+    def test_preflight_rejects_missing_transport_part(self) -> None:
+        _, fixture = self.with_fixture()
+        fixture.build()
+        fixture.part_paths[0].unlink()
+        args = fixture.args()
+        args.metadata_only = True
+        with self.assertRaisesRegex(release_import.ReleaseImportError, "unavailable.*404"):
+            release_import.import_release(args)
+        self.assertEqual(list(fixture.output_dir.iterdir()), [])
+
+    def test_preflight_rejects_wrong_part_size(self) -> None:
+        _, fixture = self.with_fixture()
+        fixture.build()
+        fixture.part_paths[0].write_bytes(b"wrong size")
+        args = fixture.args()
+        args.metadata_only = True
+        with self.assertRaisesRegex(release_import.ReleaseImportError, "size differs"):
+            release_import.import_release(args)
+
+    def test_preflight_rejects_untrusted_signer(self) -> None:
+        _, fixture = self.with_fixture()
+        fixture.build()
+        args = fixture.args()
+        args.metadata_only = True
+        args.expected_public_key = [base64.b64encode(bytes(32)).decode("ascii")]
+        with self.assertRaisesRegex(release_import.ReleaseImportError, "trusted release key"):
+            release_import.import_release(args)
+
+    def test_preflight_rejects_tampered_manifest(self) -> None:
+        _, fixture = self.with_fixture()
+        fixture.build()
+        manifest = next(fixture.release_dir.glob("*.manifest.json"))
+        manifest.write_bytes(manifest.read_bytes() + b" ")
+        args = fixture.args()
+        args.metadata_only = True
+        with self.assertRaisesRegex(release_import.ReleaseImportError, "manifest (size|SHA-256)"):
+            release_import.import_release(args)
 
 
 if __name__ == "__main__":
