@@ -21,6 +21,8 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         performance_profile: PerformanceProfile::Standard,
         metrics_port: 9095,
         http_bind: "127.0.0.1".to_string(),
+        #[cfg(feature = "mcp-server")]
+        mcp_port: None,
         state_dir: Some(state_dir.clone()),
         topology: "data-parallel".to_string(),
         tp_degree: 1,

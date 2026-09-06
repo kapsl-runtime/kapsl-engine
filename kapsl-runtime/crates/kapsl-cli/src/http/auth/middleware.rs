@@ -33,39 +33,20 @@ pub(crate) fn api_auth_filter(
             move |authorization: Option<String>, remote: Option<std::net::SocketAddr>| {
                 let auth_state = auth_state.clone();
                 async move {
-                    let grant_match = {
-                        let state = auth_state.read();
-                        if !state.auth_enabled() {
-                            if is_loopback_remote(remote) {
-                                return Ok::<(), warp::Rejection>(());
-                            }
-                            return Err(warp::reject::custom(ApiLocalOnly));
+                    authorize_api_request(
+                        &auth_state,
+                        required_role,
+                        required_scope,
+                        authorization.as_deref(),
+                        remote.map(|address| address.ip()),
+                    )
+                    .map_err(|error| match error {
+                        ApiAuthorizationError::Unauthorized => {
+                            warp::reject::custom(ApiUnauthorized)
                         }
-
-                        state.grant_from_authorization_header_read(authorization.as_deref())
-                    };
-
-                    let Some(grant_match) = grant_match else {
-                        return Err(warp::reject::custom(ApiUnauthorized));
-                    };
-
-                    if !grant_match.grant.role.allows(required_role) {
-                        return Err(warp::reject::custom(ApiForbidden));
-                    }
-
-                    if let Some(scopes) = grant_match.grant.scopes.as_ref() {
-                        if !key_scopes_allow(scopes, required_scope) {
-                            return Err(warp::reject::custom(ApiForbidden));
-                        }
-                    }
-
-                    if let Some(key_index) = grant_match.matched_key_index {
-                        if let Some(mut state) = auth_state.try_write() {
-                            state.touch_key_last_used_by_index(key_index, now_unix_seconds());
-                        }
-                    }
-
-                    Ok(())
+                        ApiAuthorizationError::Forbidden => warp::reject::custom(ApiForbidden),
+                        ApiAuthorizationError::LocalOnly => warp::reject::custom(ApiLocalOnly),
+                    })
                 }
             },
         )

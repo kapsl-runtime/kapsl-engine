@@ -8,6 +8,7 @@ edition = "2021"
 # uses the stable shared-KV `cuda` alias below. The explicit `gguf-cuda`
 # feature remains available as the llama.cpp native-KV rollback profile.
 default = []
+mcp-server = ["dep:kapsl-mcp"]
 cuda = ["gguf-cuda-shared-kv"]
 
 # Shared implementation switch for runtime-owned CUDA memory. It remains a
@@ -48,6 +49,7 @@ kapsl-loader = "0.2.0"
 kapsl-rag = "0.2.0"
 kapsl-rag-sdk = "0.2.0"
 kapsl-backend-abi = { path = "../kapsl-backend-abi" }
+kapsl-mcp = { path = "../kapsl-mcp", optional = true }
 warp = "0.3"
 hyper = { version = "0.14", features = ["client", "http1", "stream", "tcp"] }
 prometheus = "0.14"

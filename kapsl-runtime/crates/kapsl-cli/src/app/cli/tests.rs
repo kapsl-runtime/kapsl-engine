@@ -30,6 +30,16 @@ fn run_accepts_positional_and_backward_compatible_model_paths() {
     assert!(args.offline);
 }
 
+#[cfg(feature = "mcp-server")]
+#[test]
+fn run_accepts_mcp_listener_configuration() {
+    let cli = Cli::try_parse_from(["kapsl", "run", "model.aimod", "--mcp-port", "9097"]).unwrap();
+    let Some(KapslCommand::Run(args)) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.mcp_port, Some(9097));
+}
+
 #[test]
 fn bundle_accepts_multiple_models_and_cross_target() {
     let cli = Cli::try_parse_from([

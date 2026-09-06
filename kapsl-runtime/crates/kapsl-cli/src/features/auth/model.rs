@@ -17,6 +17,13 @@ pub(crate) enum ApiScope {
     Admin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiAuthorizationError {
+    Unauthorized,
+    Forbidden,
+    LocalOnly,
+}
+
 impl ApiRole {
     pub(crate) fn allows(self, required: ApiRole) -> bool {
         use ApiRole::{Admin, Reader, Writer};

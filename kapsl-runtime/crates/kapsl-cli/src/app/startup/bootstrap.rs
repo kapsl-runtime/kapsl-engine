@@ -149,6 +149,16 @@ impl PreparedServerRuntime {
             kv_control_task,
         } = self;
 
+        #[cfg(feature = "mcp-server")]
+        let mcp_settings = config.mcp_port.map(|port| {
+            (
+                config.http_bind_addr,
+                port,
+                config.mcp_allowed_hosts.clone(),
+                config.auth_state.clone(),
+            )
+        });
+
         let transport =
             RuntimeTransport::build(&config.transport, inference.clone(), registry.clone())?;
         let serving_endpoint = transport.endpoint().to_owned();
@@ -170,7 +180,7 @@ impl PreparedServerRuntime {
             HttpServerDependencies {
                 registry,
                 model_runtime: model_runtime.clone(),
-                inference,
+                inference: inference.clone(),
                 telemetry,
                 runtime_samples,
                 runtime_pressure_state,
@@ -178,6 +188,26 @@ impl PreparedServerRuntime {
                 resources: resources.clone(),
             },
         )?;
+        #[cfg(feature = "mcp-server")]
+        let mcp_server = match mcp_settings {
+            Some((bind_addr, port, allowed_hosts, auth_state)) => {
+                let handle = start_runtime_mcp_server(
+                    bind_addr,
+                    port,
+                    allowed_hosts,
+                    model_runtime.models().clone(),
+                    inference.clone(),
+                    auth_state,
+                )
+                .await
+                .map_err(|error| {
+                    format!("Failed to bind MCP server on http://{bind_addr}:{port}/mcp: {error}")
+                })?;
+                log::info!("MCP available at http://{}/mcp", handle.bound_addr());
+                Some(handle)
+            }
+            None => None,
+        };
         let autoscaler_task = spawn_auto_scaler_task(AutoScalerTaskConfig {
             auto_scaler,
             model_runtime,
@@ -197,6 +227,8 @@ impl PreparedServerRuntime {
             monitor,
             autoscaler_task,
             resources,
+            #[cfg(feature = "mcp-server")]
+            mcp_server,
         }
         .run()
         .await

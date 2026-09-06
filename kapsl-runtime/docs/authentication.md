@@ -45,6 +45,12 @@ curl http://127.0.0.1:9095/api/models \
   -H "Authorization: Bearer your-token"
 ```
 
+### MCP server
+
+When the runtime is built with `--features mcp-server` and started with
+`--mcp-port`, the Streamable HTTP endpoint uses the same bearer credentials.
+All currently exposed MCP tools require reader access and `api:read` scope.
+
 ### kapsl-sdk (Python)
 
 ```python

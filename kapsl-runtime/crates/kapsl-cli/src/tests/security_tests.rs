@@ -312,6 +312,57 @@ fn make_test_auth_state() -> ApiAuthState {
 }
 
 #[test]
+fn test_shared_authorization_enforces_loopback_role_and_scope_policy() {
+    let state = RwLock::new(make_test_auth_state());
+    assert_eq!(
+        authorize_api_request(
+            &state,
+            ApiRole::Reader,
+            ApiScope::Read,
+            None,
+            Some(IpAddr::from([127, 0, 0, 1])),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        authorize_api_request(
+            &state,
+            ApiRole::Reader,
+            ApiScope::Read,
+            None,
+            Some(IpAddr::from([10, 0, 0, 1])),
+        ),
+        Err(ApiAuthorizationError::LocalOnly)
+    );
+
+    state.write().role_tokens = ApiRoleTokenConfig {
+        reader_token: Some("reader-token".to_string()),
+        writer_token: None,
+        admin_token: Some("admin-token".to_string()),
+    };
+    assert_eq!(
+        authorize_api_request(
+            &state,
+            ApiRole::Reader,
+            ApiScope::Read,
+            Some("Bearer reader-token"),
+            Some(IpAddr::from([10, 0, 0, 1])),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        authorize_api_request(
+            &state,
+            ApiRole::Admin,
+            ApiScope::Admin,
+            Some("Bearer reader-token"),
+            Some(IpAddr::from([10, 0, 0, 1])),
+        ),
+        Err(ApiAuthorizationError::Forbidden)
+    );
+}
+
+#[test]
 fn test_first_api_key_must_be_admin() {
     let mut state = make_test_auth_state();
     let result = state.create_api_key(

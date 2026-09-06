@@ -2,6 +2,51 @@
 
 use super::*;
 
+/// Apply the shared API authorization policy for any northbound protocol.
+///
+/// Protocol adapters extract credentials and the peer address; this function
+/// owns the loopback fallback, role hierarchy, API-key scopes, and usage touch.
+pub(crate) fn authorize_api_request(
+    auth_state: &RwLock<ApiAuthState>,
+    required_role: ApiRole,
+    required_scope: ApiScope,
+    authorization: Option<&str>,
+    remote_ip: Option<IpAddr>,
+) -> Result<(), ApiAuthorizationError> {
+    let grant_match = {
+        let state = auth_state.read();
+        if !state.auth_enabled() {
+            return if remote_ip.is_some_and(|ip| ip.is_loopback()) {
+                Ok(())
+            } else {
+                Err(ApiAuthorizationError::LocalOnly)
+            };
+        }
+        state.grant_from_authorization_header_read(authorization)
+    };
+
+    let Some(grant_match) = grant_match else {
+        return Err(ApiAuthorizationError::Unauthorized);
+    };
+    if !grant_match.grant.role.allows(required_role) {
+        return Err(ApiAuthorizationError::Forbidden);
+    }
+    if grant_match
+        .grant
+        .scopes
+        .as_ref()
+        .is_some_and(|scopes| !key_scopes_allow(scopes, required_scope))
+    {
+        return Err(ApiAuthorizationError::Forbidden);
+    }
+    if let Some(key_index) = grant_match.matched_key_index {
+        if let Some(mut state) = auth_state.try_write() {
+            state.touch_key_last_used_by_index(key_index, now_unix_seconds());
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_required_text(value: &str, field: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {

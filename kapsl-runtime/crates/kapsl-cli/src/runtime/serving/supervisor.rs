@@ -10,6 +10,8 @@ pub(crate) struct RuntimeSupervisor {
     pub(crate) monitor: RuntimeMonitor,
     pub(crate) autoscaler_task: tokio::task::JoinHandle<()>,
     pub(crate) resources: Arc<RuntimeResources>,
+    #[cfg(feature = "mcp-server")]
+    pub(crate) mcp_server: Option<kapsl_mcp::McpServerHandle>,
 }
 
 impl RuntimeSupervisor {
@@ -21,6 +23,8 @@ impl RuntimeSupervisor {
             monitor,
             autoscaler_task,
             resources,
+            #[cfg(feature = "mcp-server")]
+            mut mcp_server,
         } = self;
 
         let mut transport_task = Box::pin(transport.run());
@@ -31,6 +35,19 @@ impl RuntimeSupervisor {
                 None => std::future::pending().await,
             }
         });
+        #[cfg(feature = "mcp-server")]
+        let mut mcp_exit = Box::pin(async {
+            match mcp_server.as_mut() {
+                Some(server) => Some(match server.wait().await {
+                    Ok(Ok(())) => "MCP server stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("MCP server failed: {error}"),
+                    Err(error) => format!("MCP server task failed: {error}"),
+                }),
+                None => std::future::pending().await,
+            }
+        });
+        #[cfg(not(feature = "mcp-server"))]
+        let mut mcp_exit = Box::pin(std::future::pending::<Option<String>>());
 
         let outcome = tokio::select! {
             result = &mut transport_task => {
@@ -51,6 +68,9 @@ impl RuntimeSupervisor {
                 };
                 Err(message.into())
             }
+            message = &mut mcp_exit => {
+                Err(message.expect("pending MCP future cannot complete").into())
+            }
             signal = &mut shutdown_signal => {
                 let signal = signal?;
                 log::info!("Received {signal}; shutting down managed backends");
@@ -60,12 +80,17 @@ impl RuntimeSupervisor {
 
         // Release futures borrowing task handles before coordinated cleanup.
         drop(kv_control_exit);
+        drop(mcp_exit);
         drop(transport_task);
         if let Some(task) = kv_control_task {
             task.abort();
             let _ = task.await;
         }
         http_server.abort();
+        #[cfg(feature = "mcp-server")]
+        if let Some(server) = mcp_server {
+            server.abort();
+        }
         monitor.abort();
         autoscaler_task.abort();
         outcome

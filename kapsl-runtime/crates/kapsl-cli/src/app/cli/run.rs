@@ -100,6 +100,11 @@ pub(crate) struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     pub(crate) http_bind: String,
 
+    /// Enable the MCP Streamable HTTP endpoint on this port.
+    #[cfg(feature = "mcp-server")]
+    #[arg(long, value_name = "PORT")]
+    pub(crate) mcp_port: Option<u16>,
+
     /// Root directory for persistent runtime state (RAG data, extensions, auth store).
     /// Overrides KAPSL_RAG_STORAGE_ROOT, KAPSL_EXTENSIONS_ROOT, KAPSL_EXT_CONFIG_ROOT,
     /// and KAPSL_AUTH_STORE_PATH when set.
