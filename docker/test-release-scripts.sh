@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+python3 docker/test-wait-for-release-assets.py
+
 version="9.9.9"
 test_root="$(mktemp -d)"
 release_dir="${test_root}/release"

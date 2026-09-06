@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import copy
 import json
+import re
 import stat
 import subprocess
 import sys
@@ -175,6 +176,40 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
         self.assertIn("stable-release-cpu-conformance:", release)
         self.assertIn("./.github/workflows/ort-cpu-conformance.yml", release)
         self.assertNotIn("ort-cpu-conformance.yml", beta)
+
+    def test_stable_gpu_caller_grants_oidc_for_setup_and_teardown_only(self) -> None:
+        workflows = MODULE_PATH.parent.parent / "workflows"
+        release = (workflows / "release-runtime-installers.yml").read_text(
+            encoding="utf-8"
+        )
+        dispatcher = (workflows / "gpu-device-pool-integration.yml").read_text(
+            encoding="utf-8"
+        )
+
+        def job_permissions(workflow: str, job: str) -> dict[str, str]:
+            block = re.search(
+                rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [\w-]+:|\Z)", workflow
+            )
+            self.assertIsNotNone(block, job)
+            permissions = re.search(
+                r"(?m)^    permissions:\n((?:      [\w-]+: \w+\n)+)",
+                block.group(1),
+            )
+            self.assertIsNotNone(permissions, job)
+            return dict(re.findall(r"([\w-]+): (\w+)", permissions.group(1)))
+
+        caller = job_permissions(release, "stable-release-gpu-conformance")
+        self.assertEqual(
+            caller, {"actions": "read", "contents": "read", "id-token": "write"}
+        )
+        for job in ("prepare-vllm-gcp-runner", "cleanup-vllm-gcp-runner"):
+            with self.subTest(job=job):
+                requested = job_permissions(dispatcher, job)
+                self.assertEqual(requested["id-token"], "write")
+                for permission, level in requested.items():
+                    self.assertEqual(caller.get(permission), level)
+        # Do not broaden this fix into an OIDC grant for build/publication jobs.
+        self.assertEqual(release.count("id-token: write"), 1)
 
     def test_release_publication_waits_for_conformance_and_teardown(self) -> None:
         release = (
