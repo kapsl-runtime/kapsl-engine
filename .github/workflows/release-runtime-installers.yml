@@ -108,7 +108,8 @@ jobs:
       candidate_artifact: runtime-cuda-linux-x86_64
       sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
       cuda_visible_devices: "0"
-    secrets: inherit
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
 
   release-conformance-gate:
     name: Gate publication on stable conformance and teardown
