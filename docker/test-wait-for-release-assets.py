@@ -158,14 +158,25 @@ class ReleaseAssetWaitTests(unittest.TestCase):
         self.assertEqual(self.calls("gh"), [])
         self.assertEqual(len(self.calls("curl")), 10)
 
-    def test_workflow_passes_push_commit_and_read_only_permissions(self):
+    def test_workflow_is_called_only_after_publication_without_parent_polling(self):
         workflow = (ROOT / ".github/workflows/release-docker-images.yml").read_text()
         job = workflow.split("  wait-for-release-assets:\n", 1)[1].split(
             "  build-and-push:\n", 1
         )[0]
         self.assertIn("permissions:\n      actions: read\n      contents: read", job)
-        self.assertIn("github.event_name == 'push' && github.sha || ''", job)
-        self.assertIn("GH_TOKEN: ${{ github.token }}", job)
+        self.assertIn("  workflow_call:", workflow)
+        self.assertNotIn("\n  push:\n", workflow)
+        self.assertNotIn("KAPSL_INSTALLER_RUN_SHA:", job)
+        self.assertIn('KAPSL_WAIT_ATTEMPTS: "10"', job)
+        self.assertIn('KAPSL_WAIT_DELAY_SECONDS: "30"', job)
+        release = (ROOT / ".github/workflows/release-runtime-installers.yml").read_text()
+        caller = release.split("  publish-docker:\n", 1)[1].split(
+            "  stable-release-cpu-conformance:\n", 1
+        )[0]
+        self.assertIn("needs: [prepare-version, upload-release-assets, upload-r2]", caller)
+        self.assertIn("if: needs.prepare-version.outputs.is_release == 'true'", caller)
+        self.assertIn("packages: write", caller)
+        self.assertIn("uses: ./.github/workflows/release-docker-images.yml", caller)
 
 
 if __name__ == "__main__":

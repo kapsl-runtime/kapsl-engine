@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "kapsl"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "async-channel",
  "async-trait",

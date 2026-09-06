@@ -1,6 +1,16 @@
 name: Release Docker Images
 
 on:
+  workflow_call:
+    inputs:
+      release_version:
+        description: Published installer version, after conformance and teardown
+        required: true
+        type: string
+      update_channel_tags:
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       release_version:
@@ -12,9 +22,6 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
@@ -61,9 +68,10 @@ jobs:
         if: needs.resolve-version.outputs.wait_for_assets == 'true'
         env:
           KAPSL_VERSION: ${{ needs.resolve-version.outputs.runtime_version }}
-          # Manual publication of an existing release has no associated tag run.
-          KAPSL_INSTALLER_RUN_SHA: ${{ github.event_name == 'push' && github.sha || '' }}
-          GH_TOKEN: ${{ github.token }}
+          # The caller has already published assets. Only allow CDN propagation;
+          # never wait for the parent workflow to finish from inside that parent.
+          KAPSL_WAIT_ATTEMPTS: "10"
+          KAPSL_WAIT_DELAY_SECONDS: "30"
         run: docker/wait-for-release-assets.sh
 
   build-and-push:
