@@ -227,11 +227,22 @@ fn test_api_key_scope_hierarchy_and_wildcards() {
 
 #[test]
 fn test_loopback_remote_detection() {
-    let loopback: std::net::SocketAddr = "127.0.0.1:9095".parse().expect("valid socket");
-    let non_loopback: std::net::SocketAddr = "10.1.2.3:9095".parse().expect("valid socket");
-    assert!(is_loopback_remote(Some(loopback)));
-    assert!(!is_loopback_remote(Some(non_loopback)));
-    assert!(!is_loopback_remote(None));
+    let state = RwLock::new(make_test_auth_state());
+    for (peer, expected) in [
+        (Some("127.0.0.1"), true),
+        (Some("::1"), true),
+        (Some("10.1.2.3"), false),
+        (None, false),
+    ] {
+        let result = authorize_api_request(
+            &state,
+            ApiRole::Reader,
+            ApiScope::Read,
+            None,
+            peer.map(|ip| ip.parse().unwrap()),
+        );
+        assert_eq!(result.is_ok(), expected);
+    }
 }
 
 #[test]
@@ -321,7 +332,8 @@ fn test_shared_authorization_enforces_loopback_role_and_scope_policy() {
             ApiScope::Read,
             None,
             Some(IpAddr::from([127, 0, 0, 1])),
-        ),
+        )
+        .map(|_| ()),
         Ok(())
     );
     assert_eq!(
@@ -331,7 +343,8 @@ fn test_shared_authorization_enforces_loopback_role_and_scope_policy() {
             ApiScope::Read,
             None,
             Some(IpAddr::from([10, 0, 0, 1])),
-        ),
+        )
+        .map(|_| ()),
         Err(ApiAuthorizationError::LocalOnly)
     );
 
@@ -347,7 +360,8 @@ fn test_shared_authorization_enforces_loopback_role_and_scope_policy() {
             ApiScope::Read,
             Some("Bearer reader-token"),
             Some(IpAddr::from([10, 0, 0, 1])),
-        ),
+        )
+        .map(|_| ()),
         Ok(())
     );
     assert_eq!(
@@ -357,7 +371,8 @@ fn test_shared_authorization_enforces_loopback_role_and_scope_policy() {
             ApiScope::Admin,
             Some("Bearer reader-token"),
             Some(IpAddr::from([10, 0, 0, 1])),
-        ),
+        )
+        .map(|_| ()),
         Err(ApiAuthorizationError::Forbidden)
     );
 }
@@ -375,6 +390,81 @@ fn test_first_api_key_must_be_admin() {
     );
     assert!(result.is_err());
     let _ = fs::remove_file(&state.store_path);
+}
+
+#[tokio::test]
+async fn test_shared_authorization_and_login_track_live_key_policy() {
+    let mut initial = make_test_auth_state();
+    initial.role_tokens.admin_token = Some("bootstrap-admin".to_string());
+    let created = initial
+        .create_api_key(
+            "user-admin",
+            CreateApiKeyRequest {
+                name: "scoped-key".to_string(),
+                scopes: Some(vec!["api:read".to_string()]),
+                expires_in_days: None,
+            },
+        )
+        .unwrap();
+    let original_key = initial.store.api_keys[0].clone();
+    let state = Arc::new(RwLock::new(initial));
+    let authorization = format!("Bearer {}", created.raw_key);
+    let login = build_auth_routes(state.clone()).login;
+    let reader = api_auth_filter(ApiRole::Reader, ApiScope::Read, state.clone());
+    for (case, expected_status) in [
+        ("active", 200),
+        ("scope", 403),
+        ("expired", 401),
+        ("revoked", 401),
+        ("suspended", 401),
+    ] {
+        {
+            let mut state = state.write();
+            state.store.api_keys[0] = original_key.clone();
+            state.store.users[0].status = ApiUserStatus::Active;
+            match case {
+                "scope" => state.store.api_keys[0].scopes = vec!["unrelated:read".to_string()],
+                "expired" => state.store.api_keys[0].expires_at = Some(1),
+                "revoked" => state.store.api_keys[0].revoked_at = Some(1),
+                "suspended" => state.store.users[0].status = ApiUserStatus::Suspended,
+                _ => {}
+            }
+        }
+        let peer = "10.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap();
+        let direct = authorize_api_request(
+            &state,
+            ApiRole::Reader,
+            ApiScope::Read,
+            Some(&authorization),
+            Some(peer.ip()),
+        );
+        assert_eq!(direct.is_ok(), expected_status == 200, "{case}");
+        let filtered = warp::test::request()
+            .header("authorization", &authorization)
+            .remote_addr(peer)
+            .filter(&reader)
+            .await;
+        assert_eq!(filtered.is_ok(), expected_status == 200, "{case}");
+        let response = warp::test::request()
+            .method("POST")
+            .path("/api/auth/login")
+            .header("authorization", &authorization)
+            .remote_addr(peer)
+            .json(&serde_json::json!({}))
+            .reply(&login)
+            .await;
+        assert_eq!(response.status().as_u16(), expected_status, "{case}");
+        if case == "active" {
+            let payload: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(payload["mode"], "api-key");
+            assert_eq!(
+                payload["access"],
+                serde_json::json!({"read": true, "write": false, "admin": false})
+            );
+            assert!(state.read().store.api_keys[0].last_used_at.is_some());
+        }
+    }
+    let _ = fs::remove_file(&state.read().store_path);
 }
 
 #[test]

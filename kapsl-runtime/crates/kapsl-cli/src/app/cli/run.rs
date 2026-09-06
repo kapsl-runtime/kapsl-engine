@@ -218,6 +218,6 @@ pub(crate) struct AppliedPerformanceTuning {
     pub(crate) scheduler_queue_delay_ms: Option<u64>,
     pub(crate) media_preprocess: Option<String>,
     pub(crate) rust_log: Option<String>,
-    /// Populated when Auto profile is used; emitted after env_logger::init().
+    /// Populated when Auto profile is used; emitted after logging initialization.
     pub(crate) auto_tune_rationale: Option<String>,
 }

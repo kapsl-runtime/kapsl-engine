@@ -12,12 +12,49 @@ pub(crate) fn authorize_api_request(
     required_scope: ApiScope,
     authorization: Option<&str>,
     remote_ip: Option<IpAddr>,
-) -> Result<(), ApiAuthorizationError> {
+) -> Result<AuthorizedAccess, ApiAuthorizationError> {
+    let result = evaluate_api_access(
+        auth_state,
+        required_role,
+        required_scope,
+        authorization,
+        remote_ip,
+    );
+    // Warp can evaluate more than one role group before selecting a route.
+    // These are policy evaluations, not completed request audit records.
+    tracing::debug!(
+        target: "kapsl::authorization",
+        ?required_role,
+        ?required_scope,
+        outcome = match &result {
+            Ok(_) => "allowed",
+            Err(ApiAuthorizationError::Unauthorized) => "unauthorized",
+            Err(ApiAuthorizationError::Forbidden) => "forbidden",
+            Err(ApiAuthorizationError::LocalOnly) => "local_only",
+        },
+        "authorization evaluated"
+    );
+    result
+}
+
+fn evaluate_api_access(
+    auth_state: &RwLock<ApiAuthState>,
+    required_role: ApiRole,
+    required_scope: ApiScope,
+    authorization: Option<&str>,
+    remote_ip: Option<IpAddr>,
+) -> Result<AuthorizedAccess, ApiAuthorizationError> {
     let grant_match = {
         let state = auth_state.read();
         if !state.auth_enabled() {
             return if remote_ip.is_some_and(|ip| ip.is_loopback()) {
-                Ok(())
+                Ok(AuthorizedAccess {
+                    grant: ApiAuthGrant {
+                        role: ApiRole::Admin,
+                        scopes: None,
+                    },
+                    mode: "local-loopback",
+                })
             } else {
                 Err(ApiAuthorizationError::LocalOnly)
             };
@@ -28,15 +65,7 @@ pub(crate) fn authorize_api_request(
     let Some(grant_match) = grant_match else {
         return Err(ApiAuthorizationError::Unauthorized);
     };
-    if !grant_match.grant.role.allows(required_role) {
-        return Err(ApiAuthorizationError::Forbidden);
-    }
-    if grant_match
-        .grant
-        .scopes
-        .as_ref()
-        .is_some_and(|scopes| !key_scopes_allow(scopes, required_scope))
-    {
+    if !grant_match.grant.allows(required_role, required_scope) {
         return Err(ApiAuthorizationError::Forbidden);
     }
     if let Some(key_index) = grant_match.matched_key_index {
@@ -44,7 +73,29 @@ pub(crate) fn authorize_api_request(
             state.touch_key_last_used_by_index(key_index, now_unix_seconds());
         }
     }
-    Ok(())
+    Ok(AuthorizedAccess {
+        mode: if grant_match.matched_key_index.is_some() {
+            "api-key"
+        } else {
+            "role-token"
+        },
+        grant: grant_match.grant,
+    })
+}
+
+/// Native TCP currently delegates per-frame token verification to kapsl-ipc.
+/// Keep its exposure policy here beside the API policy until the SDK exposes
+/// a dynamic authorization callback. Local IPC/SHM use OS access controls.
+pub(crate) fn validate_native_tcp_exposure(
+    bind_ip: IpAddr,
+    auth_token: Option<&str>,
+) -> Result<(), String> {
+    if bind_ip.is_loopback() || auth_token.is_some_and(|token| !token.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(format!(
+        "Refusing unauthenticated TCP inference on non-loopback address {bind_ip}. Set {TCP_AUTH_TOKEN_ENV} to a dedicated native-transport token, or bind --bind to a loopback address. Raw TCP is plaintext; use a trusted network or TLS tunnel for cross-host serving."
+    ))
 }
 
 pub(crate) fn normalize_required_text(value: &str, field: &str) -> Result<String, String> {

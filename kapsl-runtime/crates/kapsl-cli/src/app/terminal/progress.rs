@@ -69,6 +69,15 @@ pub(crate) fn run_with_loading<T, E, F>(label: &str, action: F) -> Result<T, E>
 where
     F: FnOnce() -> Result<T, E>,
 {
+    if crate::observability::uses_json_format() {
+        let result = action();
+        tracing::info!(
+            operation = label,
+            success = result.is_ok(),
+            "operation completed"
+        );
+        return result;
+    }
     let spinner = Spinner::start(label);
     let result = action();
     spinner.finish(result.is_ok());
@@ -79,6 +88,15 @@ pub(crate) async fn run_with_loading_async<T, E, Fut>(label: &str, future: Fut) 
 where
     Fut: Future<Output = Result<T, E>>,
 {
+    if crate::observability::uses_json_format() {
+        let result = future.await;
+        tracing::info!(
+            operation = label,
+            success = result.is_ok(),
+            "operation completed"
+        );
+        return result;
+    }
     let spinner = Spinner::start(label);
     let result = future.await;
     spinner.finish(result.is_ok());

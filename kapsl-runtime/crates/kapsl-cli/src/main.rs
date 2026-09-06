@@ -59,6 +59,7 @@ mod app;
 mod backend;
 mod features;
 mod http;
+mod observability;
 mod runtime;
 
 use app::*;
@@ -78,6 +79,9 @@ async fn main() -> Result<(), DynError> {
         command,
         run: _legacy_run_args,
     } = Cli::parse_from(&raw_argv);
+    if !matches!(command, Some(KapslCommand::Run(_)) | None) {
+        observability::init()?;
+    }
     match command {
         Some(KapslCommand::Build(args)) => return execute_build_command(args),
         Some(KapslCommand::Bundle(args)) => return execute_bundle_command(args),
@@ -98,7 +102,7 @@ async fn main() -> Result<(), DynError> {
     let (args, matches) = parse_runtime_args_and_matches(&runtime_argv)?;
     let startup_started_at = Instant::now();
     let config = resolve_runtime_config(args, &matches)?;
-    env_logger::init();
+    observability::init()?;
     config.validate_and_log()?;
 
     let device_info = Arc::new(DeviceInfo::probe());

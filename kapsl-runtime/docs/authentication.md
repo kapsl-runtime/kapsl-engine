@@ -1,6 +1,14 @@
 # Authentication
 
-`kapsl-runtime` supports role-based access control. When enabled, all `/api` endpoints and `/metrics` require a valid token.
+`kapsl-runtime` supports role-based access control. Protected `/api` endpoints,
+`/metrics`, and MCP use one engine-owned authorization evaluator. The public
+`/api/auth/login` route validates credentials through that same evaluator.
+
+The shared policy enforces roles, API-key scopes, expiry, revocation, suspended
+users, and the authentication-disabled loopback fallback. Adapters supply the
+credential and actual socket peer address; forwarded address headers do not
+establish local trust. Policy changes apply to subsequent requests without a
+restart. No backend implements this policy.
 
 ## Roles
 
@@ -60,6 +68,20 @@ client = KapslClient("tcp://127.0.0.1:9096", api_token="your-token")
 ```
 
 The SDK attaches the token to every inference request automatically.
+
+Native TCP currently uses the dedicated `KAPSL_TCP_AUTH_TOKEN`, verified by
+`kapsl-ipc` on each request. It does **not** consult the HTTP/MCP API-key store,
+roles, or scopes. The engine's central auth module also owns the native TCP
+exposure check: a non-loopback bind requires a nonempty dedicated token.
+Unix sockets and shared memory retain their local OS access controls.
+
+Unifying native per-request API-key authorization requires an SDK transport
+callback carrying the credential and peer context before request dispatch
+(including OpenAI wire requests). The current `kapsl-ipc` dependency only
+provides a static token setter; the engine does not duplicate its wire server.
+
+Authorization evaluations and completed HTTP/MCP requests use the shared
+logging pipeline. See [Logging](logging.md) for filtering and JSON output.
 
 ## Managing users and API keys
 

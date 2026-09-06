@@ -92,6 +92,7 @@ impl RequestAuthorizer for RuntimeMcpAuthorizer {
             authorization,
             Some(remote_ip),
         )
+        .map(|_| ())
         .map_err(|error| match error {
             ApiAuthorizationError::Unauthorized => McpAuthorizationError::Unauthorized,
             ApiAuthorizationError::Forbidden => McpAuthorizationError::Forbidden,

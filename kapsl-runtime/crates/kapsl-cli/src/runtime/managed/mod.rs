@@ -15,13 +15,13 @@ use kapsl_engine_api::{
     OpenAiWireStream, OpenAiWireStreamResponse,
 };
 use serde::Deserialize;
-use std::fs::{OpenOptions, Permissions};
+use std::fs::Permissions;
 use std::net::TcpListener as StdTcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 
 pub(crate) const MANAGED_VLLM_ADAPTER_ID: &str = "kapsl-vllm-connector";
 pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.6.0";
@@ -1307,23 +1307,6 @@ impl ManagedVllmProcess {
     }
 
     fn build_command(&self) -> Result<Command, EngineError> {
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.spec.log_path)
-            .map_err(|error| {
-                EngineError::backend(format!(
-                    "open managed vLLM log {}: {error}",
-                    self.spec.log_path.display()
-                ))
-            })?;
-        let stderr = log_file.try_clone().map_err(|error| {
-            EngineError::backend(format!(
-                "clone managed vLLM log {}: {error}",
-                self.spec.log_path.display()
-            ))
-        })?;
-
         let mut command = Command::new(&self.spec.python);
         command
             .arg("-m")
@@ -1345,9 +1328,7 @@ impl ManagedVllmProcess {
             .arg("--enforce-eager")
             .args(["--kv-transfer-config", &self.spec.kv_transfer_config])
             .env("CUDA_VISIBLE_DEVICES", &self.spec.cuda_visible_devices)
-            .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(stderr));
+            .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn");
         if self.spec.tensor_parallel_size > 1 {
             command.args([
                 "--tensor-parallel-size",
@@ -1395,7 +1376,11 @@ impl ManagedVllmProcess {
                 return Err(error);
             }
         };
-        let child = match command.spawn() {
+        let child = match crate::observability::spawn_logged_child(
+            &mut command,
+            &self.spec.log_path,
+            "vllm",
+        ) {
             Ok(child) => child,
             Err(error) => {
                 self.mark_suspect_locked();

@@ -203,18 +203,36 @@ async fn authorize_request(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    let started = std::time::Instant::now();
+    let method = request.method().clone();
     let authorization = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    authorizer
+    let decision = authorizer
         .0
         .authorize_reader(authorization, remote.ip())
         .map_err(|error| match error {
             AuthorizationError::Unauthorized => StatusCode::UNAUTHORIZED,
             AuthorizationError::Forbidden | AuthorizationError::LocalOnly => StatusCode::FORBIDDEN,
-        })?;
-    Ok(next.run(request).await)
+        });
+    let result = match decision {
+        Ok(()) => Ok(next.run(request).await),
+        Err(status) => Err(status),
+    };
+    let status = match &result {
+        Ok(response) => response.status(),
+        Err(status) => *status,
+    };
+    tracing::info!(
+        target: "kapsl::access",
+        protocol = "mcp",
+        method = method.as_str(),
+        status = status.as_u16(),
+        elapsed_us = started.elapsed().as_micros() as u64,
+        "request completed"
+    );
+    result
 }
 
 /// Bind and start a Streamable HTTP MCP server at `/mcp`.

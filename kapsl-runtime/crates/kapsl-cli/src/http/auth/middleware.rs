@@ -18,10 +18,6 @@ pub(crate) struct ApiLocalOnly;
 
 impl warp::reject::Reject for ApiLocalOnly {}
 
-pub(crate) fn is_loopback_remote(remote: Option<std::net::SocketAddr>) -> bool {
-    remote.is_some_and(|addr| addr.ip().is_loopback())
-}
-
 pub(crate) fn api_auth_filter(
     required_role: ApiRole,
     required_scope: ApiScope,
@@ -40,6 +36,7 @@ pub(crate) fn api_auth_filter(
                         authorization.as_deref(),
                         remote.map(|address| address.ip()),
                     )
+                    .map(|_| ())
                     .map_err(|error| match error {
                         ApiAuthorizationError::Unauthorized => {
                             warp::reject::custom(ApiUnauthorized)

@@ -48,6 +48,10 @@ the standard HTTP header:
 Authorization: Bearer <api-key>
 ```
 
+Login, HTTP routes, and MCP all use the engine's shared policy evaluator.
+MCP request completion events use the process-wide logging subscriber;
+see [Logging](logging.md) for JSON output and audit filters.
+
 The adapter performs no backend selection and imports no backend-specific
 crate. Backend removal or replacement therefore does not change the MCP
 protocol boundary.
