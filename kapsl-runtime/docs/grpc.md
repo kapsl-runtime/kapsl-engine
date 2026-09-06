@@ -62,7 +62,6 @@ implementation. Neither WebSocket nor Kapsl governance-control RPCs are added.
 See the SDK's `docs/grpc.md`, proto files, and Python streaming example for
 client generation and parameter details.
 
-The engine branch pins the companion SDK commit until `kapsl-grpc` is published.
-That SDK commit must be available on the remote before CI or another checkout
-can fetch it. Once the crate is released, replace the Git pin with its registry
-version.
+The engine uses [`kapsl-grpc 0.3.0`](https://crates.io/crates/kapsl-grpc/0.3.0)
+from crates.io. Its backend-neutral API dependency is shared with the engine's
+other published SDK crates.

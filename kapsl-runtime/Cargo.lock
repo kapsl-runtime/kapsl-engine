@@ -2457,7 +2457,8 @@ dependencies = [
 [[package]]
 name = "kapsl-grpc"
 version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk.git?rev=f6f628b8f25a9508bd95f29f3621347fa9806f4d#f6f628b8f25a9508bd95f29f3621347fa9806f4d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b69fddae193507761852d4a130fc62ec2e63c6b3514198b702924477c9e6db1f"
 dependencies = [
  "async-trait",
  "futures",

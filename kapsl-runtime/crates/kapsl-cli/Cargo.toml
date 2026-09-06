@@ -35,8 +35,7 @@ gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", 
 cc = "1"
 
 [dependencies]
-# Pin the companion SDK change until kapsl-grpc is published to crates.io.
-kapsl-grpc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f6f628b8f25a9508bd95f29f3621347fa9806f4d", optional = true }
+kapsl-grpc = { version = "0.3.0", optional = true }
 kapsl-core = "0.3.0"
 kapsl-hal = "0.3.0"
 kapsl-engine-api = "0.3.0"
