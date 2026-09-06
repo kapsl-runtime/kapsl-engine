@@ -14,3 +14,8 @@ rust-version = "1.92"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
+
+# Keep the temporary Git transport dependency on the same published API types
+# as the engine's other SDK crates. Remove with the kapsl-grpc registry release.
+[patch."https://github.com/kapsl-runtime/kapsl-sdk.git"]
+kapsl-engine-api = { version = "=0.3.0" }

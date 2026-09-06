@@ -9,6 +9,7 @@ rust-version.workspace = true
 # uses the stable shared-KV `cuda` alias below. The explicit `gguf-cuda`
 # feature remains available as the llama.cpp native-KV rollback profile.
 default = []
+grpc-server = ["dep:kapsl-grpc"]
 cuda = ["gguf-cuda-shared-kv"]
 
 # Shared implementation switch for runtime-owned CUDA memory. It remains a
@@ -34,6 +35,8 @@ gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", 
 cc = "1"
 
 [dependencies]
+# Pin the companion SDK change until kapsl-grpc is published to crates.io.
+kapsl-grpc = { git = "https://github.com/kapsl-runtime/kapsl-sdk.git", rev = "f6f628b8f25a9508bd95f29f3621347fa9806f4d", optional = true }
 kapsl-core = "0.3.0"
 kapsl-hal = "0.3.0"
 kapsl-engine-api = "0.3.0"

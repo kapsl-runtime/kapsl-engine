@@ -7,6 +7,8 @@ pub(crate) struct RuntimeSupervisor {
     pub(crate) transport: RuntimeTransport,
     pub(crate) kv_control_task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     pub(crate) http_server: HttpServerHandle,
+    #[cfg(feature = "grpc-server")]
+    pub(crate) grpc_server: Option<kapsl_grpc::GrpcServerHandle>,
     pub(crate) monitor: RuntimeMonitor,
     pub(crate) autoscaler_task: tokio::task::JoinHandle<()>,
     pub(crate) resources: Arc<RuntimeResources>,
@@ -18,6 +20,8 @@ impl RuntimeSupervisor {
             transport,
             mut kv_control_task,
             mut http_server,
+            #[cfg(feature = "grpc-server")]
+            mut grpc_server,
             monitor,
             autoscaler_task,
             resources,
@@ -32,7 +36,22 @@ impl RuntimeSupervisor {
             }
         });
 
+        let mut grpc_exit = Box::pin(async {
+            #[cfg(feature = "grpc-server")]
+            if let Some(server) = grpc_server.as_mut() {
+                return Some(server.wait().await);
+            }
+            std::future::pending::<Option<std::io::Result<()>>>().await
+        });
+
         let outcome = tokio::select! {
+            result = &mut grpc_exit => {
+                let message = match result.expect("pending gRPC future cannot complete") {
+                    Ok(()) => "gRPC server stopped unexpectedly".to_string(),
+                    Err(error) => format!("gRPC server failed: {error}"),
+                };
+                Err(message.into())
+            }
             result = &mut transport_task => {
                 result.map_err(|error| Box::new(error) as DynError)
             }
@@ -59,6 +78,11 @@ impl RuntimeSupervisor {
         };
 
         // Release futures borrowing task handles before coordinated cleanup.
+        drop(grpc_exit);
+        #[cfg(feature = "grpc-server")]
+        if let Some(server) = grpc_server.as_mut() {
+            server.shutdown().await;
+        }
         drop(kv_control_exit);
         drop(transport_task);
         if let Some(task) = kv_control_task {

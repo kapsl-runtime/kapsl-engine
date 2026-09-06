@@ -42,6 +42,132 @@ fn test_inference_service(models: Arc<ModelManager>) -> Arc<InferenceService> {
     )
 }
 
+#[cfg(feature = "grpc-server")]
+#[tokio::test]
+async fn grpc_uses_shared_scheduler_pressure_and_session_isolation() {
+    use kapsl_grpc::{
+        inference::{
+            infer_parameter::ParameterChoice, model_infer_request::InferInputTensor,
+            InferParameter, InferTensorContents, ModelInferRequest,
+        },
+        kapsl::v1::kapsl_inference_client::KapslInferenceClient,
+        tonic::{Code, Request},
+    };
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+    models.registry().register(ModelInfo::new(
+        9,
+        "sessions".into(),
+        "1".into(),
+        "test".into(),
+        "cpu".into(),
+        "all".into(),
+        "/unused".into(),
+    ));
+    let engine: EngineHandle = Arc::new(SessionCaptureEngine {
+        observed_sessions: captured.clone(),
+    });
+    let scheduler = Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+    let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+    pool.add_replica(0, scheduler);
+    models.install_loaded(9, PathBuf::from("/unused"), Arc::new(pool), vec![]);
+    let pressure_state = Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8));
+    let inference = InferenceService::new(
+        models.clone(),
+        ResourcePressure::new(pressure_state.clone(), test_pressure_config()),
+        Arc::new(ModelTelemetry::default()),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let auth = Arc::new(RwLock::new(ApiAuthState {
+        role_tokens: ApiRoleTokenConfig {
+            reader_token: Some("reader-token".into()),
+            writer_token: None,
+            admin_token: Some("admin-token".into()),
+        },
+        store_path: dir.path().join("auth.json"),
+        store: ApiAuthStoreFile::default(),
+        key_hash_index: HashMap::new(),
+    }));
+    let mut server = kapsl_grpc::start_server(
+        kapsl_grpc::GrpcServerConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            max_message_bytes: 1024 * 1024,
+            server_version: "test".into(),
+        },
+        Arc::new(GrpcEngine { models, inference }),
+        Arc::new(GrpcAuthorizer(auth.clone())),
+    )
+    .await
+    .unwrap();
+    let mut client = KapslInferenceClient::connect(format!("http://{}", server.bound_addr()))
+        .await
+        .unwrap();
+    let wire = || {
+        let mut wire = ModelInferRequest {
+            model_name: "sessions".into(),
+            inputs: vec![InferInputTensor {
+                name: "input".into(),
+                datatype: "BYTES".into(),
+                shape: vec![1],
+                contents: Some(InferTensorContents {
+                    bytes_contents: vec![b"hello".to_vec()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        wire.parameters.insert(
+            "session_id".into(),
+            InferParameter {
+                parameter_choice: Some(ParameterChoice::StringParam("same-session".into())),
+            },
+        );
+        wire
+    };
+    for token in ["reader-token", "admin-token"] {
+        let mut request = Request::new(wire());
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let mut stream = client.infer_stream(request).await.unwrap().into_inner();
+        let packet = stream.message().await.unwrap().unwrap();
+        assert_eq!(&packet.raw_output_contents[0][4..], b"ok");
+        assert!(stream.message().await.unwrap().is_none());
+    }
+    let sessions = captured.lock().clone();
+    assert_eq!(sessions.len(), 2);
+    assert_ne!(sessions[0], sessions[1]);
+    assert_eq!(
+        sessions[0],
+        scope_session_id_for_authorization(Some("same-session"), Some("Bearer reader-token"))
+    );
+    // Emergency pressure rejects throughput work at the shared inference boundary.
+    pressure_state.store(RuntimePressureState::Emergency as u8, Ordering::SeqCst);
+    let mut request = wire();
+    request.inputs[0].datatype = "UINT8".into();
+    request.inputs[0].shape = vec![8, 75_000];
+    request.inputs[0].contents = None;
+    request.raw_input_contents = vec![vec![0; 600_000]];
+    let mut request = Request::new(request);
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer reader-token".parse().unwrap());
+    let error = client.infer_stream(request).await.unwrap_err();
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(captured.lock().len(), 2);
+    auth.write().role_tokens.reader_token = None;
+    let mut request = Request::new(wire());
+    request
+        .metadata_mut()
+        .insert("authorization", "Bearer reader-token".parse().unwrap());
+    assert_eq!(
+        client.infer_stream(request).await.unwrap_err().code(),
+        Code::Unauthenticated
+    );
+    server.shutdown().await;
+}
+
 fn unique_temp_path(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("kapsl-route-test-{}-{}", name, std::process::id()))
 }
