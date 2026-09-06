@@ -815,28 +815,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1137cd7e7fc0fb5d3c5a8678be38ec56e819125d8d7907411fe24ccb943faca8"
-dependencies = [
- "crossbeam-channel",
- "crossbeam-deque",
- "crossbeam-epoch",
- "crossbeam-queue",
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-channel"
-version = "0.5.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -851,15 +829,6 @@ name = "crossbeam-epoch"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
-name = "crossbeam-queue"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2494,12 +2463,11 @@ dependencies = [
 
 [[package]]
 name = "kapsl-ipc"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7faadf9da12df62903b5531562a18e54598a0de2e1b6e5fb307b459f1eeb9eb"
+checksum = "951f38e01acb8137f41344b91538da6ea630fe066de745d462e629622633bcdf"
 dependencies = [
  "async-trait",
- "bincode",
  "futures",
  "kapsl-engine-api",
  "kapsl-scheduler",
@@ -2507,7 +2475,6 @@ dependencies = [
  "kapsl-transport",
  "log",
  "serde",
- "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -2699,36 +2666,29 @@ dependencies = [
 
 [[package]]
 name = "kapsl-shm"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4416f819218d06d19ec9be878a3a8d907684ebd861930d3759545f2b269fedfe"
+checksum = "b5b2d878bf06902ab8079373069d4d4a456aa11d37ad880daa9129f0e9d553f6"
 dependencies = [
  "async-trait",
- "bincode",
- "crossbeam",
  "kapsl-engine-api",
  "kapsl-scheduler",
  "kapsl-transport",
- "libc",
  "log",
- "memmap2",
  "prometheus",
- "serde",
  "shared_memory",
- "thiserror 1.0.69",
  "tokio",
 ]
 
 [[package]]
 name = "kapsl-transport"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46b2be457dcd1b0f6e63f68b585249aef38bfb14571e1e5641b99a2c1b692fce"
+checksum = "b3b114f9a22e28870532fd49ef9ab6f1f10421deb442c13425693a73b79c2407"
 dependencies = [
  "async-trait",
  "bincode",
  "kapsl-engine-api",
- "log",
  "serde",
  "thiserror 1.0.69",
  "tokio",

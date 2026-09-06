@@ -65,3 +65,21 @@ client generation and parameter details.
 The engine uses [`kapsl-grpc 0.3.0`](https://crates.io/crates/kapsl-grpc/0.3.0)
 from crates.io. Its backend-neutral API dependency is shared with the engine's
 other published SDK crates.
+
+## Python SDK and native transport upgrade
+
+Python `kapsl-sdk` 0.2.0 bundles `KapslGrpcClient` and `AsyncKapslGrpcClient`
+behind the `grpc` extra. They provide discovery, unary inference, typed server
+streaming, deadlines, and cancellation without consumer-side proto generation.
+Use the configured gRPC port when constructing either client.
+
+This engine also uses native `kapsl-transport`, `kapsl-ipc`, and `kapsl-shm`
+0.4.0. Native tensor requests require the versioned `KIRQ` envelope; old
+encodings are rejected before metadata decoding. SHM/hybrid require region and
+protocol version 3, with allocation leases and response mailboxes. Upgrade and
+restart Python clients and the engine together to recreate SHM regions. Native
+TCP retains its separately configured `KAPSL_TCP_AUTH_TOKEN` policy.
+
+See the SDK's `docs/python-sdk-0.2.md` for the supported version matrix and
+stream ownership examples. No legacy request decoder or SHM notification queue
+is retained in this transport release.
