@@ -211,6 +211,48 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
         # Do not broaden this fix into an OIDC grant for build/publication jobs.
         self.assertEqual(release.count("id-token: write"), 1)
 
+    def test_github_app_key_is_owned_by_the_protected_environment(self) -> None:
+        workflows = MODULE_PATH.parent.parent / "workflows"
+        dispatcher = (workflows / "gpu-device-pool-integration.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (workflows / "release-runtime-installers.yml").read_text(
+            encoding="utf-8"
+        )
+        call_contract = dispatcher.split("  workflow_call:\n", 1)[1].split(
+            "\npermissions:\n", 1
+        )[0]
+        caller = release.split("  stable-release-gpu-conformance:\n", 1)[1].split(
+            "\n  release-conformance-gate:\n", 1
+        )[0]
+
+        app_key_contract = call_contract.split(
+            "      GPU_RUNNER_GITHUB_APP_PRIVATE_KEY:\n", 1
+        )[1].split("\n\n", 1)[0]
+        self.assertIn("required: false", app_key_contract)
+        self.assertNotIn("required: true", app_key_contract)
+        self.assertNotIn("secrets: inherit", caller)
+        self.assertIn(
+            "KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}",
+            caller,
+        )
+        for job in ("prepare-vllm-gcp-runner", "cleanup-vllm-gcp-runner"):
+            with self.subTest(job=job):
+                block = re.search(
+                    rf"(?ms)^  {re.escape(job)}:\n(.*?)(?=^  [\w-]+:|\Z)",
+                    dispatcher,
+                )
+                self.assertIsNotNone(block, job)
+                self.assertIn(
+                    "environment: gcp-gpu-conformance", block.group(1)
+                )
+                self.assertIn(
+                    "secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY", block.group(1)
+                )
+        self.assertEqual(
+            dispatcher.count("secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY"), 2
+        )
+
     def test_release_publication_waits_for_conformance_and_teardown(self) -> None:
         release = (
             MODULE_PATH.parent.parent / "workflows" / "release-runtime-installers.yml"

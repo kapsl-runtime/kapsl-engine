@@ -26,9 +26,11 @@ on:
       KAPSL_BACKEND_PUBLIC_KEYS:
         description: Trusted raw Base64 Ed25519 backend index public key set
         required: true
+      # Declared for expression validation, but supplied by the protected
+      # gcp-gpu-conformance environment on the setup and cleanup jobs.
       GPU_RUNNER_GITHUB_APP_PRIVATE_KEY:
-        description: GitHub App private key used only to create and delete the ephemeral JIT runner
-        required: true
+        description: Environment-owned GitHub App key for the ephemeral JIT runner
+        required: false
 
 permissions:
   actions: read
@@ -78,6 +80,8 @@ jobs:
     if: needs.authorize-stable-release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # The GitHub App key is owned by this protected environment. Environment
+    # secrets cannot be passed through a reusable workflow's caller contract.
     environment: gcp-gpu-conformance
     permissions:
       contents: read
@@ -316,6 +320,8 @@ jobs:
     if: always() && needs.authorize-stable-release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Use the same protected environment so teardown can mint its own narrowly
+    # scoped App token even when conformance fails.
     environment: gcp-gpu-conformance
     permissions:
       contents: read
