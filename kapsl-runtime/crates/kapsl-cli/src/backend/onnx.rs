@@ -294,41 +294,45 @@ pub(crate) fn ensure_onnx_backend_pack(
     let manager = BackendManager::from_env(offline).map_err(|error| error.to_string())?;
     let target = target_for_profile(profile, device_info);
     let requirements = onnx_backend_pack_requirements(manifest, profile)?;
-    let pack_plan = manager
-        .plan_compatible_backend(&requirements, &target)
+    // Selection only needs the signed contract. Checking installation status
+    // here hashes every pack file, then ensure_pack repeats those hashes under
+    // the installation lock. Keep the authoritative locked verification once.
+    let index = manager.load_index().map_err(|error| error.to_string())?;
+    let selection = manager
+        .select_compatible_pack(&index, &requirements, &target)
         .map_err(|error| error.to_string())?;
-    let standard_adapter = pack_plan.manifest.adapter_abi.as_deref()
+    let standard_adapter = selection.manifest.adapter_abi.as_deref()
         == Some(crate::backend::STANDARD_NATIVE_ADAPTER_ABI);
     if !standard_adapter {
         return Err(format!(
             "capability resolver selected {}/{}, but it does not implement {STANDARD_NATIVE_ADAPTER_ABI}",
-            pack_plan.manifest.backend, pack_plan.manifest.profile
+            selection.manifest.backend, selection.manifest.profile
         ));
     }
     preliminary_memory_admission(
         profile,
         model_path,
         device_info,
-        &pack_plan.manifest,
+        &selection.manifest,
         memory_snapshot,
         &selected_cuda_devices,
     )?;
     let installed = manager
-        .ensure_pack(&pack_plan.manifest)
+        .ensure_pack(&selection.manifest)
         .map_err(|error| error.to_string())?;
-    activate_native_backend_pack(&pack_plan.manifest, &installed)?;
-    let identity = NativeBackendPackIdentity::from_manifest(&pack_plan.manifest);
+    activate_native_backend_pack(&selection.manifest, &installed)?;
+    let identity = NativeBackendPackIdentity::from_manifest(&selection.manifest);
     log::info!(
         "Selected signed native backend route {}/{} version {} for model `{}`: {}",
         identity.backend,
         identity.profile,
         identity.pack_version,
         manifest.project_name,
-        pack_plan.selection_reason
+        selection.reason
     );
     Ok(Some(OnnxBackendRoute::SignedPack {
         identity,
-        reason: pack_plan.selection_reason,
+        reason: selection.reason,
     }))
 }
 

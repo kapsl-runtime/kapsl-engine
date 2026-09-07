@@ -75,6 +75,13 @@ jobs:
           echo "sdk_ref=$KAPSL_VLLM_SDK_REF" >> "$GITHUB_OUTPUT"
           echo "candidate_artifact=$KAPSL_GPU_CANDIDATE_ARTIFACT" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check per-crate SDK pins before creating a GPU runner
+        run: python3 .github/scripts/verify_published_sdk.py --lockfile kapsl-runtime/Cargo.lock
+
   prepare-vllm-gcp-runner:
     needs: authorize-stable-release
     if: needs.authorize-stable-release.result == 'success'
