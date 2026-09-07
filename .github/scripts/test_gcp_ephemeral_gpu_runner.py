@@ -208,8 +208,10 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
                 self.assertEqual(requested["id-token"], "write")
                 for permission, level in requested.items():
                     self.assertEqual(caller.get(permission), level)
-        # Do not broaden this fix into an OIDC grant for build/publication jobs.
-        self.assertEqual(release.count("id-token: write"), 1)
+        preflight = job_permissions(release, "stable-release-infrastructure-preflight")
+        self.assertEqual(preflight, {"contents": "read", "id-token": "write"})
+        # OIDC is limited to authentication preflight and GPU setup/teardown.
+        self.assertEqual(release.count("id-token: write"), 2)
 
     def test_github_app_key_is_owned_by_the_protected_environment(self) -> None:
         workflows = MODULE_PATH.parent.parent / "workflows"
@@ -231,11 +233,8 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
         )[1].split("\n\n", 1)[0]
         self.assertIn("required: false", app_key_contract)
         self.assertNotIn("required: true", app_key_contract)
-        self.assertNotIn("secrets: inherit", caller)
-        self.assertIn(
-            "KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}",
-            caller,
-        )
+        self.assertIn("secrets: inherit", caller)
+        self.assertNotIn("GPU_RUNNER_GITHUB_APP_PRIVATE_KEY:", caller)
         for job in ("prepare-vllm-gcp-runner", "cleanup-vllm-gcp-runner"):
             with self.subTest(job=job):
                 block = re.search(

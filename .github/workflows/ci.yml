@@ -42,7 +42,9 @@ jobs:
           git config --global core.longpaths true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-check-${{ matrix.os }}
 
       - name: Check runtime workspace
         if: runner.os != 'Windows'
@@ -87,9 +89,9 @@ jobs:
           msrv: true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
         with:
-          shared-key: msrv
+          key: ci-msrv
 
       - name: Check runtime workspace on its minimum Rust version
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --locked
@@ -121,7 +123,9 @@ jobs:
           git config --global core.longpaths true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-test-${{ matrix.os }}
 
       - name: Test runtime workspace
         if: runner.os != 'Windows'

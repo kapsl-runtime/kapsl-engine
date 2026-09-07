@@ -1,0 +1,33 @@
+name: Cache Rust build dependencies
+description: Cache the real runtime workspace and ORT download sidecars, isolated by build profile
+inputs:
+  key:
+    required: true
+    description: Platform, toolchain image and feature-profile cache namespace
+  workspaces:
+    required: false
+    default: kapsl-runtime -> target
+    description: Cargo workspace and target directory mapping
+runs:
+  using: composite
+  steps:
+    - name: Resolve ORT cache paths
+      id: paths
+      shell: bash
+      run: |
+        echo "unix=$HOME/.cache/ort.pyke.io" >> "$GITHUB_OUTPUT"
+        echo "macos=$HOME/Library/Caches/ort.pyke.io" >> "$GITHUB_OUTPUT"
+        echo "windows=${LOCALAPPDATA:-$HOME/.cache}/ort.pyke.io" >> "$GITHUB_OUTPUT"
+    - name: Restore compiler and dependency cache
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      with:
+        shared-key: ${{ inputs.key }}
+        workspaces: ${{ inputs.workspaces }}
+        env-vars: KAPSL_BACKEND_PUBLIC_KEYS CUDA_PATH CMAKE_POSITION_INDEPENDENT_CODE
+        cache-directories: |
+          ${{ steps.paths.outputs.unix }}
+          ${{ steps.paths.outputs.macos }}
+          ${{ steps.paths.outputs.windows }}
+        # PRs restore trusted base-branch caches but never update them. Avoid
+        # caching signing credentials, packaging scratch or release artifacts.
+        save-if: ${{ github.event_name != 'pull_request' }}

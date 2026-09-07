@@ -3,6 +3,17 @@ set -euo pipefail
 
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 
+selected_profile="${KAPSL_LLAMA_PACK_PROFILE:-all}"
+case "$selected_profile" in
+  all|cpu|cuda12) ;;
+  *) echo "KAPSL_LLAMA_PACK_PROFILE must be all, cpu or cuda12." >&2; exit 1 ;;
+esac
+build_only="${KAPSL_LLAMA_BUILD_ONLY:-false}"
+case "$build_only" in
+  true|false) ;;
+  *) echo "KAPSL_LLAMA_BUILD_ONLY must be true or false." >&2; exit 1 ;;
+esac
+
 host_os="${RUNNER_OS:-$(uname -s)}"
 host_arch="${RUNNER_ARCH:-$(uname -m)}"
 if [ "$host_os" != "Linux" ] || { [ "$host_arch" != "X64" ] && [ "$host_arch" != "x86_64" ]; }; then
@@ -48,7 +59,9 @@ build_profile() {
     return
   fi
 
-  target_dir="$work_root/target-$profile"
+  # A caller-owned target survives packaging cleanup and can be restored on
+  # another runner. Keep CPU and CUDA/PIC feature builds in separate targets.
+  target_dir="${KAPSL_LLAMA_TARGET_ROOT:-$work_root/targets}/$profile"
   cargo_args=(
     build
     --manifest-path kapsl-runtime/Cargo.toml
@@ -133,6 +146,10 @@ package_profile() {
   if [ ! -f "$library" ]; then
     echo "llama.cpp $profile build did not produce $library" >&2
     exit 1
+  fi
+  if [ "$build_only" = true ]; then
+    echo "Built llama.cpp $profile dependencies for the trusted release cache."
+    return
   fi
   if ! file "$library" | grep -q 'ELF .* shared object'; then
     echo "llama.cpp $profile entrypoint is not an ELF shared object: $library" >&2
@@ -269,5 +286,9 @@ PY
   echo "Packaged $archive"
 }
 
-package_profile cpu cpu cpu "${KAPSL_LLAMA_CPU_LIBRARY:-}" native
-package_profile cuda12 cuda cuda12-shared-pool "${KAPSL_LLAMA_CUDA_LIBRARY:-}" shared_pool
+if [ "$selected_profile" = all ] || [ "$selected_profile" = cpu ]; then
+  package_profile cpu cpu cpu "${KAPSL_LLAMA_CPU_LIBRARY:-}" native
+fi
+if [ "$selected_profile" = all ] || [ "$selected_profile" = cuda12 ]; then
+  package_profile cuda12 cuda cuda12-shared-pool "${KAPSL_LLAMA_CUDA_LIBRARY:-}" shared_pool
+fi

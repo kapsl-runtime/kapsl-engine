@@ -1,9 +1,27 @@
 name: Beta Runtime Installers
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - develop
+    # CI/authentication-only changes use host-only checks. Full beta packaging
+    # remains available deliberately through workflow_dispatch on develop.
+    paths:
+      - "kapsl-runtime/**"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "installers/**"
+      - ".github/licenses/**"
+      - ".github/ort*.lock*"
+      - ".github/ort-release-public-key.txt"
+      - ".github/scripts/package-*"
+      - ".github/scripts/collect-*"
+      - ".github/scripts/bootstrap-vllm-backend.sh"
+      - ".github/scripts/managed-vllm-cu130.lock"
+      - ".github/scripts/generate-backend-index.py"
+      - "LICENSE"
+      - "NOTICE"
 
 permissions:
   contents: write
@@ -25,6 +43,7 @@ env:
 jobs:
   prepare-version:
     name: Resolve beta version
+    if: github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -61,6 +80,16 @@ jobs:
           echo "numeric_version=$numeric_version" >> "$GITHUB_OUTPUT"
           echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate signing and publication configuration before builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
+          KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 .github/scripts/preflight_release_environment.py --signing --sdk
+
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
     needs: prepare-version
@@ -70,6 +99,8 @@ jobs:
       KAPSL_NUMERIC_VERSION: ${{ needs.prepare-version.outputs.numeric_version }}
       KAPSL_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C debuginfo=0 -C link-arg=/DEBUG:NONE' || '' }}
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -84,6 +115,11 @@ jobs:
 
       - name: Install Rust
         uses: ./.github/actions/setup-rust
+
+      - name: Cache release compiler dependencies
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: release-portable-${{ matrix.os }}
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
@@ -287,150 +323,15 @@ jobs:
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
     needs: prepare-version
-    runs-on: ubuntu-22.04
-    container:
-      # Match the stable release: this image supplies the CUDA/cuDNN libraries
-      # folded into the one GGUF + ONNX accelerator archive.
-      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CMAKE_BUILD_PARALLEL_LEVEL: "2"
-      CUDA_PATH: /usr/local/cuda
-      KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE
-      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+    uses: ./.github/workflows/build-linux-accelerators.yml
+    with:
+      version: ${{ needs.prepare-version.outputs.version }}
+      channel: beta
+      stable_release: false
+      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
+    secrets:
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
-      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
-      LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
-    steps:
-      - name: Install CUDA build dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
-          rm -rf /var/lib/apt/lists/*
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Resolve certified ORT integrations commit
-        id: ort-integrations
-        shell: bash
-        run: |
-          set -euo pipefail
-          ref="$(tr -d '\r\n' < .github/ort-integration.lock)"
-          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-            echo ".github/ort-integration.lock must contain one exact lowercase 40-hex commit." >&2
-            exit 1
-          fi
-          echo "KAPSL_ORT_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout certified ORT adapter
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-integrations
-          ref: ${{ steps.ort-integrations.outputs.ref }}
-          path: kapsl-integrations-ort
-
-      - name: Verify certified ORT integrations checkout
-        shell: bash
-        run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
-
-      - name: Validate certified vLLM SDK commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Protected KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit." >&2
-            exit 1
-          fi
-
-      - name: Checkout certified vLLM connector
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
-          path: sdk-vllm
-
-      - name: Verify certified vLLM SDK checkout
-        shell: bash
-        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
-
-      - name: Install Rust
-        uses: ./.github/actions/setup-rust
-
-      - name: Install certified ORT packaging toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-ort/rust-toolchain.toml | head -n 1)"
-          rustup toolchain install "$toolchain" --profile minimal
-
-      - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
-
-      - name: Collect ONNX Runtime sidecars
-        shell: bash
-        run: .github/scripts/collect-ort-sidecars.sh
-
-      - name: Collect TensorRT 10 user-space runtime
-        shell: bash
-        run: .github/scripts/collect-linux-tensorrt-runtime.sh
-
-      - name: Package CUDA runtime bundle
-        shell: bash
-        run: .github/scripts/package-linux-cuda-runtime.sh
-
-      - name: Package certified ORT CPU adapter
-        shell: bash
-        run: .github/scripts/package-linux-ort-cpu-backend.sh
-
-      - name: Package llama.cpp backend packs from published SDK crates
-        shell: bash
-        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
-
-      - name: Reclaim CUDA build scratch before backend packaging
-        shell: bash
-        run: cargo clean --manifest-path kapsl-runtime/Cargo.toml
-
-      - name: Package certified managed-vLLM backend
-        shell: bash
-        env:
-          KAPSL_VLLM_SDK_DIR: sdk-vllm
-        run: .github/scripts/package-linux-vllm-backend.sh
-
-      - name: Generate signed backend index
-        shell: bash
-        env:
-          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_PUBLIC_KEYS" ]; then
-            echo "Backend signing key and embedded public key are required." >&2
-            exit 1
-          fi
-          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
-          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
-          chmod 600 "$key_file"
-          trap 'rm -f "$key_file"' EXIT
-          .github/scripts/generate-backend-index.py \
-            --version "$KAPSL_VERSION" \
-            --artifacts-dir dist \
-            --output dist/backend-index.json \
-            --signing-key "$key_file" \
-            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
-            --channel beta
-          rm -f "$key_file" dist/*.manifest.json
-          trap - EXIT
-
-      - name: Upload CUDA runtime artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-cuda-linux-x86_64
-          path: dist/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
+      KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
 
   publish-beta-release:
     needs: [prepare-version, build-runtime-installers, build-cuda-runtime]
@@ -442,6 +343,7 @@ jobs:
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: runtime-*
           path: release-assets
           merge-multiple: true
 

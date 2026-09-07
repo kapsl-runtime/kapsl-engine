@@ -71,13 +71,12 @@ require_literal "$index_generator" 'kapsl-backend-index-v1\0'
 require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
 
 for workflow in \
-  .github/workflows/release-runtime-installers.yml \
-  .github/workflows/beta-runtime-installers.yml \
+  .github/workflows/build-linux-accelerators.yml \
   .github/workflows/vllm-shared-pool-conformance.yml; do
   require_literal "$workflow" 'KAPSL_VLLM_SDK_REF'
   require_literal "$workflow" 'verify-managed-vllm-sdk-checkout.sh'
   if [ "$workflow" != ".github/workflows/vllm-shared-pool-conformance.yml" ]; then
-    require_literal "$workflow" '${{ vars.KAPSL_VLLM_SDK_REF }}'
+    require_literal "$workflow" '${{ inputs.sdk_ref }}'
     require_literal "$workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
   else
     require_literal "$workflow" "EXPECTED_CONNECTOR_VERSION: \"$connector_version\""
@@ -103,6 +102,11 @@ for workflow in \
     require_literal "$workflow" 'llama_owner_usage_bytes'
     require_literal "$workflow" 'general_pool_allocated_bytes'
   fi
+done
+
+for workflow in .github/workflows/release-runtime-installers.yml .github/workflows/beta-runtime-installers.yml; do
+  require_literal "$workflow" './.github/workflows/build-linux-accelerators.yml'
+  require_literal "$workflow" 'sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}'
 done
 
 if grep -Eq 'engine/\.cargo/config\.toml|\[patch\.crates-io\]|patch\.crates-io\.kapsl-' \
@@ -140,6 +144,7 @@ if grep -Fq -- '--index-url "$PYTORCH_INDEX_URL"' \
 fi
 
 if grep -Eq 'KAPSL_VLLM_SDK_REF:-|sdk_ref:.*default:' "$packager" \
+  .github/workflows/build-linux-accelerators.yml \
   .github/workflows/release-runtime-installers.yml \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/vllm-shared-pool-conformance.yml; then
