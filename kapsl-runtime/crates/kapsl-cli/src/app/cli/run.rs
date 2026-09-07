@@ -94,6 +94,21 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 9095)]
     pub(crate) metrics_port: u16,
 
+    /// Enable the gRPC API on this port (requires the grpc-server build feature).
+    #[cfg(feature = "grpc-server")]
+    #[arg(long)]
+    pub(crate) grpc_port: Option<u16>,
+
+    /// gRPC listen address. Remote plaintext binds require KAPSL_ALLOW_INSECURE_GRPC=1.
+    #[cfg(feature = "grpc-server")]
+    #[arg(long, default_value = "127.0.0.1")]
+    pub(crate) grpc_bind: std::net::IpAddr,
+
+    /// Maximum encoded gRPC message size, applied to requests and responses.
+    #[cfg(feature = "grpc-server")]
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    pub(crate) grpc_max_message_bytes: usize,
+
     /// Bind address for the HTTP API / dashboard / metrics server.
     /// Defaults to loopback; set to 0.0.0.0 only behind a TLS reverse proxy
     /// and with KAPSL_ALLOW_INSECURE_HTTP=1.

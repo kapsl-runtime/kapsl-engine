@@ -194,6 +194,7 @@ jobs:
           private-key: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          permission-administration: write
 
       - name: Create one-job JIT runner registration
         id: jit
@@ -262,7 +263,7 @@ jobs:
             --runner-id "${{ steps.jit.outputs.runner_id }}" \
             --expected-name "${{ steps.identity.outputs.runner_name }}" \
             --timeout-seconds 900 \
-            --interval-seconds 10
+            --interval-seconds 30
 
       - name: Delete a VM whose provisioning job failed
         if: failure() && steps.identity.outputs.instance_name != ''
@@ -376,6 +377,7 @@ jobs:
           private-key: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
+          permission-administration: write
 
       - name: Remove the completed JIT runner registration
         if: needs.prepare-vllm-gcp-runner.outputs.runner_id != ''

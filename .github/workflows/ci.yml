@@ -42,11 +42,13 @@ jobs:
           git config --global core.longpaths true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-check-${{ matrix.os }}
 
       - name: Check runtime workspace
         if: runner.os != 'Windows'
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server
 
       # Exercise the optional CUDA memory authority without requiring nvcc or a
       # GPU on the hosted runner. The gpu-device-pool feature pins the stable
@@ -73,7 +75,7 @@ jobs:
         shell: pwsh
         env:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server
 
   msrv:
     name: Cargo check (MSRV)
@@ -87,9 +89,9 @@ jobs:
           msrv: true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
         with:
-          shared-key: msrv
+          key: ci-msrv
 
       - name: Check runtime workspace on its minimum Rust version
         run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --locked
@@ -121,15 +123,17 @@ jobs:
           git config --global core.longpaths true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-test-${{ matrix.os }}
 
       - name: Test runtime workspace
         if: runner.os != 'Windows'
-        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace
+        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server
 
       - name: Test runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
-        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
+        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server

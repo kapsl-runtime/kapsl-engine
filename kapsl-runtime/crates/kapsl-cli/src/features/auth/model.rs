@@ -17,6 +17,29 @@ pub(crate) enum ApiScope {
     Admin,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApiAuthorizationError {
+    Unauthorized,
+    Forbidden,
+    LocalOnly,
+}
+
+/// Granted access contains policy metadata only, never the presented token.
+pub(crate) struct AuthorizedAccess {
+    pub(crate) grant: ApiAuthGrant,
+    pub(crate) mode: &'static str,
+}
+
+impl ApiAuthGrant {
+    pub(crate) fn allows(&self, role: ApiRole, scope: ApiScope) -> bool {
+        self.role.allows(role)
+            && self
+                .scopes
+                .as_ref()
+                .is_none_or(|scopes| key_scopes_allow(scopes, scope))
+    }
+}
+
 impl ApiRole {
     pub(crate) fn allows(self, required: ApiRole) -> bool {
         use ApiRole::{Admin, Reader, Writer};

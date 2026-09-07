@@ -80,11 +80,12 @@ class PreflightTests(TestCase):
         self.assertIn("preflight-ort-release.py --require-runtime-trust", prepare)
         for job in ("build-runtime-installers", "build-cuda-runtime", "stable-release-cpu-conformance"):
             block = release.split(f"  {job}:\n", 1)[1].split("    steps:", 1)[0]
-            self.assertIn("needs: prepare-version", block)
+            self.assertIn("needs: [prepare-version, stable-release-infrastructure-preflight]", block)
         workflow = (ROOT / ".github/workflows/release-preflight.yml").read_text()
         self.assertIn("  pull_request:", workflow)
         self.assertIn("preflight-ort-release.py", workflow)
-        self.assertNotIn("secrets.", workflow)
+        pr_job = workflow.split("  ort-release-preflight:\n", 1)[1].split("  live-infrastructure-preflight:\n", 1)[0]
+        self.assertNotIn("secrets.", pr_job)
         self.assertNotIn("self-hosted", workflow)
         self.assertNotIn("gpu-device-pool-integration.yml", workflow)
 

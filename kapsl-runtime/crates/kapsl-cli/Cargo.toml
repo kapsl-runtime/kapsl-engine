@@ -9,6 +9,7 @@ rust-version.workspace = true
 # uses the stable shared-KV `cuda` alias below. The explicit `gguf-cuda`
 # feature remains available as the llama.cpp native-KV rollback profile.
 default = []
+grpc-server = ["dep:kapsl-grpc"]
 cuda = ["gguf-cuda-shared-kv"]
 
 # Shared implementation switch for runtime-owned CUDA memory. It remains a
@@ -34,15 +35,16 @@ gguf-cuda-shared-kv = ["gpu-device-pool", "kapsl-backends/gguf-cuda-shared-kv", 
 cc = "1"
 
 [dependencies]
+kapsl-grpc = { version = "0.3.0", optional = true }
 kapsl-core = "0.3.0"
 kapsl-hal = "0.3.0"
 kapsl-engine-api = "0.3.0"
 kapsl-backends = "0.3.0"
 kapsl-scheduler = "0.3.0"
-kapsl-ipc = "0.3.0"
+kapsl-ipc = "0.4.0"
 kapsl-monitor = "0.3.0"
-kapsl-transport = "0.3.0"
-kapsl-shm = "0.3.0"
+kapsl-transport = "0.4.0"
+kapsl-shm = "0.4.0"
 kapsl-llm = "0.3.0"
 kapsl-kv-abi = "0.6.0"
 kapsl-loader = "0.3.0"
