@@ -3,6 +3,7 @@
 
 import base64
 import fnmatch
+import glob
 import hashlib
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from unittest import TestCase, main, mock
 
 
@@ -30,6 +32,7 @@ def load(name):
 
 environment = load("preflight_release_environment")
 build = load("release_build_inputs")
+sdk = load("verify_published_sdk")
 
 
 def workflow(name):
@@ -41,6 +44,94 @@ def job(source, name):
     if not match:
         raise AssertionError(f"Job {name} is missing")
     return match[1]
+
+
+def step(source, name):
+    match = re.search(rf"(?ms)^      - name: {re.escape(name)}\n(.*?)(?=^      - |\Z)", source)
+    if not match:
+        raise AssertionError(f"Step {name} is missing")
+    return match[1]
+
+
+class PublishedSdkTests(TestCase):
+    def packages(self):
+        return [{"name": name, "version": version, "source": sdk.CRATES_IO, "checksum": "a" * 64}
+                for name, version in sdk.EXPECTED_VERSIONS.items()]
+
+    def test_independent_crate_versions_and_current_lockfile_pass(self):
+        sdk.validate_packages(self.packages(), require_checksums=True)
+        sdk.verify_lockfile(ROOT / "kapsl-runtime/Cargo.lock")
+        for name in ("kapsl-ipc", "kapsl-shm", "kapsl-transport"):
+            self.assertEqual(sdk.EXPECTED_VERSIONS[name], "0.4.0")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-engine-api"], "0.3.0")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-backend-abi"], "0.2.0")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-kv-abi"], "0.6.0")
+
+    def test_stale_or_uniform_sdk_versions_are_rejected(self):
+        for name, wrong in (("kapsl-transport", "0.3.0"), ("kapsl-engine-api", "0.4.0"),
+                            ("kapsl-kv-abi", "0.6.1"), ("kapsl-ipc", "0.4.1-beta.1")):
+            packages = self.packages()
+            next(p for p in packages if p["name"] == name)["version"] = wrong
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, name + ": expected"):
+                sdk.validate_packages(packages)
+
+    def test_missing_and_duplicate_sdk_packages_fail_closed(self):
+        packages = self.packages()
+        for candidates in (packages[1:], packages + [packages[0]],
+                           packages + [packages[0] | {"version": "0.1.0"}]):
+            with self.subTest(candidates=candidates), self.assertRaisesRegex(ValueError, "expected one"):
+                sdk.validate_packages(candidates)
+
+    def test_paths_git_and_other_registries_are_rejected_without_echoing_credentials(self):
+        for source in (None, "git+https://fixture-secret@example.invalid/sdk", "registry+https://other.invalid"):
+            packages = self.packages()
+            packages[0]["source"] = source
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, "must resolve from crates.io") as error:
+                sdk.validate_packages(packages)
+            self.assertNotIn("fixture-secret", str(error.exception))
+
+    def test_lockfile_requires_registry_checksums_but_metadata_does_not_supply_them(self):
+        for checksum in (None, "", "b" * 63, "z" * 64):
+            packages = self.packages()
+            packages[0]["checksum"] = checksum
+            sdk.validate_packages(packages)
+            with self.subTest(checksum=checksum), self.assertRaisesRegex(ValueError, "registry checksum"):
+                sdk.validate_packages(packages, require_checksums=True)
+
+    def test_workspace_and_third_party_crates_do_not_need_sdk_versions(self):
+        sdk.validate_packages(self.packages() + [
+            {"name": "kapsl", "version": "0.2.8", "source": None},
+            {"name": "kapsl-backend-llama-cpp", "version": "0.1.0", "source": None},
+            {"name": "third-party", "version": "1.2.3", "source": sdk.CRATES_IO},
+        ])
+
+    def test_invalid_package_lists_and_metadata_format_are_rejected(self):
+        for packages in (None, {}, ["invalid"], []):
+            with self.subTest(packages=packages), self.assertRaises(ValueError):
+                sdk.validate_packages(packages)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            for content in ([], {}, {"version": 2, "packages": self.packages()}):
+                path.write_text(json.dumps(content))
+                with self.subTest(content=content), self.assertRaises(ValueError):
+                    sdk.verify_metadata(path)
+
+    def test_cli_checks_both_inputs_and_exits_nonzero_for_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metadata.json"
+            packages = self.packages()
+            path.write_text(json.dumps({"version": 1, "packages": packages}))
+            for flag, source in (("--metadata", path), ("--lockfile", ROOT / "kapsl-runtime/Cargo.lock")):
+                result = subprocess.run([sys.executable, sdk.__file__, flag, str(source)],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            packages[0]["version"] = "99.0.0"
+            path.write_text(json.dumps({"version": 1, "packages": packages}))
+            result = subprocess.run([sys.executable, sdk.__file__, "--metadata", str(path)],
+                                    capture_output=True, text=True, check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("expected 0.2.0, resolved 99.0.0", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
 
 
 class EnvironmentTests(TestCase):
@@ -298,6 +389,29 @@ with open(os.environ["CARGO_FIXTURE_LOG"], "a") as stream:
 
 
 class WorkflowTests(TestCase):
+    def test_one_per_crate_sdk_contract_runs_on_prs_before_builds_and_before_gpu_creation(self):
+        check = "python3 .github/scripts/verify_published_sdk.py --lockfile kapsl-runtime/Cargo.lock"
+        readiness = job(workflow("release-preflight"), "ort-release-preflight")
+        self.assertIn(check, readiness)
+        self.assertNotIn("cargo build", readiness)
+        infrastructure = workflow("release-infrastructure-preflight")
+        self.assertIn(check, infrastructure)
+        self.assertLess(infrastructure.index(check), infrastructure.index("Validate configuration"))
+        dispatcher = workflow("gpu-device-pool-integration")
+        self.assertIn(check, job(dispatcher, "authorize-stable-release"))
+        self.assertIn("needs: authorize-stable-release", job(dispatcher, "prepare-vllm-gcp-runner"))
+        for source in (readiness, infrastructure, job(dispatcher, "authorize-stable-release")):
+            self.assertIn('python-version: "3.12"', source)
+            self.assertNotIn("cargo metadata", source)  # Cheap lockfile parsing, no dependency downloads.
+        gpu = job(workflow("vllm-shared-pool-conformance"), "flash-attn")
+        build_step = step(gpu, "Build CUDA shared-pool runtime from published SDK crates")
+        self.assertIn('--locked --format-version 1 --no-default-features --features cuda', build_step)
+        self.assertIn('verify_published_sdk.py --metadata "$metadata_path"', build_step)
+        self.assertLess(build_step.index("verify_published_sdk.py"), build_step.index("cargo build"))
+        self.assertIn('metadata_path="$OUTPUT_DIR/cargo-metadata.json"', build_step)
+        self.assertNotIn("EXPECTED_RUST_SDK_VERSION", gpu)
+        self.assertIn("hashFiles('engine/kapsl-runtime/Cargo.lock')", gpu)
+
     def test_all_expensive_stable_builds_wait_for_authentication(self):
         source = workflow("release-runtime-installers")
         for name in ("build-runtime-installers", "build-cuda-runtime", "stable-release-cpu-conformance"):
@@ -439,6 +553,7 @@ class CpuSmokeWorkflowTests(TestCase):
             ".github/workflows/release-infrastructure-preflight.yml",
             ".github/actions/cache-rust-build/action.yml",
             ".github/scripts/preflight_release_environment.py",
+            ".github/scripts/verify_published_sdk.py",
             ".github/scripts/validate_stable_gpu_release.py",
             ".github/scripts/test-generate-backend-index.sh",
             ".github/scripts/test-onnx-backend-release-contract.sh",
@@ -501,6 +616,68 @@ class CpuSmokeWorkflowTests(TestCase):
         self.assertNotIn("self-hosted", self.source)
         self.assertNotIn("secrets.", self.source)
         self.assertNotIn("gpu-device-pool-integration.yml", self.source)
+
+
+class ConformanceEvidenceTests(TestCase):
+    def setUp(self):
+        self.gpu = job(workflow("vllm-shared-pool-conformance"), "flash-attn")
+        self.upload = step(self.gpu, "Upload conformance evidence")
+        self.patterns = [line.strip() for line in self.upload.split("          path: |\n", 1)[1]
+                         .split("          if-no-files-found:", 1)[0].splitlines() if line.strip()]
+
+    def test_paths_use_the_initialized_container_directory_and_keep_an_allowlist(self):
+        self.assertEqual(self.patterns, ["${{ env.OUTPUT_DIR }}/" + suffix for suffix in (
+            "*.json", "*.log", "*.txt", "*.sha256", "wheels/*.whl", "ort-bridge/**",
+        )])
+        self.assertNotIn("runner.temp", self.upload)
+        self.assertIn("if: always() && env.OUTPUT_DIR != ''", self.upload)
+        self.assertIn("if-no-files-found: error", self.upload)
+        initializer = self.gpu.index("Initialize isolated artifact paths")
+        self.assertLess(initializer, self.gpu.index("Verify GPU passthrough"))
+        self.assertLess(initializer, self.gpu.index("Install declared build dependencies"))
+        self.assertIn("if: always()", step(self.gpu, "Remove signed ORT qualification scratch"))
+        cleanup = job(workflow("gpu-device-pool-integration"), "cleanup-vllm-gcp-runner")
+        self.assertIn("always()", cleanup)
+
+    def test_real_initializer_and_upload_globs_preserve_early_failure_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            container_temp = root / "container temp"
+            container_temp.mkdir()
+            env_file = root / "github-env"
+            values = os.environ | {
+                "RUNNER_TEMP": str(container_temp), "GITHUB_ENV": str(env_file),
+                "GITHUB_RUN_ID": "34111507622", "GITHUB_RUN_ATTEMPT": "2",
+                "GITHUB_REF": "refs/tags/v0.2.8", "GITHUB_SHA": "a" * 40,
+                "KAPSL_VLLM_SDK_REF": "b" * 40,
+            }
+            initializer = step(self.gpu, "Initialize isolated artifact paths")
+            script = textwrap.dedent(initializer.split("        run: |\n", 1)[1])
+            result = subprocess.run(["bash", "-c", script], env=values,
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = Path(dict(line.split("=", 1) for line in env_file.read_text().splitlines())["OUTPUT_DIR"])
+            self.assertEqual(output.parent, container_temp)
+            context = output / "run-context.txt"
+            self.assertTrue(context.is_file())
+
+            def uploaded_files():
+                found = set()
+                for pattern in self.patterns:
+                    expanded = pattern.replace("${{ env.OUTPUT_DIR }}", str(output))
+                    found.update(Path(path) for path in glob.glob(expanded, recursive=True) if Path(path).is_file())
+                return found
+
+            # No model, GPU, wheel, or build step has run: the original failure
+            # must still retain its context, rather than failing with no files.
+            self.assertEqual(uploaded_files(), {context})
+            evidence = ["cargo-metadata.json", "runtime.log", "inputs.sha256",
+                        "wheels/connector.whl", "ort-bridge/cuda12/report.json"]
+            for relative in evidence + ["signing.pem", ".env", "runtime.so", "private/credentials.json"]:
+                path = output / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("fixture")
+            self.assertEqual(uploaded_files(), {context} | {output / relative for relative in evidence})
 
 
 if __name__ == "__main__":

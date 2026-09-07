@@ -12,8 +12,7 @@ connector_version="0.7.0"
 planner_schema_version="1"
 kv_abi_major="1"
 kv_abi_minor="5"
-rust_sdk_version="0.3.0"
-rust_kv_abi_version="0.6.0"
+rust_sdk_verifier=".github/scripts/verify_published_sdk.py"
 
 require_literal() {
   local file="$1"
@@ -69,6 +68,12 @@ require_literal "$sdk_verifier" '--ignored=matching'
 require_literal "$wheel_verifier" '"planner_entry_point": "kapsl_vllm_connector.plan:main"'
 require_literal "$index_generator" 'kapsl-backend-index-v1\0'
 require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
+require_literal "$rust_sdk_verifier" '"kapsl-engine-api": "0.3.0"'
+require_literal "$rust_sdk_verifier" '"kapsl-transport": "0.4.0"'
+require_literal "$rust_sdk_verifier" '"kapsl-ipc": "0.4.0"'
+require_literal "$rust_sdk_verifier" '"kapsl-shm": "0.4.0"'
+require_literal "$rust_sdk_verifier" '"kapsl-kv-abi": "0.6.0"'
+require_literal "$rust_sdk_verifier" 'package.get("source") != CRATES_IO'
 
 for workflow in \
   .github/workflows/build-linux-accelerators.yml \
@@ -89,15 +94,13 @@ for workflow in \
     require_literal "$workflow" 'ninja-build'
     require_literal "$workflow" '--index-url https://pypi.org/simple'
     require_literal "$workflow" '--extra-index-url "$PYTORCH_INDEX_URL"'
-    require_literal "$workflow" "EXPECTED_RUST_SDK_VERSION: \"$rust_sdk_version\""
-    require_literal "$workflow" "EXPECTED_RUST_KV_ABI_VERSION: \"$rust_kv_abi_version\""
-    require_literal "$workflow" 'startswith("registry+")'
-    require_literal "$workflow" 'key: published-sdk-${{ env.EXPECTED_RUST_SDK_VERSION }}-kv-abi-${{ env.EXPECTED_RUST_KV_ABI_VERSION }}'
-    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.json'
-    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.log'
-    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt'
-    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256'
-    require_literal "$workflow" '${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/wheels/*.whl'
+    require_literal "$workflow" 'python3 .github/scripts/verify_published_sdk.py --metadata "$metadata_path"'
+    require_literal "$workflow" "key: published-sdk-\${{ hashFiles('engine/kapsl-runtime/Cargo.lock') }}"
+    require_literal "$workflow" '${{ env.OUTPUT_DIR }}/*.json'
+    require_literal "$workflow" '${{ env.OUTPUT_DIR }}/*.log'
+    require_literal "$workflow" '${{ env.OUTPUT_DIR }}/*.txt'
+    require_literal "$workflow" '${{ env.OUTPUT_DIR }}/*.sha256'
+    require_literal "$workflow" '${{ env.OUTPUT_DIR }}/wheels/*.whl'
     require_literal "$workflow" 'mixed-backend report did not pass'
     require_literal "$workflow" 'llama_owner_usage_bytes'
     require_literal "$workflow" 'general_pool_allocated_bytes'
@@ -131,7 +134,7 @@ require_literal .github/workflows/vllm-shared-pool-conformance.yml \
 require_literal .github/workflows/vllm-shared-pool-conformance.yml \
   'managed_vllm_bridge_benchmark.py combine'
 
-if grep -Fxq '            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}' \
+if grep -Fxq '            ${{ env.OUTPUT_DIR }}' \
   .github/workflows/vllm-shared-pool-conformance.yml; then
   echo "Managed-vLLM conformance must upload an evidence allowlist, not the artifact root." >&2
   exit 1

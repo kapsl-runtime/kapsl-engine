@@ -31,6 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check per-crate SDK pins before release builds
+        run: python3 .github/scripts/verify_published_sdk.py --lockfile kapsl-runtime/Cargo.lock
+
       - name: Validate configuration without revealing credentials
         env:
           GPU_RUNNER_GITHUB_APP_PRIVATE_KEY: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
