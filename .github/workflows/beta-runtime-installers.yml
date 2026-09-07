@@ -323,6 +323,11 @@ jobs:
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
     needs: prepare-version
+    # The reusable build must be allowed to read its same-run artifacts.
+    # Keep this grant scoped to the caller, not every beta/publication job.
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/build-linux-accelerators.yml
     with:
       version: ${{ needs.prepare-version.outputs.version }}
