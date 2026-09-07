@@ -1,0 +1,27 @@
+name: Warm release build caches (no GPU)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "kapsl-runtime/**"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-build-cache-main
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/build-linux-accelerators.yml
+    with:
+      cache_only: true
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }} ${{ vars.KAPSL_ORT_BACKEND_PUBLIC_KEY }}

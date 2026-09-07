@@ -42,14 +42,18 @@ require_literal "$packager" '"entrypoint": "lib/libkapsl_backend_llama_cpp.so"'
 for workflow in \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/release-runtime-installers.yml; do
-  require_literal "$workflow" '.github/scripts/package-linux-llama-cpp-backend-packs.sh'
-  require_literal "$workflow" 'Package llama.cpp backend packs from published SDK crates'
-  require_literal "$workflow" 'cargo build --manifest-path kapsl-runtime/Cargo.toml --locked'
-  require_literal "$workflow" 'KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE'
+  require_literal "$workflow" './.github/workflows/build-linux-accelerators.yml'
 done
+
+build_workflow=".github/workflows/build-linux-accelerators.yml"
+require_literal "$build_workflow" '.github/scripts/package-linux-llama-cpp-backend-packs.sh'
+require_literal "$build_workflow" 'Package llama.cpp backend packs from published SDK crates'
+require_literal "$build_workflow" 'cargo build --manifest-path kapsl-runtime/Cargo.toml --locked'
+require_literal "$build_workflow" 'KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE'
 
 if grep -Eq 'KAPSL_LLAMA_SDK_(DIR|REF)|sdk-llama|patch\.crates-io\.kapsl-(llm|engine-api)' \
   "$packager" \
+  "$build_workflow" \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/release-runtime-installers.yml; then
   echo "llama.cpp release paths must resolve published SDK crates without path patches." >&2

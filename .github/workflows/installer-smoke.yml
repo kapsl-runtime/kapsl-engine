@@ -59,6 +59,13 @@ on:
       - ".github/workflows/gpu-device-pool-integration.yml"
       - ".github/workflows/release-runtime-installers.yml"
       - ".github/workflows/beta-runtime-installers.yml"
+      - ".github/workflows/build-linux-accelerators.yml"
+      - ".github/workflows/release-infrastructure-preflight.yml"
+      - ".github/workflows/release-build-cache.yml"
+      - ".github/actions/cache-rust-build/**"
+      - ".github/scripts/release_build_inputs.py"
+      - ".github/scripts/preflight_release_environment.py"
+      - ".github/scripts/test_release_pipeline.py"
       - ".github/scripts/gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/github_jit_runner.py"
       - ".github/scripts/validate_stable_gpu_release.py"
@@ -243,6 +250,9 @@ jobs:
 
       - name: Test ONNX backend release contract
         run: .github/scripts/test-onnx-backend-release-contract.sh
+
+      - name: Test fast release preflight, build isolation and artifact assembly
+        run: python3 .github/scripts/test_release_pipeline.py
 
       - name: Test native llama.cpp backend packs
         run: .github/scripts/test-package-linux-llama-cpp-backend-packs.sh

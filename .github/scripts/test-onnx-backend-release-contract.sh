@@ -29,6 +29,7 @@ gpu_entry_workflow=".github/workflows/gpu-device-pool-integration.yml"
 stable_gpu_workflow=".github/workflows/vllm-shared-pool-conformance.yml"
 installer_workflow=".github/workflows/installer-smoke.yml"
 release_workflow=".github/workflows/release-runtime-installers.yml"
+build_workflow=".github/workflows/build-linux-accelerators.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
 bundle="kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
@@ -212,27 +213,40 @@ fi
 for workflow in \
   .github/workflows/beta-runtime-installers.yml \
   "$release_workflow"; do
-  require_literal "$workflow" '.github/scripts/package-linux-onnx-backend-packs.sh'
-  require_literal "$workflow" '.github/scripts/package-linux-ort-cpu-backend.sh'
-  require_literal "$workflow" '.github/ort-integration.lock'
-  require_literal "$workflow" 'ref: ${{ steps.ort-integrations.outputs.ref }}'
-  require_literal "$workflow" 'repository: kapsl-runtime/kapsl-integrations'
-  require_literal "$workflow" 'verify-ort-integration-checkout.sh'
-  require_literal "$workflow" 'Install certified ORT packaging toolchain'
-  require_literal "$workflow" 'rustup toolchain install "$toolchain" --profile minimal'
-  require_literal "$workflow" '.github/scripts/collect-linux-tensorrt-runtime.sh'
+  if grep -Fq '.github/scripts/package-linux-onnx-backend-packs.sh' "$workflow"; then
+    echo "$workflow must not build legacy ONNX accelerator backend packs." >&2
+    exit 1
+  fi
+  require_literal "$workflow" './.github/workflows/build-linux-accelerators.yml'
+  # Portable installers retain explicit embedded rollback provider libraries.
+  require_literal "$workflow" '.github/scripts/collect-ort-sidecars.sh'
+  require_literal "$workflow" '.github/scripts/package-linux-provider-packs.sh'
 done
 
-require_literal "$release_workflow" 'name: Import immutable signed ORT backend packs'
+if grep -Fq '.github/scripts/package-linux-onnx-backend-packs.sh' "$build_workflow"; then
+  echo "$build_workflow must not build legacy ONNX accelerator backend packs." >&2
+  exit 1
+fi
+require_literal "$build_workflow" '.github/scripts/collect-ort-sidecars.sh'
+require_literal "$build_workflow" '.github/scripts/package-linux-ort-cpu-backend.sh'
+require_literal "$build_workflow" '.github/ort-integration.lock'
+require_literal "$build_workflow" 'ref: ${{ steps.ort-integrations.outputs.ref }}'
+require_literal "$build_workflow" 'repository: kapsl-runtime/kapsl-integrations'
+require_literal "$build_workflow" 'verify-ort-integration-checkout.sh'
+require_literal "$build_workflow" 'Install certified ORT packaging toolchain'
+require_literal "$build_workflow" 'rustup toolchain install "$toolchain" --profile minimal'
+require_literal "$build_workflow" '.github/scripts/collect-linux-tensorrt-runtime.sh'
+require_literal "$build_workflow" 'name: Import immutable signed ORT backend packs'
+require_literal "$build_workflow" 'if: inputs.stable_release'
+require_literal "$build_workflow" '.github/scripts/import-signed-backend-release.py'
+require_literal "$build_workflow" '--lock .github/ort-release.lock.json'
+require_literal "$build_workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
 require_literal "$release_workflow" "if: needs.prepare-version.outputs.is_stable_release == 'true'"
-require_literal "$release_workflow" '.github/scripts/import-signed-backend-release.py'
-require_literal "$release_workflow" '--lock .github/ort-release.lock.json'
-require_literal "$release_workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
-require_literal "$release_workflow" "if: needs.prepare-version.outputs.is_stable_release != 'true'"
+require_literal "$release_workflow" "needs.prepare-version.outputs.is_stable_release != 'true'"
 require_literal "$release_workflow" 'needs: [prepare-version, build-cuda-runtime]'
 require_literal "$release_workflow" 'candidate_artifact: runtime-cuda-linux-x86_64'
 
-require_literal "$parity_workflow" 'name: ORT CPU Conformance'
+require_literal "$parity_workflow" 'name: ORT CPU Smoke and Release Parity'
 require_literal "$parity_workflow" "cancel-in-progress: \${{ github.event_name == 'pull_request' }}"
 require_literal "$parity_workflow" '.github/ort-cpu-parity.lock.json'
 require_literal "$parity_workflow" 'repository: kapsl-runtime/kapsl-sdk'
@@ -264,6 +278,7 @@ PY
 
 if grep -Eq 'KAPSL_ORT_INTEGRATIONS_REF:-|ref:.*feature/ort|ref:.*(main|develop)' \
   "$cpu_packager" \
+  "$build_workflow" \
   .github/workflows/beta-runtime-installers.yml \
   .github/workflows/release-runtime-installers.yml; then
   echo "ORT release paths must use an exact configured integrations commit without a branch fallback." >&2
