@@ -212,7 +212,14 @@ fi
 for workflow in \
   .github/workflows/beta-runtime-installers.yml \
   "$release_workflow"; do
-  require_literal "$workflow" '.github/scripts/package-linux-onnx-backend-packs.sh'
+  if grep -Fq '.github/scripts/package-linux-onnx-backend-packs.sh' "$workflow"; then
+    echo "$workflow must not build legacy ONNX accelerator backend packs." >&2
+    exit 1
+  fi
+  # Removing legacy backend archives must not remove the embedded rollback's
+  # provider sidecars or the certified CPU adapter used by non-stable builds.
+  require_literal "$workflow" '.github/scripts/collect-ort-sidecars.sh'
+  require_literal "$workflow" '.github/scripts/package-linux-provider-packs.sh'
   require_literal "$workflow" '.github/scripts/package-linux-ort-cpu-backend.sh'
   require_literal "$workflow" '.github/ort-integration.lock'
   require_literal "$workflow" 'ref: ${{ steps.ort-integrations.outputs.ref }}'
