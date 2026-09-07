@@ -85,14 +85,33 @@ jobs:
       EXPECTED_PLANNER_SCHEMA_VERSION: "1"
       EXPECTED_KV_ABI_MAJOR: "1"
       EXPECTED_KV_ABI_MINOR: "5"
-      EXPECTED_RUST_SDK_VERSION: "0.3.0"
-      EXPECTED_RUST_KV_ABI_VERSION: "0.6.0"
       KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
       VLLM_WHEEL_URL: https://wheels.vllm.ai/2ec6f0d71ea3b350952630e310efcda1c744ff4d/vllm-0.26.1rc1.dev1130%2Bg2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl
     steps:
+      - name: Initialize isolated artifact paths
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          output_dir="$RUNNER_TEMP/kapsl-vllm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          venv_dir="$RUNNER_TEMP/kapsl-vllm-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          wheel_path="$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
+          mkdir -p "$output_dir"
+          {
+            echo "github_run_id=$GITHUB_RUN_ID"
+            echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "engine_ref=$GITHUB_REF"
+            echo "engine_sha=$GITHUB_SHA"
+            echo "sdk_ref=$KAPSL_VLLM_SDK_REF"
+          } > "$output_dir/run-context.txt"
+          {
+            echo "OUTPUT_DIR=$output_dir"
+            echo "VENV_DIR=$venv_dir"
+            echo "VLLM_WHEEL_PATH=$wheel_path"
+          } >> "$GITHUB_ENV"
+
       - name: Verify GPU passthrough before build
         shell: bash
         run: |
@@ -113,26 +132,6 @@ jobs:
             build-essential ca-certificates cmake curl git libclang-dev libssl-dev ninja-build \
             pkg-config python3-dev python3-venv
           rm -rf /var/lib/apt/lists/*
-
-      - name: Initialize isolated artifact paths
-        shell: bash
-        run: |
-          output_dir="$RUNNER_TEMP/kapsl-vllm-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          venv_dir="$RUNNER_TEMP/kapsl-vllm-venv-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          wheel_path="$RUNNER_TEMP/vllm-0.26.1rc1.dev1130+g2ec6f0d71-cp38-abi3-manylinux_2_28_x86_64.whl"
-          mkdir -p "$output_dir"
-          {
-            echo "github_run_id=$GITHUB_RUN_ID"
-            echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
-            echo "engine_ref=$GITHUB_REF"
-            echo "engine_sha=$GITHUB_SHA"
-            echo "sdk_ref=$KAPSL_VLLM_SDK_REF"
-          } > "$output_dir/run-context.txt"
-          {
-            echo "OUTPUT_DIR=$output_dir"
-            echo "VENV_DIR=$venv_dir"
-            echo "VLLM_WHEEL_PATH=$wheel_path"
-          } >> "$GITHUB_ENV"
 
       - uses: actions/checkout@v4
         with:
@@ -162,7 +161,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine/kapsl-runtime
-          key: published-sdk-${{ env.EXPECTED_RUST_SDK_VERSION }}-kv-abi-${{ env.EXPECTED_RUST_KV_ABI_VERSION }}
+          key: published-sdk-${{ hashFiles('engine/kapsl-runtime/Cargo.lock') }}
           cache-on-failure: true
 
       - name: Build CUDA shared-pool runtime from published SDK crates
@@ -170,42 +169,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          metadata_path="$RUNNER_TEMP/kapsl-cargo-metadata.json"
+          metadata_path="$OUTPUT_DIR/cargo-metadata.json"
           cargo metadata --manifest-path kapsl-runtime/Cargo.toml \
-            --locked --format-version 1 > "$metadata_path"
-          python3 - "$metadata_path" <<'PY'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          metadata = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-          expected = {
-              "kapsl-engine-api": os.environ["EXPECTED_RUST_SDK_VERSION"],
-              "kapsl-hal": os.environ["EXPECTED_RUST_SDK_VERSION"],
-              "kapsl-kv-abi": os.environ["EXPECTED_RUST_KV_ABI_VERSION"],
-              "kapsl-llm": os.environ["EXPECTED_RUST_SDK_VERSION"],
-              "kapsl-monitor": os.environ["EXPECTED_RUST_SDK_VERSION"],
-              "kapsl-scheduler": os.environ["EXPECTED_RUST_SDK_VERSION"],
-              "kapsl-transport": os.environ["EXPECTED_RUST_SDK_VERSION"],
-          }
-          resolved = {name: [] for name in expected}
-          for package in metadata["packages"]:
-              if package["name"] in expected:
-                  resolved[package["name"]].append(
-                      (package["version"], package.get("source"))
-                  )
-          invalid = {
-              name: candidates
-              for name, candidates in resolved.items()
-              if len(candidates) != 1
-              or candidates[0][0] != expected[name]
-              or not (candidates[0][1] or "").startswith("registry+")
-          }
-          if invalid:
-              raise SystemExit(f"runtime did not resolve published SDK crates: {invalid}")
-          print(resolved)
-          PY
+            --locked --format-version 1 --no-default-features --features cuda > "$metadata_path"
+          python3 .github/scripts/verify_published_sdk.py --metadata "$metadata_path"
           cargo build --manifest-path kapsl-runtime/Cargo.toml --locked \
             --release -p kapsl --no-default-features --features cuda
 
@@ -1657,15 +1624,15 @@ jobs:
           rm -rf "$candidate_artifacts" "$candidate_root" "$bridge_work"
 
       - name: Upload conformance evidence
-        if: always()
+        if: always() && env.OUTPUT_DIR != ''
         uses: actions/upload-artifact@v4
         with:
           name: vllm-shared-pool-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.json
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.log
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.txt
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/*.sha256
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/wheels/*.whl
-            ${{ runner.temp }}/kapsl-vllm-${{ github.run_id }}-${{ github.run_attempt }}/ort-bridge/**
+            ${{ env.OUTPUT_DIR }}/*.json
+            ${{ env.OUTPUT_DIR }}/*.log
+            ${{ env.OUTPUT_DIR }}/*.txt
+            ${{ env.OUTPUT_DIR }}/*.sha256
+            ${{ env.OUTPUT_DIR }}/wheels/*.whl
+            ${{ env.OUTPUT_DIR }}/ort-bridge/**
           if-no-files-found: error

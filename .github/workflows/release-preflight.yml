@@ -20,6 +20,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check per-crate SDK pins without compiling or provisioning
+        run: python3 .github/scripts/verify_published_sdk.py --lockfile kapsl-runtime/Cargo.lock
       - name: Test release preflight and immutable import contracts
         run: |
           python3 .github/scripts/test_import_signed_backend_release.py

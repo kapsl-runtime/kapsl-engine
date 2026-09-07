@@ -65,6 +65,7 @@ on:
       - ".github/actions/cache-rust-build/**"
       - ".github/scripts/release_build_inputs.py"
       - ".github/scripts/preflight_release_environment.py"
+      - ".github/scripts/verify_published_sdk.py"
       - ".github/scripts/test_release_pipeline.py"
       - ".github/scripts/gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/github_jit_runner.py"
@@ -169,6 +170,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Check shell syntax
         run: |

@@ -202,6 +202,7 @@ if conformance_mode == "smoke":
         "concurrency": [1],
         "timeout_seconds": 30,
         "readiness_timeout_seconds": 120,
+        "readiness_poll_seconds": 0.005,
         "cooldown_seconds": 0,
         "rss_sample_seconds": 0,
     }
@@ -236,6 +237,7 @@ else:
         "concurrency": [1, 4],
         "timeout_seconds": 30,
         "readiness_timeout_seconds": 120,
+        "readiness_poll_seconds": 0.005,
         "cooldown_seconds": 0.25,
         "rss_sample_seconds": 0.05,
     }
@@ -257,9 +259,9 @@ else:
         "require_route_evidence": True,
         "require_startup_evidence": True,
     }
-    # Four samples per route keep a single host-scheduler startup outlier from
-    # controlling the median while preserving balanced ABBA ordering.
-    sequence = ["baseline", "candidate", "candidate", "baseline"] * 2
+    # Twenty starts per route expose scheduler variability across balanced ABBA
+    # blocks. Keep every sample and the existing 1.5x median startup gate.
+    sequence = ["baseline", "candidate", "candidate", "baseline"] * 10
 
 command = [
     engine_binary,
