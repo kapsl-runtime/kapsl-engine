@@ -351,6 +351,33 @@ class WorkflowTests(TestCase):
             self.assertEqual(caller_source.count("pattern: runtime-*"),
                              caller_source.count("name: Download installer artifacts"))
 
+    def test_reusable_build_callers_grant_the_requested_permissions(self):
+        # GitHub rejects the whole workflow before jobs start if a reusable
+        # workflow asks for a permission omitted by its caller. actionlint's
+        # syntax checks alone do not catch this cross-workflow contract.
+        required = dict(re.findall(
+            r"^  ([\w-]+): (read|write|none)$",
+            workflow("build-linux-accelerators").split("\njobs:", 1)[0], re.MULTILINE,
+        ))
+        self.assertEqual(required, {"contents": "read", "actions": "read"})
+        levels = {"none": 0, "read": 1, "write": 2}
+        for caller, name in (
+            ("beta-runtime-installers", "build-cuda-runtime"),
+            ("release-runtime-installers", "build-cuda-runtime"),
+            ("release-build-cache", "warm"),
+        ):
+            source = workflow(caller)
+            block = job(source, name)
+            self.assertIn("uses: ./.github/workflows/build-linux-accelerators.yml", block)
+            if "    permissions:\n" in block:
+                grants = dict(re.findall(r"^      ([\w-]+): (read|write|none)$", block, re.MULTILINE))
+            else:
+                grants = dict(re.findall(r"^  ([\w-]+): (read|write|none)$",
+                                         source.split("\njobs:", 1)[0], re.MULTILINE))
+            for scope, permission in required.items():
+                with self.subTest(caller=caller, scope=scope):
+                    self.assertGreaterEqual(levels[grants.get(scope, "none")], levels[permission])
+
     def test_cache_warming_does_not_publish_or_qualify(self):
         block = job(workflow("release-build-cache"), "warm")
         self.assertIn("github.ref == 'refs/heads/main'", block)
