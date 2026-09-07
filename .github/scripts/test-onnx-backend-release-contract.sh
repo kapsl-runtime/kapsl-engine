@@ -246,7 +246,7 @@ require_literal "$release_workflow" "needs.prepare-version.outputs.is_stable_rel
 require_literal "$release_workflow" 'needs: [prepare-version, build-cuda-runtime]'
 require_literal "$release_workflow" 'candidate_artifact: runtime-cuda-linux-x86_64'
 
-require_literal "$parity_workflow" 'name: ORT CPU Conformance'
+require_literal "$parity_workflow" 'name: ORT CPU Smoke and Release Parity'
 require_literal "$parity_workflow" "cancel-in-progress: \${{ github.event_name == 'pull_request' }}"
 require_literal "$parity_workflow" '.github/ort-cpu-parity.lock.json'
 require_literal "$parity_workflow" 'repository: kapsl-runtime/kapsl-sdk'

@@ -8,6 +8,10 @@ inputs:
     required: false
     default: kapsl-runtime -> target
     description: Cargo workspace and target directory mapping
+  save-pr-cache:
+    required: false
+    default: "false"
+    description: Allow an unprivileged PR check to save its isolated merge-ref cache
 runs:
   using: composite
   steps:
@@ -28,6 +32,10 @@ runs:
           ${{ steps.paths.outputs.unix }}
           ${{ steps.paths.outputs.macos }}
           ${{ steps.paths.outputs.windows }}
-        # PRs restore trusted base-branch caches but never update them. Avoid
-        # caching signing credentials, packaging scratch or release artifacts.
-        save-if: ${{ github.event_name != 'pull_request' }}
+        # PR writes are opt-in and scoped by GitHub to refs/pull/<n>/merge;
+        # branch/tag jobs cannot restore them. Other PR checks remain read-only.
+        # Never cache signing credentials, packaging scratch or release artifacts.
+        save-if: ${{ github.event_name != 'pull_request' || inputs.save-pr-cache == 'true' }}
+        # Keep dependencies available to fix a failing PR smoke test; failed
+        # trusted-branch/release jobs still do not save compilation caches here.
+        cache-on-failure: ${{ github.event_name == 'pull_request' && inputs.save-pr-cache == 'true' }}

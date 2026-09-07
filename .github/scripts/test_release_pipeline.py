@@ -358,7 +358,9 @@ class WorkflowTests(TestCase):
         self.assertNotIn("KAPSL_BACKEND_SIGNING_KEY", block)
         cache = (ROOT / ".github/actions/cache-rust-build/action.yml").read_text()
         self.assertIn("default: kapsl-runtime -> target", cache)
-        self.assertIn("save-if: ${{ github.event_name != 'pull_request' }}", cache)
+        self.assertIn("save-if: ${{ github.event_name != 'pull_request' || inputs.save-pr-cache == 'true' }}", cache)
+        self.assertIn("cache-on-failure: ${{ github.event_name == 'pull_request' && inputs.save-pr-cache == 'true' }}", cache)
+        self.assertRegex(cache, r'save-pr-cache:\n    required: false\n    default: "false"')
         self.assertNotIn("PRIVATE_KEY", cache)
 
     def test_ci_only_changes_do_not_automatically_build_betas(self):
@@ -373,6 +375,105 @@ class WorkflowTests(TestCase):
             self.assertFalse(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns), path)
         self.assertIn("workflow_dispatch:", source)
         self.assertIn("if: github.ref == 'refs/heads/develop'", source)
+
+
+class CpuSmokeWorkflowTests(TestCase):
+    def setUp(self):
+        self.source = workflow("ort-cpu-conformance")
+        trigger = self.source.split("  pull_request:\n", 1)[1].split("  workflow_call:", 1)[0]
+        self.patterns = re.findall(r'^      - "([^"]+)"', trigger, re.MULTILINE)
+
+    def matches(self, path):
+        return any(fnmatch.fnmatchcase(path, pattern) for pattern in self.patterns)
+
+    def test_runtime_and_real_pack_inputs_still_run_correctness_smoke(self):
+        for path in (
+            "rust-toolchain.toml", ".cargo/config.toml", "kapsl-runtime/Cargo.lock",
+            "kapsl-runtime/Cargo.toml", "kapsl-runtime/crates/kapsl-cli/Cargo.toml",
+            "kapsl-runtime/crates/kapsl-cli/src/backend/native.rs",
+            "kapsl-runtime/crates/kapsl-cli/src/backend/resolver.rs",
+            "kapsl-runtime/crates/kapsl-cli/src/runtime/model/lifecycle.rs",
+            "kapsl-runtime/crates/kapsl-backends/src/onnx.rs",
+            ".github/ort-integration.lock", ".github/ort-cpu-parity.lock.json",
+            ".github/licenses/ONNX-RUNTIME-LICENSE",
+            ".github/scripts/certify-ort-cpu-parity.sh",
+            ".github/scripts/generate-backend-index.py",
+            ".github/scripts/package-linux-ort-cpu-backend.sh",
+            ".github/scripts/verify-ort-integration-checkout.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self.matches(path))
+
+    def test_ci_authentication_and_test_only_changes_do_not_compile_ort(self):
+        for path in (
+            ".github/workflows/ort-cpu-conformance.yml",
+            ".github/workflows/release-runtime-installers.yml",
+            ".github/workflows/gpu-device-pool-integration.yml",
+            ".github/workflows/release-infrastructure-preflight.yml",
+            ".github/actions/cache-rust-build/action.yml",
+            ".github/scripts/preflight_release_environment.py",
+            ".github/scripts/validate_stable_gpu_release.py",
+            ".github/scripts/test-generate-backend-index.sh",
+            ".github/scripts/test-onnx-backend-release-contract.sh",
+            ".github/scripts/test-package-linux-ort-cpu-backend.sh",
+            ".github/scripts/test-verify-ort-integration-checkout.sh",
+            ".github/scripts/test_release_pipeline.py", "docs/architecture.md",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(self.matches(path))
+
+    def test_removed_triggers_remain_covered_by_lightweight_checks(self):
+        installer = workflow("installer-smoke")
+        triggers, steps = installer.split("\njobs:\n", 1)
+        for path in (
+            ".github/scripts/test-generate-backend-index.sh",
+            ".github/scripts/test-onnx-backend-release-contract.sh",
+            ".github/scripts/test-package-linux-ort-cpu-backend.sh",
+            ".github/scripts/test-verify-ort-integration-checkout.sh",
+            ".github/scripts/validate_stable_gpu_release.py",
+            ".github/workflows/ort-cpu-conformance.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'      - "{path}"', triggers)
+                if path.endswith(".sh"):
+                    self.assertIn(f"run: {path}", steps)
+        self.assertIn("python3 .github/scripts/test_release_pipeline.py", steps)
+        self.assertIn("python3 .github/scripts/test_gcp_ephemeral_gpu_runner.py", steps)
+        self.assertNotIn("run: .github/scripts/certify-ort-cpu-parity.sh", steps)
+
+    def test_cache_covers_actual_engine_and_adapter_targets_but_no_packs_or_keys(self):
+        block = job(self.source, "ort-cpu-release-handoff")
+        cache = block.split("      - name: Cache engine", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("uses: ./.github/actions/cache-rust-build", cache)
+        self.assertIn("ort-cpu-ubuntu22.04-${{ steps.release-inputs.outputs.integrations_ref }}", cache)
+        self.assertIn('save-pr-cache: "true"', cache)
+        mappings = re.findall(r'^            ([\w-]+) -> (.+)$', cache, re.MULTILINE)
+        targets = {root: (ROOT / root / target).resolve() for root, target in mappings}
+        self.assertEqual(targets["kapsl-runtime"], ROOT / "kapsl-runtime/target")
+        build_root = re.search(r'KAPSL_ORT_PACK_BUILD_DIR: \$\{\{ github.workspace \}\}/(.+)', block)
+        self.assertIsNotNone(build_root)
+        self.assertEqual(targets["kapsl-integrations-ort"], ROOT / build_root[1] / "target")
+        self.assertFalse(targets["kapsl-integrations-ort"].is_relative_to(ROOT / "kapsl-integrations-ort"))
+        self.assertLess(block.index("Cache engine"), block.index("Build and validate release handoff"))
+        self.assertLess(block.index("Install exact ORT packaging toolchain"), block.index("Cache engine"))
+        for forbidden in ("dist/", ".pem", "evidence", "cache-all-crates: true"):
+            self.assertNotIn(forbidden, "\n".join(line for line in cache.splitlines() if not line.lstrip().startswith("#")))
+        # All other callers retain the default read-only behavior on PRs.
+        for path in WORKFLOWS.glob("*.yml"):
+            if path.name != "ort-cpu-conformance.yml":
+                self.assertNotIn("save-pr-cache:", path.read_text(), path.name)
+
+    def test_modes_and_unconditional_evidence_remain_intact(self):
+        self.assertIn("name: ORT CPU Smoke and Release Parity", self.source)
+        self.assertIn("correctness smoke (PR)", self.source)
+        self.assertIn('if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then\n            mode=smoke', self.source)
+        self.assertIn('elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then\n            mode=performance', self.source)
+        self.assertIn("python3 .github/scripts/validate_stable_gpu_release.py", self.source)
+        self.assertIn("if: always()", self.source)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.source)
+        self.assertNotIn("self-hosted", self.source)
+        self.assertNotIn("secrets.", self.source)
+        self.assertNotIn("gpu-device-pool-integration.yml", self.source)
 
 
 if __name__ == "__main__":
