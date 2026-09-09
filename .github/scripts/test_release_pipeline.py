@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -616,6 +617,61 @@ class CpuSmokeWorkflowTests(TestCase):
         self.assertNotIn("self-hosted", self.source)
         self.assertNotIn("secrets.", self.source)
         self.assertNotIn("gpu-device-pool-integration.yml", self.source)
+
+
+class ConformanceToolingTests(TestCase):
+    def setUp(self):
+        self.gpu = job(workflow("vllm-shared-pool-conformance"), "flash-attn")
+        self.bash = shutil.which("bash")
+        self.assertIsNotNone(self.bash)
+
+    def test_jq_is_installed_and_probed_before_expensive_setup(self):
+        install = step(self.gpu, "Install declared build dependencies")
+        script = textwrap.dedent(install.split("        run: |\n", 1)[1])
+        command = next(line for line in script.replace("\\\n", " ").splitlines()
+                       if "apt-get install" in line)
+        self.assertIn("jq", shlex.split(command))
+        probe = self.gpu.index("Verify conformance JSON tooling")
+        self.assertLess(self.gpu.index("Install declared build dependencies"), probe)
+        for later in ("uses: ./engine/.github/actions/setup-rust",
+                      "Build CUDA shared-pool runtime from published SDK crates",
+                      "Install pinned adapter and backend artifacts",
+                      "Verify the immutable ORT bridge candidate"):
+            with self.subTest(later=later):
+                self.assertLess(probe, self.gpu.index(later))
+
+    def run_probe(self, jq_status):
+        probe = step(self.gpu, "Verify conformance JSON tooling")
+        script = textwrap.dedent(probe.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            if jq_status is not None:
+                executable = root / "jq"
+                executable.write_text(
+                    '#!/bin/sh\n[ "$#" -eq 1 ] && [ "$1" = "--version" ] || exit 99\n'
+                    "printf 'jq-fixture\\n'\n"
+                    f"exit {jq_status}\n"
+                )
+                executable.chmod(0o755)
+            # Never inherit the developer/host runner's jq: this must reproduce
+            # the minimal GPU container even when the test host has jq installed.
+            return subprocess.run([self.bash, "-c", script], cwd=root,
+                                  env=os.environ | {"PATH": str(root)},
+                                  capture_output=True, text=True, check=False)
+
+    def test_json_tool_probe_accepts_a_working_executable(self):
+        result = self.run_probe(0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "jq-fixture\n")
+
+    def test_json_tool_probe_rejects_a_missing_executable(self):
+        result = self.run_probe(None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Required conformance tool is missing: jq", result.stderr)
+
+    def test_json_tool_probe_rejects_a_broken_executable(self):
+        result = self.run_probe(42)
+        self.assertEqual(result.returncode, 42, result.stderr)
 
 
 class ConformanceEvidenceTests(TestCase):
