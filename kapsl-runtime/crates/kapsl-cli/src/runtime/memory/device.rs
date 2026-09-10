@@ -1071,6 +1071,12 @@ impl DeviceMemoryManager {
     }
 
     fn admit_pool(&self, device_id: usize, owner: PoolOwner) -> Result<(), String> {
+        let Some(authority) = self.devices.get(&device_id) else {
+            return Ok(());
+        };
+        // Admission must retain the same backing that it protects. Serialize
+        // pool lookup and owner admission with retirement and replacement.
+        let _init_guard = authority.pool_init_lock.lock().unwrap();
         let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
             return Ok(());
         };
@@ -1304,6 +1310,10 @@ impl DeviceMemoryManager {
     /// torn down. Backend clients must retire their registrations before the
     /// backing allocation and its accounting can be released.
     fn try_reclaim_pool(&self, device_id: usize) {
+        let Some(authority) = self.devices.get(&device_id) else {
+            return;
+        };
+        let _init_guard = authority.pool_init_lock.lock().unwrap();
         if self
             .admission_refs
             .lock()
@@ -1313,10 +1323,6 @@ impl DeviceMemoryManager {
         {
             return;
         }
-        let Some(authority) = self.devices.get(&device_id) else {
-            return;
-        };
-        let _init_guard = authority.pool_init_lock.lock().unwrap();
         let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
             return;
         };
