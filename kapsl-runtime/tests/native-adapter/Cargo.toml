@@ -1,0 +1,18 @@
+[package]
+name = "kapsl-native-test-adapter"
+version = "0.0.0"
+edition = "2021"
+publish = false
+rust-version = "1.92"
+
+# Keep this dev dependency out of engine `--workspace` release builds.
+[workspace]
+resolver = "2"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kapsl-backend-abi = "=0.2.0"
+kapsl-engine-api = "0.3.0"
+serde_json = "1"

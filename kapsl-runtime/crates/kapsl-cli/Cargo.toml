@@ -85,3 +85,6 @@ semver = "1.0"
 tempfile = "3.10"
 libloading = "0.8"
 ort = { version = "=2.0.0-rc.11", default-features = false, features = ["cuda", "tensorrt"] }
+
+[dev-dependencies]
+kapsl-native-test-adapter = { path = "../../tests/native-adapter" }

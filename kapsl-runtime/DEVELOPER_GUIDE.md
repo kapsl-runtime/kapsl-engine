@@ -1152,6 +1152,9 @@ RUST_LOG=debug cargo run -p kapsl -- --model model.aimod
 
 ---
 
+Native adapter changes must pass the [host allocator regression tests](docs/native-host-tests.md),
+which load a test adapter through the production ABI with a fake device pool.
+
 **Document Version**: 1.0  
 **Maintained by**: kapsl-runtime development team  
 **Last Review**: December 4, 2025
