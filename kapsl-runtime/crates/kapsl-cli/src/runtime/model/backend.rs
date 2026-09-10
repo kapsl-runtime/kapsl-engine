@@ -5,8 +5,91 @@ use kapsl_engine_api::{
     OpenAiWireStreamResponse, RequestMemoryAdmission,
 };
 
-struct MemoryTrackedEngine {
+/// A backend and the pool registrations it needs from planning through final
+/// destruction. Drop the engine before releasing allocator callback storage.
+pub(super) struct PreparedBackend {
     inner: Box<dyn kapsl_engine_api::Engine>,
+    #[cfg(any(feature = "gpu-device-pool", test))]
+    _pool_clients: Vec<PoolClientLease>,
+}
+
+impl PreparedBackend {
+    #[cfg(any(feature = "gpu-device-pool", test))]
+    pub(super) fn with_pool_clients(mut self, clients: Vec<PoolClientLease>) -> Self {
+        self._pool_clients.extend(clients);
+        self
+    }
+}
+
+impl From<Box<dyn kapsl_engine_api::Engine>> for PreparedBackend {
+    fn from(inner: Box<dyn kapsl_engine_api::Engine>) -> Self {
+        Self {
+            inner,
+            #[cfg(any(feature = "gpu-device-pool", test))]
+            _pool_clients: Vec::new(),
+        }
+    }
+}
+
+impl<T: kapsl_engine_api::Engine + 'static> From<Box<T>> for PreparedBackend {
+    fn from(inner: Box<T>) -> Self {
+        Self::from(inner as Box<dyn kapsl_engine_api::Engine>)
+    }
+}
+
+impl std::ops::Deref for PreparedBackend {
+    type Target = dyn kapsl_engine_api::Engine;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_ref()
+    }
+}
+
+impl std::ops::DerefMut for PreparedBackend {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut()
+    }
+}
+
+impl Drop for PreparedBackend {
+    fn drop(&mut self) {
+        self.inner.unload();
+        // Fields drop in declaration order: engine first, then client leases.
+    }
+}
+
+#[cfg(feature = "gpu-device-pool")]
+pub(super) fn acquire_embedded_ort_pool_clients(
+    resources: &RuntimeResources,
+    provider: &str,
+    device_ids: &[usize],
+) -> Result<Vec<PoolClientLease>, String> {
+    if !provider.eq_ignore_ascii_case("cuda") && !provider.eq_ignore_ascii_case("tensorrt") {
+        return Ok(Vec::new());
+    }
+    let mut clients = Vec::new();
+    for &device_id in device_ids {
+        let device =
+            i32::try_from(device_id).map_err(|_| "ORT device ID exceeds i32".to_string())?;
+        if let Some(client) =
+            resources
+                .memory()
+                .acquire_cuda_pool_client(device_id, "embedded-ort", |pool| {
+                    kapsl_backends::ort_pool_allocator::register_pool_allocator(device, pool)?;
+                    let pool = pool.clone();
+                    Ok(Box::new(move || {
+                        kapsl_backends::ort_pool_allocator::unregister_pool_allocator(device, &pool)
+                    }))
+                })?
+        {
+            clients.push(client);
+        }
+    }
+    Ok(clients)
+}
+
+struct MemoryTrackedEngine {
+    inner: PreparedBackend,
     lease: std::sync::Mutex<Option<MemoryLease>>,
     resources: Arc<RuntimeResources>,
     owner: MemoryOwner,
@@ -19,7 +102,7 @@ struct MemoryTrackedEngine {
 
 impl MemoryTrackedEngine {
     fn new(
-        inner: Box<dyn kapsl_engine_api::Engine>,
+        inner: impl Into<PreparedBackend>,
         lease: MemoryLease,
         resources: Arc<RuntimeResources>,
         owner: MemoryOwner,
@@ -27,7 +110,7 @@ impl MemoryTrackedEngine {
         priority_lease: ModelPriorityLease,
     ) -> Self {
         Self {
-            inner,
+            inner: inner.into(),
             lease: std::sync::Mutex::new(Some(lease)),
             resources,
             owner,
@@ -358,7 +441,7 @@ pub(super) fn create_runtime_backend_for_device(
     resources: &RuntimeResources,
     model_id: u32,
     replica_id: u32,
-) -> Result<Box<dyn kapsl_engine_api::Engine>, String> {
+) -> Result<PreparedBackend, String> {
     let engine_kind = EngineKind::resolve(manifest);
     #[cfg(not(any(
         feature = "native",
@@ -376,7 +459,7 @@ pub(super) fn create_runtime_backend_for_device(
             model_id,
             replica_id,
         )? {
-            return Ok(backend);
+            return Ok(backend.into());
         }
     }
 
@@ -392,7 +475,7 @@ pub(super) fn create_runtime_backend_for_device(
         } else {
             BackendFactory::create_gguf_native(device_id as i32, None)?
         };
-        return Ok(Box::new(backend));
+        return Ok(Box::new(backend).into());
     }
 
     #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
@@ -407,7 +490,7 @@ pub(super) fn create_runtime_backend_for_device(
         } else {
             BackendFactory::create_gguf_cuda_shared_kv(device_id as i32, None)?
         };
-        return Ok(Box::new(backend));
+        return Ok(Box::new(backend).into());
     }
 
     #[cfg(feature = "native")]
@@ -419,7 +502,7 @@ pub(super) fn create_runtime_backend_for_device(
                 model_id,
                 replica_id,
             )
-            .map(|backend| Box::new(backend) as Box<dyn kapsl_engine_api::Engine>);
+            .map(|backend| PreparedBackend::from(Box::new(backend)));
         }
     }
 
@@ -447,7 +530,8 @@ pub(super) fn create_runtime_backend_for_device(
                     model_id,
                     replica_id,
                     &onnx_adapter_options(tuning),
-                );
+                )
+                .map(PreparedBackend::from);
             }
             OnnxBackendRoute::EmbeddedRollback { reason } => {
                 log::warn!(
@@ -464,6 +548,15 @@ pub(super) fn create_runtime_backend_for_device(
         ));
     }
 
+    #[cfg(feature = "gpu-device-pool")]
+    let pool_clients = if engine_kind.uses_onnx_session() {
+        // Signed packs returned above. Only the explicit embedded route can
+        // register the legacy environment allocator, before memory planning.
+        acquire_embedded_ort_pool_clients(resources, provider, &[device_id])?
+    } else {
+        Vec::new()
+    };
+
     if engine_kind.is_onnx_generate() {
         // The SDK's automatic ONNX-generate constructor may fall back to CPU.
         // Bind the exact provider chosen by Kapsl policy so a missing CUDA or
@@ -472,7 +565,10 @@ pub(super) fn create_runtime_backend_for_device(
             .with_memory_owner(model_id, replica_id);
         #[cfg(feature = "gpu-device-pool")]
         let backend = backend.with_env_allocators(resources.uses_env_allocators(device_id));
-        return Ok(Box::new(backend));
+        let backend = PreparedBackend::from(Box::new(backend));
+        #[cfg(feature = "gpu-device-pool")]
+        let backend = backend.with_pool_clients(pool_clients);
+        return Ok(backend);
     }
 
     let default_tuning = OnnxRuntimeTuning::default();
@@ -489,7 +585,7 @@ pub(super) fn create_runtime_backend_for_device(
         None => &default_tuning,
     };
 
-    BackendFactory::create_backend_for_device_with_tuning_and_owner(
+    let backend = BackendFactory::create_backend_for_device_with_tuning_and_owner(
         manifest,
         provider,
         device_id,
@@ -497,7 +593,11 @@ pub(super) fn create_runtime_backend_for_device(
         tuning,
         model_id,
         replica_id,
-    )
+    )?;
+    let backend = PreparedBackend::from(backend);
+    #[cfg(feature = "gpu-device-pool")]
+    let backend = backend.with_pool_clients(pool_clients);
+    Ok(backend)
 }
 
 /// Execute the runtime-owned backend load transaction.
@@ -508,7 +608,7 @@ pub(super) fn create_runtime_backend_for_device(
 /// returned engine.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_runtime_backend(
-    mut backend: Box<dyn kapsl_engine_api::Engine>,
+    mut backend: PreparedBackend,
     model_file_path: &Path,
     admission_domains: &[MemoryDomain],
     resources: &Arc<RuntimeResources>,
@@ -613,6 +713,197 @@ mod tests {
     }
 
     struct WireStreamEngine;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LoadFailure {
+        None,
+        Planning,
+        Admission,
+        Loading,
+        Cancellation,
+        Reconciliation,
+    }
+
+    struct PoolAwareEngine {
+        clients: Arc<PoolClients>,
+        events: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        failure: LoadFailure,
+    }
+
+    impl PoolAwareEngine {
+        fn report(&self, live: bool) -> MemoryReport {
+            MemoryReport {
+                allocations: [
+                    ("weights", EngineMemoryClass::PersistentWeights),
+                    ("scratch", EngineMemoryClass::TransientWorkspace),
+                ]
+                .into_iter()
+                .map(|(id, class)| MemoryAllocation {
+                    allocation_id: id.to_string(),
+                    domain: EngineMemoryDomain::Host,
+                    class,
+                    source: MemoryAllocationSource::BackendManaged,
+                    bytes: if self.failure == LoadFailure::Admission
+                        || (live && self.failure == LoadFailure::Reconciliation)
+                    {
+                        usize::MAX / 4
+                    } else {
+                        128
+                    },
+                })
+                .collect(),
+            }
+        }
+    }
+
+    impl Drop for PoolAwareEngine {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("destroy");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl kapsl_engine_api::Engine for PoolAwareEngine {
+        fn planned_memory(&self, _path: &Path) -> Result<MemoryReport, EngineError> {
+            assert!(
+                !self.clients.retire().unwrap(),
+                "registration must precede planning"
+            );
+            self.events.lock().unwrap().push("plan");
+            if self.failure == LoadFailure::Planning {
+                return Err(EngineError::backend("planned failure"));
+            }
+            Ok(self.report(false))
+        }
+
+        async fn load(&mut self, _path: &Path) -> Result<(), EngineError> {
+            assert!(
+                !self.clients.retire().unwrap(),
+                "registration must survive loading"
+            );
+            self.events.lock().unwrap().push("load");
+            if self.failure == LoadFailure::Cancellation {
+                return std::future::pending().await;
+            }
+            if self.failure == LoadFailure::Loading {
+                return Err(EngineError::backend("load failure"));
+            }
+            Ok(())
+        }
+
+        fn actual_memory(&self) -> MemoryReport {
+            self.report(true)
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+            Ok(request.input.clone())
+        }
+
+        fn infer_stream(&self, request: &InferenceRequest) -> EngineStream {
+            let output = request.input.clone();
+            Box::pin(stream::once(async move { Ok(output) }))
+        }
+
+        fn unload(&mut self) {
+            self.events.lock().unwrap().push("unload");
+        }
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        fn health_check(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn pool_registration_survives_planning_and_releases_after_backend_destruction() {
+        use kapsl_engine_api::Engine;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for failure in [
+            LoadFailure::None,
+            LoadFailure::Planning,
+            LoadFailure::Admission,
+            LoadFailure::Loading,
+            LoadFailure::Cancellation,
+            LoadFailure::Reconciliation,
+        ] {
+            let resources = RuntimeResources::new(&device_info()).unwrap();
+            let clients = Arc::new(PoolClients::default());
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let cleanup_events = events.clone();
+            let client = clients
+                .acquire("fake-adapter", || {
+                    events.lock().unwrap().push("register");
+                    Ok(Box::new(move || {
+                        let mut events = cleanup_events.lock().unwrap();
+                        assert_eq!(
+                            events.last(),
+                            Some(&"destroy"),
+                            "allocator outlives backend destructor"
+                        );
+                        events.push("unregister");
+                        Ok(())
+                    }))
+                })
+                .unwrap();
+            let prepared = PreparedBackend::from(Box::new(PoolAwareEngine {
+                clients: clients.clone(),
+                events: events.clone(),
+                failure,
+            }))
+            .with_pool_clients(vec![client]);
+            let mut loading = Box::pin(load_runtime_backend(
+                prepared,
+                file.path(),
+                &[MemoryDomain::Host],
+                &resources,
+                61,
+                0,
+                EngineKind::Native,
+                1,
+                "fake adapter lifecycle",
+            ));
+            if failure == LoadFailure::Cancellation {
+                assert!(futures::poll!(loading.as_mut()).is_pending());
+                assert!(events.lock().unwrap().contains(&"load"));
+                assert!(!clients.retire().unwrap());
+                drop(loading);
+            } else {
+                let result = loading.await;
+                if failure == LoadFailure::None {
+                    let mut backend = result.unwrap();
+                    assert!(!clients.retire().unwrap());
+                    backend.unload();
+                    assert!(
+                        !clients.retire().unwrap(),
+                        "backend can still hold allocator pointers until destruction"
+                    );
+                    drop(backend);
+                } else {
+                    assert!(result.is_err(), "{failure:?} should reject loading");
+                }
+            }
+            assert!(clients.retire().unwrap());
+            let events = events.lock().unwrap();
+            assert_eq!(events.first(), Some(&"register"));
+            assert_eq!(&events[events.len() - 2..], &["destroy", "unregister"]);
+            if matches!(failure, LoadFailure::Planning | LoadFailure::Admission) {
+                assert!(
+                    !events.contains(&"load"),
+                    "failure before admission must not load the backend"
+                );
+            }
+            assert!(resources
+                .memory()
+                .snapshot()
+                .rows
+                .iter()
+                .filter(|row| row.owner == MemoryOwner::new(61, 0))
+                .all(|row| row.reserved_bytes == 0));
+        }
+    }
 
     #[cfg(feature = "gpu-device-pool")]
     struct PeakThenSettledSwapEngine {

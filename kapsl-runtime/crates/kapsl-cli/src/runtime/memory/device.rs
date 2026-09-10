@@ -126,6 +126,19 @@ struct ExternalReservation {
     owns_charge: bool,
 }
 
+struct ManagedDevicePool {
+    backing: Arc<GpuDevicePool>,
+    clients: Arc<PoolClients>,
+}
+
+impl std::ops::Deref for ManagedDevicePool {
+    type Target = GpuDevicePool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.backing
+    }
+}
+
 /// Runtime memory authority for each CUDA device.
 ///
 /// Backends receive cloned elastic-pool handles where available, while this
@@ -133,7 +146,7 @@ struct ExternalReservation {
 /// cannot yet live in that pool (notably llama.cpp weights and compute scratch).
 pub(crate) struct DeviceMemoryManager {
     devices: HashMap<usize, DeviceAuthority>,
-    pools: Mutex<HashMap<usize, Arc<GpuDevicePool>>>,
+    pools: Mutex<HashMap<usize, Arc<ManagedDevicePool>>>,
     budget: Mutex<DeviceBudgetLedger>,
     admission_refs: Mutex<HashMap<(usize, PoolOwner), usize>>,
     next_fallback_allocation: AtomicU64,
@@ -142,8 +155,9 @@ pub(crate) struct DeviceMemoryManager {
 
 impl DeviceMemoryManager {
     /// Create one authority for every CUDA device. Fixed and model-aware
-    /// automatic pools are built and registered with ORT before any model
-    /// session is constructed; external-memory accounting remains active when
+    /// automatic pools are built before any model session is constructed.
+    /// Backend registrations are acquired separately by their consumers;
+    /// external-memory accounting remains active when
     /// no physical pool is materialized.
     pub(crate) fn from_env_with_plan(
         device_info: &DeviceInfo,
@@ -243,10 +257,10 @@ impl DeviceMemoryManager {
             }
         }
 
-        // Validate every deterministic sizing decision before registering the
-        // first process-global ORT allocator. Physical allocation failures can
-        // still happen later if live free VRAM changes, but a bad configuration
-        // cannot leave startup half-registered across devices.
+        // Validate every deterministic sizing decision before allocating the
+        // first device pool. Physical allocation failures can still happen
+        // later if live free VRAM changes, but a bad configuration cannot leave
+        // startup partially allocated across devices.
         for (&device_id, authority) in &self.devices {
             let demand = bootstrap.demand(device_id);
             match authority.pool_mode {
@@ -466,10 +480,13 @@ impl DeviceMemoryManager {
                 "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool still has live allocations and cannot be rematerialized"
             ));
         }
-        kapsl_backends::ort_pool_allocator::unregister_pool_allocator(device_id as i32, &pool)
-            .map_err(|error| {
-                format!("cannot rematerialize automatic CUDA pool on device {device_id}: {error}")
-            })?;
+        if !pool.clients.retire().map_err(|error| {
+            format!("cannot rematerialize automatic CUDA pool on device {device_id}: {error}")
+        })? {
+            return Err(format!(
+                "cannot rematerialize automatic CUDA pool on device {device_id}: backend clients are still live"
+            ));
+        }
         self.pools.lock().unwrap().remove(&device_id);
         if let Some(metrics) = self.metrics.lock().unwrap().clone() {
             metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
@@ -588,17 +605,13 @@ impl DeviceMemoryManager {
                 ));
             }
         };
-        if let Err(error) =
-            kapsl_backends::ort_pool_allocator::register_pool_allocator(device_id as i32, &pool)
-        {
-            let _ = self
-                .budget
-                .lock()
-                .unwrap()
-                .set_pooled_bytes(device_id, previous.pooled_bytes);
-            return Err(error);
-        }
-        self.pools.lock().unwrap().insert(device_id, pool);
+        self.pools.lock().unwrap().insert(
+            device_id,
+            Arc::new(ManagedDevicePool {
+                backing: pool,
+                clients: Arc::new(PoolClients::default()),
+            }),
+        );
         self.publish_metrics(device_id, charged);
         Ok(())
     }
@@ -623,7 +636,7 @@ impl DeviceMemoryManager {
     }
 
     /// Refresh inference-time allocator metrics immediately before a
-    /// Prometheus scrape. Budget metrics are event-driven, but ORT and KV
+    /// Prometheus scrape. Budget metrics are event-driven, but backend and KV
     /// suballocations can change on every inference, so they must be sampled
     /// from the live pool instead of waiting for another model lifecycle event.
     pub(crate) fn refresh_pool_metrics(&self) {
@@ -649,7 +662,36 @@ impl DeviceMemoryManager {
 
     #[cfg(feature = "gpu-device-pool")]
     pub(crate) fn pool(&self, device_id: usize) -> Option<Arc<GpuDevicePool>> {
-        self.pools.lock().unwrap().get(&device_id).cloned()
+        self.pools
+            .lock()
+            .unwrap()
+            .get(&device_id)
+            .map(|pool| pool.backing.clone())
+    }
+
+    pub(crate) fn acquire_pool_client(
+        self: &Arc<Self>,
+        device_id: usize,
+        client: &'static str,
+        register: impl FnOnce(&Arc<GpuDevicePool>) -> Result<PoolClientCleanup, String>,
+    ) -> Result<Option<PoolClientLease>, String> {
+        let Some(authority) = self.devices.get(&device_id) else {
+            return Ok(None);
+        };
+        let _init_guard = authority.pool_init_lock.lock().unwrap();
+        let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
+            return Ok(None);
+        };
+        let manager = Arc::downgrade(self);
+        pool.clients
+            .acquire(client, || register(&pool.backing))
+            .map(|lease| {
+                Some(lease.on_release(move || {
+                    if let Some(manager) = manager.upgrade() {
+                        manager.try_reclaim_pool(device_id);
+                    }
+                }))
+            })
     }
 
     pub(crate) fn has_pool(&self, device_id: usize) -> bool {
@@ -1259,8 +1301,8 @@ impl DeviceMemoryManager {
     }
 
     /// Drop an idle backing allocation after the final admitted consumer has
-    /// torn down. ORT must be unregistered before its stable allocator Box and
-    /// pool Arc can be released.
+    /// torn down. Backend clients must retire their registrations before the
+    /// backing allocation and its accounting can be released.
     fn try_reclaim_pool(&self, device_id: usize) {
         if self
             .admission_refs
@@ -1281,15 +1323,17 @@ impl DeviceMemoryManager {
         if pool.free_bytes() != pool.capacity_bytes() {
             return;
         }
-        if let Err(error) =
-            kapsl_backends::ort_pool_allocator::unregister_pool_allocator(device_id as i32, &pool)
-        {
-            log::warn!(
-                "[device-memory] cannot reclaim idle CUDA pool on device {}: {}",
-                device_id,
-                error
-            );
-            return;
+        match pool.clients.retire() {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                log::warn!(
+                    "[device-memory] cannot reclaim idle CUDA pool on device {}: {}",
+                    device_id,
+                    error
+                );
+                return;
+            }
         }
         self.pools.lock().unwrap().remove(&device_id);
         if let Some(metrics) = self.metrics.lock().unwrap().clone() {
@@ -1694,7 +1738,7 @@ fn configured_quota(
     };
     let max = configured_bytes(max_name, device_id)?.unwrap_or(pool.capacity_bytes());
     // Protect a useful share for each admitted backend by default. Four-way
-    // sharing covers the common ORT + multiple KV-owner deployment while
+    // sharing covers backend sessions plus multiple KV owners while
     // explicit per-owner settings retain full control (including zero).
     let guaranteed = configured_bytes(guaranteed_name, device_id)?
         .unwrap_or_else(|| (pool.capacity_bytes() / 4).min(max));
