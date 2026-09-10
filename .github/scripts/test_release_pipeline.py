@@ -615,6 +615,29 @@ class CpuSmokeWorkflowTests(TestCase):
 
 
 class ConformanceToolingTests(TestCase):
+    def test_ort_qualification_request_matches_the_utf8_tensor_contract(self):
+        source = step(workflow("vllm-shared-pool-conformance"),
+                      "Build exact CUDA and TensorRT offline qualification bundles")
+        script = textwrap.dedent(source.split("        run: |\n", 1)[1])
+        command = next(line.strip() for line in script.replace("\\\n", " ").splitlines()
+                       if line.strip().startswith("jq -cn --arg prompt "))
+        arguments = shlex.split(command)
+        arguments = arguments[:arguments.index(">")]
+        self.assertIsNotNone(shutil.which(arguments[0]), "jq is required by release conformance")
+        prompt_index = arguments.index("prompt") + 1
+        for prompt in (arguments[prompt_index], "GPU mémoire 🦙"):
+            with self.subTest(prompt=prompt):
+                invocation = arguments.copy()
+                invocation[prompt_index] = prompt
+                result = subprocess.run(invocation, capture_output=True, text=True, check=True)
+                request = json.loads(result.stdout)
+                tensor = request["input"]
+                payload = base64.b64decode(tensor["data_base64"], validate=True)
+                self.assertEqual(payload, prompt.encode("utf-8"))
+                self.assertEqual(tensor["dtype"], "string")
+                self.assertEqual(tensor["shape"], [1, len(payload)])
+                self.assertEqual(request["metadata"]["max_new_tokens"], 8)
+
     def setUp(self):
         self.gpu = job(workflow("vllm-shared-pool-conformance"), "flash-attn")
         self.bash = shutil.which("bash")

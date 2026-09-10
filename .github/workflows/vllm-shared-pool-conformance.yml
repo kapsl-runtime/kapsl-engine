@@ -1573,7 +1573,7 @@ jobs:
               ' "$ORT_BRIDGE_EVIDENCE_DIR/bundle-$profile.json" >/dev/null
           done
           jq -cn --arg prompt "The bridge release uses signed backend packs." \
-            '{input:{shape:[1,1],dtype:"string",data_base64:($prompt|@base64)},session_id:"ort-stable-qualification",metadata:{max_new_tokens:8,min_new_tokens:8,temperature:0.0,seed:7}}' \
+            '{input:{shape:[1,($prompt|utf8bytelength)],dtype:"string",data_base64:($prompt|@base64)},session_id:"ort-stable-qualification",metadata:{max_new_tokens:8,min_new_tokens:8,temperature:0.0,seed:7}}' \
             > "$ORT_BRIDGE_WORK_DIR/ort-request.json"
           sha256sum "$cuda_aimod" "$tensorrt_aimod" "$cuda_bundle" "$tensorrt_bundle" \
             > "$ORT_BRIDGE_EVIDENCE_DIR/qualification-inputs.sha256"
