@@ -505,18 +505,13 @@ class WorkflowTests(TestCase):
         self.assertRegex(cache, r'save-pr-cache:\n    required: false\n    default: "false"')
         self.assertNotIn("PRIVATE_KEY", cache)
 
-    def test_ci_only_changes_do_not_automatically_build_betas(self):
+    def test_beta_packaging_requires_deliberate_dispatch_on_develop(self):
         source = workflow("beta-runtime-installers")
-        paths = source.split("    paths:\n", 1)[1].split("\npermissions:", 1)[0]
-        patterns = re.findall(r'^      - "([^"]+)"', paths, re.MULTILINE)
-        for path in ("kapsl-runtime/crates/kapsl-cli/src/main.rs", "rust-toolchain.toml",
-                     "installers/install.sh", ".github/scripts/package-linux-cuda-runtime.sh"):
-            self.assertTrue(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns), path)
-        for path in (".github/workflows/gpu-device-pool-integration.yml",
-                     ".github/scripts/preflight_release_environment.py", "docs/architecture.md"):
-            self.assertFalse(any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns), path)
-        self.assertIn("workflow_dispatch:", source)
-        self.assertIn("if: github.ref == 'refs/heads/develop'", source)
+        trigger = source.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertEqual(re.findall(r"^  ([a-z_]+):", trigger, re.MULTILINE),
+                         ["workflow_dispatch"])
+        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'",
+                      job(source, "prepare-version"))
 
 
 class CpuSmokeWorkflowTests(TestCase):
