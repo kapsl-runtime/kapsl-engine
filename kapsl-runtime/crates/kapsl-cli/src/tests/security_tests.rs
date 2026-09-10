@@ -322,6 +322,102 @@ fn make_test_auth_state() -> ApiAuthState {
     }
 }
 
+#[cfg(feature = "grpc-server")]
+#[tokio::test]
+async fn grpc_http_and_login_share_live_key_scope_expiry_and_revocation() {
+    use kapsl_grpc::{tonic::Code, RequestAuthorizer};
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = make_test_auth_state();
+    state.store_path = dir.path().join("auth.json");
+    state
+        .create_api_key(
+            "user-admin",
+            CreateApiKeyRequest {
+                name: "admin".into(),
+                scopes: None,
+                expires_in_days: None,
+            },
+        )
+        .unwrap();
+    let key = state
+        .create_api_key(
+            "user-reader",
+            CreateApiKeyRequest {
+                name: "reader".into(),
+                scopes: Some(vec!["api:read".into()]),
+                expires_in_days: None,
+            },
+        )
+        .unwrap();
+    let token = format!("Bearer {}", key.raw_key);
+    let state = Arc::new(RwLock::new(state));
+    let grpc = GrpcAuthorizer(state.clone());
+    let http = api_auth_filter(ApiRole::Reader, ApiScope::Read, state.clone());
+    let login = build_auth_routes(state.clone()).login;
+    let peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    for scenario in ["allowed", "scope", "expired", "suspended", "revoked"] {
+        {
+            let mut state = state.write();
+            let reader = state
+                .store
+                .api_keys
+                .iter_mut()
+                .find(|stored| stored.id == key.api_key.id)
+                .unwrap();
+            reader.scopes = if scenario == "scope" {
+                vec!["unrelated:read".into()]
+            } else {
+                vec!["api:read".into()]
+            };
+            reader.expires_at = (scenario == "expired").then(|| now_unix_seconds() - 1);
+            reader.revoked_at = (scenario == "revoked").then(now_unix_seconds);
+            state
+                .store
+                .users
+                .iter_mut()
+                .find(|user| user.id == "user-reader")
+                .unwrap()
+                .status = if scenario == "suspended" {
+                ApiUserStatus::Suspended
+            } else {
+                ApiUserStatus::Active
+            };
+        }
+        let grpc_result = grpc.authorize_reader(Some(&token), Some(peer.ip()));
+        let http_result = warp::test::request()
+            .remote_addr(peer)
+            .header("authorization", &token)
+            .filter(&http)
+            .await;
+        let login_result = warp::test::request()
+            .method("POST")
+            .path("/api/auth/login")
+            .remote_addr(peer)
+            .header("authorization", &token)
+            .header("content-type", "application/json")
+            .body("{}")
+            .reply(&login)
+            .await;
+        if scenario == "allowed" {
+            assert!(grpc_result.is_ok());
+            assert!(http_result.is_ok());
+            assert_eq!(login_result.status(), 200);
+        } else {
+            let forbidden = scenario == "scope";
+            assert_eq!(
+                grpc_result.unwrap_err().code(),
+                if forbidden {
+                    Code::PermissionDenied
+                } else {
+                    Code::Unauthenticated
+                }
+            );
+            assert!(http_result.is_err());
+            assert_eq!(login_result.status(), if forbidden { 403 } else { 401 });
+        }
+    }
+}
+
 #[test]
 fn test_shared_authorization_enforces_loopback_role_and_scope_policy() {
     let state = RwLock::new(make_test_auth_state());
@@ -411,6 +507,8 @@ async fn test_shared_authorization_and_login_track_live_key_policy() {
     let authorization = format!("Bearer {}", created.raw_key);
     let login = build_auth_routes(state.clone()).login;
     let reader = api_auth_filter(ApiRole::Reader, ApiScope::Read, state.clone());
+    #[cfg(feature = "mcp-server")]
+    let mcp = RuntimeMcpAuthorizer::new(state.clone());
     for (case, expected_status) in [
         ("active", 200),
         ("scope", 403),
@@ -439,6 +537,21 @@ async fn test_shared_authorization_and_login_track_live_key_policy() {
             Some(peer.ip()),
         );
         assert_eq!(direct.is_ok(), expected_status == 200, "{case}");
+        #[cfg(feature = "mcp-server")]
+        {
+            let decision = kapsl_mcp::RequestAuthorizer::authorize_reader(
+                &mcp,
+                Some(&authorization),
+                peer.ip(),
+            );
+            let status = match decision {
+                Ok(()) => 200,
+                Err(kapsl_mcp::AuthorizationError::Unauthorized) => 401,
+                Err(kapsl_mcp::AuthorizationError::Forbidden)
+                | Err(kapsl_mcp::AuthorizationError::LocalOnly) => 403,
+            };
+            assert_eq!(status, expected_status, "MCP {case}");
+        }
         let filtered = warp::test::request()
             .header("authorization", &authorization)
             .remote_addr(peer)

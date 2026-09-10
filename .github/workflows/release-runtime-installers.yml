@@ -7,6 +7,7 @@ on:
       - "v*"
 
 permissions:
+  actions: read
   contents: write
 
 env:
@@ -18,7 +19,7 @@ env:
   APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
   WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
   WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-  KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+  KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }} ${{ vars.KAPSL_ORT_BACKEND_PUBLIC_KEY }}
 
 jobs:
   prepare-version:
@@ -29,6 +30,7 @@ jobs:
       numeric_version: ${{ steps.version.outputs.numeric_version }}
       deb_version: ${{ steps.version.outputs.deb_version }}
       is_release: ${{ steps.version.outputs.is_release }}
+      is_stable_release: ${{ steps.version.outputs.is_stable_release }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,6 +41,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo_version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          is_stable_release=false
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ -n "${GITHUB_REF_NAME:-}" ]; then
             version="${GITHUB_REF_NAME#v}"
             if [ "$cargo_version" != "$version" ]; then
@@ -46,6 +49,13 @@ jobs:
               exit 1
             fi
             is_release=true
+            if [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then
+                echo "Official stable releases require their original tag-push event." >&2
+                exit 1
+              fi
+              is_stable_release=true
+            fi
           else
             version="${cargo_version}-dev.${GITHUB_RUN_NUMBER}"
             is_release=false
@@ -61,15 +71,128 @@ jobs:
           echo "numeric_version=$numeric_version" >> "$GITHUB_OUTPUT"
           echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
           echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
+          echo "is_stable_release=$is_stable_release" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signed ORT release before any builds or qualification
+        if: steps.version.outputs.is_stable_release == 'true'
+        run: python3 .github/scripts/preflight-ort-release.py --require-runtime-trust
+
+      - name: Validate signing and publication configuration before builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 .github/scripts/preflight_release_environment.py --signing --sdk
+
+  stable-release-infrastructure-preflight:
+    name: Authenticate release infrastructure before builds (no GPU)
+    needs: prepare-version
+    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-infrastructure-preflight.yml
+    secrets: inherit
+
+  publish-docker:
+    name: Publish Docker images after qualified installers
+    needs: [prepare-version, upload-release-assets, upload-r2]
+    if: needs.prepare-version.outputs.is_release == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-docker-images.yml
+    with:
+      release_version: ${{ needs.prepare-version.outputs.version }}
+      update_channel_tags: true
+
+  stable-release-cpu-conformance:
+    name: Stable release CPU performance parity
+    needs: [prepare-version, stable-release-infrastructure-preflight]
+    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    uses: ./.github/workflows/ort-cpu-conformance.yml
+
+  stable-release-gpu-conformance:
+    name: Stable release GPU conformance
+    needs: [prepare-version, build-cuda-runtime]
+    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    # Reusable workflows cannot elevate permissions: both GCP setup and teardown
+    # require OIDC, but ordinary build and publication jobs do not.
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/gpu-device-pool-integration.yml
+    with:
+      release_tag: ${{ github.ref_name }}
+      candidate_artifact: runtime-cuda-linux-x86_64
+      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
+      cuda_visible_devices: "0"
+    # Keep the App key environment-owned and optional in workflow_call. Secret
+    # inheritance is also needed for environment-secret resolution by runners.
+    secrets: inherit
+
+  release-conformance-gate:
+    name: Gate publication on stable conformance and teardown
+    needs:
+      - prepare-version
+      - stable-release-infrastructure-preflight
+      - stable-release-cpu-conformance
+      - stable-release-gpu-conformance
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the appropriate qualification results
+        shell: bash
+        env:
+          PREPARE_RESULT: ${{ needs.prepare-version.result }}
+          IS_STABLE_RELEASE: ${{ needs.prepare-version.outputs.is_stable_release }}
+          INFRASTRUCTURE_RESULT: ${{ needs.stable-release-infrastructure-preflight.result }}
+          CPU_CONFORMANCE_RESULT: ${{ needs.stable-release-cpu-conformance.result }}
+          GPU_CONFORMANCE_AND_TEARDOWN_RESULT: ${{ needs.stable-release-gpu-conformance.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$PREPARE_RESULT" != "success" ]]; then
+            echo "Release version preparation did not succeed." >&2
+            exit 1
+          fi
+          if [[ "$IS_STABLE_RELEASE" == "true" ]]; then
+            if [[ "$INFRASTRUCTURE_RESULT" != "success" ]]; then
+              echo "Stable release infrastructure authentication did not succeed." >&2
+              exit 1
+            fi
+            if [[ "$CPU_CONFORMANCE_RESULT" != "success" ]]; then
+              echo "Stable CPU performance parity did not succeed." >&2
+              exit 1
+            fi
+            if [[ "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "success" ]]; then
+              echo "Stable GPU conformance or its unconditional teardown did not succeed." >&2
+              exit 1
+            fi
+          else
+            if [[ "$CPU_CONFORMANCE_RESULT" != "skipped" || "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "skipped" ]]; then
+              echo "Prerelease and development workflows must not invoke stable conformance." >&2
+              exit 1
+            fi
+          fi
 
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
-    needs: prepare-version
+    needs: [prepare-version, stable-release-infrastructure-preflight]
+    if: >-
+      !cancelled() && needs.prepare-version.result == 'success' &&
+      (needs.prepare-version.outputs.is_stable_release != 'true' ||
+      needs.stable-release-infrastructure-preflight.result == 'success')
     runs-on: ${{ matrix.os }}
     env:
       KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
       KAPSL_NUMERIC_VERSION: ${{ needs.prepare-version.outputs.numeric_version }}
       KAPSL_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
+      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C debuginfo=0 -C link-arg=/DEBUG:NONE' || '' }}
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -84,9 +207,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache release compiler dependencies
+        uses: ./.github/actions/cache-rust-build
         with:
-          toolchain: 1.92.0
+          key: release-portable-${{ matrix.os }}
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
@@ -339,141 +465,30 @@ jobs:
 
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
-    needs: prepare-version
-    runs-on: ubuntu-22.04
-    container:
-      # The CUDA archive carries the complete GGUF + ONNX GPU runtime, like a
-      # Triton GPU image. Use the cuDNN build image so the packager can collect
-      # every user-space library; only the NVIDIA driver stays host-provided.
-      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CMAKE_BUILD_PARALLEL_LEVEL: "2"
-      CUDA_PATH: /usr/local/cuda
-      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
-      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
-      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
-      LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
-    steps:
-      - name: Install CUDA build dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
-          rm -rf /var/lib/apt/lists/*
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate certified vLLM SDK commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Protected KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit." >&2
-            exit 1
-          fi
-
-      - name: Checkout certified vLLM connector
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
-          path: sdk-vllm
-
-      - name: Verify certified vLLM SDK checkout
-        shell: bash
-        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
-
-      - name: Checkout certified llama.cpp shared-pool SDK
-        if: ${{ vars.KAPSL_LLAMA_SDK_REF != '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ vars.KAPSL_LLAMA_SDK_REF }}
-          path: sdk-llama
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
-
-      - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
-
-      - name: Collect ONNX Runtime sidecars
-        shell: bash
-        run: .github/scripts/collect-ort-sidecars.sh
-
-      - name: Collect TensorRT 10 user-space runtime
-        shell: bash
-        run: .github/scripts/collect-linux-tensorrt-runtime.sh
-
-      - name: Package CUDA runtime bundle
-        shell: bash
-        run: .github/scripts/package-linux-cuda-runtime.sh
-
-      - name: Package split ONNX backend packs
-        shell: bash
-        run: .github/scripts/package-linux-onnx-backend-packs.sh
-
-      - name: Package native llama.cpp backend packs
-        shell: bash
-        env:
-          KAPSL_LLAMA_SDK_DIR: ${{ vars.KAPSL_LLAMA_SDK_REF != '' && 'sdk-llama' || '' }}
-          KAPSL_LLAMA_SDK_REF: ${{ vars.KAPSL_LLAMA_SDK_REF }}
-        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
-
-      - name: Reclaim CUDA build scratch before backend packaging
-        shell: bash
-        run: cargo clean --manifest-path kapsl-runtime/Cargo.toml
-
-      - name: Package certified managed-vLLM backend
-        shell: bash
-        env:
-          KAPSL_VLLM_SDK_DIR: sdk-vllm
-        run: .github/scripts/package-linux-vllm-backend.sh
-
-      - name: Generate signed backend index
-        shell: bash
-        env:
-          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_PUBLIC_KEYS" ]; then
-            echo "Backend signing key and embedded public key are required." >&2
-            exit 1
-          fi
-          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
-          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
-          chmod 600 "$key_file"
-          trap 'rm -f "$key_file"' EXIT
-          .github/scripts/generate-backend-index.py \
-            --version "$KAPSL_VERSION" \
-            --artifacts-dir dist \
-            --output dist/backend-index.json \
-            --signing-key "$key_file" \
-            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
-            --channel stable
-          rm -f "$key_file" dist/*.manifest.json
-          trap - EXIT
-
-      - name: Upload CUDA runtime artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-cuda-linux-x86_64
-          path: dist/*
-          if-no-files-found: error
-          compression-level: 0
+    needs: [prepare-version, stable-release-infrastructure-preflight]
+    if: >-
+      !cancelled() && needs.prepare-version.result == 'success' &&
+      (needs.prepare-version.outputs.is_stable_release != 'true' ||
+      needs.stable-release-infrastructure-preflight.result == 'success')
+    uses: ./.github/workflows/build-linux-accelerators.yml
+    with:
+      version: ${{ needs.prepare-version.outputs.version }}
+      channel: stable
+      stable_release: ${{ needs.prepare-version.outputs.is_stable_release == 'true' }}
+      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }} ${{ vars.KAPSL_ORT_BACKEND_PUBLIC_KEY }}
+      KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
 
   upload-release-assets:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-runtime-installers, build-cuda-runtime]
+    needs: [build-runtime-installers, build-cuda-runtime, release-conformance-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: runtime-*
           path: release-assets
           merge-multiple: true
 
@@ -537,7 +552,7 @@ jobs:
           files: github-release-assets/**
 
   upload-r2:
-    needs: [prepare-version, build-runtime-installers, build-cuda-runtime]
+    needs: [prepare-version, build-runtime-installers, build-cuda-runtime, release-conformance-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -546,6 +561,7 @@ jobs:
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: runtime-*
           path: release-assets
           merge-multiple: true
 
@@ -555,15 +571,32 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
+          release_root="s3://kapsl-installer/runtime/v${{ needs.prepare-version.outputs.version }}"
+          public_root="https://downloads.kapsl.net/runtime/v${{ needs.prepare-version.outputs.version }}"
+
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/v${{ needs.prepare-version.outputs.version }}/ \
+            "$release_root/" \
             --recursive \
+            --exclude "backend-index.json" \
+            --exclude "backend-index.json.sig" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
           .github/scripts/verify-public-backend-release.sh \
             release-assets/backend-index.json \
-            https://downloads.kapsl.net/runtime/v${{ needs.prepare-version.outputs.version }}
+            "$public_root" \
+            --artifacts-only
+
+          for name in backend-index.json.sig backend-index.json; do
+            aws s3 cp "release-assets/$name" \
+              "$release_root/$name" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done
+
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            "$public_root"
 
       - name: Upload Linux installer scripts to R2 (stable URLs)
         env:
@@ -571,8 +604,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          for script in install.sh install-cuda.sh; do
-            aws s3 cp "$script" \
+          for script_path in installers/install.sh installers/install-cuda.sh; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
@@ -585,8 +619,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          for script in install.ps1 install-cuda.ps1 install-tensorrt.ps1; do
-            aws s3 cp "$script" \
+          for script_path in installers/install.ps1 installers/install-cuda.ps1 installers/install-tensorrt.ps1; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \

@@ -3,6 +3,17 @@ set -euo pipefail
 
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 
+selected_profile="${KAPSL_LLAMA_PACK_PROFILE:-all}"
+case "$selected_profile" in
+  all|cpu|cuda12) ;;
+  *) echo "KAPSL_LLAMA_PACK_PROFILE must be all, cpu or cuda12." >&2; exit 1 ;;
+esac
+build_only="${KAPSL_LLAMA_BUILD_ONLY:-false}"
+case "$build_only" in
+  true|false) ;;
+  *) echo "KAPSL_LLAMA_BUILD_ONLY must be true or false." >&2; exit 1 ;;
+esac
+
 host_os="${RUNNER_OS:-$(uname -s)}"
 host_arch="${RUNNER_ARCH:-$(uname -m)}"
 if [ "$host_os" != "Linux" ] || { [ "$host_arch" != "X64" ] && [ "$host_arch" != "x86_64" ]; }; then
@@ -39,25 +50,6 @@ build_profile() {
   feature="$2"
   override="$3"
   kv_mode="$4"
-  sdk_dir="${KAPSL_LLAMA_SDK_DIR:-}"
-  if [ "$kv_mode" = "shared_pool" ] && [ -z "$sdk_dir" ]; then
-    echo "KAPSL_LLAMA_SDK_DIR is required for shared-pool packs" >&2
-    exit 1
-  fi
-  if [ -n "$sdk_dir" ]; then
-    sdk_ref="${KAPSL_LLAMA_SDK_REF:?KAPSL_LLAMA_SDK_REF is required when KAPSL_LLAMA_SDK_DIR is set}"
-    if [ ! -f "$sdk_dir/crates/kapsl-llm/Cargo.toml" ] \
-      || [ ! -f "$sdk_dir/crates/kapsl-engine-api/Cargo.toml" ]; then
-      echo "KAPSL llama.cpp SDK checkout is missing kapsl-llm or kapsl-engine-api: $sdk_dir" >&2
-      exit 1
-    fi
-    actual_sdk_ref="$(git -C "$sdk_dir" rev-parse HEAD)"
-    if [ "$actual_sdk_ref" != "$sdk_ref" ]; then
-      echo "kapsl-sdk checkout is $actual_sdk_ref, expected $sdk_ref" >&2
-      exit 1
-    fi
-    sdk_dir="$(cd "$sdk_dir" && pwd)"
-  fi
   if [ -n "$override" ]; then
     if [ ! -f "$override" ]; then
       echo "Configured $profile llama.cpp library does not exist: $override" >&2
@@ -67,36 +59,23 @@ build_profile() {
     return
   fi
 
-  target_dir="$work_root/target-$profile"
-  build_features="$feature"
-  if [ "$kv_mode" = "shared_pool" ]; then
-    build_features="$build_features,kapsl-llm/gguf-external-kv"
-  fi
+  # A caller-owned target survives packaging cleanup and can be restored on
+  # another runner. Keep CPU and CUDA/PIC feature builds in separate targets.
+  target_dir="${KAPSL_LLAMA_TARGET_ROOT:-$work_root/targets}/$profile"
   cargo_args=(
     build
     --manifest-path kapsl-runtime/Cargo.toml
     -p kapsl-backend-llama-cpp
     --release
+    --locked
     --no-default-features
-    --features "$build_features"
+    --features "$feature"
     --target-dir "$target_dir"
   )
-  if [ "$kv_mode" = "shared_pool" ]; then
-    # The backend entrypoint is a cdylib which statically links llama.cpp's
-    # C/CUDA archives. Force every CMake target (including nvcc objects) to be
-    # position independent so the final shared object is linkable on Linux.
-    CMAKE_POSITION_INDEPENDENT_CODE=ON KAPSL_LLAMA_EXTERNAL_POOL_SDK=1 cargo \
-      --config "patch.crates-io.kapsl-llm.path='$sdk_dir/crates/kapsl-llm'" \
-      --config "patch.crates-io.kapsl-engine-api.path='$sdk_dir/crates/kapsl-engine-api'" \
-      "${cargo_args[@]}"
-  elif [ -n "$sdk_dir" ]; then
-    CMAKE_POSITION_INDEPENDENT_CODE=ON cargo \
-      --config "patch.crates-io.kapsl-llm.path='$sdk_dir/crates/kapsl-llm'" \
-      --config "patch.crates-io.kapsl-engine-api.path='$sdk_dir/crates/kapsl-engine-api'" \
-      "${cargo_args[@]}"
-  else
-    CMAKE_POSITION_INDEPENDENT_CODE=ON cargo "${cargo_args[@]}"
-  fi
+  # The backend entrypoint is a cdylib which statically links llama.cpp's
+  # C/CUDA archives. Force every CMake target (including nvcc objects) to be
+  # position independent so the final shared object is linkable on Linux.
+  CMAKE_POSITION_INDEPENDENT_CODE=ON cargo "${cargo_args[@]}"
   printf '%s\n' "$target_dir/release/libkapsl_backend_llama_cpp.so"
 }
 
@@ -168,6 +147,10 @@ package_profile() {
     echo "llama.cpp $profile build did not produce $library" >&2
     exit 1
   fi
+  if [ "$build_only" = true ]; then
+    echo "Built llama.cpp $profile dependencies for the trusted release cache."
+    return
+  fi
   if ! file "$library" | grep -q 'ELF .* shared object'; then
     echo "llama.cpp $profile entrypoint is not an ELF shared object: $library" >&2
     exit 1
@@ -210,9 +193,13 @@ package_profile() {
     cp "$gcc_license" "$root/licenses/GCC-RUNTIME-COPYRIGHT"
   fi
   if [ "$accelerator" = "cuda" ]; then
-    nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-${KAPSL_CUDA_RUNTIME_ROOT:-}/NVIDIA-CONTAINER-LICENSE}"
-    if [ -z "$nvidia_license" ] || [ ! -f "$nvidia_license" ]; then
-      echo "Missing NVIDIA redistribution license for llama.cpp CUDA pack." >&2
+    nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-}"
+    if [ -z "$nvidia_license" ] && [ -n "${KAPSL_CUDA_RUNTIME_ROOT:-}" ]; then
+      nvidia_license="${KAPSL_CUDA_RUNTIME_ROOT%/}/NVIDIA-CONTAINER-LICENSE"
+    fi
+    nvidia_license="${nvidia_license:-/NGC-DL-CONTAINER-LICENSE}"
+    if [ ! -f "$nvidia_license" ]; then
+      echo "Missing NVIDIA redistribution license for llama.cpp CUDA pack: $nvidia_license" >&2
       exit 1
     fi
     cp "$nvidia_license" "$root/licenses/NVIDIA-CONTAINER-LICENSE"
@@ -299,9 +286,9 @@ PY
   echo "Packaged $archive"
 }
 
-package_profile cpu cpu cpu "${KAPSL_LLAMA_CPU_LIBRARY:-}" native
-if [ -n "${KAPSL_LLAMA_SDK_DIR:-}" ]; then
+if [ "$selected_profile" = all ] || [ "$selected_profile" = cpu ]; then
+  package_profile cpu cpu cpu "${KAPSL_LLAMA_CPU_LIBRARY:-}" native
+fi
+if [ "$selected_profile" = all ] || [ "$selected_profile" = cuda12 ]; then
   package_profile cuda12 cuda cuda12-shared-pool "${KAPSL_LLAMA_CUDA_LIBRARY:-}" shared_pool
-else
-  package_profile cuda12 cuda cuda12 "${KAPSL_LLAMA_CUDA_LIBRARY:-}" native
 fi

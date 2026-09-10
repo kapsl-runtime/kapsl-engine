@@ -1,0 +1,247 @@
+name: Build Linux accelerator artifacts (host only)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ""
+      channel:
+        type: string
+        required: false
+        default: stable
+      stable_release:
+        type: boolean
+        required: false
+        default: false
+      cache_only:
+        type: boolean
+        required: false
+        default: false
+      sdk_ref:
+        type: string
+        required: false
+        default: ""
+    secrets:
+      KAPSL_BACKEND_PUBLIC_KEYS:
+        required: true
+      KAPSL_BACKEND_SIGNING_KEY_B64:
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.inputs.outputs.version }}
+      matrix: ${{ steps.inputs.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate build inputs and select independent components
+        id: inputs
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+          STABLE_RELEASE: ${{ inputs.stable_release }}
+          CACHE_ONLY: ${{ inputs.cache_only }}
+          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+        run: python3 .github/scripts/release_build_inputs.py
+
+      - name: Verify certified SDK availability before fan-out
+        if: '!inputs.cache_only'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+        run: python3 .github/scripts/preflight_release_environment.py --sdk
+
+  components:
+    name: Build ${{ matrix.component }}
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    container:
+      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CMAKE_BUILD_PARALLEL_LEVEL: "2"
+      CUDA_PATH: /usr/local/cuda
+      KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE
+      KAPSL_VERSION: ${{ needs.prepare.outputs.version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
+      LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
+    steps:
+      - name: Install CUDA build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust
+        if: matrix.component != 'vllm'
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache engine and native backend dependencies
+        if: matrix.component == 'engine' || startsWith(matrix.component, 'llama-')
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: release-linux-x86_64-cuda1263-ubuntu2204-${{ matrix.component }}
+          workspaces: kapsl-runtime -> ${{ matrix.target }}
+
+      - name: Build kapsl with statically compiled GGUF CUDA
+        if: matrix.component == 'engine'
+        run: cargo build --manifest-path kapsl-runtime/Cargo.toml --locked -p kapsl --release --no-default-features --features cuda
+
+      - name: Collect ONNX Runtime sidecars
+        if: matrix.component == 'engine' && !inputs.cache_only
+        run: .github/scripts/collect-ort-sidecars.sh
+
+      - name: Collect TensorRT 10 user-space runtime
+        if: matrix.component == 'engine' && !inputs.cache_only
+        run: .github/scripts/collect-linux-tensorrt-runtime.sh
+
+      - name: Package CUDA runtime bundle
+        if: matrix.component == 'engine' && !inputs.cache_only
+        run: .github/scripts/package-linux-cuda-runtime.sh
+
+      - name: Package llama.cpp backend packs from published SDK crates
+        if: startsWith(matrix.component, 'llama-')
+        env:
+          KAPSL_LLAMA_PACK_PROFILE: ${{ matrix.profile }}
+          KAPSL_LLAMA_TARGET_ROOT: ${{ github.workspace }}/kapsl-runtime/target-llama
+          KAPSL_LLAMA_BUILD_ONLY: ${{ inputs.cache_only }}
+          CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
+
+      - name: Checkout certified vLLM connector
+        if: matrix.component == 'vllm'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kapsl-runtime/kapsl-sdk
+          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
+          path: sdk-vllm
+
+      - name: Verify certified vLLM SDK checkout
+        if: matrix.component == 'vllm'
+        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
+
+      - name: Package certified managed-vLLM backend
+        if: matrix.component == 'vllm'
+        env:
+          KAPSL_VLLM_SDK_DIR: sdk-vllm
+        run: .github/scripts/package-linux-vllm-backend.sh
+
+      - name: Resolve certified ORT integrations commit
+        if: matrix.component == 'ort-cpu'
+        id: ort-integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '\r\n' < .github/ort-integration.lock)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "KAPSL_ORT_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout certified ORT adapter
+        if: matrix.component == 'ort-cpu'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.ort-integrations.outputs.ref }}
+          path: kapsl-integrations-ort
+
+      - name: Verify certified ORT integrations checkout
+        if: matrix.component == 'ort-cpu'
+        run: .github/scripts/verify-ort-integration-checkout.sh kapsl-integrations-ort "$KAPSL_ORT_INTEGRATIONS_REF"
+
+      - name: Install certified ORT packaging toolchain
+        if: matrix.component == 'ort-cpu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-ort/rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$toolchain" --profile minimal
+
+      - name: Package certified ORT CPU adapter
+        if: matrix.component == 'ort-cpu'
+        run: .github/scripts/package-linux-ort-cpu-backend.sh
+
+      - name: Upload independently retryable build component
+        if: '!inputs.cache_only'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: build-cuda-${{ matrix.component }}-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.stable_release && 7 || 1 }}
+          overwrite: true
+
+  assemble:
+    name: Assemble and sign the CUDA release candidate
+    needs: [prepare, components]
+    if: '!inputs.cache_only'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      KAPSL_VERSION: ${{ needs.prepare.outputs.version }}
+      KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download only this run's component artifacts for this commit
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-cuda-*-${{ github.sha }}
+          path: release-parts
+          merge-multiple: false
+
+      - name: Verify component set and assemble without duplicate filenames
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          STABLE_RELEASE: ${{ inputs.stable_release }}
+        run: python3 .github/scripts/release_build_inputs.py --assemble release-parts --output dist
+
+      - name: Import immutable signed ORT backend packs
+        if: inputs.stable_release
+        run: |
+          python3 .github/scripts/import-signed-backend-release.py \
+            --version "$KAPSL_VERSION" --lock .github/ort-release.lock.json \
+            --artifacts-dir dist --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"
+
+      - name: Generate signed backend index
+        env:
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          RELEASE_CHANNEL: ${{ inputs.channel }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
+          trap 'rm -f "$key_file"' EXIT
+          umask 077
+          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
+          python3 .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" --artifacts-dir dist --output dist/backend-index.json \
+            --signing-key "$key_file" --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
+            --channel "$RELEASE_CHANNEL"
+          rm -f dist/*.manifest.json
+
+      - name: Upload CUDA runtime artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-cuda-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: ${{ inputs.stable_release && 7 || 1 }}
+          overwrite: true

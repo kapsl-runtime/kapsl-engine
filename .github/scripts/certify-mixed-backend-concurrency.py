@@ -17,6 +17,13 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from managed_vllm_gpu_conformance import parse_prometheus
+
+
+METRICS_SAMPLE_INTERVAL_SECONDS = 0.01
+METRICS_REQUEST_TIMEOUT_SECONDS = 2.0
+RELEASE_TIMEOUT_SECONDS = 10.0
+
 
 @dataclass(frozen=True)
 class PromptCase:
@@ -148,9 +155,262 @@ def backend_summary(samples: list[dict[str, Any]], backend: str) -> dict[str, An
     }
 
 
+def _values_by_device(
+    metrics,
+    name: str,
+    labels: dict[str, str] | None = None,
+    *,
+    integral: bool,
+    required: bool = True,
+) -> dict[str, float | int]:
+    selected: dict[str, float | int] = {}
+    for sample in metrics.get(name, []):
+        if labels and any(sample.labels.get(key) != value for key, value in labels.items()):
+            continue
+        device = sample.labels.get("device")
+        if device is None or not device.isdigit() or str(int(device)) != device:
+            raise ValueError(f"metric {name} has no canonical device label")
+        if device in selected:
+            raise ValueError(f"metric {name} repeats device {device}")
+        if integral and not sample.value.is_integer():
+            raise ValueError(f"metric {name} is not integral: {sample.value}")
+        selected[device] = int(sample.value) if integral else float(sample.value)
+    if not selected and required:
+        available = [sample.labels for sample in metrics.get(name, [])[:10]]
+        raise ValueError(
+            f"metric {name} has no matching samples for labels {labels or {}}; "
+            f"available={available}"
+        )
+    return selected
+
+
+def _integral_by_device(
+    metrics,
+    name: str,
+    labels: dict[str, str] | None = None,
+    *,
+    required: bool = True,
+) -> dict[str, int]:
+    return _values_by_device(
+        metrics, name, labels, integral=True, required=required
+    )  # type: ignore[return-value]
+
+
+def _numeric_by_device(metrics, name: str) -> dict[str, float]:
+    return _values_by_device(
+        metrics, name, integral=False
+    )  # type: ignore[return-value]
+
+
+def primary_model_id(models: Any, model: str) -> int:
+    if not isinstance(models, list):
+        raise ValueError("model inventory was not a list")
+    primary = [
+        row
+        for row in models
+        if isinstance(row, dict)
+        and row.get("name") == model
+        and row.get("replica_id") == 0
+    ]
+    if len(primary) != 1:
+        raise ValueError(f"expected one llama.cpp primary model row, found {primary!r}")
+    model_id = primary[0].get("base_model_id")
+    if isinstance(model_id, bool) or not isinstance(model_id, int) or model_id < 0:
+        raise ValueError(f"llama.cpp primary has an invalid base_model_id: {model_id!r}")
+    return model_id
+
+
+def validate_mixed_memory(
+    metrics_text: str, *, vllm_model: str, llama_model_id: int
+) -> dict[str, Any]:
+    metrics = parse_prometheus(metrics_text)
+    vllm_labels = {"model": vllm_model}
+    backing = _integral_by_device(
+        metrics, "kapsl_managed_vllm_kv_backing_bytes", vllm_labels
+    )
+    quarantine = _integral_by_device(
+        metrics, "kapsl_managed_vllm_kv_quarantine_bytes", vllm_labels
+    )
+    # Runtime pool metrics retain the allocation class in the owner label.
+    # Admission is established with the model-load representative while the
+    # persistent shared KV allocation is charged to the same workload under
+    # its exact class. Bind both samples to the selected primary replica so an
+    # unrelated GGUF model cannot satisfy this gate.
+    workload = f"gguf:{llama_model_id}:0"
+    admission_owner = f"{workload}:persistent-weights"
+    kv_owner = f"{workload}:kv-cache"
+    llama_admitted = _integral_by_device(
+        metrics,
+        "kapsl_gpu_device_pool_owner_admitted",
+        {"owner": admission_owner},
+    )
+    llama_kv_admitted = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_owner_admitted", {"owner": kv_owner}
+    )
+    llama_usage = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_owner_usage_bytes", {"owner": kv_owner}
+    )
+    authority_available = _integral_by_device(
+        metrics, "kapsl_device_memory_available_bytes"
+    )
+    pool_allocated = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_allocated_bytes"
+    )
+    pool_free = _integral_by_device(metrics, "kapsl_gpu_device_pool_free_bytes")
+    pool_free_ranges = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_free_ranges"
+    )
+    largest_free_ranges = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_largest_free_range_bytes"
+    )
+    fragmentation = _numeric_by_device(
+        metrics, "kapsl_gpu_device_pool_fragmentation_ratio"
+    )
+    if set(backing) != set(quarantine):
+        raise ValueError(
+            f"managed-vLLM backing/quarantine devices diverged: {backing} != {quarantine}"
+        )
+    if any(value <= 0 for value in backing.values()):
+        raise ValueError(f"managed-vLLM backing is not active: {backing}")
+    if any(quarantine.values()):
+        raise ValueError(f"managed-vLLM has quarantined memory: {quarantine}")
+    if (
+        set(llama_admitted) != set(llama_usage)
+        or set(llama_kv_admitted) != set(llama_usage)
+        or any(value != 1 for value in llama_admitted.values())
+        or any(value != 1 for value in llama_kv_admitted.values())
+        or any(value <= 0 for value in llama_usage.values())
+    ):
+        raise ValueError(
+            "llama.cpp shared-pool workload is not active: "
+            f"admission_owner={admission_owner} admitted={llama_admitted} "
+            f"kv_owner={kv_owner} kv_admitted={llama_kv_admitted} "
+            f"usage={llama_usage}"
+        )
+    missing_authority = set(backing) - set(authority_available)
+    if missing_authority or any(
+        authority_available[device] <= 0 for device in backing
+    ):
+        raise ValueError(
+            "mixed load consumed every authority byte instead of leaving ungranted VRAM: "
+            f"{authority_available}"
+        )
+    owner_devices = set(llama_usage)
+    if not owner_devices.issubset(backing):
+        raise ValueError(
+            "llama.cpp and managed vLLM are not active on the same devices: "
+            f"llama={sorted(owner_devices)} vllm={sorted(backing)}"
+        )
+    pool_maps = (
+        pool_allocated,
+        pool_free,
+        pool_free_ranges,
+        largest_free_ranges,
+        fragmentation,
+    )
+    if any(not owner_devices.issubset(values) for values in pool_maps) or any(
+        pool_allocated[device] <= 0
+        or pool_free[device] <= 0
+        or pool_free_ranges[device] <= 0
+        or largest_free_ranges[device] <= 0
+        or largest_free_ranges[device] > pool_free[device]
+        or not 0.0 <= fragmentation[device] <= 1.0
+        for device in owner_devices
+    ):
+        raise ValueError(
+            "mixed load did not retain a valid reusable general-pool range: "
+            f"free={pool_free} ranges={pool_free_ranges} largest={largest_free_ranges} "
+            f"fragmentation={fragmentation}"
+        )
+    return {
+        "vllm_backing_bytes": backing,
+        "vllm_quarantine_bytes": quarantine,
+        "llama_admission_owner": admission_owner,
+        "llama_kv_owner": kv_owner,
+        "llama_owner_usage_bytes": llama_usage,
+        "authority_available_bytes": authority_available,
+        "general_pool_allocated_bytes": pool_allocated,
+        "general_pool_free_bytes": pool_free,
+        "general_pool_free_ranges": pool_free_ranges,
+        "general_pool_largest_free_range_bytes": largest_free_ranges,
+        "general_pool_fragmentation_ratio": fragmentation,
+    }
+
+
+def validate_released_mixed_memory(
+    metrics_text: str, *, llama_model_id: int, active_devices: set[str]
+) -> dict[str, Any]:
+    if not active_devices:
+        raise ValueError("active llama.cpp KV devices were empty")
+    metrics = parse_prometheus(metrics_text)
+    workload = f"gguf:{llama_model_id}:0"
+    admission_owner = f"{workload}:persistent-weights"
+    kv_owner = f"{workload}:kv-cache"
+    admitted = _integral_by_device(
+        metrics,
+        "kapsl_gpu_device_pool_owner_admitted",
+        {"owner": admission_owner},
+    )
+    residual_kv = _integral_by_device(
+        metrics,
+        "kapsl_gpu_device_pool_owner_usage_bytes",
+        {"owner": kv_owner},
+        required=False,
+    )
+    pool_allocated = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_allocated_bytes"
+    )
+    pool_free = _integral_by_device(metrics, "kapsl_gpu_device_pool_free_bytes")
+    pool_free_ranges = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_free_ranges"
+    )
+    largest_free_ranges = _integral_by_device(
+        metrics, "kapsl_gpu_device_pool_largest_free_range_bytes"
+    )
+    fragmentation = _numeric_by_device(
+        metrics, "kapsl_gpu_device_pool_fragmentation_ratio"
+    )
+    if set(admitted) != active_devices or any(value != 1 for value in admitted.values()):
+        raise ValueError(
+            "llama.cpp workload admission changed after inference: "
+            f"active_devices={sorted(active_devices)} admitted={admitted}"
+        )
+    if any(value != 0 for value in residual_kv.values()):
+        raise ValueError(f"llama.cpp retained request KV after completion: {residual_kv}")
+    pool_maps = (
+        pool_allocated,
+        pool_free,
+        pool_free_ranges,
+        largest_free_ranges,
+        fragmentation,
+    )
+    if any(not active_devices.issubset(values) for values in pool_maps) or any(
+        pool_allocated[device] != 0
+        or pool_free[device] <= 0
+        or pool_free_ranges[device] != 1
+        or largest_free_ranges[device] != pool_free[device]
+        or fragmentation[device] != 0.0
+        for device in active_devices
+    ):
+        raise ValueError(
+            "llama.cpp request KV did not return to one fully reusable range: "
+            f"allocated={pool_allocated} free={pool_free} ranges={pool_free_ranges} "
+            f"largest={largest_free_ranges} fragmentation={fragmentation}"
+        )
+    return {
+        "llama_residual_kv_bytes": residual_kv,
+        "general_pool_allocated_bytes": pool_allocated,
+        "general_pool_free_bytes": pool_free,
+        "general_pool_free_ranges": pool_free_ranges,
+        "general_pool_largest_free_range_bytes": largest_free_ranges,
+        "general_pool_fragmentation_ratio": fragmentation,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
+    parser.add_argument("--metrics-url")
     parser.add_argument("--llama-model", required=True)
     parser.add_argument("--vllm-model", required=True)
     parser.add_argument("--requests-per-backend", type=int, default=8)
@@ -161,6 +421,17 @@ def main() -> int:
     if args.requests_per_backend <= 0 or args.max_tokens <= 0:
         parser.error("request and token counts must be positive")
 
+    llama_model_id = None
+    memory_setup_error: Exception | None = None
+    if args.metrics_url:
+        try:
+            with urllib.request.urlopen(
+                f"{args.base_url.rstrip('/')}/api/models", timeout=args.timeout_seconds
+            ) as response:
+                llama_model_id = primary_model_id(json.load(response), args.llama_model)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            memory_setup_error = error
+
     work = []
     for backend, model in (
         ("llama_cpp", args.llama_model),
@@ -170,6 +441,8 @@ def main() -> int:
             work.append((backend, model, CASES[index % len(CASES)]))
 
     barrier = threading.Barrier(len(work))
+    active_memory = None
+    last_active_memory_error: Exception | None = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(work)) as executor:
         futures = [
             executor.submit(
@@ -184,6 +457,28 @@ def main() -> int:
             )
             for backend, model, case in work
         ]
+        while (
+            args.metrics_url
+            and llama_model_id is not None
+            and any(not future.done() for future in futures)
+        ):
+            try:
+                with urllib.request.urlopen(
+                    args.metrics_url, timeout=METRICS_REQUEST_TIMEOUT_SECONDS
+                ) as response:
+                    metrics_text = response.read().decode("utf-8")
+                candidate = validate_mixed_memory(
+                    metrics_text,
+                    vllm_model=args.vllm_model,
+                    llama_model_id=llama_model_id,
+                )
+                if active_memory is None or sum(
+                    candidate["llama_owner_usage_bytes"].values()
+                ) > sum(active_memory["llama_owner_usage_bytes"].values()):
+                    active_memory = candidate
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                last_active_memory_error = error
+            time.sleep(METRICS_SAMPLE_INTERVAL_SECONDS)
         samples = [future.result(timeout=args.timeout_seconds + 30) for future in futures]
 
     concurrency = concurrency_summary(samples)
@@ -201,11 +496,50 @@ def main() -> int:
     if not concurrency["cross_backend_overlap"]:
         failures.append("llama.cpp and vLLM requests did not overlap")
 
+    memory = None
+    if args.metrics_url:
+        if memory_setup_error is not None:
+            failures.append(f"mixed memory accounting failed: {memory_setup_error}")
+        elif llama_model_id is None:
+            failures.append("mixed memory accounting failed: llama.cpp model ID is missing")
+        elif active_memory is None:
+            failures.append(
+                "mixed memory accounting failed: no in-flight shared-KV sample was observed; "
+                f"last_error={last_active_memory_error}"
+            )
+        else:
+            release = None
+            last_release_error: Exception | None = None
+            release_deadline = time.monotonic() + RELEASE_TIMEOUT_SECONDS
+            while time.monotonic() < release_deadline:
+                try:
+                    with urllib.request.urlopen(
+                        args.metrics_url, timeout=METRICS_REQUEST_TIMEOUT_SECONDS
+                    ) as response:
+                        metrics_text = response.read().decode("utf-8")
+                    release = validate_released_mixed_memory(
+                        metrics_text,
+                        llama_model_id=llama_model_id,
+                        active_devices=set(active_memory["llama_owner_usage_bytes"]),
+                    )
+                    break
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    last_release_error = error
+                    time.sleep(METRICS_SAMPLE_INTERVAL_SECONDS)
+            if release is None:
+                failures.append(
+                    "mixed memory accounting failed to observe request-KV release: "
+                    f"{last_release_error}"
+                )
+            else:
+                memory = {**active_memory, "post_completion": release}
+
     report = {
         "schema_version": 1,
         "status": "failed" if failures else "passed",
         "concurrency": concurrency,
         "backends": summaries,
+        "memory": memory,
         "failures": failures,
         "samples": samples,
     }

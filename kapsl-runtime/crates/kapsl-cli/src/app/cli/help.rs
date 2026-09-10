@@ -78,6 +78,10 @@ const HELP_ENV_VARS: &[(&str, &str)] = &[
     ("KAPSL_OFFLINE", "Disable lazy-backend network access"),
     ("KAPSL_BACKEND_CACHE_DIR", "Lazy backend cache root"),
     (
+        "KAPSL_GENERIC_NATIVE_PACKS",
+        "Set 0 only for explicit embedded ORT rollback",
+    ),
+    (
         "KAPSL_TCP_AUTH_TOKEN",
         "Required native-inference token for non-loopback TCP",
     ),

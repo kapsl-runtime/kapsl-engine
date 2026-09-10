@@ -1,0 +1,64 @@
+name: Release Preflight
+
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preflight-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ort-release-preflight:
+    name: Signed ORT release readiness (host only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check per-crate SDK pins without compiling or provisioning
+        run: python3 .github/scripts/verify_published_sdk.py --lockfile kapsl-runtime/Cargo.lock
+      - name: Test release preflight and immutable import contracts
+        run: |
+          python3 .github/scripts/test_import_signed_backend_release.py
+          python3 .github/scripts/test_preflight_ort_release.py
+          python3 .github/scripts/test_release_pipeline.py
+      - name: Verify published ORT metadata, signatures, compatibility and availability
+        run: python3 .github/scripts/preflight-ort-release.py
+
+  live-infrastructure-preflight:
+    name: Live authentication readiness (main only, no GPU)
+    needs: ort-release-preflight
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/release-infrastructure-preflight.yml
+    secrets: inherit
+
+  live-signing-preflight:
+    name: Live signing readiness (main only)
+    needs: ort-release-preflight
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate release signer and publication settings without uploading
+        env:
+          KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }} ${{ vars.KAPSL_ORT_BACKEND_PUBLIC_KEY }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 .github/scripts/preflight_release_environment.py --signing

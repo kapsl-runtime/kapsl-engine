@@ -1,9 +1,9 @@
 name: Beta Runtime Installers
 
 on:
-  push:
-    branches:
-      - develop
+  # Packaging is deliberate. Runtime changes on develop are validated by CI;
+  # they must not publish an intermediate installer during the neutral migration.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -25,6 +25,7 @@ env:
 jobs:
   prepare-version:
     name: Resolve beta version
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -61,6 +62,16 @@ jobs:
           echo "numeric_version=$numeric_version" >> "$GITHUB_OUTPUT"
           echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate signing and publication configuration before builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
+          KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 .github/scripts/preflight_release_environment.py --signing --sdk
+
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
     needs: prepare-version
@@ -70,6 +81,8 @@ jobs:
       KAPSL_NUMERIC_VERSION: ${{ needs.prepare-version.outputs.numeric_version }}
       KAPSL_DEB_VERSION: ${{ needs.prepare-version.outputs.deb_version }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
+      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-C debuginfo=0 -C link-arg=/DEBUG:NONE' || '' }}
+      CARGO_INCREMENTAL: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -83,9 +96,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache release compiler dependencies
+        uses: ./.github/actions/cache-rust-build
         with:
-          toolchain: 1.92.0
+          key: release-portable-${{ matrix.os }}
 
       - name: Set up Python for accelerator dependency collection
         if: runner.os == 'Windows'
@@ -289,131 +305,20 @@ jobs:
   build-cuda-runtime:
     name: Build CUDA runtime (linux-x86_64)
     needs: prepare-version
-    runs-on: ubuntu-22.04
-    container:
-      # Match the stable release: this image supplies the CUDA/cuDNN libraries
-      # folded into the one GGUF + ONNX accelerator archive.
-      image: nvidia/cuda:12.6.3-cudnn-devel-ubuntu22.04
-    env:
-      CARGO_BUILD_JOBS: "2"
-      CMAKE_BUILD_PARALLEL_LEVEL: "2"
-      CUDA_PATH: /usr/local/cuda
-      KAPSL_VERSION: ${{ needs.prepare-version.outputs.version }}
+    # The reusable build must be allowed to read its same-run artifacts.
+    # Keep this grant scoped to the caller, not every beta/publication job.
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/build-linux-accelerators.yml
+    with:
+      version: ${{ needs.prepare-version.outputs.version }}
+      channel: beta
+      stable_release: false
+      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
+    secrets:
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
-      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
-      LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
-    steps:
-      - name: Install CUDA build dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            binutils build-essential ca-certificates clang cmake curl file git libclang-dev libssl-dev openssl patchelf pkg-config python3 python3-pip
-          rm -rf /var/lib/apt/lists/*
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Validate certified vLLM SDK commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Protected KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit." >&2
-            exit 1
-          fi
-
-      - name: Checkout certified vLLM connector
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
-          path: sdk-vllm
-
-      - name: Verify certified vLLM SDK checkout
-        shell: bash
-        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
-
-      - name: Checkout certified llama.cpp shared-pool SDK
-        if: ${{ vars.KAPSL_LLAMA_SDK_REF != '' }}
-        uses: actions/checkout@v4
-        with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ vars.KAPSL_LLAMA_SDK_REF }}
-          path: sdk-llama
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
-
-      - name: Build kapsl with statically compiled GGUF CUDA
-        run: cargo build --manifest-path kapsl-runtime/Cargo.toml -p kapsl --release --no-default-features --features cuda
-
-      - name: Collect ONNX Runtime sidecars
-        shell: bash
-        run: .github/scripts/collect-ort-sidecars.sh
-
-      - name: Collect TensorRT 10 user-space runtime
-        shell: bash
-        run: .github/scripts/collect-linux-tensorrt-runtime.sh
-
-      - name: Package CUDA runtime bundle
-        shell: bash
-        run: .github/scripts/package-linux-cuda-runtime.sh
-
-      - name: Package split ONNX backend packs
-        shell: bash
-        run: .github/scripts/package-linux-onnx-backend-packs.sh
-
-      - name: Package native llama.cpp backend packs
-        shell: bash
-        env:
-          KAPSL_LLAMA_SDK_DIR: ${{ vars.KAPSL_LLAMA_SDK_REF != '' && 'sdk-llama' || '' }}
-          KAPSL_LLAMA_SDK_REF: ${{ vars.KAPSL_LLAMA_SDK_REF }}
-        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
-
-      - name: Reclaim CUDA build scratch before backend packaging
-        shell: bash
-        run: cargo clean --manifest-path kapsl-runtime/Cargo.toml
-
-      - name: Package certified managed-vLLM backend
-        shell: bash
-        env:
-          KAPSL_VLLM_SDK_DIR: sdk-vllm
-        run: .github/scripts/package-linux-vllm-backend.sh
-
-      - name: Generate signed backend index
-        shell: bash
-        env:
-          KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
-        run: |
-          set -euo pipefail
-          if [ -z "$KAPSL_BACKEND_SIGNING_KEY_B64" ] || [ -z "$KAPSL_BACKEND_PUBLIC_KEYS" ]; then
-            echo "Backend signing key and embedded public key are required." >&2
-            exit 1
-          fi
-          key_file="${RUNNER_TEMP}/kapsl-backend-signing-key.pem"
-          printf '%s' "$KAPSL_BACKEND_SIGNING_KEY_B64" | base64 --decode > "$key_file"
-          chmod 600 "$key_file"
-          trap 'rm -f "$key_file"' EXIT
-          .github/scripts/generate-backend-index.py \
-            --version "$KAPSL_VERSION" \
-            --artifacts-dir dist \
-            --output dist/backend-index.json \
-            --signing-key "$key_file" \
-            --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS" \
-            --channel beta
-          rm -f "$key_file" dist/*.manifest.json
-          trap - EXIT
-
-      - name: Upload CUDA runtime artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: runtime-cuda-linux-x86_64
-          path: dist/*
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 1
+      KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
 
   publish-beta-release:
     needs: [prepare-version, build-runtime-installers, build-cuda-runtime]
@@ -425,6 +330,7 @@ jobs:
       - name: Download installer artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: runtime-*
           path: release-assets
           merge-multiple: true
 
@@ -527,15 +433,32 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-east-1
         run: |
+          release_root="s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}"
+          public_root="https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}"
+
           aws s3 cp release-assets/ \
-            s3://kapsl-installer/runtime/beta/v${{ needs.prepare-version.outputs.version }}/ \
+            "$release_root/" \
             --recursive \
+            --exclude "backend-index.json" \
+            --exclude "backend-index.json.sig" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
           .github/scripts/verify-public-backend-release.sh \
             release-assets/backend-index.json \
-            https://downloads.kapsl.net/runtime/beta/v${{ needs.prepare-version.outputs.version }}
+            "$public_root" \
+            --artifacts-only
+
+          for name in backend-index.json.sig backend-index.json; do
+            aws s3 cp "release-assets/$name" \
+              "$release_root/$name" \
+              --no-progress \
+              --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
+          done
+
+          .github/scripts/verify-public-backend-release.sh \
+            release-assets/backend-index.json \
+            "$public_root"
 
           # Keep the mutable latest directory as an exact mirror. Artifact names
           # contain their version, so --delete prevents old betas accumulating here.
@@ -552,37 +475,31 @@ jobs:
               --no-progress \
               --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          aws s3 cp install.ps1 \
+          aws s3 cp installers/install.ps1 \
             s3://kapsl-installer/install-beta-base.ps1 \
             --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          aws s3 cp install.sh \
+          aws s3 cp installers/install.sh \
             s3://kapsl-installer/install-beta-base.sh \
             --content-type "text/plain" \
             --no-progress \
             --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
-          for script in install-beta.ps1 install-beta-cuda.ps1 install-beta-tensorrt.ps1; do
-            aws s3 cp "$script" \
+          for script_path in \
+            installers/install-beta.ps1 \
+            installers/install-beta-cuda.ps1 \
+            installers/install-beta-tensorrt.ps1 \
+            installers/install-beta-cuda.sh \
+            installers/install-beta.sh; do
+            script="$(basename "$script_path")"
+            aws s3 cp "$script_path" \
               "s3://kapsl-installer/$script" \
               --content-type "text/plain" \
               --no-progress \
               --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
           done
-
-          aws s3 cp install-beta-cuda.sh \
-            s3://kapsl-installer/install-beta-cuda.sh \
-            --content-type "text/plain" \
-            --no-progress \
-            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
-
-          aws s3 cp install-beta.sh \
-            s3://kapsl-installer/install-beta.sh \
-            --content-type "text/plain" \
-            --no-progress \
-            --endpoint-url https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
 
       - name: Retain current and rollback-compatible beta installers in R2
         env:

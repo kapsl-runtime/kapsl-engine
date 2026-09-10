@@ -9,6 +9,7 @@
 
 use futures::Stream;
 use hyper::body::{Bytes, HttpBody};
+use hyper::client::connect::{Connected, Connection};
 use hyper::client::HttpConnector;
 use hyper::header::{HeaderMap, CONTENT_TYPE};
 use hyper::http::uri::PathAndQuery;
@@ -16,9 +17,13 @@ use hyper::{Body, Client, Method, Request, StatusCode, Uri};
 use kapsl_engine_api::CancellationToken;
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::time::Instant;
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +31,227 @@ const DEFAULT_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const DEFAULT_MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_ERROR_BODY_BYTES: usize = 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+#[derive(Clone)]
+pub(crate) struct ManagedVllmBridgeTelemetry {
+    metrics: kapsl_monitor::metrics::KapslMetrics,
+    model: String,
+    replica: String,
+}
+
+impl ManagedVllmBridgeTelemetry {
+    pub(crate) fn new(
+        metrics: kapsl_monitor::metrics::KapslMetrics,
+        model: String,
+        replica: impl ToString,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            metrics,
+            model,
+            replica: replica.to_string(),
+        })
+    }
+
+    fn request(&self, mode: &'static str, streaming: bool) {
+        self.metrics
+            .managed_vllm
+            .bridge_requests_total
+            .with_label_values(&[
+                self.model.as_str(),
+                self.replica.as_str(),
+                mode,
+                if streaming { "true" } else { "false" },
+            ])
+            .inc();
+    }
+
+    fn stage(&self, mode: &'static str, stage: &'static str, elapsed: Duration) {
+        self.metrics
+            .managed_vllm
+            .bridge_stage_seconds
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), mode, stage])
+            .observe(elapsed.as_secs_f64());
+    }
+
+    fn relayed(&self, mode: &'static str, bytes: usize) {
+        let labels = &[self.model.as_str(), self.replica.as_str(), mode];
+        self.metrics
+            .managed_vllm
+            .bridge_relayed_bytes_total
+            .with_label_values(labels)
+            .inc_by(u64::try_from(bytes).unwrap_or(u64::MAX));
+        self.metrics
+            .managed_vllm
+            .bridge_relayed_chunks_total
+            .with_label_values(labels)
+            .inc();
+    }
+
+    fn stream_started(&self, mode: &'static str) {
+        self.metrics
+            .managed_vllm
+            .bridge_active_streams
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), mode])
+            .inc();
+    }
+
+    fn stream_finished(&self, mode: &'static str) {
+        self.metrics
+            .managed_vllm
+            .bridge_active_streams
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), mode])
+            .dec();
+    }
+
+    fn cancellation(&self, mode: &'static str) {
+        self.metrics
+            .managed_vllm
+            .bridge_cancellations_total
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), mode])
+            .inc();
+    }
+
+    fn error(&self, mode: &'static str, error: &ManagedVllmBridgeError) {
+        self.metrics
+            .managed_vllm
+            .bridge_upstream_errors_total
+            .with_label_values(&[
+                self.model.as_str(),
+                self.replica.as_str(),
+                mode,
+                bridge_error_kind(error),
+            ])
+            .inc();
+    }
+
+    fn connection_attempt(&self) {
+        self.metrics
+            .managed_vllm
+            .bridge_connection_attempts_total
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), "async"])
+            .inc();
+    }
+
+    fn connection_opened(&self) {
+        self.metrics
+            .managed_vllm
+            .bridge_open_connections
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), "async"])
+            .inc();
+    }
+
+    fn connection_closed(&self) {
+        self.metrics
+            .managed_vllm
+            .bridge_open_connections
+            .with_label_values(&[self.model.as_str(), self.replica.as_str(), "async"])
+            .dec();
+    }
+}
+
+fn bridge_error_kind(error: &ManagedVllmBridgeError) -> &'static str {
+    match error {
+        ManagedVllmBridgeError::HeaderTimeout => "header_timeout",
+        ManagedVllmBridgeError::IdleBodyTimeout => "idle_timeout",
+        ManagedVllmBridgeError::TotalTimeout => "total_timeout",
+        ManagedVllmBridgeError::Cancelled => "cancelled",
+        ManagedVllmBridgeError::UpstreamStatus { .. } => "upstream_status",
+        ManagedVllmBridgeError::SseBufferExceeded { .. }
+        | ManagedVllmBridgeError::ResponseBodyExceeded { .. } => "limit",
+        ManagedVllmBridgeError::Body(_) => "body",
+        ManagedVllmBridgeError::Request(_) => "transport",
+        ManagedVllmBridgeError::InvalidEndpoint(_)
+        | ManagedVllmBridgeError::InvalidPath(_)
+        | ManagedVllmBridgeError::InvalidTimeout(_)
+        | ManagedVllmBridgeError::InvalidLimit(_)
+        | ManagedVllmBridgeError::BuildRequest(_) => "local",
+    }
+}
+
+#[derive(Clone)]
+struct InstrumentedConnector {
+    inner: HttpConnector,
+    telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
+}
+
+impl hyper::service::Service<Uri> for InstrumentedConnector {
+    type Response = InstrumentedConnection;
+    type Error = <HttpConnector as hyper::service::Service<Uri>>::Error;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.connection_attempt();
+        }
+        let connecting = self.inner.call(uri);
+        let telemetry = self.telemetry.clone();
+        Box::pin(async move {
+            let inner = connecting.await?;
+            if let Some(telemetry) = &telemetry {
+                telemetry.connection_opened();
+            }
+            Ok(InstrumentedConnection { inner, telemetry })
+        })
+    }
+}
+
+struct InstrumentedConnection {
+    inner: TcpStream,
+    telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
+}
+
+impl AsyncRead for InstrumentedConnection {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for InstrumentedConnection {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.inner).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl Connection for InstrumentedConnection {
+    fn connected(&self) -> Connected {
+        self.inner.connected()
+    }
+}
+
+impl Drop for InstrumentedConnection {
+    fn drop(&mut self) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.connection_closed();
+        }
+    }
+}
 
 /// Per-call deadlines. The asynchronous header deadline also covers acquiring
 /// or establishing the pooled connection. `idle_body` is reset after every
@@ -198,24 +424,64 @@ pub(crate) struct ManagedVllmSseResponse {
     pub(crate) events: ManagedVllmSseStream,
 }
 
+struct BodyCollectionTelemetry {
+    telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
+    mode: &'static str,
+    started: Instant,
+}
+
 /// Cloneable handle to two persistent connection pools for one managed child.
 /// Cloning this type shares both pools; it does not construct new clients.
 #[derive(Clone)]
 pub(crate) struct ManagedVllmHttpBridge {
     origin: Arc<Uri>,
     blocking_client: ureq::Agent,
-    async_client: Client<HttpConnector, Body>,
+    async_client: Client<InstrumentedConnector, Body>,
     config: ManagedVllmBridgeConfig,
+    telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
 }
 
 impl ManagedVllmHttpBridge {
-    pub(crate) fn new(endpoint: impl AsRef<str>) -> Result<Self, ManagedVllmBridgeError> {
-        Self::with_config(endpoint, ManagedVllmBridgeConfig::default())
+    fn record_request(&self, mode: &'static str, streaming: bool) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.request(mode, streaming);
+        }
     }
 
-    pub(crate) fn with_config(
+    fn record_stage(&self, mode: &'static str, stage: &'static str, elapsed: Duration) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.stage(mode, stage, elapsed);
+        }
+    }
+
+    fn record_error(&self, mode: &'static str, error: &ManagedVllmBridgeError) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.error(mode, error);
+            if matches!(error, ManagedVllmBridgeError::Cancelled) {
+                telemetry.cancellation(mode);
+            }
+        }
+    }
+
+    pub(crate) fn new(endpoint: impl AsRef<str>) -> Result<Self, ManagedVllmBridgeError> {
+        Self::with_config_and_telemetry(endpoint, ManagedVllmBridgeConfig::default(), None)
+    }
+
+    pub(crate) fn new_with_telemetry(
+        endpoint: impl AsRef<str>,
+        telemetry: Arc<ManagedVllmBridgeTelemetry>,
+    ) -> Result<Self, ManagedVllmBridgeError> {
+        Self::with_config_and_telemetry(
+            endpoint,
+            ManagedVllmBridgeConfig::default(),
+            Some(telemetry),
+        )
+    }
+
+    fn with_config_and_telemetry(
         endpoint: impl AsRef<str>,
         config: ManagedVllmBridgeConfig,
+        telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
     ) -> Result<Self, ManagedVllmBridgeError> {
         let config = config.validate()?;
         let origin = endpoint
@@ -245,13 +511,17 @@ impl ManagedVllmHttpBridge {
         let async_client = Client::builder()
             .pool_idle_timeout(config.pool_idle_timeout)
             .pool_max_idle_per_host(16)
-            .build(connector);
+            .build(InstrumentedConnector {
+                inner: connector,
+                telemetry: telemetry.clone(),
+            });
 
         Ok(Self {
             origin: Arc::new(origin),
             blocking_client,
             async_client,
             config,
+            telemetry,
         })
     }
 
@@ -264,9 +534,14 @@ impl ManagedVllmHttpBridge {
         body: &[u8],
         timeouts: ManagedVllmRequestTimeouts,
     ) -> Result<ureq::http::Response<ureq::Body>, ManagedVllmBridgeError> {
+        const MODE: &str = "legacy";
+        self.record_request(MODE, false);
+        let started = Instant::now();
         let timeouts = timeouts.validate()?;
         let uri = self.uri(path)?;
-        self.blocking_client
+        self.record_stage(MODE, "upstream_dispatch", started.elapsed());
+        let response = self
+            .blocking_client
             .post(uri.to_string())
             .header("content-type", "application/json")
             .config()
@@ -283,7 +558,24 @@ impl ManagedVllmHttpBridge {
             .http_status_as_error(false)
             .build()
             .send(body)
-            .map_err(|error| map_ureq_error(error, false))
+            .map_err(|error| map_ureq_error(error, false));
+        match &response {
+            Ok(response) => {
+                self.record_stage(MODE, "upstream_headers", started.elapsed());
+                if !response.status().is_success() {
+                    self.record_error(
+                        MODE,
+                        &ManagedVllmBridgeError::UpstreamStatus {
+                            status: StatusCode::from_u16(response.status().as_u16())
+                                .expect("ureq returned a valid HTTP status"),
+                            body: Vec::new(),
+                        },
+                    );
+                }
+            }
+            Err(error) => self.record_error(MODE, error),
+        }
+        response
     }
 
     /// Probe an endpoint with the shared asynchronous client. Successful
@@ -294,6 +586,8 @@ impl ManagedVllmHttpBridge {
         timeouts: ManagedVllmRequestTimeouts,
         cancellation: Option<CancellationToken>,
     ) -> Result<(), ManagedVllmBridgeError> {
+        const MODE: &str = "health";
+        self.record_request(MODE, false);
         let timeouts = timeouts.validate()?;
         let started = Instant::now();
         let request = Request::builder()
@@ -301,8 +595,9 @@ impl ManagedVllmHttpBridge {
             .uri(self.uri(path)?)
             .body(Body::empty())
             .map_err(|error| ManagedVllmBridgeError::BuildRequest(error.to_string()))?;
+        self.record_stage(MODE, "upstream_dispatch", started.elapsed());
         let response = self
-            .send_async(request, timeouts, started, cancellation.as_ref())
+            .send_async(request, timeouts, started, cancellation.as_ref(), MODE)
             .await?;
         let status = response.status();
         let body = collect_body_bounded(
@@ -311,10 +606,24 @@ impl ManagedVllmHttpBridge {
             started + timeouts.total,
             timeouts.idle_body,
             cancellation,
+            BodyCollectionTelemetry {
+                telemetry: self.telemetry.clone(),
+                mode: MODE,
+                started,
+            },
         )
-        .await?;
+        .await;
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                self.record_error(MODE, &error);
+                return Err(error);
+            }
+        };
         if !status.is_success() {
-            return Err(ManagedVllmBridgeError::UpstreamStatus { status, body });
+            let error = ManagedVllmBridgeError::UpstreamStatus { status, body };
+            self.record_error(MODE, &error);
+            return Err(error);
         }
         Ok(())
     }
@@ -329,6 +638,8 @@ impl ManagedVllmHttpBridge {
         timeouts: ManagedVllmRequestTimeouts,
         cancellation: Option<CancellationToken>,
     ) -> Result<ManagedVllmSseResponse, ManagedVllmBridgeError> {
+        const MODE: &str = "async_translated";
+        self.record_request(MODE, true);
         let timeouts = timeouts.validate()?;
         let started = Instant::now();
         let request = Request::builder()
@@ -337,8 +648,9 @@ impl ManagedVllmHttpBridge {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .map_err(|error| ManagedVllmBridgeError::BuildRequest(error.to_string()))?;
+        self.record_stage(MODE, "upstream_dispatch", started.elapsed());
         let response = self
-            .send_async(request, timeouts, started, cancellation.as_ref())
+            .send_async(request, timeouts, started, cancellation.as_ref(), MODE)
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
@@ -352,20 +664,39 @@ impl ManagedVllmHttpBridge {
                 total_deadline,
                 timeouts.idle_body,
                 cancellation,
+                BodyCollectionTelemetry {
+                    telemetry: self.telemetry.clone(),
+                    mode: MODE,
+                    started,
+                },
             )
-            .await?;
-            return Err(ManagedVllmBridgeError::UpstreamStatus { status, body });
+            .await;
+            let body = match body {
+                Ok(body) => body,
+                Err(error) => {
+                    self.record_error(MODE, &error);
+                    return Err(error);
+                }
+            };
+            let error = ManagedVllmBridgeError::UpstreamStatus { status, body };
+            self.record_error(MODE, &error);
+            return Err(error);
         }
 
         Ok(ManagedVllmSseResponse {
             status,
             headers,
-            events: decode_sse_body(
-                body,
-                self.config.max_sse_buffer_bytes,
-                total_deadline,
-                timeouts.idle_body,
-                cancellation,
+            events: instrument_response_stream(
+                decode_sse_body(
+                    body,
+                    self.config.max_sse_buffer_bytes,
+                    total_deadline,
+                    timeouts.idle_body,
+                    cancellation,
+                ),
+                self.telemetry.clone(),
+                MODE,
+                started,
             ),
         })
     }
@@ -382,6 +713,8 @@ impl ManagedVllmHttpBridge {
         cancellation: Option<CancellationToken>,
         maximum_body_bytes: usize,
     ) -> Result<ManagedVllmBufferedResponse, ManagedVllmBridgeError> {
+        const MODE: &str = "wire";
+        self.record_request(MODE, false);
         if maximum_body_bytes == 0 {
             return Err(ManagedVllmBridgeError::InvalidLimit(
                 "managed vLLM response body limit must be non-zero".to_string(),
@@ -395,8 +728,9 @@ impl ManagedVllmHttpBridge {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .map_err(|error| ManagedVllmBridgeError::BuildRequest(error.to_string()))?;
+        self.record_stage(MODE, "upstream_dispatch", started.elapsed());
         let response = self
-            .send_async(request, timeouts, started, cancellation.as_ref())
+            .send_async(request, timeouts, started, cancellation.as_ref(), MODE)
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
@@ -406,8 +740,32 @@ impl ManagedVllmHttpBridge {
             started + timeouts.total,
             timeouts.idle_body,
             cancellation,
+            BodyCollectionTelemetry {
+                telemetry: self.telemetry.clone(),
+                mode: MODE,
+                started,
+            },
         )
-        .await?;
+        .await;
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                self.record_error(MODE, &error);
+                return Err(error);
+            }
+        };
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.relayed(MODE, body.len());
+        }
+        if !status.is_success() {
+            self.record_error(
+                MODE,
+                &ManagedVllmBridgeError::UpstreamStatus {
+                    status,
+                    body: Vec::new(),
+                },
+            );
+        }
         Ok(ManagedVllmBufferedResponse {
             status,
             headers,
@@ -424,6 +782,8 @@ impl ManagedVllmHttpBridge {
         timeouts: ManagedVllmRequestTimeouts,
         cancellation: Option<CancellationToken>,
     ) -> Result<ManagedVllmRawResponse, ManagedVllmBridgeError> {
+        const MODE: &str = "wire";
+        self.record_request(MODE, true);
         let timeouts = timeouts.validate()?;
         let started = Instant::now();
         let request = Request::builder()
@@ -432,19 +792,34 @@ impl ManagedVllmHttpBridge {
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .map_err(|error| ManagedVllmBridgeError::BuildRequest(error.to_string()))?;
+        self.record_stage(MODE, "upstream_dispatch", started.elapsed());
         let response = self
-            .send_async(request, timeouts, started, cancellation.as_ref())
+            .send_async(request, timeouts, started, cancellation.as_ref(), MODE)
             .await?;
         let status = response.status();
         let headers = response.headers().clone();
+        if !status.is_success() {
+            self.record_error(
+                MODE,
+                &ManagedVllmBridgeError::UpstreamStatus {
+                    status,
+                    body: Vec::new(),
+                },
+            );
+        }
         Ok(ManagedVllmRawResponse {
             status,
             headers,
-            body: decode_raw_body(
-                response.into_body(),
-                started + timeouts.total,
-                timeouts.idle_body,
-                cancellation,
+            body: instrument_response_stream(
+                decode_raw_body(
+                    response.into_body(),
+                    started + timeouts.total,
+                    timeouts.idle_body,
+                    cancellation,
+                ),
+                self.telemetry.clone(),
+                MODE,
+                started,
             ),
         })
     }
@@ -482,21 +857,24 @@ impl ManagedVllmHttpBridge {
         timeouts: ManagedVllmRequestTimeouts,
         started: Instant,
         cancellation: Option<&CancellationToken>,
+        mode: &'static str,
     ) -> Result<hyper::Response<Body>, ManagedVllmBridgeError> {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            return Err(ManagedVllmBridgeError::Cancelled);
+            let error = ManagedVllmBridgeError::Cancelled;
+            self.record_error(mode, &error);
+            return Err(error);
         }
         let total_deadline = started + timeouts.total;
         let header_deadline = (started + timeouts.headers).min(total_deadline);
         let request = self.async_client.request(request);
         tokio::pin!(request);
-        loop {
+        let result = loop {
             tokio::select! {
                 result = &mut request => {
-                    return result.map_err(|error| ManagedVllmBridgeError::Request(error.to_string()));
+                    break result.map_err(|error| ManagedVllmBridgeError::Request(error.to_string()));
                 }
                 _ = tokio::time::sleep_until(header_deadline) => {
-                    return if Instant::now() >= total_deadline {
+                    break if Instant::now() >= total_deadline {
                         Err(ManagedVllmBridgeError::TotalTimeout)
                     } else {
                         Err(ManagedVllmBridgeError::HeaderTimeout)
@@ -504,11 +882,16 @@ impl ManagedVllmHttpBridge {
                 }
                 _ = tokio::time::sleep(CANCELLATION_POLL_INTERVAL), if cancellation.is_some() => {
                     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                        return Err(ManagedVllmBridgeError::Cancelled);
+                        break Err(ManagedVllmBridgeError::Cancelled);
                     }
                 }
             }
+        };
+        match &result {
+            Ok(_) => self.record_stage(mode, "upstream_headers", started.elapsed()),
+            Err(error) => self.record_error(mode, error),
         }
+        result
     }
 }
 
@@ -654,6 +1037,87 @@ fn decode_raw_body(
     ))
 }
 
+struct InstrumentedResponseStream {
+    inner: ManagedVllmByteStream,
+    telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
+    mode: &'static str,
+    started: Instant,
+    first_byte_seen: bool,
+    terminal: bool,
+}
+
+impl Stream for InstrumentedResponseStream {
+    type Item = Result<Vec<u8>, ManagedVllmBridgeError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(bytes))) => {
+                let received = Instant::now();
+                if !self.first_byte_seen {
+                    self.first_byte_seen = true;
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry.stage(self.mode, "first_upstream_byte", self.started.elapsed());
+                        telemetry.stage(
+                            self.mode,
+                            "first_upstream_to_downstream",
+                            received.elapsed(),
+                        );
+                    }
+                }
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.relayed(self.mode, bytes.len());
+                }
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.terminal = true;
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.error(self.mode, &error);
+                    if matches!(error, ManagedVllmBridgeError::Cancelled) {
+                        telemetry.cancellation(self.mode);
+                    }
+                }
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.terminal = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl Drop for InstrumentedResponseStream {
+    fn drop(&mut self) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.stream_finished(self.mode);
+            if !self.terminal {
+                telemetry.cancellation(self.mode);
+            }
+        }
+    }
+}
+
+fn instrument_response_stream(
+    inner: ManagedVllmByteStream,
+    telemetry: Option<Arc<ManagedVllmBridgeTelemetry>>,
+    mode: &'static str,
+    started: Instant,
+) -> ManagedVllmByteStream {
+    if let Some(telemetry) = &telemetry {
+        telemetry.stream_started(mode);
+    }
+    Box::pin(InstrumentedResponseStream {
+        inner,
+        telemetry,
+        mode,
+        started,
+        first_byte_seen: false,
+        terminal: false,
+    })
+}
+
 fn spawn_terminal_body_drain(mut body: Body, total_deadline: Instant, idle_body: Duration) {
     tokio::spawn(async move {
         loop {
@@ -771,11 +1235,23 @@ async fn collect_body_bounded(
     total_deadline: Instant,
     idle_body: Duration,
     cancellation: Option<CancellationToken>,
+    metrics: BodyCollectionTelemetry,
 ) -> Result<Vec<u8>, ManagedVllmBridgeError> {
     let mut output = Vec::new();
+    let mut first_byte_seen = false;
     while let Some(chunk) =
         next_body_chunk(&mut body, total_deadline, idle_body, cancellation.as_ref()).await?
     {
+        if !first_byte_seen {
+            first_byte_seen = true;
+            if let Some(telemetry) = &metrics.telemetry {
+                telemetry.stage(
+                    metrics.mode,
+                    "first_upstream_byte",
+                    metrics.started.elapsed(),
+                );
+            }
+        }
         let length = output
             .len()
             .checked_add(chunk.len())
@@ -912,6 +1388,72 @@ mod tests {
             connections.load(Ordering::SeqCst) - blocking_connections,
             1,
             "Hyper should reuse its connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_tracks_connection_stream_bytes_and_terminal_release() {
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server = start_server(connections.clone(), |_request| async move {
+            Ok(Response::new(Body::wrap_stream(futures::stream::iter(
+                vec![
+                    Ok::<_, Infallible>(Bytes::from_static(b"data: one\n\n")),
+                    Ok::<_, Infallible>(Bytes::from_static(b"data: [DONE]\n\n")),
+                ],
+            ))))
+        })
+        .await;
+        let registry = Arc::new(prometheus::Registry::new());
+        let metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
+        let bridge = ManagedVllmHttpBridge::new_with_telemetry(
+            &server.endpoint,
+            ManagedVllmBridgeTelemetry::new(metrics.clone(), "model-a".to_string(), 3),
+        )
+        .unwrap();
+        let mut response = bridge
+            .post_json_raw(
+                "/v1/chat/completions",
+                b"{}".to_vec(),
+                ManagedVllmRequestTimeouts::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        while response.body.next().await.is_some() {}
+        drop(response);
+
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .managed_vllm
+                .bridge_connection_attempts_total
+                .with_label_values(&["model-a", "3", "async"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .managed_vllm
+                .bridge_active_streams
+                .with_label_values(&["model-a", "3", "wire"])
+                .get(),
+            0
+        );
+        assert_eq!(
+            metrics
+                .managed_vllm
+                .bridge_relayed_chunks_total
+                .with_label_values(&["model-a", "3", "wire"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .managed_vllm
+                .bridge_relayed_bytes_total
+                .with_label_values(&["model-a", "3", "wire"])
+                .get(),
+            25
         );
     }
 

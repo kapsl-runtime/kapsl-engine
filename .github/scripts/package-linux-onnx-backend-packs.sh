@@ -4,13 +4,13 @@ set -euo pipefail
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
 
 if [ "${RUNNER_OS:-Linux}" != "Linux" ] || [ "${RUNNER_ARCH:-X64}" != "X64" ]; then
-  echo "ONNX native backend packs are currently published only for Linux x86_64." >&2
+  echo "Legacy ONNX accelerator packs are currently published only for Linux x86_64." >&2
   exit 1
 fi
 
 for command_name in cc file patchelf python3 sha256sum tar; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
-    echo "$command_name is required to package ONNX backend packs." >&2
+    echo "$command_name is required to package legacy ONNX accelerator packs." >&2
     exit 1
   fi
 done
@@ -72,6 +72,14 @@ copy_cuda_runtime_libraries() {
   while IFS= read -r -d '' source; do
     name="$(basename "$source")"
     case "$name" in
+      libonnxruntime_providers_*.so*)
+        # The full CUDA runtime bundle also carries ORT provider sidecars.
+        # Split backend packs must use the provider copies staged explicitly
+        # in core_dir/cuda_dir/tensorrt_provider_dir instead of treating those
+        # sidecars as CUDA runtime dependencies (and rejecting the duplicate
+        # basename when their bytes differ).
+        continue
+        ;;
       libcuda.so* | libnvidia-*.so*)
         echo "Refusing to bundle host NVIDIA driver library $name" >&2
         exit 1
@@ -140,8 +148,6 @@ package_profile() {
 
   copy_flat_files "$core_dir" "$root"
   case "$profile" in
-    cpu)
-      ;;
     cuda12)
       copy_flat_files "$cuda_dir" "$root"
       copy_cuda_runtime_libraries "$root"
@@ -160,14 +166,12 @@ package_profile() {
 
   cp LICENSE "$root/licenses/KAPSL-LICENSE"
   cp "$onnx_license" "$root/licenses/ONNX-RUNTIME-LICENSE"
-  if [ "$profile" != "cpu" ]; then
-    nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-$cuda_runtime_root/NVIDIA-CONTAINER-LICENSE}"
-    if [ ! -f "$nvidia_license" ]; then
-      echo "Missing NVIDIA redistribution license: $nvidia_license" >&2
-      exit 1
-    fi
-    cp "$nvidia_license" "$root/licenses/NVIDIA-CONTAINER-LICENSE"
+  nvidia_license="${KAPSL_NVIDIA_LICENSE_FILE:-$cuda_runtime_root/NVIDIA-CONTAINER-LICENSE}"
+  if [ ! -f "$nvidia_license" ]; then
+    echo "Missing NVIDIA redistribution license: $nvidia_license" >&2
+    exit 1
   fi
+  cp "$nvidia_license" "$root/licenses/NVIDIA-CONTAINER-LICENSE"
   if [ "$profile" = "tensorrt10" ] && [ -d "$tensorrt_license_dir" ]; then
     license_number=0
     while IFS= read -r -d '' license; do
@@ -182,14 +186,6 @@ package_profile() {
     -o "$root/libkapsl_backend_onnx.so"
 
   case "$profile" in
-    cpu)
-      if find "$root" -maxdepth 1 -type f \
-        \( -iname '*cuda*' -o -iname '*cudnn*' -o -iname '*tensorrt*' -o -iname '*nvinfer*' \) \
-        -print -quit | grep -q .; then
-        echo "CPU ONNX pack unexpectedly contains accelerator libraries." >&2
-        exit 1
-      fi
-      ;;
     cuda12)
       write_provider_marker "$root" cuda 12 ""
       if find "$root" -maxdepth 1 -type f \
@@ -246,7 +242,7 @@ for path in sorted(item for item in root.rglob("*") if item.is_file()):
 
 memory = {
     "host_bytes": 67108864,
-    "accelerator_bytes": 0 if accelerator == "cpu" else 134217728,
+    "accelerator_bytes": 134217728,
     "workspace_weight_ppm": 250000,
     "minimum_workspace_bytes": 268435456,
 }
@@ -280,6 +276,5 @@ PY
   echo "Packaged $archive"
 }
 
-package_profile cpu cpu 1
 package_profile cuda12 cuda 2
 package_profile tensorrt10 tensorrt 3

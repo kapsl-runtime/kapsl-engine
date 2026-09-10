@@ -671,7 +671,7 @@ impl DeviceMemoryManager {
     /// CUDA context retained by the authority for allocations that must live
     /// outside the process-wide suballocator (for example exportable CUDA IPC
     /// regions). Callers still reserve those bytes through `MemoryAuthority`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn cuda_device(&self, device_id: usize) -> Result<Arc<CudaDevice>, String> {
         self.devices
             .get(&device_id)

@@ -91,13 +91,11 @@ public_release="$root/public/runtime/beta/v1.2.3"
 mkdir -p "$public_release"
 cp "$root/artifacts/pack.tar.gz" "$public_release/pack.tar.gz"
 cp "$root/artifacts/pack-macos.tar.gz" "$public_release/pack-macos.tar.gz"
-cp "$root/artifacts/backend-index.json" "$public_release/backend-index.json"
-cp "$root/artifacts/backend-index.json.sig" "$public_release/backend-index.json.sig"
 python3 -m http.server 18082 --bind 127.0.0.1 --directory "$root/public" \
   >"$root/http.log" 2>&1 &
 server_pid="$!"
 attempt=1
-while ! curl -fsSI "$public_base/runtime/beta/v1.2.3/backend-index.json" >/dev/null; do
+while ! curl -fsSI "$public_base/runtime/beta/v1.2.3/pack.tar.gz" >/dev/null; do
   if [ "$attempt" -ge 20 ]; then
     cat "$root/http.log" >&2
     echo "Timed out waiting for backend release fixture server." >&2
@@ -108,7 +106,71 @@ while ! curl -fsSI "$public_base/runtime/beta/v1.2.3/backend-index.json" >/dev/n
 done
 .github/scripts/verify-public-backend-release.sh \
   "$root/artifacts/backend-index.json" \
+  "$public_base/runtime/beta/v1.2.3" \
+  --artifacts-only
+cp "$root/artifacts/backend-index.json" "$public_release/backend-index.json"
+cp "$root/artifacts/backend-index.json.sig" "$public_release/backend-index.json.sig"
+.github/scripts/verify-public-backend-release.sh \
+  "$root/artifacts/backend-index.json" \
   "$public_base/runtime/beta/v1.2.3"
+
+python3 - "$root" <<'PY'
+import http.server
+import json
+import pathlib
+import subprocess
+import sys
+import threading
+
+root = pathlib.Path(sys.argv[1])
+requests = []
+
+
+class Challenge(http.server.BaseHTTPRequestHandler):
+    def deny(self):
+        requests.append((self.command, self.path))
+        self.send_response(403)
+        self.send_header("cf-mitigated", "challenge")
+        self.send_header("cf-ray", "fixture-ray-id")
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        if self.command == "GET":
+            self.wfile.write(b"<html>Just a moment...</html>")
+
+    do_GET = deny
+    do_HEAD = deny
+
+    def log_message(self, *args):
+        pass
+
+
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Challenge)
+thread = threading.Thread(target=server.serve_forever, daemon=True)
+thread.start()
+try:
+    public_root = f"http://127.0.0.1:{server.server_port}/runtime/beta/v1.2.3"
+    index = json.loads((root / "artifacts/backend-index.json").read_text())
+    index["packs"] = [{"artifact": f"{public_root}/pack.tar.gz"}]
+    local_index = root / "challenge-index.json"
+    local_index.write_text(json.dumps(index))
+    pathlib.Path(f"{local_index}.sig").write_text("fixture signature")
+    for mode, expected_request in [([], ("GET", "/runtime/beta/v1.2.3/backend-index.json")),
+                                   (["--artifacts-only"], ("HEAD", "/runtime/beta/v1.2.3/pack.tar.gz"))]:
+        requests.clear()
+        result = subprocess.run(
+            [".github/scripts/verify-public-backend-release.sh", str(local_index), public_root, *mode],
+            capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode != 0, "Challenge response must fail verification"
+        assert "Cloudflare browser challenge" in result.stderr, result.stderr
+        assert "fixture-ray-id" in result.stderr, result.stderr
+        assert public_root in result.stderr, result.stderr
+        assert requests == [expected_request], requests
+finally:
+    server.shutdown()
+    server.server_close()
+    thread.join()
+PY
 
 openssl genpkey -algorithm ED25519 -out "$root/wrong-key.pem" >/dev/null 2>&1
 wrong_public_key="$(openssl pkey -in "$root/wrong-key.pem" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
@@ -123,5 +185,89 @@ if .github/scripts/generate-backend-index.py \
   exit 1
 fi
 grep -q 'does not match any public key' "$root/wrong-key.log"
+
+python3 - <<'PY'
+import copy
+import importlib.util
+import pathlib
+
+script = pathlib.Path(".github/scripts/generate-backend-index.py")
+spec = importlib.util.spec_from_file_location("generate_backend_index", script)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+source = pathlib.Path("standard-native-fixture.json")
+
+accelerator = {
+    "formats": ["onnx"],
+    "model_types": [],
+    "tasks": ["forward", "generate"],
+    "accelerator_profile": "cuda",
+    "capabilities": {
+        "batching": True,
+        "streaming": True,
+        "cancellation": True,
+        "memory_reporting": True,
+        "governed_device_allocator": True,
+        "scoped_device_allocator": True,
+        "kv_participation": False,
+        "concurrent_inference": True,
+    },
+    "accelerator_requirements": {
+        "kind": "cuda",
+        "execution_providers": ["cuda"],
+        "implicit_cpu_fallback": False,
+    },
+    "memory_behavior": {
+        "allocation_scope": "kapsl-scoped-device-allocator-v1",
+        "device_allocation": "host-governed-scoped",
+        "planned_reporting": True,
+        "live_reporting": True,
+        "request_reporting": True,
+        "synchronize_before_free": True,
+    },
+}
+module.validate_standard_native_contract(accelerator, source)
+
+cpu = copy.deepcopy(accelerator)
+cpu["accelerator_profile"] = "cpu"
+cpu["accelerator_requirements"] = {
+    "kind": "cpu",
+    "execution_providers": ["cpu"],
+    "implicit_cpu_fallback": False,
+}
+cpu["capabilities"]["governed_device_allocator"] = False
+cpu["capabilities"]["scoped_device_allocator"] = False
+cpu["memory_behavior"]["allocation_scope"] = None
+cpu["memory_behavior"]["device_allocation"] = "none"
+cpu["memory_behavior"]["synchronize_before_free"] = False
+module.validate_standard_native_contract(cpu, source)
+
+
+def expect_failure(template, message):
+    try:
+        module.validate_standard_native_contract(template, source)
+    except SystemExit as error:
+        assert message in str(error), error
+    else:
+        raise AssertionError(f"standard native contract unexpectedly accepted: {message}")
+
+
+fallback = copy.deepcopy(accelerator)
+fallback["accelerator_requirements"]["implicit_cpu_fallback"] = True
+expect_failure(fallback, "disable implicit CPU fallback")
+
+unscoped = copy.deepcopy(accelerator)
+unscoped["memory_behavior"]["allocation_scope"] = None
+expect_failure(unscoped, "name their allocation scope")
+
+unreported = copy.deepcopy(accelerator)
+unreported["memory_behavior"]["request_reporting"] = False
+expect_failure(unreported, "planned, live, and request memory reporting")
+
+unspecified_allocation = copy.deepcopy(accelerator)
+unspecified_allocation["memory_behavior"]["device_allocation"] = None
+expect_failure(unspecified_allocation, "device allocation behavior")
+PY
 
 echo "backend index generation tests passed"

@@ -16,7 +16,7 @@ cat > "$bootstrap_root/python/bin/python3.12" <<'EOF'
 set -euo pipefail
 if [ "$#" -eq 0 ]; then
   cat >/dev/null
-  printf '%s\n' '{"connector":"0.6.0","profile":"vllm-v1-packed-cuda-ipc/flash-attn","planner_schema_version":1}'
+  printf '%s\n' '{"connector":"0.7.0","profile":"vllm-v1-packed-cuda-ipc/flash-attn","elastic_profile":"vllm-v1-packed-cuda-vmm/flash-attn-blnhc","kv_abi":{"major":1,"minor":5},"planner_schema_version":1}'
   exit 0
 fi
 if [ "${1:-}" = "-" ]; then
@@ -41,9 +41,11 @@ cat > "$bootstrap_root/installed-manifest.json" <<'EOF'
   "torchaudio": "2.11.0+cu130",
   "cuda_runtime": "13.0",
   "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-  "connector_distribution": "0.6.0",
-  "connector": "0.6.0",
+  "connector_distribution": "0.7.0",
+  "connector": "0.7.0",
   "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
+  "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
+  "kv_abi": {"major": 1, "minor": 5},
   "planner_schema_version": 1
 }
 EOF
@@ -61,7 +63,9 @@ test -x "$target_root/bin/python3.12"
 test -f "$target_root/kapsl-vllm-backend.json"
 test ! -e "$target_root/old-installation"
 grep -qF 'vllm-v1-packed-cuda-ipc/flash-attn' "$target_root/kapsl-vllm-backend.json"
-grep -qF '"connector": "0.6.0"' "$target_root/kapsl-vllm-backend.json"
+grep -qF 'vllm-v1-packed-cuda-vmm/flash-attn-blnhc' "$target_root/kapsl-vllm-backend.json"
+grep -qF '"connector": "0.7.0"' "$target_root/kapsl-vllm-backend.json"
+grep -qF '"kv_abi": {"major": 1, "minor": 5}' "$target_root/kapsl-vllm-backend.json"
 grep -qF '"planner_schema_version": 1' "$target_root/kapsl-vllm-backend.json"
 
 python3 - "$bootstrap_root/installed-manifest.json" <<'PY'
@@ -86,7 +90,7 @@ if [ "$status" -eq 0 ]; then
   echo "A mismatched managed-vLLM installed manifest unexpectedly succeeded." >&2
   exit 1
 fi
-grep -qF '"connector": "0.6.0"' "$target_root/kapsl-vllm-backend.json"
+grep -qF '"connector": "0.7.0"' "$target_root/kapsl-vllm-backend.json"
 
 python3 - "$bootstrap_root/installed-manifest.json" <<'PY'
 import json
@@ -95,7 +99,7 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 manifest = json.loads(path.read_text(encoding="utf-8"))
-manifest["connector"] = "0.6.0"
+manifest["connector"] = "0.7.0"
 path.write_text(json.dumps(manifest), encoding="utf-8")
 PY
 (cd "$bootstrap_root" && {

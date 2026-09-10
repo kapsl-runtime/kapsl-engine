@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# One-command installer for the latest Kapsl beta. On Linux x86_64, select the
+# Published one-command installer for the latest Kapsl beta. On Linux x86_64, select the
 # CUDA runtime when a working NVIDIA driver is visible; all other hosts use the
 # portable runtime. KAPSL_ACCELERATOR or --accelerator can override the choice.
 set -e

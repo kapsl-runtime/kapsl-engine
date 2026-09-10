@@ -71,6 +71,10 @@ pub(crate) struct BundleCommandArgs {
     /// Target host, for example linux-x86_64-cuda or linux-x86_64-cpu
     #[arg(long, value_name = "TARGET")]
     pub(crate) target: Option<String>,
+
+    /// Resolve signed backend archives from this local directory instead of downloading them
+    #[arg(long, value_name = "DIR")]
+    pub(crate) backend_artifacts_dir: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]

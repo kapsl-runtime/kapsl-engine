@@ -5,6 +5,7 @@ use clap::ValueEnum;
 
 const SERVING_METADATA_KEY: &str = "serving";
 const BACKEND_METADATA_KEY: &str = "backend";
+const BACKEND_PACK_METADATA_KEY: &str = "backend_pack";
 const BACKEND_PLAN_MANIFEST_MAX_BYTES: u64 = 1024 * 1024;
 
 #[derive(clap::Args, Debug)]
@@ -177,6 +178,51 @@ pub(crate) fn manifest_serving_backend(
     ServingBackendPolicy::parse_manifest_value(value).map(Some)
 }
 
+/// Read an optional signed-pack backend ID from
+/// `metadata.serving.backend_pack`.
+///
+/// This is separate from `metadata.serving.backend`, which still selects a
+/// managed/built-in serving process during the bridge release. Pack IDs are
+/// opaque to the engine and are matched against signed descriptors.
+pub(crate) fn manifest_backend_pack_pin(manifest: &Manifest) -> Result<Option<String>, String> {
+    let Some(metadata) = manifest.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(serving) = metadata.get(SERVING_METADATA_KEY) else {
+        return Ok(None);
+    };
+    let serving = serving.as_mapping().ok_or_else(|| {
+        "metadata.serving must be an object containing optional backend settings".to_string()
+    })?;
+    let key = serde_yaml::Value::String(BACKEND_PACK_METADATA_KEY.to_string());
+    let Some(value) = serving.get(&key) else {
+        return Ok(None);
+    };
+    let value = value.as_str().ok_or_else(|| {
+        "metadata.serving.backend_pack must be a signed backend ID string or `auto`".to_string()
+    })?;
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized == "auto" {
+        return Ok(None);
+    }
+    if normalized.is_empty()
+        || normalized.len() > 128
+        || !normalized
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match byte {
+                b'a'..=b'z' | b'0'..=b'9' => true,
+                b'-' | b'_' | b'.' => index > 0,
+                _ => false,
+            })
+    {
+        return Err(format!(
+            "metadata.serving.backend_pack `{value}` is not a valid backend ID"
+        ));
+    }
+    Ok(Some(normalized))
+}
+
 fn is_vllm_model_contract(manifest: &Manifest) -> bool {
     manifest
         .format
@@ -194,6 +240,14 @@ fn is_vllm_model_contract(manifest: &Manifest) -> bool {
 
 /// Validate model-policy compatibility without making a hardware decision.
 pub(crate) fn validate_serving_backend_declaration(manifest: &Manifest) -> Result<(), String> {
+    if let Some(backend) = manifest_backend_pack_pin(manifest)? {
+        if !EngineKind::resolve(manifest).uses_onnx_session() {
+            return Err(format!(
+                "metadata.serving.backend_pack `{backend}` is unsupported for model `{}` because this bridge release applies signed-pack capability selection only to ONNX contracts",
+                manifest.project_name
+            ));
+        }
+    }
     match manifest_serving_backend(manifest)? {
         None | Some(ServingBackendPolicy::Auto) => Ok(()),
         Some(ServingBackendPolicy::LlamaCpp) if EngineKind::resolve(manifest).is_gguf() => Ok(()),
@@ -594,7 +648,18 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
         memory.status = MemoryAdmissionStatus::Unknown;
         memory.reason = "CUDA was enabled by --cuda, but this host exposes no GPU capacity; final memory admission must run on the target host".to_string();
     }
-    let onnx_profile = if crate::backend::lazy_onnx_packs_enabled() {
+    let uses_onnx = EngineKind::resolve(&manifest).uses_onnx_session();
+    let signed_onnx_route = crate::backend::generic_native_backend_packs_enabled()?;
+    if uses_onnx && signed_onnx_route && !crate::backend::lazy_onnx_packs_enabled() {
+        return Err(format!(
+            "model `{}` requires a signed native backend pack, but ONNX pack installation is disabled or unsupported on {}; set {}=0 only for an explicit embedded ORT rollback",
+            manifest.project_name,
+            crate::backend::current_platform(),
+            crate::backend::GENERIC_NATIVE_PACKS_ENV
+        )
+        .into());
+    }
+    let onnx_profile = if uses_onnx && signed_onnx_route {
         match args.cuda {
             Some(true) => {
                 crate::backend::onnx_pack_profile_for_target(&manifest, BackendAccelerator::Cuda)?
@@ -626,6 +691,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
     } else {
         None
     };
+    let mut selection_reason = decision.reason.to_string();
     let (selected_backend, installed, download_required, download_bytes, execution_mode, profile) =
         if decision.selected == ResolvedServingBackend::Vllm
             && memory.status != MemoryAdmissionStatus::Rejected
@@ -640,6 +706,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
             }
             let manager = BackendManager::from_env(args.offline)?;
             let plan = manager.plan_vllm(&target)?;
+            selection_reason = plan.selection_reason.clone();
             (
                 "vllm".to_string(),
                 plan.installed,
@@ -668,9 +735,12 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
                 target.driver_version = Some("9999.0".to_string());
             }
             let manager = BackendManager::from_env(args.offline)?;
-            let plan = manager.plan_onnx(onnx_profile, &target)?;
+            let requirements =
+                crate::backend::onnx_backend_pack_requirements(&manifest, onnx_profile)?;
+            let plan = manager.plan_compatible_backend(&requirements, &target)?;
+            selection_reason = plan.selection_reason.clone();
             (
-                "onnx".to_string(),
+                plan.selected_backend.clone(),
                 plan.installed,
                 plan.download_required,
                 plan.download_bytes,
@@ -689,6 +759,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
             }
             let manager = BackendManager::from_env(args.offline)?;
             let plan = manager.plan_llama_cpp(llama_profile, &target)?;
+            selection_reason = plan.selection_reason.clone();
             memory = crate::backend::preliminary_llama_cpp_memory_admission(
                 llama_profile,
                 &absolute_path,
@@ -709,6 +780,16 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
                 if admitted { plan.download_bytes } else { 0 },
                 plan.execution_mode,
                 Some(plan.profile),
+            )
+        } else if uses_onnx && !signed_onnx_route {
+            selection_reason = crate::backend::embedded_onnx_rollback_reason(&manifest)?;
+            (
+                "embedded_ort".to_string(),
+                true,
+                false,
+                0,
+                "native".to_string(),
+                None,
             )
         } else {
             (
@@ -740,7 +821,13 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
         "external_process": decision.selected == ResolvedServingBackend::Vllm,
         "cuda": has_cuda,
         "cuda_source": cuda_source,
-        "reason": decision.reason,
+        "reason": selection_reason,
+        "serving_reason": decision.reason,
+        "onnx_route": if uses_onnx {
+            if signed_onnx_route { "signed_pack" } else { "embedded_rollback" }
+        } else {
+            "not_applicable"
+        },
     });
     println!(
         "{}",
@@ -779,6 +866,13 @@ mod tests {
         manifest.metadata = Some(
             serde_yaml::from_str(&format!("serving:\n  backend: {backend}\n"))
                 .expect("policy metadata"),
+        );
+    }
+
+    fn set_pack_pin(manifest: &mut Manifest, backend: &str) {
+        manifest.metadata = Some(
+            serde_yaml::from_str(&format!("serving:\n  backend_pack: {backend}\n"))
+                .expect("pack pin metadata"),
         );
     }
 
@@ -839,6 +933,34 @@ mod tests {
         assert!(manifest_serving_backend(&manifest)
             .unwrap_err()
             .contains("unknown metadata.serving.backend"));
+    }
+
+    #[test]
+    fn backend_pack_pin_is_opaque_normalized_and_optional() {
+        let mut pinned = manifest("onnx", "embedding", "embed");
+        set_pack_pin(&mut pinned, "Vendor.Backend-1");
+        assert_eq!(
+            manifest_backend_pack_pin(&pinned).unwrap().as_deref(),
+            Some("vendor.backend-1")
+        );
+
+        set_pack_pin(&mut pinned, "auto");
+        assert_eq!(manifest_backend_pack_pin(&pinned).unwrap(), None);
+
+        set_pack_pin(&mut pinned, "../unsafe");
+        assert!(manifest_backend_pack_pin(&pinned)
+            .unwrap_err()
+            .contains("not a valid backend ID"));
+    }
+
+    #[test]
+    fn backend_pack_pin_is_never_ignored_for_an_unmigrated_model_family() {
+        let mut gguf = manifest("gguf", "causal-lm", "generate");
+        set_pack_pin(&mut gguf, "vendor-backend");
+
+        let error = validate_serving_backend_declaration(&gguf).unwrap_err();
+        assert!(error.contains("unsupported"));
+        assert!(error.contains("only to ONNX contracts"));
     }
 
     #[test]

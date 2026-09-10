@@ -31,6 +31,7 @@ pub(crate) const MANAGED_VLLM_PACK_PROFILE: &str = "cu130-flash-attn";
 pub(crate) const ONNX_CPU_PACK_PROFILE: &str = "cpu";
 pub(crate) const ONNX_CUDA12_PACK_PROFILE: &str = "cuda12";
 pub(crate) const ONNX_TENSORRT10_PACK_PROFILE: &str = "tensorrt10";
+pub(crate) const STANDARD_NATIVE_ADAPTER_ABI: &str = "kapsl-backend-v1";
 pub(crate) const LLAMA_CPP_CPU_PACK_PROFILE: &str = "cpu";
 pub(crate) const LLAMA_CPP_CUDA12_PACK_PROFILE: &str = "cuda12";
 
@@ -116,6 +117,99 @@ pub(crate) struct BackendMemoryManifest {
     pub(crate) minimum_workspace_bytes: u64,
 }
 
+/// Capabilities covered by the signed pack index.
+///
+/// The adapter's runtime function table must make the same claims before the
+/// host will initialize it. Keeping these values in the signed index lets the
+/// resolver reject an incompatible multi-gigabyte pack before downloading it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct BackendPackCapabilities {
+    #[serde(default)]
+    pub(crate) batching: bool,
+    #[serde(default)]
+    pub(crate) streaming: bool,
+    #[serde(default)]
+    pub(crate) cancellation: bool,
+    #[serde(default)]
+    pub(crate) memory_reporting: bool,
+    #[serde(default)]
+    pub(crate) governed_device_allocator: bool,
+    #[serde(default)]
+    pub(crate) scoped_device_allocator: bool,
+    #[serde(default)]
+    pub(crate) kv_participation: bool,
+    #[serde(default)]
+    pub(crate) concurrent_inference: bool,
+}
+
+impl BackendPackCapabilities {
+    fn missing_required(&self, required: &Self) -> Vec<&'static str> {
+        [
+            (required.batching, self.batching, "batching"),
+            (required.streaming, self.streaming, "streaming"),
+            (required.cancellation, self.cancellation, "cancellation"),
+            (
+                required.memory_reporting,
+                self.memory_reporting,
+                "memory_reporting",
+            ),
+            (
+                required.governed_device_allocator,
+                self.governed_device_allocator,
+                "governed_device_allocator",
+            ),
+            (
+                required.scoped_device_allocator,
+                self.scoped_device_allocator,
+                "scoped_device_allocator",
+            ),
+            (
+                required.kv_participation,
+                self.kv_participation,
+                "kv_participation",
+            ),
+            (
+                required.concurrent_inference,
+                self.concurrent_inference,
+                "concurrent_inference",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(needed, available, label)| (needed && !available).then_some(label))
+        .collect()
+    }
+}
+
+/// Accelerator policy asserted by the pack producer.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct BackendAcceleratorRequirements {
+    #[serde(default)]
+    pub(crate) kind: Option<String>,
+    #[serde(default)]
+    pub(crate) execution_providers: Vec<String>,
+    /// `None` means an older pack made no signed claim and is therefore not
+    /// eligible for the standard native adapter route.
+    #[serde(default)]
+    pub(crate) implicit_cpu_fallback: Option<bool>,
+}
+
+/// Memory semantics covered by the signed pack index.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct BackendMemoryBehavior {
+    #[serde(default)]
+    pub(crate) allocation_scope: Option<String>,
+    #[serde(default)]
+    pub(crate) device_allocation: Option<String>,
+    #[serde(default)]
+    pub(crate) planned_reporting: bool,
+    #[serde(default)]
+    pub(crate) live_reporting: bool,
+    #[serde(default)]
+    pub(crate) request_reporting: bool,
+    #[serde(default)]
+    pub(crate) synchronize_before_free: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct BackendLicenseNotice {
     pub(crate) name: String,
@@ -133,6 +227,9 @@ pub(crate) struct BackendPackManifest {
     pub(crate) profile: String,
     pub(crate) pack_version: String,
     pub(crate) runtime_abi: u32,
+    /// Standard in-process adapter contract. Legacy provider-only packs omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) adapter_abi: Option<String>,
     /// A semver requirement evaluated against the Kapsl runtime version.
     pub(crate) compatible_kapsl: String,
     /// Canonical OS/architecture pair, for example `linux-x86_64`.
@@ -140,6 +237,8 @@ pub(crate) struct BackendPackManifest {
     pub(crate) architecture: String,
     /// `cpu`, `cuda`, or `tensorrt`.
     pub(crate) accelerator_profile: String,
+    #[serde(default)]
+    pub(crate) accelerator_requirements: BackendAcceleratorRequirements,
     #[serde(default)]
     pub(crate) minimum_cuda: Option<String>,
     #[serde(default)]
@@ -149,6 +248,18 @@ pub(crate) struct BackendPackManifest {
     /// backends and legacy native-KV records.
     #[serde(default)]
     pub(crate) kv_mode: Option<String>,
+    /// Model contracts this signed pack can execute. Empty lists are accepted
+    /// only for legacy packs that do not use the standard native adapter ABI.
+    #[serde(default)]
+    pub(crate) formats: Vec<String>,
+    #[serde(default)]
+    pub(crate) model_types: Vec<String>,
+    #[serde(default)]
+    pub(crate) tasks: Vec<String>,
+    #[serde(default)]
+    pub(crate) capabilities: BackendPackCapabilities,
+    #[serde(default)]
+    pub(crate) memory_behavior: BackendMemoryBehavior,
     /// Pack-local native library or external executable.
     pub(crate) entrypoint: String,
     pub(crate) artifact: String,
@@ -178,6 +289,39 @@ pub(crate) struct BackendIndex {
     pub(crate) packs: Vec<BackendPackManifest>,
 }
 
+/// Model and runtime requirements used to query a signed backend index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct BackendPackRequirements {
+    pub(crate) backend_pin: Option<String>,
+    pub(crate) preferred_profile: Option<String>,
+    pub(crate) format: Option<String>,
+    pub(crate) model_type: Option<String>,
+    pub(crate) task: Option<String>,
+    pub(crate) execution_provider: Option<String>,
+    pub(crate) execution_mode: Option<BackendExecutionMode>,
+    pub(crate) adapter_abi: Option<String>,
+    pub(crate) capabilities: BackendPackCapabilities,
+    pub(crate) allocation_scope: Option<String>,
+    pub(crate) synchronize_before_free: bool,
+}
+
+impl BackendPackRequirements {
+    pub(crate) fn for_model(manifest: &kapsl_core::Manifest) -> Self {
+        Self {
+            format: Some(kapsl_core::engine_kind::effective_format(manifest)),
+            model_type: Some(kapsl_core::engine_kind::effective_model_type(manifest)),
+            task: Some(kapsl_core::engine_kind::effective_task(manifest)),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendPackSelection {
+    pub(crate) manifest: BackendPackManifest,
+    pub(crate) reason: String,
+}
+
 /// Small manifest physically carried by a pack. Artifact hashes/signatures are
 /// deliberately absent because embedding an archive's own digest is circular.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -187,6 +331,8 @@ struct BackendPayloadManifest {
     profile: String,
     pack_version: String,
     runtime_abi: u32,
+    #[serde(default)]
+    adapter_abi: Option<String>,
     platform: String,
     execution_mode: BackendExecutionMode,
     #[serde(default)]
@@ -305,6 +451,7 @@ impl BackendTarget {
 pub(crate) struct BackendPackPlan {
     pub(crate) selected_backend: String,
     pub(crate) profile: String,
+    pub(crate) selection_reason: String,
     pub(crate) installed: bool,
     pub(crate) download_required: bool,
     pub(crate) download_bytes: u64,
@@ -419,6 +566,29 @@ impl BackendManager {
             .join(&pack.profile))
     }
 
+    /// Resolve one model contract against the verified signed index without
+    /// downloading or loading adapter code.
+    pub(crate) fn plan_compatible_backend(
+        &self,
+        requirements: &BackendPackRequirements,
+        target: &BackendTarget,
+    ) -> ManagerResult<BackendPackPlan> {
+        let index = self.load_index()?;
+        let selection = self.select_compatible_pack(&index, requirements, target)?;
+        let pack = selection.manifest;
+        let installed = self.installed_pack_is_valid(&pack).unwrap_or(false);
+        Ok(BackendPackPlan {
+            selected_backend: pack.backend.clone(),
+            profile: pack.profile.clone(),
+            selection_reason: selection.reason,
+            installed,
+            download_required: !installed,
+            download_bytes: if installed { 0 } else { pack.download_bytes },
+            execution_mode: pack.execution_mode.as_str().to_string(),
+            manifest: pack,
+        })
+    }
+
     pub(crate) fn plan_vllm(&self, target: &BackendTarget) -> ManagerResult<BackendPackPlan> {
         let index = self.load_index()?;
         let pack = self.select_pack(&index, "vllm", Some(MANAGED_VLLM_PACK_PROFILE), target)?;
@@ -431,6 +601,10 @@ impl BackendManager {
         Ok(BackendPackPlan {
             selected_backend: pack.backend.clone(),
             profile: pack.profile.clone(),
+            selection_reason: format!(
+                "explicit vLLM profile `{}` matched the signed backend index",
+                pack.profile
+            ),
             installed,
             download_required: !installed,
             download_bytes: if installed { 0 } else { pack.download_bytes },
@@ -464,6 +638,10 @@ impl BackendManager {
         Ok(BackendPackPlan {
             selected_backend: pack.backend.clone(),
             profile: pack.profile.clone(),
+            selection_reason: format!(
+                "explicit ONNX profile `{}` matched the signed backend index",
+                pack.profile
+            ),
             installed,
             download_required: !installed,
             download_bytes: if installed { 0 } else { pack.download_bytes },
@@ -497,6 +675,10 @@ impl BackendManager {
         Ok(BackendPackPlan {
             selected_backend: pack.backend.clone(),
             profile: pack.profile.clone(),
+            selection_reason: format!(
+                "explicit llama.cpp profile `{}` matched the signed backend index",
+                pack.profile
+            ),
             installed,
             download_required: !installed,
             download_bytes: if installed { 0 } else { pack.download_bytes },
@@ -508,16 +690,6 @@ impl BackendManager {
     pub(crate) fn ensure_vllm(&self, target: &BackendTarget) -> ManagerResult<PathBuf> {
         let plan = self.plan_vllm(target)?;
         self.ensure_pack(&plan.manifest)
-    }
-
-    pub(crate) fn ensure_onnx(
-        &self,
-        profile: OnnxBackendPackProfile,
-        target: &BackendTarget,
-    ) -> ManagerResult<(BackendPackManifest, PathBuf)> {
-        let plan = self.plan_onnx(profile, target)?;
-        let installed = self.ensure_pack(&plan.manifest)?;
-        Ok((plan.manifest, installed))
     }
 
     pub(crate) fn ensure_pack(&self, pack: &BackendPackManifest) -> ManagerResult<PathBuf> {
@@ -630,6 +802,18 @@ impl BackendManager {
             )));
         }
         self.download_artifact(pack, destination)
+    }
+
+    /// Verify a caller-supplied archive against its signed index entry without
+    /// installing it. Offline bundle creation uses this for release artifacts
+    /// already present on the preparation host.
+    pub(crate) fn verify_pack_archive(
+        &self,
+        pack: &BackendPackManifest,
+        archive_path: &Path,
+    ) -> ManagerResult<()> {
+        self.validate_pack_manifest(pack, None)?;
+        self.verify_artifact_file(pack, archive_path)
     }
 
     pub(crate) fn load_index(&self) -> ManagerResult<BackendIndex> {
@@ -768,6 +952,199 @@ impl BackendManager {
         Ok((index, bytes, signature))
     }
 
+    pub(crate) fn select_compatible_pack(
+        &self,
+        index: &BackendIndex,
+        requirements: &BackendPackRequirements,
+        target: &BackendTarget,
+    ) -> ManagerResult<BackendPackSelection> {
+        let backend_pin = requirements
+            .backend_pin
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let preferred_profile = requirements
+            .preferred_profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut rejected = Vec::new();
+        let mut candidates = Vec::new();
+
+        for pack in &index.packs {
+            if backend_pin.is_some_and(|backend| !pack.backend.eq_ignore_ascii_case(backend)) {
+                continue;
+            }
+            if preferred_profile.is_some_and(|profile| pack.profile != profile) {
+                continue;
+            }
+
+            let identity = format!("{}/{}", pack.backend, pack.profile);
+            if let Err(error) = self.validate_pack_manifest(pack, Some(target)) {
+                rejected.push(format!("{identity}: {error}"));
+                continue;
+            }
+            if requirements
+                .execution_mode
+                .is_some_and(|mode| pack.execution_mode != mode)
+            {
+                rejected.push(format!(
+                    "{identity}: execution mode {} does not match required {}",
+                    pack.execution_mode.as_str(),
+                    requirements
+                        .execution_mode
+                        .expect("checked execution mode")
+                        .as_str()
+                ));
+                continue;
+            }
+            if requirements.adapter_abi.is_some()
+                && pack.adapter_abi.as_deref() != requirements.adapter_abi.as_deref()
+            {
+                rejected.push(format!(
+                    "{identity}: adapter ABI {:?} does not match required {:?}",
+                    pack.adapter_abi, requirements.adapter_abi
+                ));
+                continue;
+            }
+            if let Some(format) = requirements.format.as_deref() {
+                if !signed_contract_contains(&pack.formats, format) {
+                    rejected.push(format!(
+                        "{identity}: format `{format}` is not declared by the signed pack"
+                    ));
+                    continue;
+                }
+            }
+            if let Some(model_type) = requirements.model_type.as_deref() {
+                if !pack.model_types.is_empty()
+                    && !signed_contract_contains(&pack.model_types, model_type)
+                {
+                    rejected.push(format!(
+                        "{identity}: model type `{model_type}` is not declared by the signed pack"
+                    ));
+                    continue;
+                }
+            }
+            if let Some(task) = requirements.task.as_deref() {
+                if !signed_contract_contains(&pack.tasks, task) {
+                    rejected.push(format!(
+                        "{identity}: task `{task}` is not declared by the signed pack"
+                    ));
+                    continue;
+                }
+            }
+            if let Some(provider) = requirements.execution_provider.as_deref() {
+                if !signed_contract_contains(
+                    &pack.accelerator_requirements.execution_providers,
+                    provider,
+                ) {
+                    rejected.push(format!(
+                        "{identity}: execution provider `{provider}` is not declared by the signed pack"
+                    ));
+                    continue;
+                }
+            }
+            let missing = pack
+                .capabilities
+                .missing_required(&requirements.capabilities);
+            if !missing.is_empty() {
+                rejected.push(format!(
+                    "{identity}: missing required capabilities {}",
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            if let Some(scope) = requirements.allocation_scope.as_deref() {
+                if pack.memory_behavior.allocation_scope.as_deref() != Some(scope) {
+                    rejected.push(format!(
+                        "{identity}: allocation scope {:?} does not match required `{scope}`",
+                        pack.memory_behavior.allocation_scope
+                    ));
+                    continue;
+                }
+            }
+            if requirements.synchronize_before_free && !pack.memory_behavior.synchronize_before_free
+            {
+                rejected.push(format!(
+                    "{identity}: signed memory behavior does not synchronize the device before freeing governed allocations"
+                ));
+                continue;
+            }
+            candidates.push(pack.clone());
+        }
+
+        candidates.sort_by(|left, right| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| compare_pack_versions(&right.pack_version, &left.pack_version))
+                .then_with(|| left.backend.cmp(&right.backend))
+                .then_with(|| left.profile.cmp(&right.profile))
+        });
+
+        let Some(selected) = candidates.first() else {
+            let selection = backend_pin
+                .map(|backend| format!("explicit backend `{backend}`"))
+                .unwrap_or_else(|| "automatic backend selection".to_string());
+            return Err(BackendManagerError::new(format!(
+                "{selection} found no compatible signed pack for format `{}`, model type `{}`, task `{}`, provider `{}` on {} ({}){}",
+                requirements.format.as_deref().unwrap_or("any"),
+                requirements.model_type.as_deref().unwrap_or("any"),
+                requirements.task.as_deref().unwrap_or("any"),
+                requirements.execution_provider.as_deref().unwrap_or("any"),
+                target.platform,
+                target.accelerator.as_str(),
+                if rejected.is_empty() {
+                    String::new()
+                } else {
+                    format!("; rejected candidates: {}", rejected.join("; "))
+                }
+            )));
+        };
+
+        let tied = candidates
+            .iter()
+            .take_while(|candidate| {
+                candidate.priority == selected.priority
+                    && compare_pack_versions(&candidate.pack_version, &selected.pack_version)
+                        == std::cmp::Ordering::Equal
+            })
+            .map(|candidate| format!("{}/{}", candidate.backend, candidate.profile))
+            .collect::<Vec<_>>();
+        if tied.len() > 1 {
+            return Err(BackendManagerError::new(format!(
+                "backend selection is ambiguous between equally ranked signed packs: {}; use an explicit backend pin or assign distinct signed priorities",
+                tied.join(", ")
+            )));
+        }
+
+        let selection_kind = backend_pin
+            .map(|backend| format!("explicit backend pin `{backend}`"))
+            .unwrap_or_else(|| "capability-based automatic selection".to_string());
+        Ok(BackendPackSelection {
+            manifest: selected.clone(),
+            reason: format!(
+                "{selection_kind} matched signed {}/{} version {} for format `{}`, model type `{}`, task `{}`, provider `{}`, and {} execution",
+                selected.backend,
+                selected.profile,
+                selected.pack_version,
+                requirements.format.as_deref().unwrap_or("any"),
+                requirements.model_type.as_deref().unwrap_or("any"),
+                requirements.task.as_deref().unwrap_or("any"),
+                requirements.execution_provider.as_deref().unwrap_or("any"),
+                target.accelerator.as_str()
+            ),
+        })
+    }
+
+    pub(crate) fn validate_pack_for_target(
+        &self,
+        pack: &BackendPackManifest,
+        target: &BackendTarget,
+    ) -> ManagerResult<()> {
+        self.validate_pack_manifest(pack, Some(target))
+    }
+
     pub(crate) fn select_pack(
         &self,
         index: &BackendIndex,
@@ -790,7 +1167,7 @@ impl BackendManager {
             right
                 .priority
                 .cmp(&left.priority)
-                .then_with(|| right.pack_version.cmp(&left.pack_version))
+                .then_with(|| compare_pack_versions(&right.pack_version, &left.pack_version))
         });
         candidates.into_iter().next().ok_or_else(|| {
             BackendManagerError::new(format!(
@@ -1110,6 +1487,100 @@ impl BackendManager {
                 "backend ABI {} does not match runtime ABI {}",
                 pack.runtime_abi, BACKEND_RUNTIME_ABI
             )));
+        }
+        if let Some(adapter_abi) = pack.adapter_abi.as_deref() {
+            if pack.execution_mode != BackendExecutionMode::Native {
+                return Err(BackendManagerError::new(
+                    "only native backend packs may declare adapter_abi",
+                ));
+            }
+            if adapter_abi != STANDARD_NATIVE_ADAPTER_ABI {
+                return Err(BackendManagerError::new(format!(
+                    "unsupported native adapter ABI `{adapter_abi}`"
+                )));
+            }
+            validate_signed_contract_values("formats", &pack.formats, false)?;
+            validate_signed_contract_values("model_types", &pack.model_types, true)?;
+            validate_signed_contract_values("tasks", &pack.tasks, false)?;
+            if !pack.capabilities.memory_reporting {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} must declare memory_reporting",
+                    pack.backend, pack.profile
+                )));
+            }
+            if pack.capabilities.scoped_device_allocator
+                && !pack.capabilities.governed_device_allocator
+            {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} declares a scoped allocator without a governed device allocator",
+                    pack.backend, pack.profile
+                )));
+            }
+            if pack.accelerator_profile != "cpu" && !pack.capabilities.governed_device_allocator {
+                return Err(BackendManagerError::new(format!(
+                    "standard native accelerator pack {}/{} must use the governed device allocator",
+                    pack.backend, pack.profile
+                )));
+            }
+            if pack.capabilities.scoped_device_allocator
+                && pack
+                    .memory_behavior
+                    .allocation_scope
+                    .as_deref()
+                    .is_none_or(|scope| scope.trim().is_empty())
+            {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} must name its scoped allocation contract",
+                    pack.backend, pack.profile
+                )));
+            }
+            if pack
+                .memory_behavior
+                .device_allocation
+                .as_deref()
+                .is_none_or(|behavior| behavior.trim().is_empty())
+            {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} must declare its device allocation behavior",
+                    pack.backend, pack.profile
+                )));
+            }
+            if pack.memory_behavior.synchronize_before_free
+                && !pack.capabilities.governed_device_allocator
+            {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} cannot request host synchronization without a governed device allocator",
+                    pack.backend, pack.profile
+                )));
+            }
+            if !pack.memory_behavior.planned_reporting
+                || !pack.memory_behavior.live_reporting
+                || !pack.memory_behavior.request_reporting
+            {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} must declare planned, live, and request memory reporting",
+                    pack.backend, pack.profile
+                )));
+            }
+            if pack.accelerator_requirements.kind.as_deref()
+                != Some(pack.accelerator_profile.as_str())
+            {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} accelerator requirement does not match profile `{}`",
+                    pack.backend, pack.profile, pack.accelerator_profile
+                )));
+            }
+            validate_signed_contract_values(
+                "execution providers",
+                &pack.accelerator_requirements.execution_providers,
+                false,
+            )?;
+            if pack.accelerator_requirements.implicit_cpu_fallback != Some(false) {
+                return Err(BackendManagerError::new(format!(
+                    "standard native backend pack {}/{} must explicitly disable implicit CPU fallback",
+                    pack.backend, pack.profile
+                )));
+            }
         }
         validate_cache_component("backend", &pack.backend)?;
         validate_cache_component("profile", &pack.profile)?;
@@ -1556,9 +2027,10 @@ pub(crate) fn execute_backend_command(
         crate::app::BackendSubcommand::Ensure(args) => {
             let device_info = DeviceInfo::probe();
             let target = BackendTarget::current(&device_info);
+            let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;
             let manager = BackendManager::from_env(args.offline)?;
-            let mut ensured = HashSet::new();
-            for model in args.model {
+            let mut ensured = HashSet::<(String, String)>::new();
+            for model in model_paths {
                 let absolute = model.canonicalize().map_err(|error| {
                     BackendManagerError::new(format!(
                         "invalid model path {}: {error}",
@@ -1583,7 +2055,18 @@ pub(crate) fn execute_backend_command(
                     )
                     .into());
                 }
-                let onnx_profile = if crate::backend::lazy_onnx_packs_enabled() {
+                let uses_onnx = kapsl_core::EngineKind::resolve(&manifest).uses_onnx_session();
+                let signed_onnx_route = crate::backend::generic_native_backend_packs_enabled()?;
+                let onnx_profile = if uses_onnx && signed_onnx_route {
+                    if !crate::backend::lazy_onnx_packs_enabled() {
+                        return Err(format!(
+                            "model `{}` requires a signed native backend pack, but ONNX pack installation is disabled or unsupported on {}; set {}=0 only for an explicit embedded ORT rollback",
+                            manifest.project_name,
+                            crate::backend::current_platform(),
+                            crate::backend::GENERIC_NATIVE_PACKS_ENV
+                        )
+                        .into());
+                    }
                     crate::backend::onnx_pack_profile_for_manifest(&manifest, &device_info)?
                 } else {
                     None
@@ -1594,7 +2077,7 @@ pub(crate) fn execute_backend_command(
                     None
                 };
                 if decision.selected == crate::backend::ResolvedServingBackend::Vllm
-                    && ensured.insert(("vllm", MANAGED_VLLM_PACK_PROFILE))
+                    && ensured.insert(("vllm".to_string(), MANAGED_VLLM_PACK_PROFILE.to_string()))
                 {
                     let installed = manager.ensure_vllm(&target)?;
                     println!(
@@ -1603,23 +2086,28 @@ pub(crate) fn execute_backend_command(
                         installed.display()
                     );
                 } else if let Some(profile) = onnx_profile {
-                    let identity = ("onnx", profile.profile());
+                    let mut onnx_target = target.clone();
+                    onnx_target.accelerator = profile.accelerator();
+                    if profile == OnnxBackendPackProfile::Cpu {
+                        onnx_target.cuda_version = None;
+                        onnx_target.driver_version = None;
+                    }
+                    let requirements =
+                        crate::backend::onnx_backend_pack_requirements(&manifest, profile)?;
+                    let plan = manager.plan_compatible_backend(&requirements, &onnx_target)?;
+                    let identity = (plan.selected_backend.clone(), plan.profile.clone());
                     if ensured.insert(identity) {
-                        let mut onnx_target = target.clone();
-                        onnx_target.accelerator = profile.accelerator();
-                        if profile == OnnxBackendPackProfile::Cpu {
-                            onnx_target.cuda_version = None;
-                            onnx_target.driver_version = None;
-                        }
-                        let (_, installed) = manager.ensure_onnx(profile, &onnx_target)?;
+                        let installed = manager.ensure_pack(&plan.manifest)?;
                         println!(
-                            "Ensured backend onnx/{} at {}",
-                            profile.profile(),
-                            installed.display()
+                            "Ensured backend {}/{} at {} ({})",
+                            plan.selected_backend,
+                            plan.profile,
+                            installed.display(),
+                            plan.selection_reason
                         );
                     }
                 } else if let Some(profile) = llama_profile {
-                    let identity = ("llama-cpp", profile.profile());
+                    let identity = ("llama-cpp".to_string(), profile.profile().to_string());
                     if ensured.insert(identity) {
                         let mut llama_target = target.clone();
                         llama_target.accelerator = profile.accelerator();
@@ -1650,6 +2138,12 @@ pub(crate) fn execute_backend_command(
                             installed.display()
                         );
                     }
+                } else if uses_onnx && !signed_onnx_route {
+                    let reason = crate::backend::embedded_onnx_rollback_reason(&manifest)?;
+                    println!(
+                        "{} uses the embedded ORT rollback ({})",
+                        manifest.project_name, reason
+                    );
                 } else if decision.selected != crate::backend::ResolvedServingBackend::Vllm {
                     println!(
                         "{} uses the in-process {} backend; no lazy pack is required by this runtime build",
@@ -1790,6 +2284,41 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+fn signed_contract_contains(values: &[String], required: &str) -> bool {
+    let required = required.trim();
+    !required.is_empty()
+        && values
+            .iter()
+            .any(|value| value.trim().eq_ignore_ascii_case(required))
+}
+
+fn validate_signed_contract_values(
+    label: &str,
+    values: &[String],
+    allow_empty: bool,
+) -> ManagerResult<()> {
+    if values.is_empty() && !allow_empty {
+        return Err(BackendManagerError::new(format!(
+            "standard native backend pack must declare non-empty {label}"
+        )));
+    }
+    let mut normalized = HashSet::new();
+    for value in values {
+        let value = value.trim().to_ascii_lowercase();
+        if value.is_empty() {
+            return Err(BackendManagerError::new(format!(
+                "standard native backend pack contains an empty {label} value"
+            )));
+        }
+        if !normalized.insert(value.clone()) {
+            return Err(BackendManagerError::new(format!(
+                "standard native backend pack repeats {label} value `{value}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn accelerator_matches(profile: &str, target: BackendAccelerator) -> bool {
     match profile.trim().to_ascii_lowercase().as_str() {
         "cpu" => target == BackendAccelerator::Cpu,
@@ -1807,6 +2336,21 @@ fn normalize_architecture(value: &str) -> &str {
         "amd64" => "x86_64",
         "arm64" => "aarch64",
         other => other,
+    }
+}
+
+fn compare_pack_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    match (semver::Version::parse(left), semver::Version::parse(right)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Err(_), Err(_)) => {
+            let left_numeric = numeric_version_components(left);
+            let right_numeric = numeric_version_components(right);
+            left_numeric
+                .cmp(&right_numeric)
+                .then_with(|| left.cmp(right))
+        }
     }
 }
 
@@ -2207,6 +2751,7 @@ fn validate_payload_manifest(
         && payload.profile == signed.profile
         && payload.pack_version == signed.pack_version
         && payload.runtime_abi == signed.runtime_abi
+        && payload.adapter_abi == signed.adapter_abi
         && payload.platform == signed.platform
         && payload.execution_mode == signed.execution_mode
         && payload.kv_mode == signed.kv_mode
@@ -2334,6 +2879,7 @@ mod tests {
             profile: MANAGED_VLLM_PACK_PROFILE.to_string(),
             pack_version: "0.26.1".to_string(),
             runtime_abi: 1,
+            adapter_abi: None,
             platform: current_platform(),
             execution_mode: BackendExecutionMode::External,
             kv_mode: None,
@@ -2376,14 +2922,21 @@ mod tests {
             profile: MANAGED_VLLM_PACK_PROFILE.to_string(),
             pack_version: "0.26.1".to_string(),
             runtime_abi: 1,
+            adapter_abi: None,
             compatible_kapsl: ">=0.2.3, <0.3.0".to_string(),
             platform: current_platform(),
             architecture: std::env::consts::ARCH.to_string(),
             accelerator_profile: "cuda".to_string(),
+            accelerator_requirements: Default::default(),
             minimum_cuda: Some("12.0".to_string()),
             minimum_driver: None,
             execution_mode: BackendExecutionMode::External,
             kv_mode: None,
+            formats: Vec::new(),
+            model_types: Vec::new(),
+            tasks: Vec::new(),
+            capabilities: Default::default(),
+            memory_behavior: Default::default(),
             entrypoint: "bin/python".to_string(),
             artifact: format!("file://{}", artifact.display()),
             download_bytes: fs::metadata(&artifact).unwrap().len(),
@@ -2440,6 +2993,60 @@ mod tests {
         }
     }
 
+    fn tensorrt_target() -> BackendTarget {
+        BackendTarget {
+            accelerator: BackendAccelerator::TensorRt,
+            ..cuda_target()
+        }
+    }
+
+    fn standard_native_pack(
+        mut pack: BackendPackManifest,
+        backend: &str,
+        profile: &str,
+        accelerator: &str,
+    ) -> BackendPackManifest {
+        let uses_device = accelerator != "cpu";
+        pack.backend = backend.to_string();
+        pack.profile = profile.to_string();
+        pack.adapter_abi = Some(STANDARD_NATIVE_ADAPTER_ABI.to_string());
+        pack.accelerator_profile = accelerator.to_string();
+        pack.accelerator_requirements = BackendAcceleratorRequirements {
+            kind: Some(accelerator.to_string()),
+            execution_providers: vec![accelerator.to_string()],
+            implicit_cpu_fallback: Some(false),
+        };
+        pack.minimum_cuda = uses_device.then(|| "12.0".to_string());
+        pack.execution_mode = BackendExecutionMode::Native;
+        pack.kv_mode = None;
+        pack.formats = vec!["onnx".to_string()];
+        pack.model_types = Vec::new();
+        pack.tasks = vec!["forward".to_string(), "generate".to_string()];
+        pack.capabilities = BackendPackCapabilities {
+            batching: true,
+            streaming: true,
+            cancellation: true,
+            memory_reporting: true,
+            governed_device_allocator: uses_device,
+            scoped_device_allocator: uses_device,
+            kv_participation: false,
+            concurrent_inference: true,
+        };
+        pack.memory_behavior = BackendMemoryBehavior {
+            allocation_scope: uses_device.then(|| "kapsl-scoped-device-allocator-v1".to_string()),
+            device_allocation: Some(if uses_device {
+                "host-governed-scoped".to_string()
+            } else {
+                "none".to_string()
+            }),
+            planned_reporting: true,
+            live_reporting: true,
+            request_reporting: true,
+            synchronize_before_free: uses_device,
+        };
+        pack
+    }
+
     #[test]
     fn signed_pack_installs_atomically_and_is_reused() {
         let (_root, manager, pack, _) = fixture();
@@ -2456,12 +3063,8 @@ mod tests {
 
     #[test]
     fn onnx_plan_requires_an_exact_native_profile() {
-        let (_root, manager, mut pack, signing) = fixture();
-        pack.backend = "onnx".to_string();
-        pack.profile = ONNX_CPU_PACK_PROFILE.to_string();
-        pack.accelerator_profile = "cpu".to_string();
-        pack.minimum_cuda = None;
-        pack.execution_mode = BackendExecutionMode::Native;
+        let (_root, manager, pack, signing) = fixture();
+        let pack = standard_native_pack(pack, "onnx", ONNX_CPU_PACK_PROFILE, "cpu");
         let index = BackendIndex {
             schema_version: BACKEND_INDEX_SCHEMA_VERSION,
             runtime_version: manager.runtime_version().to_string(),
@@ -2483,11 +3086,274 @@ mod tests {
         assert_eq!(plan.selected_backend, "onnx");
         assert_eq!(plan.profile, ONNX_CPU_PACK_PROFILE);
         assert_eq!(plan.execution_mode, "native");
+        assert_eq!(
+            plan.manifest.adapter_abi.as_deref(),
+            Some(STANDARD_NATIVE_ADAPTER_ABI)
+        );
         assert!(manager
             .plan_onnx(OnnxBackendPackProfile::Cuda12, &cpu_target())
             .unwrap_err()
             .to_string()
             .contains("requires a cuda target"));
+    }
+
+    #[test]
+    fn capability_resolver_filters_model_contract_and_records_reason() {
+        let (_root, manager, pack, _) = fixture();
+        let mut compatible = standard_native_pack(pack.clone(), "fake-a", "cpu", "cpu");
+        compatible.priority = 20;
+        let mut wrong_task = standard_native_pack(pack, "fake-b", "cpu", "cpu");
+        wrong_task.priority = 100;
+        wrong_task.tasks = vec!["classify".to_string()];
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![wrong_task, compatible],
+        };
+        let requirements = BackendPackRequirements {
+            format: Some("onnx".to_string()),
+            model_type: Some("causal-lm".to_string()),
+            task: Some("generate".to_string()),
+            execution_mode: Some(BackendExecutionMode::Native),
+            capabilities: BackendPackCapabilities {
+                batching: true,
+                streaming: true,
+                cancellation: true,
+                memory_reporting: true,
+                ..BackendPackCapabilities::default()
+            },
+            ..BackendPackRequirements::default()
+        };
+
+        let selected = manager
+            .select_compatible_pack(&index, &requirements, &cpu_target())
+            .unwrap();
+        assert_eq!(selected.manifest.backend, "fake-a");
+        assert!(selected
+            .reason
+            .contains("capability-based automatic selection"));
+        assert!(selected.reason.contains("causal-lm"));
+        assert!(selected.reason.contains("generate"));
+    }
+
+    #[test]
+    fn capability_resolver_requires_the_selected_execution_provider() {
+        let (_root, manager, pack, _) = fixture();
+        let mut cuda = standard_native_pack(pack.clone(), "fake-cuda", "cuda12", "cuda");
+        cuda.priority = 100;
+        let tensorrt = standard_native_pack(pack, "fake-tensorrt", "tensorrt10", "tensorrt");
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![cuda, tensorrt],
+        };
+        let requirements = BackendPackRequirements {
+            format: Some("onnx".to_string()),
+            task: Some("forward".to_string()),
+            execution_provider: Some("tensorrt".to_string()),
+            ..BackendPackRequirements::default()
+        };
+
+        let selected = manager
+            .select_compatible_pack(&index, &requirements, &tensorrt_target())
+            .unwrap();
+        assert_eq!(selected.manifest.backend, "fake-tensorrt");
+        assert!(selected.reason.contains("provider `tensorrt`"));
+    }
+
+    #[test]
+    fn capability_resolver_orders_semantic_versions_numerically() {
+        let (_root, manager, pack, _) = fixture();
+        let mut older = standard_native_pack(pack.clone(), "fake", "cpu", "cpu");
+        older.pack_version = "0.9.0".to_string();
+        let mut newer = standard_native_pack(pack, "fake", "cpu", "cpu");
+        newer.pack_version = "0.10.0".to_string();
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![older, newer],
+        };
+        let requirements = BackendPackRequirements {
+            backend_pin: Some("fake".to_string()),
+            format: Some("onnx".to_string()),
+            task: Some("forward".to_string()),
+            ..BackendPackRequirements::default()
+        };
+
+        let selected = manager
+            .select_compatible_pack(&index, &requirements, &cpu_target())
+            .unwrap();
+        assert_eq!(selected.manifest.pack_version, "0.10.0");
+    }
+
+    #[test]
+    fn explicit_backend_pin_fails_without_substitution() {
+        let (_root, manager, pack, _) = fixture();
+        let available = standard_native_pack(pack, "available", "cpu", "cpu");
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![available],
+        };
+        let requirements = BackendPackRequirements {
+            backend_pin: Some("required".to_string()),
+            format: Some("onnx".to_string()),
+            task: Some("forward".to_string()),
+            ..BackendPackRequirements::default()
+        };
+
+        let error = manager
+            .select_compatible_pack(&index, &requirements, &cpu_target())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicit backend `required`"));
+        assert!(error.contains("no compatible signed pack"));
+        assert!(!error.contains("selected available"));
+    }
+
+    #[test]
+    fn equally_ranked_automatic_candidates_are_ambiguous() {
+        let (_root, manager, pack, _) = fixture();
+        let first = standard_native_pack(pack.clone(), "fake-a", "cpu", "cpu");
+        let second = standard_native_pack(pack, "fake-b", "cpu", "cpu");
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![second, first],
+        };
+        let mut requirements = BackendPackRequirements {
+            format: Some("onnx".to_string()),
+            task: Some("forward".to_string()),
+            ..BackendPackRequirements::default()
+        };
+
+        let error = manager
+            .select_compatible_pack(&index, &requirements, &cpu_target())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous"));
+        assert!(error.contains("fake-a/cpu"));
+        assert!(error.contains("fake-b/cpu"));
+
+        requirements.backend_pin = Some("fake-b".to_string());
+        let selected = manager
+            .select_compatible_pack(&index, &requirements, &cpu_target())
+            .unwrap();
+        assert_eq!(selected.manifest.backend, "fake-b");
+    }
+
+    #[test]
+    fn scoped_allocator_requirement_rejects_unscoped_accelerator_pack() {
+        let (_root, manager, pack, _) = fixture();
+        let mut unscoped = standard_native_pack(pack, "fake-gpu", "cuda12", "cuda");
+        unscoped.capabilities.scoped_device_allocator = false;
+        unscoped.memory_behavior.allocation_scope = None;
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![unscoped],
+        };
+        let requirements = BackendPackRequirements {
+            backend_pin: Some("fake-gpu".to_string()),
+            format: Some("onnx".to_string()),
+            task: Some("generate".to_string()),
+            execution_mode: Some(BackendExecutionMode::Native),
+            capabilities: BackendPackCapabilities {
+                memory_reporting: true,
+                governed_device_allocator: true,
+                scoped_device_allocator: true,
+                ..BackendPackCapabilities::default()
+            },
+            allocation_scope: Some("kapsl-scoped-device-allocator-v1".to_string()),
+            ..BackendPackRequirements::default()
+        };
+
+        let error = manager
+            .select_compatible_pack(&index, &requirements, &cuda_target())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("scoped_device_allocator"));
+    }
+
+    #[test]
+    fn governed_allocator_requirement_rejects_missing_device_synchronization() {
+        let (_root, manager, pack, _) = fixture();
+        let mut unsynchronized = standard_native_pack(pack, "fake-gpu", "cuda12", "cuda");
+        unsynchronized.memory_behavior.synchronize_before_free = false;
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: manager.runtime_version().to_string(),
+            generated_at: "2026-09-03T00:00:00Z".to_string(),
+            packs: vec![unsynchronized],
+        };
+        let requirements = BackendPackRequirements {
+            backend_pin: Some("fake-gpu".to_string()),
+            format: Some("onnx".to_string()),
+            task: Some("generate".to_string()),
+            execution_provider: Some("cuda".to_string()),
+            capabilities: BackendPackCapabilities {
+                governed_device_allocator: true,
+                scoped_device_allocator: true,
+                ..BackendPackCapabilities::default()
+            },
+            allocation_scope: Some("kapsl-scoped-device-allocator-v1".to_string()),
+            synchronize_before_free: true,
+            ..BackendPackRequirements::default()
+        };
+
+        let error = manager
+            .select_compatible_pack(&index, &requirements, &cuda_target())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("synchronize the device"));
+    }
+
+    #[test]
+    fn adapter_abi_is_explicit_and_fail_closed() {
+        let (_root, manager, mut pack, _) = fixture();
+        pack.execution_mode = BackendExecutionMode::Native;
+        pack.adapter_abi = Some("vendor-private-v1".to_string());
+        let error = manager
+            .validate_pack_manifest(&pack, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported native adapter ABI"));
+
+        pack.adapter_abi = Some(STANDARD_NATIVE_ADAPTER_ABI.to_string());
+        pack.execution_mode = BackendExecutionMode::External;
+        let error = manager
+            .validate_pack_manifest(&pack, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("only native backend packs"));
+    }
+
+    #[test]
+    fn payload_must_repeat_the_signed_adapter_abi() {
+        let (_root, _manager, mut signed, _) = fixture();
+        signed.execution_mode = BackendExecutionMode::Native;
+        signed.adapter_abi = Some(STANDARD_NATIVE_ADAPTER_ABI.to_string());
+        let mut payload = BackendPayloadManifest {
+            schema_version: signed.schema_version,
+            backend: signed.backend.clone(),
+            profile: signed.profile.clone(),
+            pack_version: signed.pack_version.clone(),
+            runtime_abi: signed.runtime_abi,
+            adapter_abi: None,
+            platform: signed.platform.clone(),
+            execution_mode: signed.execution_mode,
+            kv_mode: signed.kv_mode.clone(),
+            entrypoint: signed.entrypoint.clone(),
+        };
+        assert!(validate_payload_manifest(&signed, &payload).is_err());
+        payload.adapter_abi = signed.adapter_abi.clone();
+        assert!(validate_payload_manifest(&signed, &payload).is_ok());
     }
 
     #[test]

@@ -106,6 +106,17 @@ Packages may declare a deployment-time policy at
 this policy existed; an old package is never redirected to vLLM merely because
 it is loaded on a CUDA host.
 
+ONNX packages may independently pin an opaque signed-pack backend ID at
+`metadata.serving.backend_pack`. Omitting it, or setting it to `auto`, uses
+capability-based selection. An unsupported explicit pin is an error and never
+substitutes another backend. For example:
+
+```yaml
+metadata:
+  serving:
+    backend_pack: vendor.backend-1
+```
+
 The build command writes the field without replacing other metadata:
 
 ```bash
@@ -144,9 +155,10 @@ kapsl backend-plan ./model.aimod --cuda true
 
 The command emits machine-readable JSON including `selected_backend`,
 `installed`, `download_required`, `download_bytes`, `memory_admission`,
-`execution_mode`, and the reason for the decision. `external_process` is true
-for vLLM because Kapsl supervises a separate Python process; it does not mean
-the user starts or addresses a second server. Run the package normally:
+`execution_mode`, `onnx_route`, the serving-policy reason, and the signed-pack
+selection reason. `external_process` is true for vLLM because Kapsl supervises
+a separate Python process; it does not mean the user starts or addresses a
+second server. Run the package normally:
 
 ```bash
 kapsl run ./model.aimod

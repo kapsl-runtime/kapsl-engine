@@ -1,0 +1,96 @@
+name: Release Infrastructure Preflight (host only)
+
+on:
+  workflow_call:
+    secrets:
+      # Environment-owned: requiring this at the caller rejects valid callers
+      # before the protected environment can supply it.
+      GPU_RUNNER_GITHUB_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: gcp-gpu-conformance
+    env:
+      GCP_GPU_PROJECT_ID: ${{ vars.GCP_GPU_PROJECT_ID }}
+      GCP_GPU_ZONE: ${{ vars.GCP_GPU_ZONE }}
+      GCP_GPU_RUNNER_IMAGE: ${{ vars.GCP_GPU_RUNNER_IMAGE }}
+      GCP_GPU_SUBNET: ${{ vars.GCP_GPU_SUBNET }}
+      GCP_GPU_EXTERNAL_IP: ${{ vars.GCP_GPU_EXTERNAL_IP }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_GPU_PROVISIONER_SERVICE_ACCOUNT: ${{ vars.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+      GCP_GPU_RUNNER_GROUP_ID: ${{ vars.GCP_GPU_RUNNER_GROUP_ID }}
+      GPU_RUNNER_GITHUB_APP_ID: ${{ vars.GPU_RUNNER_GITHUB_APP_ID }}
+      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check per-crate SDK pins before release builds
+        run: python3 .github/scripts/verify_published_sdk.py --lockfile kapsl-runtime/Cargo.lock
+
+      - name: Validate configuration without revealing credentials
+        env:
+          GPU_RUNNER_GITHUB_APP_PRIVATE_KEY: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
+        run: python3 .github/scripts/preflight_release_environment.py --gpu
+
+      - name: Validate GitHub App authentication and administration grant
+        id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ env.GPU_RUNNER_GITHUB_APP_ID }}
+          private-key: ${{ secrets.GPU_RUNNER_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+
+      - name: Verify runner API access without registering a runner
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh api "repos/$GITHUB_REPOSITORY/actions/runners?per_page=1" --jq .total_count
+
+      - name: Verify the exact certified SDK commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/preflight_release_environment.py --sdk
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_GPU_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Verify GCE zone, immutable image and subnet (read only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute zones describe "$GCP_GPU_ZONE" \
+            --project "$GCP_GPU_PROJECT_ID" --format='value(name)' | grep -Fx "$GCP_GPU_ZONE"
+          image_ref=${GCP_GPU_RUNNER_IMAGE#https://www.googleapis.com/compute/v1/}
+          image_project=${image_ref#projects/}
+          image_project=${image_project%%/*}
+          gcloud compute images describe "${image_ref##*/}" \
+            --project "$image_project" --format='value(status)' | grep -Fx READY
+          if [[ -n "$GCP_GPU_SUBNET" ]]; then
+            subnet_ref=${GCP_GPU_SUBNET#https://www.googleapis.com/compute/v1/}
+            if [[ ! "$subnet_ref" =~ ^projects/([^/]+)/regions/([^/]+)/subnetworks/([^/]+)$ ]]; then
+              echo "GCP_GPU_SUBNET must be a project/region-qualified subnet." >&2
+              exit 1
+            fi
+            gcloud compute networks subnets describe "${BASH_REMATCH[3]}" \
+              --project "${BASH_REMATCH[1]}" --region "${BASH_REMATCH[2]}" --format='value(name)'
+          fi
+
+      - name: Record preflight scope
+        run: echo "Authentication and read access passed; no VM, disk, firewall or JIT registration was created." >> "$GITHUB_STEP_SUMMARY"

@@ -48,7 +48,7 @@ the standard HTTP header:
 Authorization: Bearer <api-key>
 ```
 
-Login, HTTP routes, and MCP all use the engine's shared policy evaluator.
+Login, HTTP routes, gRPC, and MCP all use the engine's shared policy evaluator.
 MCP request completion events use the process-wide logging subscriber;
 see [Logging](logging.md) for JSON output and audit filters.
 

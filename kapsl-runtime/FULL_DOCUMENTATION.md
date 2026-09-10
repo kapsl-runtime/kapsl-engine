@@ -44,7 +44,7 @@ Shared Rust crates live in the separate `kapsl-sdk` repository:
 
 ### 3.1 Prerequisites
 
-- Rust 1.92.0.
+- Rust 1.98.0 is the pinned build toolchain; Rust 1.92.0 is the workspace MSRV.
 - Python 3.9+ for the SDK Python package.
 - Optional GPU/runtime dependencies depending on provider:
   - CUDA/TensorRT (NVIDIA),

@@ -75,8 +75,14 @@ impl EngineFacade for RuntimeMcpEngine {
     }
 }
 
-struct RuntimeMcpAuthorizer {
+pub(crate) struct RuntimeMcpAuthorizer {
     auth_state: Arc<RwLock<ApiAuthState>>,
+}
+
+impl RuntimeMcpAuthorizer {
+    pub(crate) fn new(auth_state: Arc<RwLock<ApiAuthState>>) -> Self {
+        Self { auth_state }
+    }
 }
 
 impl RequestAuthorizer for RuntimeMcpAuthorizer {
@@ -112,7 +118,7 @@ pub(crate) async fn start_runtime_mcp_server(
     kapsl_mcp::start_mcp_server(
         McpServerConfig::new(bind_addr, port).with_allowed_hosts(allowed_hosts),
         Arc::new(RuntimeMcpEngine::new(models, inference)),
-        Arc::new(RuntimeMcpAuthorizer { auth_state }),
+        Arc::new(RuntimeMcpAuthorizer::new(auth_state)),
     )
     .await
 }

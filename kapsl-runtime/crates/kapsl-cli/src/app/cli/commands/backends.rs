@@ -22,8 +22,8 @@ pub(crate) enum BackendSubcommand {
 
 #[derive(clap::Args, Debug)]
 pub(crate) struct BackendEnsureCommandArgs {
-    /// Model package(s) whose backend should be prepared
-    #[arg(required = true, value_name = "MODEL")]
+    /// Model package(s) or offline bundle(s) whose backends should be prepared
+    #[arg(required = true, value_name = "MODEL_OR_BUNDLE")]
     pub(crate) model: Vec<PathBuf>,
 
     /// Refuse network access and report any missing pack

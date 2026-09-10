@@ -19,18 +19,27 @@ enum ManagedVllmOpenAiMode {
 
 impl ManagedVllmOpenAiMode {
     fn from_environment() -> Self {
-        match std::env::var(VLLM_BRIDGE_MODE_ENV) {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "wire" => Self::Wire,
-                "legacy" | "async-translated" | "translated" | "" => Self::Translated,
-                other => {
-                    log::warn!(
-                        "Ignoring unsupported {VLLM_BRIDGE_MODE_ENV}={other:?}; expected wire, async-translated, or legacy"
-                    );
-                    Self::Translated
-                }
-            },
-            Err(_) => Self::Translated,
+        Self::from_value(std::env::var(VLLM_BRIDGE_MODE_ENV).ok().as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("wire") => Self::Wire,
+            Some("legacy" | "async-translated" | "translated") => Self::Translated,
+            Some(other) => {
+                log::warn!(
+                    "Ignoring unsupported {VLLM_BRIDGE_MODE_ENV}={other:?}; expected wire, async-translated, or legacy"
+                );
+                Self::Wire
+            }
+        }
+    }
+
+    fn metric_mode(self, streaming: bool) -> &'static str {
+        match (self, streaming) {
+            (Self::Wire, _) => "wire",
+            (Self::Translated, true) => "async_translated",
+            (Self::Translated, false) => "legacy",
         }
     }
 }
@@ -94,11 +103,13 @@ pub(crate) fn build_chat_completions_route(
 
     warp::path!("v1" / "chat" / "completions")
         .and(warp::post())
+        .and(warp::any().map(std::time::Instant::now))
         .and(bounded_chat_body())
         .and(warp::header::optional::<String>("x-kapsl-session"))
         .and(warp::header::optional::<String>("authorization"))
         .and_then(
-            move |body: BoundedChatBody,
+            move |ingress_started: std::time::Instant,
+                  body: BoundedChatBody,
                   session_header: Option<String>,
                   authorization: Option<String>| {
                 let models = models.clone();
@@ -107,6 +118,7 @@ pub(crate) fn build_chat_completions_route(
                     Ok::<_, warp::Rejection>(
                         handle_chat_completion(
                             body,
+                            ingress_started,
                             session_header,
                             authorization,
                             &models,
@@ -126,6 +138,7 @@ pub(crate) fn build_chat_completions_route(
 #[allow(clippy::too_many_arguments)]
 async fn handle_chat_completion(
     body: BoundedChatBody,
+    ingress_started: std::time::Instant,
     session_header: Option<String>,
     authorization: Option<String>,
     models: &Arc<ModelManager>,
@@ -200,6 +213,13 @@ async fn handle_chat_completion(
         .registry()
         .get(resolved.id)
         .is_some_and(|model| model.device == "vllm");
+    if is_managed_vllm {
+        inference.observe_managed_vllm_ingress(
+            &resolved.name,
+            managed_vllm_mode.metric_mode(chat.stream),
+            ingress_started.elapsed(),
+        );
+    }
 
     let request_id = completion_id();
     // KV affinity: an explicit session header wins, else the OpenAI end-user id.
@@ -832,6 +852,30 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_vllm_wire_is_default_with_explicit_translated_rollback() {
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(None),
+            ManagedVllmOpenAiMode::Wire
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("wire")),
+            ManagedVllmOpenAiMode::Wire
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("async-translated")),
+            ManagedVllmOpenAiMode::Translated
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("legacy")),
+            ManagedVllmOpenAiMode::Translated
+        );
+        assert_eq!(
+            ManagedVllmOpenAiMode::from_value(Some("invalid")),
+            ManagedVllmOpenAiMode::Wire
+        );
+    }
 
     #[tokio::test]
     async fn chat_body_filter_rejects_before_buffering_above_the_wire_limit() {

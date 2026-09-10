@@ -1,7 +1,7 @@
 # Logging
 
 The `kapsl` executable installs one process-wide `tracing` subscriber, including
-a bridge for existing `log` calls. HTTP, MCP, scheduling, memory governance,
+a bridge for existing `log` calls. HTTP, gRPC, MCP, scheduling, memory governance,
 native transport dependencies, and backend lifecycle diagnostics use the same
 filter, formatter, and stderr sink. Libraries do not install a logger.
 
@@ -27,6 +27,10 @@ with required role, scope, and outcome. Warp can evaluate several role groups
 while selecting a route, so evaluation records are not request counts; use
 the completion records for request totals. These logs are diagnostics, not a
 durable or tamper-resistant compliance audit store.
+
+The gRPC adapter also emits `kapsl::access` completion records through this
+subscriber, including stream termination, using its method, gRPC status, and
+elapsed-time fields. See [gRPC](grpc.md) for its serving and authorization policy.
 
 Managed vLLM stdout and stderr are independently drained in bounded 8 KiB
 chunks, including unterminated lines. Raw bytes are still appended to the

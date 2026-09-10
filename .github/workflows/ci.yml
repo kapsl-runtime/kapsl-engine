@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   cargo-check:
     name: Cargo check (${{ matrix.os }})
@@ -23,15 +27,12 @@ jobs:
 
       - name: Set up Rust
         if: runner.os != 'Windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Rust (Windows)
         if: runner.os == 'Windows'
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
 
       - name: Enable long paths on Windows
@@ -41,11 +42,13 @@ jobs:
           git config --global core.longpaths true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-check-${{ matrix.os }}
 
       - name: Check runtime workspace
         if: runner.os != 'Windows'
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server,mcp-server
 
       # Exercise the optional CUDA memory authority without requiring nvcc or a
       # GPU on the hosted runner. The gpu-device-pool feature pins the stable
@@ -72,8 +75,26 @@ jobs:
         shell: pwsh
         env:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server,mcp-server
 
+  msrv:
+    name: Cargo check (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up workspace MSRV
+        uses: ./.github/actions/setup-rust
+        with:
+          msrv: true
+
+      - name: Cache Cargo
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-msrv
+
+      - name: Check runtime workspace on its minimum Rust version
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --locked --features grpc-server,mcp-server
 
   test:
     name: Cargo test (${{ matrix.os }})
@@ -87,15 +108,12 @@ jobs:
 
       - name: Set up Rust
         if: runner.os != 'Windows'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.92.0
+        uses: ./.github/actions/setup-rust
 
       - name: Set up Rust (Windows)
         if: runner.os == 'Windows'
-        uses: dtolnay/rust-toolchain@stable
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: 1.92.0
           targets: x86_64-pc-windows-msvc
 
       - name: Enable long paths on Windows
@@ -105,15 +123,17 @@ jobs:
           git config --global core.longpaths true
 
       - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: ci-test-${{ matrix.os }}
 
       - name: Test runtime workspace
         if: runner.os != 'Windows'
-        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace
+        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server,mcp-server
 
       - name: Test runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
-        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl
+        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server,mcp-server

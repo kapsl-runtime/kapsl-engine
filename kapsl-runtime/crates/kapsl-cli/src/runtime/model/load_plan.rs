@@ -231,17 +231,36 @@ pub(super) fn build_model_load_plan(
         );
     let priority_weight = resolve_model_priority_weight(&loader.manifest, base_model_id);
     let pipeline_stages = manifest_llm_pipeline_stages(&loader.manifest);
+    let requested_topology = placement.topology.trim().to_ascii_lowercase();
+    let topology_choice = if serving_backend.selected == ResolvedServingBackend::Vllm
+        && matches!(
+            requested_topology.as_str(),
+            "tensor-parallel" | "tensor_parallel"
+        ) {
+        let degree = placement.tp_degree.max(1);
+        EffectiveTopologyChoice {
+            mesh_topology: kapsl_hal::device_mesh::MeshTopology::TensorParallel {
+                degree,
+                mesh_shape: (1, degree),
+            },
+            worker_topology: "tensor-parallel",
+            worker_tp_degree: degree,
+            use_pipeline_backend: false,
+        }
+    } else {
+        resolve_effective_topology_choice(
+            &loader.manifest,
+            &placement.topology,
+            placement.tp_degree,
+            pipeline_stages.as_deref(),
+        )
+    };
     let EffectiveTopologyChoice {
         mesh_topology,
         worker_topology,
         worker_tp_degree,
         use_pipeline_backend,
-    } = resolve_effective_topology_choice(
-        &loader.manifest,
-        &placement.topology,
-        placement.tp_degree,
-        pipeline_stages.as_deref(),
-    );
+    } = topology_choice;
     BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
         .map_err(|error| {
             format!(

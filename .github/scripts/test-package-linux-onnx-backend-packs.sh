@@ -33,6 +33,11 @@ printf 'ORT CUDA\n' > "$test_root/repo/ort-cuda-libs/libonnxruntime_providers_cu
 printf 'ORT TensorRT\n' > "$test_root/repo/ort-tensorrt-libs/libonnxruntime_providers_tensorrt.so"
 printf 'cuDNN\n' > "$test_root/repo/cuda-runtime/libcudnn.so.9"
 printf 'CUDA runtime\n' > "$test_root/repo/cuda-runtime/libcudart.so.12"
+# The full CUDA runtime archive also contains ORT sidecars. Use deliberately
+# different bytes so this fixture catches accidental copying or conflicts with
+# the authoritative provider-specific staging directories above.
+printf 'Bundled ORT shared copy\n' > "$test_root/repo/cuda-runtime/libonnxruntime_providers_shared.so"
+printf 'Bundled ORT CUDA copy\n' > "$test_root/repo/cuda-runtime/libonnxruntime_providers_cuda.so"
 printf 'NVIDIA license\n' > "$test_root/repo/cuda-runtime/NVIDIA-CONTAINER-LICENSE"
 printf 'TensorRT\n' > "$test_root/repo/tensorrt-runtime-libs/libnvinfer.so.10"
 printf 'TensorRT parser\n' > "$test_root/repo/tensorrt-runtime-libs/libnvonnxparser.so.10"
@@ -76,16 +81,15 @@ import tarfile
 dist = pathlib.Path(sys.argv[1])
 extracted = pathlib.Path(sys.argv[2])
 profiles = {
-    "cpu": "cpu",
     "cuda12": "cuda",
     "tensorrt10": "tensorrt",
 }
 index = json.loads((dist / "backend-index.json").read_text())
 assert {(pack["backend"], pack["profile"]) for pack in index["packs"]} == {
-    ("onnx", "cpu"),
     ("onnx", "cuda12"),
     ("onnx", "tensorrt10"),
 }
+assert not (dist / "kapsl-backend-onnx-cpu-1.2.3-linux-x86_64.tar.gz").exists()
 for profile, accelerator in profiles.items():
     archive = dist / f"kapsl-backend-onnx-{profile}-1.2.3-linux-x86_64.tar.gz"
     template_path = pathlib.Path(str(archive) + ".manifest.json")
@@ -124,11 +128,12 @@ for profile, accelerator in profiles.items():
     assert descriptor.runtime_abi == 1
     assert descriptor.profile == {"cpu": 1, "cuda12": 2, "tensorrt10": 3}[profile]
 
-cpu = extracted / "cpu"
-assert not (cpu / "libonnxruntime_providers_cuda.so").exists()
-assert not (cpu / "libcudnn.so.9").exists()
 cuda = extracted / "cuda12"
 assert (cuda / "kapsl-provider-cuda12.json").is_file()
+assert (cuda / "libonnxruntime_providers_shared.so").read_text() == "ORT shared\n"
+assert (cuda / "libonnxruntime_providers_cuda.so").read_text() == "ORT CUDA\n"
+assert (cuda / "libcudnn.so.9").is_file()
+assert (cuda / "libcudart.so.12").is_file()
 assert not (cuda / "libonnxruntime_providers_tensorrt.so").exists()
 tensorrt = extracted / "tensorrt10"
 assert (tensorrt / "kapsl-provider-cuda12.json").is_file()
@@ -137,8 +142,8 @@ assert (tensorrt / "libnvinfer.so.10").is_file()
 PY
 
 if command -v nm >/dev/null 2>&1; then
-  nm "$test_root/extracted/cpu/libkapsl_backend_onnx.so" \
+  nm "$test_root/extracted/cuda12/libkapsl_backend_onnx.so" \
     | grep -q 'kapsl_onnx_backend_pack_v1'
 fi
 
-echo "Linux ONNX backend packager tests passed."
+echo "Linux legacy ONNX accelerator packager tests passed."

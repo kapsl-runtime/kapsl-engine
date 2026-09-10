@@ -98,7 +98,8 @@ graph TB
 
 ### Required
 
-- **Rust**: 1.92.0
+- **Rust**: 1.98.0 is the pinned development and release toolchain; Rust 1.92.0
+  is the workspace MSRV
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -1150,6 +1151,9 @@ RUST_LOG=debug cargo run -p kapsl -- --model model.aimod
 ```
 
 ---
+
+Native adapter changes must pass the [host allocator regression tests](docs/native-host-tests.md),
+which load a test adapter through the production ABI with a fake device pool.
 
 **Document Version**: 1.0  
 **Maintained by**: kapsl-runtime development team  

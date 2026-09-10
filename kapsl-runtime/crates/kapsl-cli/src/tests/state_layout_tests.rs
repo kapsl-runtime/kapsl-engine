@@ -20,6 +20,12 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         scheduler_queue_delay_ms: 2,
         performance_profile: PerformanceProfile::Standard,
         metrics_port: 9095,
+        #[cfg(feature = "grpc-server")]
+        grpc_port: None,
+        #[cfg(feature = "grpc-server")]
+        grpc_bind: "127.0.0.1".parse().unwrap(),
+        #[cfg(feature = "grpc-server")]
+        grpc_max_message_bytes: 16 * 1024 * 1024,
         http_bind: "127.0.0.1".to_string(),
         #[cfg(feature = "mcp-server")]
         mcp_port: None,
