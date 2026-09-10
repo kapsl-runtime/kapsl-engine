@@ -59,6 +59,12 @@ Every advertised optional function and every required ABI function is removed
 in turn to verify host rejection. KV participation is not advertised by this
 fixture; adding that capability without its functions is also rejected.
 
+Adapter-specific initialization options pass through the generic host as JSON.
+The loaded fixture verifies nested values arrive unchanged and that an adapter
+cannot override the engine's selected provider, signed descriptor, pack version,
+pack root or entrypoint. Legacy ONNX tuning is translated outside the native
+host, which has no dependency on `OnnxRuntimeTuning` or `kapsl-backends`.
+
 These tests exercise the loader after the signed-installation boundary. The fake
 library is a local test artifact, not a published signed pack. They establish no
 ORT provider, platform, output or performance qualification. Stable signed-pack

@@ -63,7 +63,12 @@ require_literal "$native_allocator" 'GpuDevicePool'
 require_literal "$native_allocator" 'KapslBackendHostScopedAllocatorV1'
 require_literal "$native_allocator" 'allocate_device_scoped'
 require_literal "$native_host" '"pack_root": pack.root'
-require_literal "$native_host" '"onnx_tuning": tuning.map'
+require_literal "$activator" 'pub(crate) fn onnx_adapter_options('
+require_literal "$runtime_backend" '&onnx_adapter_options(tuning)'
+if grep -Eq 'kapsl_backends|OnnxRuntimeTuning|onnx_tuning' "$native_host"; then
+  echo "$native_host must not depend on ONNX configuration types or translation" >&2
+  exit 1
+fi
 require_literal "$native_host" 'pointer.cast::<KapslBackendApiPrefixV1>().read()'
 require_literal "$native_host" 'pack.api.shutdown'
 require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.2.0"'

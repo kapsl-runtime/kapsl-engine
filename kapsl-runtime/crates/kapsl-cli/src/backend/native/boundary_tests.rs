@@ -41,6 +41,15 @@ fn engine(
     owner: (u32, u32),
     mode: &str,
 ) -> Result<NativePackedEngine, String> {
+    engine_with_options(pool, owner, mode, &serde_json::Map::new())
+}
+
+fn engine_with_options(
+    pool: &Arc<FakePool>,
+    owner: (u32, u32),
+    mode: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<NativePackedEngine, String> {
     let host = pool.host(owner.0, owner.1, 2048);
     NativePackInstance::initialize_with_host(
         pack(),
@@ -50,7 +59,7 @@ fn engine(
         0,
         owner.0,
         owner.1,
-        None,
+        options,
     )
     .map(|instance| NativePackedEngine { instance })
 }
@@ -75,6 +84,55 @@ async fn wait_started(instance: &NativePackInstance, count: u64) {
     })
     .await
     .expect("fake adapter never entered inference");
+}
+
+#[test]
+fn opaque_adapter_options_cross_the_loaded_native_boundary() {
+    let pool = Arc::new(FakePool::default());
+    let options = serde_json::json!({
+        "vendor_config": { "strategy": "paged", "shape": [2, 4], "enabled": true },
+        "extension": null,
+    });
+    let engine =
+        engine_with_options(&pool, (7, 2), "normal", options.as_object().unwrap()).unwrap();
+    let received: serde_json::Value = engine
+        .instance
+        .call_json_report(engine.instance.pack.api.model_info.unwrap())
+        .unwrap();
+    let received = &received["options"];
+    for (key, value) in options.as_object().unwrap() {
+        assert_eq!(&received[key], value);
+    }
+    assert_eq!(received["provider"], "cuda");
+    assert_eq!(received["descriptor"]["backend"], "fake-native");
+    assert_eq!(
+        received["pack_root"],
+        serde_json::json!(engine.instance.pack.root)
+    );
+    assert!(received.get("onnx_tuning").is_none());
+}
+
+#[test]
+fn adapter_options_cannot_override_engine_owned_configuration() {
+    let pool = Arc::new(FakePool::default());
+    for key in [
+        "provider",
+        "accelerator_profile",
+        "pack_version",
+        "descriptor",
+        "pack_root",
+        "entrypoint",
+    ] {
+        let options = serde_json::Map::from_iter([(key.into(), serde_json::json!("override"))]);
+        let error = engine_with_options(&pool, (7, 2), "initialize-allocates", &options)
+            .err()
+            .expect("engine-owned configuration must reject overrides");
+        assert!(
+            error.contains(&format!("adapter option `{key}` conflicts")),
+            "{error}"
+        );
+        assert_eq!(pool.bytes((7, 2)), 0);
+    }
 }
 
 #[tokio::test]
