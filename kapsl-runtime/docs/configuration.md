@@ -390,6 +390,8 @@ by its participant but is not device-free.
 | Variable | Description |
 |----------|-------------|
 | `KAPSL_LOG_SENSITIVE_IDS` | Set to `1` to include request/session IDs in logs (off by default for privacy) |
+| `RUST_LOG` | Shared runtime and dependency log filter (default `warn`); e.g. `warn,kapsl::access=info` |
+| `KAPSL_LOG_FORMAT` | Shared stderr format: `text` (default) or `json`; see [Logging](logging.md) |
 
 ## Example: production deployment
 

@@ -22,16 +22,18 @@ pub(crate) fn authorize_api_request(
     );
     // Warp can evaluate more than one role group before selecting a route.
     // These are policy evaluations, not completed request audit records.
-    log::debug!(target: "kapsl::authorization",
-    "required_role={:?} required_scope={:?} outcome={}",
-    required_role, required_scope,
-    match &result {
-        Ok(_) => "allowed",
-        Err(ApiAuthorizationError::Unauthorized) => "unauthorized",
-        Err(ApiAuthorizationError::Forbidden) => "forbidden",
-        Err(ApiAuthorizationError::LocalOnly) => "local_only",
-    });
-
+    tracing::debug!(
+        target: "kapsl::authorization",
+        ?required_role,
+        ?required_scope,
+        outcome = match &result {
+            Ok(_) => "allowed",
+            Err(ApiAuthorizationError::Unauthorized) => "unauthorized",
+            Err(ApiAuthorizationError::Forbidden) => "forbidden",
+            Err(ApiAuthorizationError::LocalOnly) => "local_only",
+        },
+        "authorization evaluated"
+    );
     result
 }
 
@@ -79,6 +81,21 @@ fn evaluate_api_access(
         },
         grant: grant_match.grant,
     })
+}
+
+/// Native TCP currently delegates per-frame token verification to kapsl-ipc.
+/// Keep its exposure policy here beside the API policy until the SDK exposes
+/// a dynamic authorization callback. Local IPC/SHM use OS access controls.
+pub(crate) fn validate_native_tcp_exposure(
+    bind_ip: IpAddr,
+    auth_token: Option<&str>,
+) -> Result<(), String> {
+    if bind_ip.is_loopback() || auth_token.is_some_and(|token| !token.trim().is_empty()) {
+        return Ok(());
+    }
+    Err(format!(
+        "Refusing unauthenticated TCP inference on non-loopback address {bind_ip}. Set {TCP_AUTH_TOKEN_ENV} to a dedicated native-transport token, or bind --bind to a loopback address. Raw TCP is plaintext; use a trusted network or TLS tunnel for cross-host serving."
+    ))
 }
 
 pub(crate) fn normalize_required_text(value: &str, field: &str) -> Result<String, String> {

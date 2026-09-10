@@ -12,6 +12,10 @@ pub(crate) struct ResolvedRuntimeConfig {
     pub(crate) log_sensitive_ids: bool,
     pub(crate) http_bind_addr: IpAddr,
     pub(crate) http_port: u16,
+    #[cfg(feature = "mcp-server")]
+    pub(crate) mcp_port: Option<u16>,
+    #[cfg(feature = "mcp-server")]
+    pub(crate) mcp_allowed_hosts: Vec<String>,
     #[cfg(feature = "grpc-server")]
     pub(crate) grpc: Option<kapsl_grpc::GrpcServerConfig>,
     pub(crate) transport: RuntimeTransportConfig,
@@ -49,6 +53,14 @@ impl ResolvedRuntimeConfig {
                 "HTTP API is bound to {}. Traffic is plaintext HTTP; place runtime behind TLS and network ACLs.",
                 self.http_bind_addr
             );
+        }
+        #[cfg(feature = "mcp-server")]
+        if self.mcp_port.is_some() && !self.http_bind_addr.is_loopback() && !allow_insecure_http {
+            return Err(format!(
+                "Refusing to bind MCP on non-loopback address {} without {}=1. Use a TLS-terminating reverse proxy if exposing runtime externally.",
+                self.http_bind_addr, ALLOW_INSECURE_HTTP_ENV
+            )
+            .into());
         }
         self.transport.validate_tcp_exposure()?;
         #[cfg(feature = "grpc-server")]
@@ -149,6 +161,19 @@ pub(crate) fn resolve_runtime_config(
     )));
     let log_sensitive_ids = env_flag(LOG_SENSITIVE_IDS_ENV);
     let http_bind_addr = parse_bind_ip(&args.http_bind, IpAddr::from([127, 0, 0, 1]), "http_bind");
+    #[cfg(feature = "mcp-server")]
+    let mcp_allowed_hosts = std::env::var("KAPSL_MCP_ALLOWED_HOSTS")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let transport = RuntimeTransportConfig {
         mode: RuntimeTransportMode::parse(&args.transport)?,
         socket_path: args.socket.clone(),
@@ -192,6 +217,10 @@ pub(crate) fn resolve_runtime_config(
         log_sensitive_ids,
         http_bind_addr,
         http_port: args.metrics_port,
+        #[cfg(feature = "mcp-server")]
+        mcp_port: args.mcp_port,
+        #[cfg(feature = "mcp-server")]
+        mcp_allowed_hosts,
         #[cfg(feature = "grpc-server")]
         grpc: args.grpc_port.map(|port| kapsl_grpc::GrpcServerConfig {
             bind_addr: std::net::SocketAddr::new(args.grpc_bind, port),

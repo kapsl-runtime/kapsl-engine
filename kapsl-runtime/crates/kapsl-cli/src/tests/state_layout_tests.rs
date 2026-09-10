@@ -27,6 +27,8 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         #[cfg(feature = "grpc-server")]
         grpc_max_message_bytes: 16 * 1024 * 1024,
         http_bind: "127.0.0.1".to_string(),
+        #[cfg(feature = "mcp-server")]
+        mcp_port: None,
         state_dir: Some(state_dir.clone()),
         topology: "data-parallel".to_string(),
         tp_degree: 1,
