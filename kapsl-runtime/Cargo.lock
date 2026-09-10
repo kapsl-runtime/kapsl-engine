@@ -2309,6 +2309,7 @@ dependencies = [
  "kapsl-llm",
  "kapsl-loader",
  "kapsl-monitor",
+ "kapsl-native-test-adapter",
  "kapsl-rag",
  "kapsl-rag-sdk",
  "kapsl-scheduler",
@@ -2592,6 +2593,15 @@ dependencies = [
  "prometheus",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "kapsl-native-test-adapter"
+version = "0.0.0"
+dependencies = [
+ "kapsl-backend-abi",
+ "kapsl-engine-api",
+ "serde_json",
 ]
 
 [[package]]

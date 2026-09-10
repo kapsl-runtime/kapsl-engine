@@ -22,14 +22,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[cfg(feature = "gpu-device-pool")]
-use kapsl_hal::gpu_arena::{
-    GpuAllocation, GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner,
-};
-#[cfg(feature = "gpu-device-pool")]
-use std::collections::HashMap;
-#[cfg(feature = "gpu-device-pool")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
+mod allocator;
+use allocator::{GovernedDeviceHost, NativeBackendHost};
 
 pub(crate) const GENERIC_NATIVE_PACKS_ENV: &str = "KAPSL_GENERIC_NATIVE_PACKS";
 const MAX_JSON_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -158,6 +152,14 @@ pub(crate) fn activate_native_backend_pack(
         return Ok(());
     }
 
+    active.push(load_native_backend_pack(manifest, root)?);
+    Ok(())
+}
+
+fn load_native_backend_pack(
+    manifest: &BackendPackManifest,
+    root: &Path,
+) -> Result<Arc<ActiveNativePack>, String> {
     let root = root
         .canonicalize()
         .map_err(|error| format!("resolve native pack {}: {error}", root.display()))?;
@@ -200,15 +202,14 @@ pub(crate) fn activate_native_backend_pack(
         manifest.pack_version,
         root.display()
     );
-    active.push(Arc::new(ActiveNativePack {
+    Ok(Arc::new(ActiveNativePack {
         manifest: manifest.clone(),
         api,
         descriptor,
         root,
         entrypoint,
         library,
-    }));
-    Ok(())
+    }))
 }
 
 fn validate_native_backend_api(
@@ -448,6 +449,7 @@ struct NativePackInstance {
     cancel_target: Arc<NativeCancelTarget>,
     next_request_id: AtomicU64,
     loaded: AtomicBool,
+    cleanup_required: AtomicBool,
     call_lock: RwLock<()>,
 }
 
@@ -471,11 +473,13 @@ struct LiveNativeCancelTarget {
 
 struct NativeCancelTarget {
     live: RwLock<Option<LiveNativeCancelTarget>>,
+    allocator: Option<Arc<GovernedDeviceHost>>,
 }
 
 impl NativeCancelTarget {
     fn new(handle: *mut c_void, function: Option<KapslBackendCancelFn>) -> Self {
         Self {
+            allocator: None,
             live: RwLock::new(function.map(|function| LiveNativeCancelTarget {
                 handle: handle as usize,
                 function,
@@ -489,6 +493,9 @@ impl NativeCancelTarget {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let target = *live.as_ref()?;
+        if let Some(allocator) = &self.allocator {
+            allocator.cancel(request_id);
+        }
         // SAFETY: the read guard prevents instance shutdown from invalidating
         // the adapter handle until this cancellation call returns.
         Some(unsafe { (target.function)(target.handle as *mut c_void, request_id) })
@@ -548,6 +555,7 @@ impl Drop for NativeCancellationWatches {
 }
 
 struct NativeStreamCallbackContext {
+    request_id: u64,
     sender: async_channel::Sender<Result<BinaryTensorPacket, EngineError>>,
     callback_error: Option<EngineError>,
     consumer_closed: bool,
@@ -555,7 +563,7 @@ struct NativeStreamCallbackContext {
 
 unsafe extern "C" fn native_stream_chunk(
     user_data: *mut c_void,
-    _request_id: u64,
+    request_id: u64,
     result: *const KapslInferenceResultV1,
 ) -> i32 {
     if user_data.is_null() {
@@ -571,7 +579,11 @@ unsafe extern "C" fn native_stream_chunk(
     }
 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let packet = if result.is_null() {
+        let packet = if request_id != context.request_id {
+            Err(EngineError::backend(
+                "native stream chunk belongs to a different request",
+            ))
+        } else if result.is_null() {
             Err(EngineError::backend(
                 "native backend stream callback received a null result",
             ))
@@ -649,10 +661,6 @@ impl NativePackInstance {
     ) -> Result<Arc<Self>, String> {
         let requires_governed_memory =
             pack.api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
-        let supports_cancellation = pack.api.capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0;
-        let cancellation_runtime = supports_cancellation
-            .then(native_bridge_runtime)
-            .transpose()?;
         let host = NativeBackendHost::new(
             resources,
             &pack.manifest.backend,
@@ -660,7 +668,30 @@ impl NativePackInstance {
             model_id,
             replica_id,
             requires_governed_memory,
+            pack.api.capabilities & KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR != 0,
         )?;
+        Self::initialize_with_host(
+            pack, manifest, provider, host, device_id, model_id, replica_id, tuning,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_with_host(
+        pack: Arc<ActiveNativePack>,
+        manifest: &Manifest,
+        provider: &str,
+        host: NativeBackendHost,
+        device_id: usize,
+        model_id: u32,
+        replica_id: u32,
+        tuning: Option<&OnnxRuntimeTuning>,
+    ) -> Result<Arc<Self>, String> {
+        let requires_governed_memory =
+            pack.api.capabilities & KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR != 0;
+        let supports_cancellation = pack.api.capabilities & KAPSL_BACKEND_CAP_CANCELLATION != 0;
+        let cancellation_runtime = supports_cancellation
+            .then(native_bridge_runtime)
+            .transpose()?;
         let profile = pack.manifest.profile.as_bytes();
         let manifest_json = serde_json::to_vec(manifest)
             .map_err(|error| format!("encode model manifest for native backend: {error}"))?;
@@ -699,6 +730,7 @@ impl NativePackInstance {
         // SAFETY: the table was validated and all borrowed config storage lives
         // through this synchronous call. The host table itself is boxed and is
         // retained until adapter shutdown.
+        let allocation_call = host.begin_model_call()?;
         let status = unsafe {
             pack.api.initialize.expect("validated initialize function")(
                 &config,
@@ -706,7 +738,9 @@ impl NativePackInstance {
                 &mut error,
             )
         };
+        drop(allocation_call);
         if status != KAPSL_STATUS_OK || handle.is_null() {
+            host.stop_allocating();
             let message = read_ffi_error(&pack.api, status, error);
             if !handle.is_null() {
                 // SAFETY: an adapter that published a handle transferred it
@@ -730,14 +764,17 @@ impl NativePackInstance {
         } else {
             None
         };
+        let mut cancel_target = NativeCancelTarget::new(handle, cancel_function);
+        cancel_target.allocator = host.allocator.clone();
         Ok(Arc::new(Self {
             pack,
             handle,
             host,
             cancellation_runtime,
-            cancel_target: Arc::new(NativeCancelTarget::new(handle, cancel_function)),
+            cancel_target: Arc::new(cancel_target),
             next_request_id: AtomicU64::new(1),
             loaded: AtomicBool::new(false),
+            cleanup_required: AtomicBool::new(false),
             call_lock: RwLock::new(()),
         }))
     }
@@ -886,6 +923,10 @@ impl NativePackInstance {
         let mut bridge = RequestBridge::new(request)?;
         let wire = bridge.wire(request_id);
         let _guard = self.inference_guard();
+        self.require_loaded()?;
+        let _allocation_call = self
+            .host
+            .begin_requests([(request_id, request.cancellation.clone())])?;
         let _cancellation_watches = self.watch_cancellations(
             request
                 .cancellation
@@ -985,13 +1026,21 @@ impl NativePackInstance {
             let mut bridge = RequestBridge::new(request)?;
             let wire = bridge.wire(request_id);
             let _guard = self.inference_guard();
+            self.require_loaded()?;
+            let _allocation_call = self
+                .host
+                .begin_requests([(request_id, request.cancellation.clone())])?;
             let _cancellation_watches = self.watch_cancellations(
                 request
                     .cancellation
                     .clone()
                     .map(|cancellation| (request_id, cancellation)),
             );
+            if sender.is_closed() {
+                return Ok(());
+            }
             let mut context = NativeStreamCallbackContext {
+                request_id,
                 sender: sender.clone(),
                 callback_error: None,
                 consumer_closed: false,
@@ -1092,6 +1141,13 @@ impl NativePackInstance {
             requests: wires.as_ptr(),
         };
         let _guard = self.inference_guard();
+        self.require_loaded()?;
+        let _allocation_call = self.host.begin_requests(
+            request_ids
+                .iter()
+                .zip(requests)
+                .map(|(id, request)| (*id, request.cancellation.clone())),
+        )?;
         let _cancellation_watches =
             self.watch_cancellations(requests.iter().zip(&request_ids).filter_map(
                 |(request, request_id)| {
@@ -1138,28 +1194,51 @@ impl NativePackInstance {
         copy_batch_results(&result, requests.len())
     }
 
-    fn unload(&self) -> Result<(), EngineError> {
-        if !self.loaded.swap(false, Ordering::AcqRel) {
-            return Ok(());
+    fn require_loaded(&self) -> Result<(), EngineError> {
+        if self.loaded.load(Ordering::Acquire) && !self.cleanup_required.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(EngineError::backend(
+                "native backend model is not loaded or requires cleanup",
+            ))
         }
+    }
+
+    fn unload(&self) -> Result<(), EngineError> {
         let _guard = self.exclusive_guard();
         let _cancel_pause = self.cancel_target.pause();
+        self.unload_locked()
+    }
+
+    fn unload_locked(&self) -> Result<(), EngineError> {
+        self.host.stop_allocating();
+        if !self.loaded.load(Ordering::Acquire)
+            && !self.cleanup_required.load(Ordering::Acquire)
+            && self.host.live_allocations() == 0
+        {
+            return self.host.reclaim().map_err(EngineError::backend);
+        }
+        self.cleanup_required.store(true, Ordering::Release);
         let mut error = KapslOwnedBuffer::empty();
-        // SAFETY: lifecycle ownership guarantees no request is active here.
+        // SAFETY: the exclusive call guard has drained every native request.
         let status = unsafe {
             self.pack.api.unload.expect("validated unload function")(self.handle, &mut error)
         };
-        if status == KAPSL_STATUS_OK {
-            if !error.ptr.is_null() {
-                let _ = take_owned_buffer(&self.pack.api, error, "unexpected unload error");
-            }
-            Ok(())
-        } else {
-            Err(status_engine_error(
+        if status != KAPSL_STATUS_OK {
+            // A failed unload may still retain pointers. Reclaim only after a
+            // successful retry or terminal adapter shutdown.
+            return Err(status_engine_error(
                 status,
                 read_ffi_error(&self.pack.api, status, error),
-            ))
+            ));
         }
+        if !error.ptr.is_null() {
+            let _ = take_owned_buffer(&self.pack.api, error, "unexpected unload error");
+        }
+        self.loaded.store(false, Ordering::Release);
+        self.host.reclaim().map_err(EngineError::backend)?;
+        self.cleanup_required.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -1169,7 +1248,8 @@ impl Drop for NativePackInstance {
         // once terminal lifecycle teardown begins. Any call already in flight
         // completes before this write lock is acquired.
         self.cancel_target.deactivate();
-        if self.loaded.load(Ordering::Acquire) {
+        self.host.stop_allocating();
+        if self.loaded.load(Ordering::Acquire) || self.cleanup_required.load(Ordering::Acquire) {
             if let Err(error) = self.unload() {
                 log::error!("native backend unload during shutdown failed: {error}");
             }
@@ -1180,6 +1260,9 @@ impl Drop for NativePackInstance {
                 self.pack.api.shutdown.expect("validated shutdown function")(self.handle);
             }
             self.handle = std::ptr::null_mut();
+        }
+        if let Err(error) = self.host.reclaim() {
+            log::error!("native allocator cleanup after shutdown failed: {error}");
         }
         if self.host.live_allocations() != 0 {
             log::error!(
@@ -1236,6 +1319,18 @@ impl Engine for NativePackedEngine {
         })?;
         let _guard = self.instance.exclusive_guard();
         let _cancel_pause = self.instance.cancel_target.pause();
+        if self.instance.loaded.load(Ordering::Acquire)
+            || self.instance.cleanup_required.load(Ordering::Acquire)
+        {
+            return Err(EngineError::backend(
+                "native backend must unload successfully before loading again",
+            ));
+        }
+        let allocation_call = self
+            .instance
+            .host
+            .begin_model_call()
+            .map_err(EngineError::backend)?;
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: path bytes remain valid through this synchronous call.
         let status = unsafe {
@@ -1249,6 +1344,7 @@ impl Engine for NativePackedEngine {
                 &mut error,
             )
         };
+        drop(allocation_call);
         if status == KAPSL_STATUS_OK {
             self.instance.loaded.store(true, Ordering::Release);
             if !error.ptr.is_null() {
@@ -1256,15 +1352,25 @@ impl Engine for NativePackedEngine {
             }
             Ok(())
         } else {
-            Err(status_engine_error(
+            let load_error = status_engine_error(
                 status,
                 read_ffi_error(&self.instance.pack.api, status, error),
-            ))
+            );
+            self.instance
+                .cleanup_required
+                .store(true, Ordering::Release);
+            if let Err(cleanup_error) = self.instance.unload_locked() {
+                return Err(EngineError::backend(format!(
+                    "{load_error}; native load cleanup failed: {cleanup_error}"
+                )));
+            }
+            Err(load_error)
         }
     }
 
     fn actual_memory(&self) -> MemoryReport {
-        self.instance
+        let report = self
+            .instance
             .call_json_report(
                 self.instance
                     .pack
@@ -1275,7 +1381,8 @@ impl Engine for NativePackedEngine {
             .unwrap_or_else(|error| {
                 log::error!("native backend actual-memory report failed: {error}");
                 MemoryReport::default()
-            })
+            });
+        self.instance.host.actual_memory(report)
     }
 
     fn planned_request_memory(&self, request: &InferenceRequest) -> MemoryReport {
@@ -1329,7 +1436,8 @@ impl Engine for NativePackedEngine {
     }
 
     fn metrics(&self) -> EngineMetrics {
-        self.instance
+        let mut metrics = self
+            .instance
             .call_json_report(
                 self.instance
                     .pack
@@ -1340,7 +1448,9 @@ impl Engine for NativePackedEngine {
             .unwrap_or_else(|error| {
                 log::error!("native backend metrics failed: {error}");
                 EngineMetrics::new()
-            })
+            });
+        metrics.memory_usage = metrics.memory_usage.max(self.instance.host.live_bytes());
+        metrics
     }
 
     fn model_info(&self) -> Option<EngineModelInfo> {
@@ -1353,6 +1463,7 @@ impl Engine for NativePackedEngine {
 
     fn health_check(&self) -> Result<(), EngineError> {
         let _guard = self.instance.exclusive_guard();
+        self.instance.require_loaded()?;
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: the validated health function borrows the live handle only.
         let status = unsafe {
@@ -1771,366 +1882,6 @@ unsafe extern "C" fn host_log(_user_data: *mut c_void, level: u32, message: Kaps
     }));
 }
 
-struct NativeBackendHost {
-    table: Box<KapslBackendHostV1>,
-    #[cfg(feature = "gpu-device-pool")]
-    allocator: Option<Box<GovernedDeviceHost>>,
-}
-
-impl NativeBackendHost {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        resources: &RuntimeResources,
-        backend: &str,
-        device_id: usize,
-        model_id: u32,
-        replica_id: u32,
-        require_governed: bool,
-    ) -> Result<Self, String> {
-        #[cfg(feature = "gpu-device-pool")]
-        {
-            let mut allocator = if require_governed {
-                let pool = resources.device_pool(device_id).ok_or_else(|| {
-                    format!(
-                        "native {backend} pack requires governed device memory, but device {device_id} has no runtime-owned pool"
-                    )
-                })?;
-                Some(Box::new(GovernedDeviceHost::new(
-                    pool,
-                    pool_backend(backend),
-                    device_id,
-                    model_id,
-                    replica_id,
-                )))
-            } else {
-                None
-            };
-            let user_data = allocator
-                .as_mut()
-                .map(|host| (&mut **host as *mut GovernedDeviceHost).cast())
-                .unwrap_or(std::ptr::null_mut());
-            let table = Box::new(KapslBackendHostV1 {
-                struct_size: std::mem::size_of::<KapslBackendHostV1>() as u32,
-                abi_version: KAPSL_BACKEND_ABI_VERSION,
-                user_data,
-                log: Some(host_log),
-                allocate_device: allocator
-                    .as_ref()
-                    .map(|_| allocate_device as KapslDeviceAllocateFn),
-                free_device: allocator.as_ref().map(|_| free_device as KapslDeviceFreeFn),
-                synchronize_device: allocator
-                    .as_ref()
-                    .map(|_| synchronize_device as KapslDeviceSynchronizeFn),
-            });
-            Ok(Self { table, allocator })
-        }
-        #[cfg(not(feature = "gpu-device-pool"))]
-        {
-            let _ = (resources, backend, device_id, model_id, replica_id);
-            if require_governed {
-                return Err(
-                    "native pack requires governed device memory, but this runtime was built without GPU pool authority"
-                        .to_string(),
-                );
-            }
-            Ok(Self {
-                table: Box::new(KapslBackendHostV1 {
-                    struct_size: std::mem::size_of::<KapslBackendHostV1>() as u32,
-                    abi_version: KAPSL_BACKEND_ABI_VERSION,
-                    user_data: std::ptr::null_mut(),
-                    log: Some(host_log),
-                    allocate_device: None,
-                    free_device: None,
-                    synchronize_device: None,
-                }),
-            })
-        }
-    }
-
-    fn table(&self) -> *const KapslBackendHostV1 {
-        self.table.as_ref()
-    }
-
-    fn live_allocations(&self) -> usize {
-        #[cfg(feature = "gpu-device-pool")]
-        {
-            self.allocator
-                .as_ref()
-                .map(|allocator| allocator.live_allocations())
-                .unwrap_or(0)
-        }
-        #[cfg(not(feature = "gpu-device-pool"))]
-        {
-            0
-        }
-    }
-}
-
-#[cfg(feature = "gpu-device-pool")]
-fn pool_backend(backend: &str) -> PoolBackend {
-    match backend.trim().to_ascii_lowercase().as_str() {
-        "onnx" | "ort" | "onnxruntime" => PoolBackend::Onnx,
-        "llama.cpp" | "llama_cpp" | "llama-cpp" => PoolBackend::Gguf,
-        _ => PoolBackend::Native,
-    }
-}
-
-#[cfg(feature = "gpu-device-pool")]
-struct GovernedDeviceHost {
-    pool: Arc<GpuDevicePool>,
-    backend: PoolBackend,
-    device_id: usize,
-    model_id: u32,
-    replica_id: u32,
-    next_allocation_id: AtomicU64,
-    allocations: Mutex<HashMap<u64, GpuAllocation>>,
-}
-
-#[cfg(feature = "gpu-device-pool")]
-impl GovernedDeviceHost {
-    fn new(
-        pool: Arc<GpuDevicePool>,
-        backend: PoolBackend,
-        device_id: usize,
-        model_id: u32,
-        replica_id: u32,
-    ) -> Self {
-        Self {
-            pool,
-            backend,
-            device_id,
-            model_id,
-            replica_id,
-            next_allocation_id: AtomicU64::new(1),
-            allocations: Mutex::new(HashMap::new()),
-        }
-    }
-
-    fn allocate(
-        &self,
-        request: KapslDeviceAllocationRequestV1,
-    ) -> Result<KapslDeviceAllocationV1, String> {
-        if request.struct_size < std::mem::size_of::<KapslDeviceAllocationRequestV1>() as u32 {
-            return Err("device allocation request struct is truncated".to_string());
-        }
-        if request.reserved != 0 || request.flags != 0 {
-            return Err("device allocation request uses unsupported flags".to_string());
-        }
-        if request.memory_kind != KAPSL_MEMORY_CUDA {
-            return Err(format!(
-                "governed device allocator supports CUDA memory, not kind {}",
-                request.memory_kind
-            ));
-        }
-        if request.device_id as usize != self.device_id
-            || request.model_id != self.model_id
-            || request.replica_id != self.replica_id
-        {
-            return Err(
-                "device allocation identity does not match its backend instance".to_string(),
-            );
-        }
-        let bytes = usize::try_from(request.bytes)
-            .map_err(|_| "device allocation byte count exceeds this platform".to_string())?;
-        let alignment = usize::try_from(request.alignment)
-            .map_err(|_| "device allocation alignment exceeds this platform".to_string())?;
-        if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
-            return Err(
-                "device allocation requires non-zero bytes and power-of-two alignment".to_string(),
-            );
-        }
-        let class = match request.allocation_class {
-            KAPSL_ALLOCATION_CLASS_WEIGHTS => PoolAllocationClass::PersistentWeights,
-            KAPSL_ALLOCATION_CLASS_WORKSPACE => PoolAllocationClass::TransientWorkspace,
-            KAPSL_ALLOCATION_CLASS_KV => PoolAllocationClass::KvCache,
-            KAPSL_ALLOCATION_CLASS_REQUEST => PoolAllocationClass::RequestTransient,
-            KAPSL_ALLOCATION_CLASS_OTHER => PoolAllocationClass::ExternallyOwned,
-            other => return Err(format!("unknown device allocation class {other}")),
-        };
-        let owner = PoolOwner::new(self.backend, self.model_id, self.replica_id, class);
-        let allocation = self
-            .pool
-            .alloc(owner, bytes, alignment)
-            .map_err(|error| format!("runtime device-pool allocation failed: {error}"))?;
-        let pointer = self.pool.allocation_ptr(&allocation);
-        let granted_bytes = allocation.bytes() as u64;
-        let allocation_id = match self.next_allocation_id.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |next| next.checked_add(1),
-        ) {
-            Ok(allocation_id) => allocation_id,
-            Err(_) => {
-                let _ = self.pool.free(allocation);
-                return Err("native device allocation ID space exhausted".to_string());
-            }
-        };
-        self.allocations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(allocation_id, allocation);
-        Ok(KapslDeviceAllocationV1 {
-            struct_size: std::mem::size_of::<KapslDeviceAllocationV1>() as u32,
-            reserved: 0,
-            allocation_id,
-            device_ptr: pointer,
-            granted_bytes,
-        })
-    }
-
-    fn free(&self, returned: KapslDeviceAllocationV1) -> Result<(), String> {
-        if returned.struct_size < std::mem::size_of::<KapslDeviceAllocationV1>() as u32
-            || returned.reserved != 0
-            || returned.allocation_id == 0
-        {
-            return Err("device free contains an invalid allocation identity".to_string());
-        }
-        let mut allocations = self
-            .allocations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let stored = allocations
-            .get(&returned.allocation_id)
-            .ok_or_else(|| "device free references an unknown allocation ID".to_string())?;
-        if self.pool.allocation_ptr(stored) != returned.device_ptr
-            || stored.bytes() as u64 != returned.granted_bytes
-        {
-            return Err(
-                "device free pointer or byte count does not match its allocation ID".to_string(),
-            );
-        }
-        let allocation = allocations
-            .remove(&returned.allocation_id)
-            .expect("allocation checked above");
-        drop(allocations);
-        self.pool
-            .free(allocation)
-            .map_err(|error| format!("runtime device-pool free failed: {error}"))
-    }
-
-    fn synchronize(&self, device_id: u32) -> Result<(), String> {
-        if device_id as usize != self.device_id {
-            return Err(format!(
-                "backend requested synchronization for device {device_id}, expected {}",
-                self.device_id
-            ));
-        }
-        self.pool
-            .device()
-            .bind_to_thread()
-            .map_err(|error| format!("bind CUDA device before synchronize: {error}"))?;
-        self.pool
-            .device()
-            .synchronize()
-            .map_err(|error| format!("synchronize governed CUDA device: {error}"))
-    }
-
-    fn live_allocations(&self) -> usize {
-        self.allocations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-    }
-}
-
-#[cfg(feature = "gpu-device-pool")]
-impl Drop for GovernedDeviceHost {
-    fn drop(&mut self) {
-        let allocations = self
-            .allocations
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain()
-            .map(|(_, allocation)| allocation)
-            .collect::<Vec<_>>();
-        if allocations.is_empty() {
-            return;
-        }
-        log::error!(
-            "native backend leaked {} governed allocations; reclaiming after shutdown",
-            allocations.len()
-        );
-        if let Err(error) = self.pool.device().synchronize() {
-            log::error!("synchronize before reclaiming leaked native allocations: {error}");
-        }
-        for allocation in allocations {
-            if let Err(error) = self.pool.free(allocation) {
-                log::error!("reclaim leaked native allocation: {error}");
-            }
-        }
-    }
-}
-
-#[cfg(feature = "gpu-device-pool")]
-unsafe extern "C" fn allocate_device(
-    user_data: *mut c_void,
-    request: *const KapslDeviceAllocationRequestV1,
-    allocation_out: *mut KapslDeviceAllocationV1,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if user_data.is_null() || request.is_null() || allocation_out.is_null() {
-            return KAPSL_STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: non-null callback pointers are borrowed for this invocation.
-        let host = unsafe { &*(user_data as *const GovernedDeviceHost) };
-        let request = unsafe { *request };
-        match host.allocate(request) {
-            Ok(allocation) => {
-                // SAFETY: the caller provided a writable output slot.
-                unsafe { *allocation_out = allocation };
-                KAPSL_STATUS_OK
-            }
-            Err(error) => {
-                log::error!("native backend governed allocation rejected: {error}");
-                KAPSL_STATUS_BACKEND_ERROR
-            }
-        }
-    }))
-    .unwrap_or(KAPSL_STATUS_PANIC)
-}
-
-#[cfg(feature = "gpu-device-pool")]
-unsafe extern "C" fn free_device(
-    user_data: *mut c_void,
-    allocation: *const KapslDeviceAllocationV1,
-) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if user_data.is_null() || allocation.is_null() {
-            return KAPSL_STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: non-null callback pointers are borrowed for this invocation.
-        let host = unsafe { &*(user_data as *const GovernedDeviceHost) };
-        let allocation = unsafe { *allocation };
-        match host.free(allocation) {
-            Ok(()) => KAPSL_STATUS_OK,
-            Err(error) => {
-                log::error!("native backend governed free rejected: {error}");
-                KAPSL_STATUS_INVALID_ARGUMENT
-            }
-        }
-    }))
-    .unwrap_or(KAPSL_STATUS_PANIC)
-}
-
-#[cfg(feature = "gpu-device-pool")]
-unsafe extern "C" fn synchronize_device(user_data: *mut c_void, device_id: u32) -> i32 {
-    catch_unwind(AssertUnwindSafe(|| {
-        if user_data.is_null() {
-            return KAPSL_STATUS_INVALID_ARGUMENT;
-        }
-        // SAFETY: user_data points to the retained governed host.
-        let host = unsafe { &*(user_data as *const GovernedDeviceHost) };
-        match host.synchronize(device_id) {
-            Ok(()) => KAPSL_STATUS_OK,
-            Err(error) => {
-                log::error!("native backend device synchronize rejected: {error}");
-                KAPSL_STATUS_BACKEND_ERROR
-            }
-        }
-    }))
-    .unwrap_or(KAPSL_STATUS_PANIC)
-}
-
 fn take_owned_buffer(
     api: &KapslBackendApiV1,
     buffer: KapslOwnedBuffer,
@@ -2344,7 +2095,10 @@ mod tests {
         }
     }
 
-    fn test_manifest(accelerator_profile: &str, capabilities: u64) -> BackendPackManifest {
+    pub(super) fn test_manifest(
+        accelerator_profile: &str,
+        capabilities: u64,
+    ) -> BackendPackManifest {
         let profile = match accelerator_profile {
             "cpu" => crate::backend::ONNX_CPU_PACK_PROFILE,
             "cuda" => crate::backend::ONNX_CUDA12_PACK_PROFILE,
@@ -2665,6 +2419,7 @@ mod tests {
     fn stream_callback_copies_borrowed_chunks_into_the_bounded_bridge() {
         let (sender, receiver) = async_channel::bounded(1);
         let mut context = NativeStreamCallbackContext {
+            request_id: 9,
             sender,
             callback_error: None,
             consumer_closed: false,
@@ -2721,6 +2476,7 @@ mod tests {
             .unwrap();
         let producer = std::thread::spawn(move || {
             let mut context = NativeStreamCallbackContext {
+                request_id: 10,
                 sender,
                 callback_error: None,
                 consumer_closed: false,
@@ -2783,6 +2539,7 @@ mod tests {
         let (sender, receiver) = async_channel::bounded(1);
         drop(receiver);
         let mut context = NativeStreamCallbackContext {
+            request_id: 10,
             sender,
             callback_error: None,
             consumer_closed: false,
@@ -2861,3 +2618,6 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+#[cfg(test)]
+mod boundary_tests;
