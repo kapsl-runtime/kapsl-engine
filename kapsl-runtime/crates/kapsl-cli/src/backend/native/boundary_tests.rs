@@ -86,6 +86,69 @@ async fn wait_started(instance: &NativePackInstance, count: u64) {
     .expect("fake adapter never entered inference");
 }
 
+#[tokio::test]
+async fn packaged_assets_reach_the_adapter_after_source_and_extraction_cleanup() {
+    use crate::features::packaging::{
+        create_kapsl_package_from_context, ContextPackageRequest, TempDirGuard,
+    };
+    use kapsl_core::PackageLoader;
+
+    let temp = TempDirGuard::new("native-package-assets").unwrap();
+    let context = temp.path().join("source");
+    std::fs::create_dir_all(context.join("graphs")).unwrap();
+    std::fs::create_dir_all(context.join("assets")).unwrap();
+    for (relative, contents) in [
+        ("graphs/model.onnx", "fake model"),
+        ("vocab.json", "root vocabulary"),
+        ("graphs/vocab.json", "graph vocabulary"),
+        ("assets/config.json", "model configuration"),
+    ] {
+        std::fs::write(context.join(relative), contents).unwrap();
+    }
+    let mut manifest = model("package-assets");
+    manifest.model_file = "graphs/model.onnx".into();
+    std::fs::write(
+        context.join("metadata.json"),
+        serde_json::to_vec(&manifest).unwrap(),
+    )
+    .unwrap();
+    let package = temp.path().join("model.aimod");
+    create_kapsl_package_from_context(ContextPackageRequest {
+        output_override: Some(&package),
+        ..ContextPackageRequest::new(&context)
+    })
+    .unwrap();
+    let loader = PackageLoader::load(&package).unwrap();
+    let model_path = loader.get_model_path();
+    let extracted = loader.extracted_path.clone();
+    let pool = Arc::new(FakePool::default());
+    let instance = NativePackInstance::initialize_with_host(
+        pack(),
+        &loader.manifest,
+        "cuda",
+        pool.host(7, 2, 2048),
+        0,
+        7,
+        2,
+        &serde_json::Map::new(),
+    )
+    .unwrap();
+    drop(loader);
+    assert!(!extracted.exists());
+    std::fs::remove_dir_all(&context).unwrap();
+    std::fs::remove_file(&package).unwrap();
+
+    let mut engine = NativePackedEngine { instance };
+    // The loaded cdylib reads the model and root/nested assets from the exact
+    // path passed through the production native ABI, using only the cache.
+    for _ in 0..2 {
+        engine.load(&model_path).await.unwrap();
+        assert_eq!(engine.infer(&request()).unwrap().data, vec![42]);
+        engine.unload();
+        assert_eq!(pool.bytes((7, 2)), 0);
+    }
+}
+
 #[test]
 fn opaque_adapter_options_cross_the_loaded_native_boundary() {
     let pool = Arc::new(FakePool::default());

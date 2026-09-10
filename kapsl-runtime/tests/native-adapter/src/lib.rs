@@ -238,8 +238,8 @@ unsafe extern "C" fn planned_memory(
 
 unsafe extern "C" fn load(
     handle: *mut c_void,
-    _path: KapslSlice,
-    _error: *mut KapslOwnedBuffer,
+    path: KapslSlice,
+    error: *mut KapslOwnedBuffer,
 ) -> i32 {
     let state = unsafe { state(handle) };
     let status = state.allocate(KAPSL_ALLOCATION_SCOPE_MODEL, &[], 256);
@@ -248,6 +248,26 @@ unsafe extern "C" fn load(
     }
     if state.mode == "fail-load" || state.mode == "fail-load-cleanup" {
         return KAPSL_STATUS_BACKEND_ERROR;
+    }
+    if state.mode == "package-assets" {
+        let path =
+            std::path::Path::new(std::str::from_utf8(unsafe { path.as_bytes() }.unwrap()).unwrap());
+        let root = path.parent().and_then(std::path::Path::parent).unwrap();
+        let assets: &[(&str, &[u8])] = &[
+            ("graphs/model.onnx", b"fake model"),
+            ("vocab.json", b"root vocabulary"),
+            ("graphs/vocab.json", b"graph vocabulary"),
+            ("assets/config.json", b"model configuration"),
+        ];
+        for (relative, expected) in assets {
+            if std::fs::read(root.join(relative)).ok().as_deref() != Some(*expected) {
+                output(
+                    format!("missing package asset: {relative}").into_bytes(),
+                    error,
+                );
+                return KAPSL_STATUS_BACKEND_ERROR;
+            }
+        }
     }
     state.loaded.store(true, Ordering::Release);
     KAPSL_STATUS_OK

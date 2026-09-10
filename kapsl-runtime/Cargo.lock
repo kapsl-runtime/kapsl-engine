@@ -2431,9 +2431,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f82444501a45f1da8cae90b36aad081b87ddac1450c9ba101e06f9251b5e23cb"
+checksum = "4328c2d4b6cec499618ecce62fdc852c6c1ee3f7b67f78fc573e0acfbf6b4192"
 dependencies = [
  "flate2",
  "fs2",
