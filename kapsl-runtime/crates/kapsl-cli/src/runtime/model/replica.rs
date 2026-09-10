@@ -182,12 +182,13 @@ pub(super) async fn load_replica(
             .collect();
         let backend = create_pipeline_backend(
             &plan,
+            onnx_route.as_ref(),
             logical_provider
                 .as_deref()
                 .expect("pipeline loads always select a provider"),
             &device_ids,
             &resources,
-        );
+        )?;
         let backend = load_runtime_backend(
             backend,
             &plan.model_file_path,
@@ -393,7 +394,7 @@ async fn load_managed_vllm_replica(
         shared_metrics.clone(),
     )?;
     let backend = load_runtime_backend(
-        backend,
+        backend.into(),
         &plan.model_file_path,
         &memory_domains,
         &resources,
@@ -440,10 +441,18 @@ async fn load_managed_vllm_replica(
 
 fn create_pipeline_backend(
     plan: &ModelLoadPlan,
+    onnx_route: Option<&OnnxBackendRoute>,
     logical_provider: &str,
     device_ids: &[usize],
     resources: &RuntimeResources,
-) -> Box<dyn kapsl_engine_api::Engine> {
+) -> Result<PreparedBackend, String> {
+    validate_pipeline_backend_route(EngineKind::resolve(&plan.loader.manifest), onnx_route)?;
+    #[cfg(feature = "gpu-device-pool")]
+    let pool_clients = if matches!(onnx_route, Some(OnnxBackendRoute::EmbeddedRollback { .. })) {
+        acquire_embedded_ort_pool_clients(resources, logical_provider, device_ids)?
+    } else {
+        Vec::new()
+    };
     let backend_device_ids: Vec<i32> = device_ids.iter().map(|&id| id as i32).collect();
     let mut backend = if EngineKind::resolve(&plan.loader.manifest).uses_onnx_session()
         || provider_policy() == "manifest"
@@ -479,7 +488,25 @@ fn create_pipeline_backend(
             let kv = resources.kv().clone();
             Arc::new(move |engine_id| kv.detach_engine(engine_id))
         });
-    Box::new(backend)
+    let backend = PreparedBackend::from(Box::new(backend));
+    #[cfg(feature = "gpu-device-pool")]
+    let backend = backend.with_pool_clients(pool_clients);
+    Ok(backend)
+}
+
+fn validate_pipeline_backend_route(
+    engine_kind: EngineKind,
+    onnx_route: Option<&OnnxBackendRoute>,
+) -> Result<(), String> {
+    match (engine_kind.uses_onnx_session(), onnx_route) {
+        (true, Some(OnnxBackendRoute::EmbeddedRollback { .. })) | (false, None) => Ok(()),
+        (true, Some(OnnxBackendRoute::SignedPack { .. })) => Err(
+            "signed native ONNX packs do not support the embedded pipeline executor; refusing embedded ORT fallback"
+                .to_string(),
+        ),
+        (true, None) => Err("ONNX pipeline requires an immutable backend route decision".to_string()),
+        (false, Some(_)) => Err("non-ONNX pipeline received an ONNX backend route".to_string()),
+    }
 }
 
 fn model_info_for_plan(
@@ -595,6 +622,49 @@ mod tests {
         let info = model_info_for_plan(&test_plan(), ReplicaLoadRole::Primary, "cpu");
 
         assert_eq!(info.device, "cpu");
+    }
+
+    #[test]
+    fn signed_pipeline_selection_cannot_construct_an_embedded_backend() {
+        let plan = test_plan();
+        let device_info = DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 1024 * 1024 * 1024,
+            os_type: "test".into(),
+            os_release: "test".into(),
+            has_cuda: false,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: Vec::new(),
+        };
+        let resources = RuntimeResources::new(&device_info).unwrap();
+        for profile in ["cpu", "cuda12", "tensorrt10"] {
+            let route = OnnxBackendRoute::SignedPack {
+                identity: crate::backend::NativeBackendPackIdentity {
+                    backend: "onnx".into(),
+                    profile: profile.into(),
+                    pack_version: "test".into(),
+                },
+                reason: "explicit signed selection".into(),
+            };
+            let error = create_pipeline_backend(&plan, Some(&route), "cuda", &[0], &resources)
+                .err()
+                .expect("signed route cannot enter embedded pipeline construction");
+            assert!(error.contains("refusing embedded ORT fallback"));
+        }
+        assert!(
+            create_pipeline_backend(&plan, None, "cpu", &[0], &resources)
+                .err()
+                .unwrap()
+                .contains("immutable backend route")
+        );
+        let rollback = OnnxBackendRoute::EmbeddedRollback {
+            reason: "explicit rollback".into(),
+        };
+        assert!(create_pipeline_backend(&plan, Some(&rollback), "cpu", &[0], &resources).is_ok());
+        assert!(validate_pipeline_backend_route(EngineKind::Native, Some(&rollback)).is_err());
+        assert!(validate_pipeline_backend_route(EngineKind::Native, None).is_ok());
     }
 
     #[test]
