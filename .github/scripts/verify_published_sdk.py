@@ -20,7 +20,7 @@ EXPECTED_VERSIONS = {
     "kapsl-hal": "0.3.0",
     "kapsl-ipc": "0.4.0",
     "kapsl-kv-abi": "0.6.0",
-    "kapsl-llm": "0.3.0",
+    "kapsl-llm": "0.3.4",
     "kapsl-monitor": "0.3.0",
     "kapsl-scheduler": "0.3.0",
     "kapsl-shm": "0.4.0",
