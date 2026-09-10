@@ -32,6 +32,7 @@ set -Eeuo pipefail
 
 script_name="$(basename "$0")"
 runtime_pid=""
+api_admin_token=""
 created_output_dir=0
 
 usage() {
@@ -638,13 +639,13 @@ cleanup() {
 }
 
 api_get() {
-  curl -fsS --max-time 15 "$base_url$1"
+  curl -fsS --max-time 15 -H "Authorization: Bearer $api_admin_token" "$base_url$1"
 }
 
 api_post() {
   local path="$1"
   shift
-  curl -fsS --max-time 30 -X POST "$base_url$path" "$@"
+  curl -fsS --max-time 30 -H "Authorization: Bearer $api_admin_token" -X POST "$base_url$path" "$@"
 }
 
 runtime_is_alive() {
@@ -922,6 +923,7 @@ main() {
   require_command jq
   require_command nvidia-smi
   require_command awk
+  require_command python3
 
   binary="${KAPSL_GPU_TEST_BINARY:-}"
   bundle="${KAPSL_GPU_TEST_BUNDLE:-}"
@@ -1025,6 +1027,9 @@ main() {
   fi
 
   note "starting ORT model 0 and GGUF model 1 on CUDA_VISIBLE_DEVICES=$cuda_visible_devices"
+  # The engine requires authentication even on loopback. Keep this disposable
+  # test credential in memory and use the same token for the server and client.
+  api_admin_token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
   env_args=(
     "CUDA_VISIBLE_DEVICES=$cuda_visible_devices"
     "KAPSL_GPU_DEVICE_POOL_MODE=$pool_mode"
@@ -1044,7 +1049,7 @@ main() {
     "KAPSL_PROVIDER_POLICY=fastest"
     "KAPSL_API_TOKEN_READER="
     "KAPSL_API_TOKEN_WRITER="
-    "KAPSL_API_TOKEN_ADMIN="
+    "KAPSL_API_TOKEN_ADMIN=$api_admin_token"
     "KAPSL_DISCARD_PACKAGE_AFTER_LOAD=0"
     "KAPSL_LITE_DISCARD_PACKAGE_AFTER_LOAD=0"
     "KAPSL_ALLOW_INSECURE_HTTP=1"

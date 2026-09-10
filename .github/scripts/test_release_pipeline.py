@@ -5,6 +5,7 @@ import base64
 import fnmatch
 import glob
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 import os
@@ -16,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 from unittest import TestCase, main, mock
 
 
@@ -52,6 +54,62 @@ def step(source, name):
     if not match:
         raise AssertionError(f"Step {name} is missing")
     return match[1]
+
+
+class GpuHarnessAuthenticationTests(TestCase):
+    def test_lifecycle_client_authenticates_and_rejects_invalid_credentials(self):
+        token = "host-only-disposable-test-token"
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def handle_request(self):
+                payload = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                authorized = self.headers.get("Authorization") == "Bearer " + token
+                requests.append((self.command, self.path, payload, authorized))
+                self.send_response(200 if authorized else 401)
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}' if authorized else b'{"error":"unauthorized"}')
+
+            do_GET = handle_request
+            do_POST = handle_request
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            env = os.environ | {
+                "KAPSL_GPU_INTEGRATION": "0",
+                "KAPSL_TEST_HARNESS": str(ROOT / ".github/scripts/test-gpu-device-pool-integration.sh"),
+                "KAPSL_TEST_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+            }
+            preamble = '''source "$KAPSL_TEST_HARNESS" ''
+base_url="$KAPSL_TEST_BASE_URL"
+api_admin_token="$KAPSL_TEST_TOKEN"
+'''
+            for credential in ("", "wrong-test-token", token):
+                for command in (
+                    "api_get /api/models",
+                    '''api_post /api/models/0/stop -H 'Content-Type: application/json' --data-binary '{"probe":true}' ''',
+                ):
+                    with self.subTest(authorized=credential == token, command=command):
+                        result = subprocess.run(
+                            ["bash", "-c", preamble + command],
+                            env=env | {"KAPSL_TEST_TOKEN": credential},
+                            text=True, capture_output=True, timeout=10,
+                        )
+                        self.assertEqual(result.returncode, 0 if credential == token else 22)
+                        self.assertNotIn(token, result.stdout + result.stderr)
+            self.assertEqual(requests[-2:], [
+                ("GET", "/api/models", b"", True),
+                ("POST", "/api/models/0/stop", b'{"probe":true}', True),
+            ])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 class PublishedSdkTests(TestCase):
