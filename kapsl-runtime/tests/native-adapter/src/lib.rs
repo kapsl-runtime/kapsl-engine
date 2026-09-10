@@ -24,6 +24,7 @@ struct State {
     model: u32,
     replica: u32,
     mode: String,
+    options: serde_json::Value,
     scope: AtomicU64,
     loaded: AtomicBool,
     allocations: Mutex<Vec<KapslDeviceAllocationV1>>,
@@ -173,6 +174,8 @@ unsafe extern "C" fn initialize(
         model: config.model_id,
         replica: config.replica_id,
         mode: manifest["project_name"].as_str().unwrap_or("normal").into(),
+        options: serde_json::from_slice(unsafe { config.options_json.as_bytes() }.unwrap())
+            .unwrap(),
         scope: AtomicU64::new(1),
         loaded: AtomicBool::new(false),
         allocations: Mutex::new(Vec::new()),
@@ -501,11 +504,11 @@ unsafe extern "C" fn metrics(
 }
 
 unsafe extern "C" fn model_info(
-    _handle: *mut c_void,
+    handle: *mut c_void,
     out: *mut KapslOwnedBuffer,
     _error: *mut KapslOwnedBuffer,
 ) -> i32 {
-    output(serde_json::to_vec(&json!({"input_names": ["input"], "output_names": ["output"], "input_shapes": [[1]], "output_shapes": [[1]], "input_dtypes": ["uint8"], "output_dtypes": ["uint8"], "framework": "fake"})).unwrap(), out);
+    output(serde_json::to_vec(&json!({"input_names": ["input"], "output_names": ["output"], "input_shapes": [[1]], "output_shapes": [[1]], "input_dtypes": ["uint8"], "output_dtypes": ["uint8"], "framework": "fake", "options": unsafe { state(handle) }.options})).unwrap(), out);
     KAPSL_STATUS_OK
 }
 

@@ -29,6 +29,24 @@ const SCOPED_DEVICE_ALLOCATOR_V1: &str = "kapsl-scoped-device-allocator-v1";
 
 static OFFLINE: AtomicBool = AtomicBool::new(false);
 
+/// Translate legacy ONNX configuration at the compatibility boundary. The
+/// native host passes these values without linking to the backend's Rust types.
+pub(crate) fn onnx_adapter_options(
+    tuning: Option<&kapsl_backends::OnnxRuntimeTuning>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let tuning = tuning.map(|tuning| {
+        serde_json::json!({
+            "memory_pattern": tuning.memory_pattern,
+            "disable_cpu_mem_arena": tuning.disable_cpu_mem_arena,
+            "session_buckets": tuning.session_buckets,
+            "bucket_dim_granularity": tuning.bucket_dim_granularity,
+            "bucket_max_dims": tuning.bucket_max_dims,
+            "peak_concurrency_hint": tuning.peak_concurrency_hint,
+        })
+    });
+    serde_json::Map::from_iter([("onnx_tuning".into(), serde_json::json!(tuning))])
+}
+
 /// The route is resolved once per model load and carried to backend creation;
 /// backend construction may not infer a different route from process state.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -440,7 +440,13 @@ pub(super) fn create_runtime_backend_for_device(
                     reason
                 );
                 return create_native_backend_pack_engine(
-                    identity, manifest, resources, device_id, model_id, replica_id, tuning,
+                    identity,
+                    manifest,
+                    resources,
+                    device_id,
+                    model_id,
+                    replica_id,
+                    &onnx_adapter_options(tuning),
                 );
             }
             OnnxBackendRoute::EmbeddedRollback { reason } => {
