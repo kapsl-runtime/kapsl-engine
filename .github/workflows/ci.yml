@@ -68,7 +68,9 @@ jobs:
 
       - name: Test GPU integration harness contract
         if: runner.os == 'Linux'
-        run: .github/scripts/test-gpu-device-pool-integration.sh --self-test
+        run: |
+          .github/scripts/test-gpu-device-pool-integration.sh --self-test
+          python3 .github/scripts/test_live_kv_owner.py
 
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'

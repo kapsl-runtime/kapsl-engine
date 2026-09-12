@@ -31,6 +31,7 @@
 set -Eeuo pipefail
 
 script_name="$(basename "$0")"
+script_dir="$(cd "$(dirname "$0")" && pwd)"
 runtime_pid=""
 api_admin_token=""
 created_output_dir=0
@@ -53,7 +54,8 @@ Usage:
 
 The GPU run fails unless all of these are observed in one process:
   * exactly one runtime GPU backing allocation
-  * positive model/replica-scoped ONNX and GGUF owner bytes
+  * positive model/replica-scoped ONNX bytes and GGUF KV bytes during generation
+  * GGUF request KV reclaimed after stream cancellation, with no idle KV owner
   * GGUF reporting kv_path=shared-kv, both before and after reload
   * each owner disappears on unload and live/free state recovers on reload
   * stable pool capacity and external-memory accounting across both reloads
@@ -292,11 +294,11 @@ require_owner_prefix_absent() {
   ! grep -F -q -- "owner=\"$owner_prefix" "$file"
 }
 
-require_active_workload_owners() {
+require_idle_workload_owners() {
   local file="$1"
   require_active_owner "$file" "$onnx_allocation_owner" \
     && require_admitted_owner "$file" "$gguf_admission_owner" \
-    && require_active_owner "$file" "$gguf_kv_owner"
+    && require_owner_absent "$file" "$gguf_kv_owner"
 }
 
 assert_fragmentation_not_worse() {
@@ -351,7 +353,7 @@ reloaded_pool_snapshot_matches() {
     && [[ "$live" == "$initial_live" ]] \
     && [[ "$free" == "$initial_free" ]] \
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
-    && require_active_workload_owners "$candidate"
+    && require_idle_workload_owners "$candidate"
 }
 
 ort_reloaded_pool_snapshot_matches() {
@@ -376,7 +378,7 @@ ort_reloaded_pool_snapshot_matches() {
     && [[ "$live" == "$initial_live" ]] \
     && [[ "$free" == "$initial_free" ]] \
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
-    && require_active_workload_owners "$candidate"
+    && require_idle_workload_owners "$candidate"
 }
 
 ort_stopped_pool_snapshot_matches() {
@@ -407,7 +409,7 @@ ort_stopped_pool_snapshot_matches() {
     && assert_pool_snapshot_consistent "$candidate" "$backing_bytes" \
     && require_owner_prefix_absent "$candidate" "$onnx_owner_prefix" \
     && require_admitted_owner "$candidate" "$gguf_admission_owner" \
-    && require_active_owner "$candidate" "$gguf_kv_owner"
+    && require_owner_absent "$candidate" "$gguf_kv_owner"
 }
 
 run_self_test() {
@@ -551,12 +553,18 @@ EOF
   stopped_pool_snapshot_matches \
     "$fixture/stopped-metrics.txt" 2000 3221225472 7 1073741824 4294967296 \
     || die "self-test rejected a valid unload snapshot"
+  sed 's/kapsl_device_memory_external_bytes{device="0"} 0/kapsl_device_memory_external_bytes{device="0"} 2000/' \
+    "$fixture/stopped-metrics.txt" >"$fixture/idle-metrics.txt"
+  awk '/owner="gguf:1:0:persistent-weights"/' "$fixture/metrics.txt" >>"$fixture/idle-metrics.txt"
   reloaded_pool_snapshot_matches \
-    "$fixture/metrics.txt" 2000 3221225472 7 1073741824 4294967296 \
+    "$fixture/idle-metrics.txt" 2000 2147483648 3 2147483648 4294967296 \
     || die "self-test rejected a valid reuse snapshot"
   if stopped_pool_snapshot_matches \
     "$fixture/metrics.txt" 2000 3221225472 7 1073741824 4294967296; then
     die "self-test accepted a snapshot that retained the GGUF owner"
+  fi
+  if require_idle_workload_owners "$fixture/metrics.txt"; then
+    die "self-test accepted unreclaimed request KV in an idle snapshot"
   fi
   assert_fragmentation_not_worse 0.25 0.255 0.01 \
     || die "self-test rejected fragmentation within tolerance"
@@ -584,18 +592,25 @@ kapsl_gpu_device_pool_owner_quota_max_bytes{device="0",owner="gguf:1:0:kv-cache"
 kapsl_gpu_device_pool_owner_admitted{device="0",owner="gguf:1:0:kv-cache"} 1
 kapsl_gpu_device_pool_owner_allocatable_bytes{device="0",owner="gguf:1:0:kv-cache"} 3221225472
 EOF
+  sed -e '/owner="gguf:1:0:kv-cache"/d' \
+    -e 's/allocated_bytes{device="0"} 1073741824/allocated_bytes{device="0"} 0/' \
+    -e 's/live_allocations{device="0"} 4/live_allocations{device="0"} 0/' \
+    -e 's/free_bytes{device="0"} 3221225472/free_bytes{device="0"} 4294967296/' \
+    -e 's/largest_free_range_bytes{device="0"} 3221225472/largest_free_range_bytes{device="0"} 4294967296/' \
+    "$fixture/ort-stopped-metrics.txt" >"$fixture/ort-stopped-idle.txt"
+  cp "$fixture/ort-stopped-idle.txt" "$fixture/ort-stopped-metrics.txt"
   ort_stopped_pool_snapshot_matches \
-    "$fixture/ort-stopped-metrics.txt" 2000 3221225472 7 1073741824 4294967296 \
+    "$fixture/ort-stopped-metrics.txt" 2000 2147483648 3 2147483648 4294967296 \
     || die "self-test rejected a valid ORT unload snapshot"
   sed 's/kapsl_device_memory_external_bytes{device="0"} 2000/kapsl_device_memory_external_bytes{device="0"} 1500/' \
     "$fixture/ort-stopped-metrics.txt" >"$fixture/ort-stopped-external-released.txt"
   ort_stopped_pool_snapshot_matches \
-    "$fixture/ort-stopped-external-released.txt" 2000 3221225472 7 1073741824 4294967296 \
+    "$fixture/ort-stopped-external-released.txt" 2000 2147483648 3 2147483648 4294967296 \
     || die "self-test rejected ORT external CUDA state released on unload"
   sed 's/kapsl_device_memory_external_bytes{device="0"} 2000/kapsl_device_memory_external_bytes{device="0"} 1750/' \
-    "$fixture/metrics.txt" >"$fixture/ort-reloaded-external-reused.txt"
+    "$fixture/idle-metrics.txt" >"$fixture/ort-reloaded-external-reused.txt"
   ort_reloaded_pool_snapshot_matches \
-    "$fixture/ort-reloaded-external-reused.txt" 2000 1500 3221225472 7 1073741824 4294967296 \
+    "$fixture/ort-reloaded-external-reused.txt" 2000 1500 2147483648 3 2147483648 4294967296 \
     || die "self-test rejected lower ORT external CUDA state after reload"
 
   printf '%s\n' '{"shape":[1,1],"dtype":"string","data_base64":"Q1VEQQ=="}' \
@@ -856,6 +871,16 @@ run_gguf_concurrency_transition_test() {
   done
 }
 
+run_gguf_live_ownership_probe() {
+  local destination="$1"
+  KAPSL_GPU_TEST_API_TOKEN="$api_admin_token" \
+    python3 "$script_dir/probe-live-kv-owner.py" \
+      --base-url "$base_url" --model-id "$gguf_model_id" \
+      --owner "$gguf_kv_owner" --output "$destination"
+  require_active_owner "$destination/metrics-active.txt" "$gguf_kv_owner" \
+    || die "in-flight GGUF request lacked governed model/replica KV ownership"
+}
+
 run_onnx_inference_if_configured() {
   local destination="$1"
   local request_file="${KAPSL_GPU_TEST_ORT_REQUEST:-}"
@@ -1046,6 +1071,7 @@ main() {
     "KAPSL_GPU_GGUF_MAX_BYTES="
     "KAPSL_GPU_GGUF_MAX_BYTES_0="
     "KAPSL_GGUF_DISABLE_SHARED_KV=0"
+    "KAPSL_GGUF_ALLOW_CROSS_SESSION_PREFIX_CACHE=0"
     "KAPSL_PROVIDER_POLICY=fastest"
     "KAPSL_API_TOKEN_READER="
     "KAPSL_API_TOKEN_WRITER="
@@ -1124,6 +1150,7 @@ main() {
   run_gguf_inference "$output_dir/gguf-inference-initial.json"
   assert_gguf_response_correct "$output_dir/gguf-inference-initial.json"
   run_gguf_concurrency_transition_test "$output_dir/gguf-concurrency-transition"
+  run_gguf_live_ownership_probe "$output_dir/gguf-live-initial"
   sleep "$settle_seconds"
   api_get /metrics >"$output_dir/metrics-initial.txt"
 
@@ -1143,10 +1170,11 @@ main() {
     || die "ONNX has no positive live allocation/admission in the shared pool"
   require_admitted_owner "$output_dir/metrics-initial.txt" "$gguf_admission_owner" \
     || die "GGUF model/replica admission owner is missing or invalid"
-  require_active_owner "$output_dir/metrics-initial.txt" "$gguf_kv_owner" \
-    || die "GGUF shared-KV allocation owner is missing or inactive"
+  require_owner_absent "$output_dir/metrics-initial.txt" "$gguf_kv_owner" \
+    || die "completed GGUF requests retained KV allocations"
   initial_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-initial.txt")"
   initial_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-initial.txt")"
+  initial_gguf_usage="${initial_gguf_usage:-0}"
   if grep -F -q -- 'owner="native:unattributed:' "$output_dir/metrics-initial.txt" \
     || grep -F -q -- 'owner="onnx:unattributed:' "$output_dir/metrics-initial.txt"; then
     die "unattributed native/ONNX allocation unexpectedly appeared in the shared-pool run"
@@ -1183,6 +1211,7 @@ main() {
   wait_for_model_status "$onnx_model_id" active || die "ORT model stopped during GGUF reload"
   wait_for_log_count "kv_path=shared-kv" 2 || die "reloaded GGUF did not return to shared-KV"
   run_gguf_inference "$output_dir/gguf-inference-reloaded.json"
+  run_gguf_live_ownership_probe "$output_dir/gguf-live-reloaded"
   sleep "$settle_seconds"
 
   api_get /api/models >"$output_dir/models-reloaded.json"
@@ -1200,6 +1229,7 @@ main() {
   reloaded_fragmentation="$(metric_from_file kapsl_gpu_device_pool_fragmentation_ratio "$output_dir/metrics-reloaded.txt")"
   reloaded_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-reloaded.txt")"
   reloaded_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-reloaded.txt")"
+  reloaded_gguf_usage="${reloaded_gguf_usage:-0}"
   reloaded_vram="$(process_vram_bytes || true)"
 
   [[ "$reloaded_pool" == "$initial_pool" ]] \
@@ -1234,7 +1264,9 @@ main() {
   ort_stopped_free="$(metric_from_file kapsl_gpu_device_pool_free_bytes "$output_dir/metrics-ort-stopped.txt")"
   ort_stopped_external="$(metric_from_file kapsl_device_memory_external_bytes "$output_dir/metrics-ort-stopped.txt")"
   ort_stopped_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-ort-stopped.txt")"
+  ort_stopped_gguf_usage="${ort_stopped_gguf_usage:-0}"
   api_get /api/models >"$output_dir/models-ort-stopped.json"
+  run_gguf_live_ownership_probe "$output_dir/gguf-live-without-ort"
 
   note "reloading ORT model id $onnx_model_id"
   ort_start_payload="$(jq -cn --arg path "$ort_model" --argjson id "$onnx_model_id" \
@@ -1268,6 +1300,7 @@ main() {
   final_fragmentation="$(metric_from_file kapsl_gpu_device_pool_fragmentation_ratio "$output_dir/metrics-final.txt")"
   final_onnx_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$onnx_allocation_owner" "$output_dir/metrics-final.txt")"
   final_gguf_usage="$(owner_metric_from_file kapsl_gpu_device_pool_owner_usage_bytes "$gguf_kv_owner" "$output_dir/metrics-final.txt")"
+  final_gguf_usage="${final_gguf_usage:-0}"
   final_vram="$(process_vram_bytes || true)"
 
   [[ "$final_pool" == "$initial_pool" ]] || die "ORT reload replaced the pool backing"
