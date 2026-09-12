@@ -5,6 +5,7 @@
 //! runtime-owned device allocator through `KapslBackendHostV1`. ORT is the
 //! first consumer, but no ORT-specific type crosses this boundary.
 
+use super::request_profile::RequestProfile;
 use super::{BackendExecutionMode, BackendPackManifest};
 use crate::runtime::RuntimeResources;
 use kapsl_backend_abi::*;
@@ -450,6 +451,7 @@ struct NativePackInstance {
     loaded: AtomicBool,
     cleanup_required: AtomicBool,
     call_lock: RwLock<()>,
+    request_profile: RequestProfile,
 }
 
 // The adapter owns its handle. Concurrent inference tables take shared call
@@ -784,6 +786,7 @@ impl NativePackInstance {
             loaded: AtomicBool::new(false),
             cleanup_required: AtomicBool::new(false),
             call_lock: RwLock::new(()),
+            request_profile: RequestProfile::new("engine.native", model_id, replica_id),
         }))
     }
 
@@ -872,9 +875,14 @@ impl NativePackInstance {
         request: &InferenceRequest,
     ) -> Result<T, EngineError> {
         let request_id = self.next_request_id()?;
+        let mut timing = self
+            .request_profile
+            .start("planned_request_memory", request_id);
         let mut bridge = RequestBridge::new(request)?;
         let wire = bridge.wire(request_id);
+        timing.mark("request_conversion");
         let _guard = self.exclusive_guard();
+        timing.mark("call_lock");
         let mut output = KapslOwnedBuffer::empty();
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: all request views and callback context remain live through
@@ -890,7 +898,10 @@ impl NativePackInstance {
                 &mut error,
             )
         };
-        self.decode_json(status, output, error)
+        timing.mark("adapter_report");
+        let result = self.decode_json(status, output, error);
+        timing.mark("report_conversion");
+        result
     }
 
     fn decode_json<T: DeserializeOwned>(
@@ -918,6 +929,7 @@ impl NativePackInstance {
     }
 
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        let mut timing = self.request_profile.start("infer", 0);
         if request
             .cancellation
             .as_ref()
@@ -928,19 +940,24 @@ impl NativePackInstance {
             ));
         }
         let request_id = self.next_request_id()?;
+        timing.request_id(request_id);
         let mut bridge = RequestBridge::new(request)?;
         let wire = bridge.wire(request_id);
+        timing.mark("request_conversion");
         let _guard = self.inference_guard();
         self.require_loaded()?;
+        timing.mark("call_lock");
         let _allocation_call = self
             .host
             .begin_requests([(request_id, request.cancellation.clone())])?;
+        timing.mark("ownership_registration");
         let _cancellation_watches = self.watch_cancellations(
             request
                 .cancellation
                 .clone()
                 .map(|cancellation| (request_id, cancellation)),
         );
+        timing.mark("cancellation_registration");
         let mut result = KapslInferenceResultV1::empty();
         let mut error = KapslOwnedBuffer::empty();
         // SAFETY: request and result storage follows the synchronous ABI lifetime.
@@ -952,6 +969,7 @@ impl NativePackInstance {
                 &mut error,
             )
         };
+        timing.mark("adapter_infer");
         if status != KAPSL_STATUS_OK {
             return Err(status_engine_error(
                 status,
@@ -971,7 +989,9 @@ impl NativePackInstance {
                 "native backend request was cancelled during execution",
             ));
         }
-        copy_single_result(&result)
+        let output = copy_single_result(&result);
+        timing.mark("result_conversion");
+        output
     }
 
     fn infer_stream(self: &Arc<Self>, request: InferenceRequest) -> EngineStream {
@@ -1215,7 +1235,9 @@ impl NativePackInstance {
     fn unload(&self) -> Result<(), EngineError> {
         let _guard = self.exclusive_guard();
         let _cancel_pause = self.cancel_target.pause();
-        self.unload_locked()
+        let result = self.unload_locked();
+        self.request_profile.flush(|line| log::info!("{line}"));
+        result
     }
 
     fn unload_locked(&self) -> Result<(), EngineError> {
