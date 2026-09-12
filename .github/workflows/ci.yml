@@ -71,6 +71,7 @@ jobs:
         run: |
           .github/scripts/test-gpu-device-pool-integration.sh --self-test
           python3 .github/scripts/test_live_kv_owner.py
+          python3 .github/scripts/test_gpu_process_vram.py
 
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'

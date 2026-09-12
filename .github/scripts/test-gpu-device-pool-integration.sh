@@ -15,6 +15,7 @@
 #   KAPSL_GPU_TEST_POOL_BYTES        exact fixed backing size (default: strict auto)
 #   KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES  one physical GPU/UUID (default: 0)
 #   KAPSL_GPU_TEST_VRAM_GROWTH_BYTES reload tolerance (default: 256 MiB)
+#   KAPSL_GPU_TEST_EXCLUSIVE_GPU    opt in to host-PID attribution on an idle dedicated GPU
 #   KAPSL_GPU_TEST_FRAGMENTATION_TOLERANCE allowed ratio increase (default: 0.01)
 #   KAPSL_GPU_TEST_REQUIRE_LAZY_LLAMA_PACK require signed lazy-pack markers
 #   KAPSL_GPU_TEST_REQUIRE_SIGNED_ORT_PACK require the generic signed ORT route
@@ -826,19 +827,20 @@ wait_for_ort_stopped_pool_snapshot() {
 }
 
 process_vram_bytes() {
-  nvidia-smi --query-compute-apps=pid,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null \
-    | awk -F, -v wanted="$runtime_pid" '
-        {
-          pid=$1; memory=$2
-          gsub(/[[:space:]]/, "", pid)
-          gsub(/[[:space:]]/, "", memory)
-          if (pid == wanted && memory ~ /^[0-9]+$/) {
-            total += memory
-            found = 1
-          }
-        }
-        END { if (found) printf "%.0f\n", total * 1024 * 1024 }
-      '
+  local snapshot
+  local -a identity_args=()
+  runtime_is_alive || return 1
+  snapshot="$(mktemp "$output_dir/gpu-process-snapshot.XXXXXX")"
+  nvidia-smi -i "$cuda_visible_devices" \
+    --query-compute-apps=gpu_uuid,pid,used_gpu_memory --format=csv,noheader,nounits \
+    >"$snapshot" || return 1
+  if is_true "${KAPSL_GPU_TEST_EXCLUSIVE_GPU:-0}"; then
+    identity_args+=(--exclusive)
+  fi
+  python3 "$script_dir/gpu-process-vram.py" \
+    --baseline "$output_dir/gpu-process-baseline.csv" \
+    --snapshot "$snapshot" --identity "$output_dir/gpu-process-identity.json" \
+    --runtime-pid "$runtime_pid" "${identity_args[@]}"
 }
 
 run_gguf_inference() {
@@ -1058,6 +1060,13 @@ main() {
   gguf_kv_owner="${gguf_owner_prefix}kv-cache"
 
   nvidia-smi -L >"$output_dir/nvidia-smi.txt"
+  nvidia-smi -i "$cuda_visible_devices" \
+    --query-compute-apps=gpu_uuid,pid,used_gpu_memory --format=csv,noheader,nounits \
+    >"$output_dir/gpu-process-baseline.csv"
+  if is_true "${KAPSL_GPU_TEST_EXCLUSIVE_GPU:-0}"; then
+    [[ ! -s "$output_dir/gpu-process-baseline.csv" ]] \
+      || die "exclusive GPU already has a compute process before runtime launch"
+  fi
   "$binary" --version >"$output_dir/kapsl-version.txt" 2>&1 || true
 
   pool_mode=auto
