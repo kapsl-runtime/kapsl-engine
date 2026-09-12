@@ -347,7 +347,11 @@ reloaded_pool_snapshot_matches() {
   allocated="$(metric_from_file kapsl_gpu_device_pool_allocated_bytes "$candidate")"
   live="$(metric_from_file kapsl_gpu_device_pool_live_allocations "$candidate")"
   free="$(metric_from_file kapsl_gpu_device_pool_free_bytes "$candidate")"
-  [[ "$external" == "$initial_external" ]] \
+  # CUDA can release external provider/context state across a GGUF reload.
+  # Keep the original upper bound while accepting reclaimed external bytes;
+  # governed pool ranges and ownership must still match the idle snapshot.
+  [[ "$external" =~ ^[1-9][0-9]*$ ]] \
+    && (( external <= initial_external )) \
     && [[ "$pooled" == "$backing_bytes" ]] \
     && [[ "$allocated" == "$initial_allocated" ]] \
     && [[ "$live" == "$initial_live" ]] \
@@ -559,6 +563,17 @@ EOF
   reloaded_pool_snapshot_matches \
     "$fixture/idle-metrics.txt" 2000 2147483648 3 2147483648 4294967296 \
     || die "self-test rejected a valid reuse snapshot"
+  sed 's/kapsl_device_memory_external_bytes{device="0"} 2000/kapsl_device_memory_external_bytes{device="0"} 1750/' \
+    "$fixture/idle-metrics.txt" >"$fixture/gguf-reloaded-reclaimed.txt"
+  reloaded_pool_snapshot_matches \
+    "$fixture/gguf-reloaded-reclaimed.txt" 2000 2147483648 3 2147483648 4294967296 \
+    || die "self-test rejected reclaimed external CUDA state after GGUF reload"
+  sed 's/kapsl_device_memory_external_bytes{device="0"} 2000/kapsl_device_memory_external_bytes{device="0"} 2001/' \
+    "$fixture/idle-metrics.txt" >"$fixture/gguf-reloaded-growth.txt"
+  if reloaded_pool_snapshot_matches \
+    "$fixture/gguf-reloaded-growth.txt" 2000 2147483648 3 2147483648 4294967296; then
+    die "self-test accepted external memory growth after GGUF reload"
+  fi
   if stopped_pool_snapshot_matches \
     "$fixture/metrics.txt" 2000 3221225472 7 1073741824 4294967296; then
     die "self-test accepted a snapshot that retained the GGUF owner"
@@ -1234,8 +1249,8 @@ main() {
 
   [[ "$reloaded_pool" == "$initial_pool" ]] \
     || die "reload grew/replaced the pool backing: $initial_pool -> $reloaded_pool"
-  [[ "$reloaded_external" == "$initial_external" ]] \
-    || die "reload changed external-memory accounting: $initial_external -> $reloaded_external"
+  (( reloaded_external <= initial_external )) \
+    || die "reload grew external-memory accounting: $initial_external -> $reloaded_external"
   assert_fragmentation_not_worse \
     "$initial_fragmentation" "$reloaded_fragmentation" "$fragmentation_tolerance" \
     || die "fragmentation grew after GGUF reload: $initial_fragmentation -> $reloaded_fragmentation"
