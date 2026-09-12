@@ -266,6 +266,38 @@ async fn loaded_adapter_exercises_reporting_batching_streaming_and_reload() {
 }
 
 #[tokio::test]
+async fn live_host_memory_reaches_metrics_without_double_counting_governed_allocations() {
+    let pool = Arc::new(FakePool::default());
+    for (mode, model_device_bytes) in [("host-memory", 0), ("mixed-memory", 256)] {
+        let mut engine = engine(&pool, (7, 2), mode).unwrap();
+        assert_eq!(engine.metrics().memory_usage, 0);
+        for _ in 0..2 {
+            engine.load(Path::new("fake.onnx")).await.unwrap();
+            let raw_metrics: EngineMetrics = engine
+                .instance
+                .call_json_report(engine.instance.pack.api.metrics.unwrap())
+                .unwrap();
+            assert_eq!(raw_metrics.memory_usage, 0);
+            assert_eq!(pool.bytes((7, 2)), model_device_bytes);
+            assert_eq!(
+                engine.actual_memory().bytes_for_domain(&MemoryDomain::Host),
+                1536
+            );
+            assert_eq!(engine.metrics().memory_usage, 1536 + model_device_bytes);
+            assert_eq!(engine.infer(&request()).unwrap().data, [42]);
+            assert_eq!(pool.bytes((7, 2)), model_device_bytes + 64);
+            assert_eq!(
+                engine.metrics().memory_usage,
+                1536 + model_device_bytes + 64
+            );
+            engine.instance.unload().unwrap();
+            assert_eq!(pool.bytes((7, 2)), 0);
+            assert_eq!(engine.metrics().memory_usage, 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn shared_pool_isolates_models_and_replicas_through_unload_and_bad_ownership() {
     let pool = Arc::new(FakePool::default());
     let mut first = engine(&pool, (7, 2), "invalid-scope").unwrap();

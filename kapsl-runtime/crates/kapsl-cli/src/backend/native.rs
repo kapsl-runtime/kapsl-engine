@@ -1457,7 +1457,17 @@ impl Engine for NativePackedEngine {
                 log::error!("native backend metrics failed: {error}");
                 EngineMetrics::new()
             });
-        metrics.memory_usage = metrics.memory_usage.max(self.instance.host.live_bytes());
+        // Some adapters report host allocations only through actual_memory.
+        // Its canonical report includes those domains and replaces governed
+        // device reports with the engine ledger, avoiding double accounting.
+        let live_bytes = self
+            .actual_memory()
+            .allocations
+            .iter()
+            .fold(0usize, |bytes, allocation| {
+                bytes.saturating_add(allocation.bytes)
+            });
+        metrics.memory_usage = metrics.memory_usage.max(live_bytes);
         metrics
     }
 
