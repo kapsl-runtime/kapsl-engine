@@ -7,6 +7,7 @@ mod llama_cpp;
 mod manager;
 mod native;
 mod onnx;
+pub(crate) mod request_profile;
 mod selection;
 
 pub(crate) use bundle::*;

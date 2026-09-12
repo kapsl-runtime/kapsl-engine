@@ -94,6 +94,7 @@ struct MemoryTrackedEngine {
     resources: Arc<RuntimeResources>,
     owner: MemoryOwner,
     engine_kind: EngineKind,
+    request_profile: Arc<crate::backend::request_profile::RequestProfile>,
     priority_lease: std::sync::Mutex<Option<ModelPriorityLease>>,
     reconciliation_error: std::sync::Mutex<Option<String>>,
     #[cfg(feature = "gpu-device-pool")]
@@ -115,6 +116,11 @@ impl MemoryTrackedEngine {
             resources,
             owner,
             engine_kind,
+            request_profile: Arc::new(crate::backend::request_profile::RequestProfile::new(
+                "engine.dispatch",
+                owner.model_id,
+                owner.replica_id,
+            )),
             priority_lease: std::sync::Mutex::new(Some(priority_lease)),
             reconciliation_error: std::sync::Mutex::new(None),
             #[cfg(feature = "gpu-device-pool")]
@@ -124,6 +130,7 @@ impl MemoryTrackedEngine {
 
     fn unload_and_release(&mut self) {
         self.inner.unload();
+        self.request_profile.flush(|line| log::info!("{line}"));
         #[cfg(feature = "gpu-device-pool")]
         self.staged_memory_lease.get_mut().unwrap().take();
         self.lease.get_mut().unwrap().take();
@@ -183,7 +190,13 @@ impl MemoryTrackedEngine {
     fn request_admission(&self, request: &InferenceRequest) -> RequestMemoryAdmission {
         let resources = Arc::clone(&self.resources);
         let plan = self.request_plan(std::slice::from_ref(request));
-        RequestMemoryAdmission::new(move || Self::acquire_request_plan(&resources, &plan))
+        let profile = Arc::clone(&self.request_profile);
+        RequestMemoryAdmission::new(move || {
+            let mut timing = profile.start("memory_admission", 0);
+            let result = Self::acquire_request_plan(&resources, &plan);
+            timing.mark("acquire_request_plan");
+            result
+        })
     }
 
     fn openai_wire_request_plan(&self, request: &OpenAiWireRequest) -> MemoryPlan {
@@ -275,8 +288,12 @@ impl kapsl_engine_api::Engine for MemoryTrackedEngine {
         self.inner.planned_request_memory(request)
     }
     fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
-        self.inner
-            .infer_with_memory_admission(request, self.request_admission(request))
+        let mut timing = self.request_profile.start("infer", 0);
+        let admission = self.request_admission(request);
+        timing.mark("request_planning");
+        let result = self.inner.infer_with_memory_admission(request, admission);
+        timing.mark("admission_and_backend");
+        result
     }
     fn supports_openai_wire(&self) -> bool {
         self.inner.supports_openai_wire()
