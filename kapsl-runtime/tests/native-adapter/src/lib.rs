@@ -242,9 +242,11 @@ unsafe extern "C" fn load(
     error: *mut KapslOwnedBuffer,
 ) -> i32 {
     let state = unsafe { state(handle) };
-    let status = state.allocate(KAPSL_ALLOCATION_SCOPE_MODEL, &[], 256);
-    if status != KAPSL_STATUS_OK {
-        return status;
+    if state.mode != "host-memory" {
+        let status = state.allocate(KAPSL_ALLOCATION_SCOPE_MODEL, &[], 256);
+        if status != KAPSL_STATUS_OK {
+            return status;
+        }
     }
     if state.mode == "fail-load" || state.mode == "fail-load-cleanup" {
         return KAPSL_STATUS_BACKEND_ERROR;
@@ -489,8 +491,12 @@ unsafe extern "C" fn actual_memory(
     _error: *mut KapslOwnedBuffer,
 ) -> i32 {
     let state = unsafe { state(handle) };
-    report_memory(
-        state,
+    let mut report = MemoryReport::runtime(
+        "fake-memory",
+        MemoryDomain::Cuda {
+            device_id: state.device as usize,
+        },
+        MemoryAllocationClass::PersistentWeights,
         state
             .allocations
             .lock()
@@ -498,8 +504,24 @@ unsafe extern "C" fn actual_memory(
             .iter()
             .map(|a| a.granted_bytes as usize)
             .sum(),
-        out,
     );
+    if matches!(state.mode.as_str(), "host-memory" | "mixed-memory")
+        && state.loaded.load(Ordering::Acquire)
+    {
+        report.extend(MemoryReport::single(
+            "host-session",
+            MemoryDomain::Host,
+            MemoryAllocationClass::ModelSession,
+            1024,
+        ));
+        report.extend(MemoryReport::single(
+            "host-weights",
+            MemoryDomain::Host,
+            MemoryAllocationClass::PersistentWeights,
+            512,
+        ));
+    }
+    output(serde_json::to_vec(&report).unwrap(), out);
     KAPSL_STATUS_OK
 }
 
@@ -519,6 +541,11 @@ unsafe extern "C" fn metrics(
         .iter()
         .map(|a| a.granted_bytes as usize)
         .sum();
+    if matches!(state.mode.as_str(), "host-memory" | "mixed-memory") {
+        // Reproduce an adapter with complete actual_memory reporting and an
+        // unset legacy metric, including when it uses the governed pool.
+        metrics.memory_usage = 0;
+    }
     output(serde_json::to_vec(&metrics).unwrap(), out);
     KAPSL_STATUS_OK
 }
