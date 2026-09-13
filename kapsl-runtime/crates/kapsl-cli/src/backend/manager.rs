@@ -12,17 +12,18 @@ use fs2::FileExt;
 use kapsl_hal::device::{DeviceBackend, DeviceInfo};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tar::Archive;
+
+mod checksums;
 
 pub(crate) const BACKEND_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const BACKEND_PACK_SCHEMA_VERSION: u32 = 1;
@@ -43,7 +44,6 @@ const OFFLINE_ENV: &str = "KAPSL_OFFLINE";
 const DEFAULT_DOWNLOAD_BASE_URL: &str = "https://downloads.kapsl.net";
 const MAX_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const INSTALL_SPACE_OVERHEAD_BYTES: u64 = 256 * 1024 * 1024;
 const INSTALLED_SIZE_TOLERANCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 250_000;
@@ -1740,11 +1740,18 @@ impl BackendManager {
         if !entrypoint_is_usable(&root, expected)? {
             return Ok(false);
         }
-        for (relative, expected_digest) in &expected.files {
-            let path = root.join(relative);
-            if !path.is_file() || sha256_file(&path)? != expected_digest.to_ascii_lowercase() {
-                return Ok(false);
-            }
+        let started = Instant::now();
+        let valid = checksums::verify_installed_files(&root, &expected.files)?;
+        log::debug!(
+            "Installed backend pack checksums {}/{} files={} valid={} elapsed_ms={:.3}",
+            expected.backend,
+            expected.profile,
+            expected.files.len(),
+            valid,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        if !valid {
+            return Ok(false);
         }
         for notice in &expected.licenses {
             if notice
@@ -2514,17 +2521,7 @@ fn download_bytes(url: &str, limit: u64) -> ManagerResult<Vec<u8>> {
 }
 
 pub(crate) fn sha256_file(path: &Path) -> ManagerResult<String> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(checksums::sha256_file(path)?)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> ManagerResult<()> {
@@ -2852,6 +2849,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use sha2::{Digest, Sha256};
     use std::sync::{Arc, Barrier};
     use tar::Builder;
 

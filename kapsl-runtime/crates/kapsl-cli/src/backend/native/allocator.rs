@@ -336,19 +336,6 @@ impl NativeBackendHost {
         })
     }
 
-    pub(super) fn live_bytes(&self) -> usize {
-        self.allocator.as_ref().map_or(0, |host| {
-            host.ledger
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .allocations
-                .values()
-                .fold(0usize, |bytes, allocation| {
-                    bytes.saturating_add(allocation.storage.bytes())
-                })
-        })
-    }
-
     pub(super) fn actual_memory(&self, mut report: MemoryReport) -> MemoryReport {
         use kapsl_engine_api::{MemoryAllocationClass as Class, MemoryDomain};
         let Some(host) = &self.allocator else {

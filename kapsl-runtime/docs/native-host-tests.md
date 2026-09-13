@@ -52,7 +52,7 @@ and is not built or packaged by engine release builds.
 | Batching | Multiple outputs and the matching release callback; declared batching policy and metrics |
 | Streaming | Borrowed chunks, bounded delivery, cancellation on consumer drop, and rejection of a chunk for another request |
 | Cancellation | Single, batch and stream cancellation reaches the adapter; cancelled scopes cannot allocate; retained arenas stay charged |
-| Memory reporting | Planned model and request reports; live host ledger; metrics retain leaked bytes during failed cleanup |
+| Memory reporting | Planned model and request reports; live host ledger; host allocations reach metrics when the adapter's legacy metric is unset; governed device bytes are counted once; metrics track inference, unload/reload and failed cleanup |
 | Required lifecycle and reports | Descriptor validation, model information, health, load/unload/reload, initialization/load/inference failure cleanup |
 
 Every advertised optional function and every required ABI function is removed
