@@ -127,6 +127,9 @@ jobs:
         with:
           key: ci-test-${{ matrix.os }}
 
+      - name: Test installed pack checksums without backend runtimes
+        run: cargo test --locked --manifest-path .github/benchmarks/pack-verification/Cargo.toml
+
       - name: Test runtime workspace
         if: runner.os != 'Windows'
         run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server,mcp-server
