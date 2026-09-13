@@ -1237,6 +1237,7 @@ impl NativePackInstance {
         let _cancel_pause = self.cancel_target.pause();
         let result = self.unload_locked();
         self.request_profile.flush(|line| log::info!("{line}"));
+        self.host.flush_profile();
         result
     }
 

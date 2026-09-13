@@ -102,6 +102,7 @@ pub(super) struct GovernedDeviceHost {
     model_id: u32,
     replica_id: u32,
     require_scoped: bool,
+    request_profile: RequestProfile,
     ledger: Mutex<AllocationLedger>,
 }
 
@@ -196,6 +197,7 @@ impl NativeBackendHost {
             model_id,
             replica_id,
             require_scoped,
+            request_profile: RequestProfile::new("engine.native.allocator", model_id, replica_id),
             ledger: Mutex::new(AllocationLedger::default()),
         })))
     }
@@ -326,6 +328,12 @@ impl NativeBackendHost {
             .map_or(Ok(()), |host| host.reclaim())
     }
 
+    pub(super) fn flush_profile(&self) {
+        if let Some(host) = &self.allocator {
+            host.request_profile.flush(|line| log::info!("{line}"));
+        }
+    }
+
     pub(super) fn live_allocations(&self) -> usize {
         self.allocator.as_ref().map_or(0, |host| {
             host.ledger
@@ -387,6 +395,7 @@ impl GovernedDeviceHost {
         &self,
         request: KapslScopedDeviceAllocationRequestV1,
     ) -> Result<KapslDeviceAllocationV1, String> {
+        let mut timing = self.request_profile.start("allocate_scoped", 0);
         if !request.is_well_formed() {
             return Err("malformed scoped device allocation request".into());
         }
@@ -396,7 +405,9 @@ impl GovernedDeviceHost {
         {
             return Err("device allocation ownership does not match its backend instance".into());
         }
+        timing.mark("validate_header");
         let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        timing.mark("ledger_lock");
         if !ledger.enabled {
             return Err("native allocator is closed for this lifecycle".into());
         }
@@ -462,14 +473,20 @@ impl GovernedDeviceHost {
             ledger.scopes.insert(scope.id, Arc::clone(&scope));
             scope
         };
-        self.allocate_locked(
+        if scope.request_ids.len() == 1 {
+            timing.request_id(scope.request_ids[0]);
+        }
+        timing.mark("validate_ownership");
+        let result = self.allocate_locked(
             &mut ledger,
             scope,
             request.memory_kind,
             request.allocation_class,
             request.bytes,
             request.alignment,
-        )
+        );
+        timing.mark("pool_allocate_and_accounting");
+        result
     }
 
     fn allocate_legacy(
@@ -598,10 +615,13 @@ impl GovernedDeviceHost {
     }
 
     fn free(&self, returned: KapslDeviceAllocationV1) -> Result<(), String> {
+        let mut timing = self.request_profile.start("free", 0);
         if returned.reserved != 0 || returned.allocation_id == 0 {
             return Err("invalid device free identity".into());
         }
+        timing.mark("validate_header");
         let mut ledger = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        timing.mark("ledger_lock");
         let allocation = ledger
             .allocations
             .get(&returned.allocation_id)
@@ -611,10 +631,16 @@ impl GovernedDeviceHost {
         {
             return Err("device free pointer or bytes do not match its allocation ID".into());
         }
+        if allocation.scope.request_ids.len() == 1 {
+            timing.request_id(allocation.scope.request_ids[0]);
+        }
+        timing.mark("validate_identity");
         // A successful free makes the range immediately reusable by another
         // model. Never rely on an adapter's declaration that it synchronized.
         self.allocator.synchronize()?;
+        timing.mark("synchronize_before_free");
         allocation.storage.free()?;
+        timing.mark("pool_free");
         log::debug!(
             "native governed free id={} device={} class={} bytes={} scope={:?}",
             returned.allocation_id,
@@ -624,6 +650,7 @@ impl GovernedDeviceHost {
             allocation.scope
         );
         ledger.allocations.remove(&returned.allocation_id);
+        timing.mark("log_and_accounting");
         Ok(())
     }
 
@@ -782,7 +809,10 @@ unsafe extern "C" fn synchronize_device(user_data: *mut c_void, device_id: u32) 
         if device_id != host.device_id {
             return KAPSL_STATUS_INVALID_ARGUMENT;
         }
-        match host.allocator.synchronize() {
+        let mut timing = host.request_profile.start("synchronize_callback", 0);
+        let result = host.allocator.synchronize();
+        timing.mark("device_synchronize");
+        match result {
             Ok(()) => KAPSL_STATUS_OK,
             Err(error) => {
                 log::error!("native device synchronization failed: {error}");
