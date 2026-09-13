@@ -534,3 +534,51 @@ fn host_without_a_device_pool_does_not_advertise_allocator_callbacks() {
     assert!(host.table.base.free_device.is_none());
     assert!(host.table.base.synchronize_device.is_none());
 }
+
+#[test]
+fn allocation_profiling_preserves_failed_free_ownership_and_successful_sync() {
+    let pool = Arc::new(FakePool::default());
+    let mut host = pool.host(7, 2, 1024);
+    Arc::get_mut(host.allocator.as_mut().unwrap())
+        .unwrap()
+        .request_profile = RequestProfile::enabled_for_test("engine.native.allocator", 7, 2);
+    drop(host.begin_model_call().unwrap());
+    let call = host.begin_requests([(11, None)]).unwrap();
+    let allocation = allocate(&host, &request(KAPSL_ALLOCATION_SCOPE_REQUEST, 1, &[11])).unwrap();
+    drop(call);
+    pool.fail_sync(true);
+    assert_eq!(free(&host, &allocation), KAPSL_STATUS_BACKEND_ERROR);
+    assert_eq!(pool.bytes((7, 2)), 128);
+    pool.fail_sync(false);
+    assert_eq!(free(&host, &allocation), KAPSL_STATUS_OK);
+    assert_eq!(pool.bytes((7, 2)), 0);
+    let profile = &host.allocator.as_ref().unwrap().request_profile;
+    let mut reports = Vec::new();
+    profile.flush(|line| {
+        reports.push(
+            serde_json::from_str::<serde_json::Value>(
+                line.strip_prefix("KAPSL_REQUEST_PROFILE ").unwrap(),
+            )
+            .unwrap(),
+        );
+    });
+    let records = reports[0]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 3);
+    assert!(records.iter().all(|record| record["request_id"] == 11));
+    let successful_free = records
+        .iter()
+        .find(|record| {
+            record["operation"] == "free"
+                && record["phases"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|phase| phase["name"] == "pool_free")
+        })
+        .unwrap();
+    assert!(successful_free["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|phase| phase["name"] == "synchronize_before_free"));
+}
