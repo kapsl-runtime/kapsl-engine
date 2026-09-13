@@ -42,3 +42,14 @@ every load. No verification results are cached or reused.
 Without `--diagnostic`, the existing serial-versus-parallel ABBA harness retains
 its warmup, block count, and measurements. Neither mode replaces the unchanged
 1.5x startup and 0.80x throughput qualification gates.
+
+The original comparison command remains:
+
+```sh
+cargo run --release --locked --manifest-path .github/benchmarks/pack-verification/Cargo.toml -- PACK_ROOT CHECKSUMS_JSON 10 > measurements.json
+```
+
+It warms both routes, then runs 10 ABBA blocks (40 samples) by default and emits
+raw times, medians, and the parallel/serial ratio. Stop builds, inference and
+compression before manual timings. Signature checks, adapter loading and total
+startup remain the engine's responsibility.
