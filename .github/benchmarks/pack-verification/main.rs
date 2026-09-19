@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "diagnostic_only": true,
                 "os": std::env::consts::OS,
                 "architecture": std::env::consts::ARCH,
-            "sha256_implementation": "ring=0.17.14",
+                "sha256_implementation": "ring=0.17.14",
                 "available_parallelism": std::thread::available_parallelism()?.get(),
                 "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
                 "files": rows.into_inner().unwrap(),
