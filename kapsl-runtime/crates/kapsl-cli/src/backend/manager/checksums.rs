@@ -3,8 +3,9 @@
 //! Verification is repeated for each load. File metadata only chooses how to
 //! schedule reads; it is never accepted as evidence that content is unchanged.
 
-use sha2::{Digest, Sha256};
+use ring::digest::{Context, SHA256};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -32,7 +33,7 @@ fn hash_file<const PROFILE: bool>(path: &Path) -> io::Result<(String, FileTiming
     let started = PROFILE.then(Instant::now);
     let mut timing = FileTiming::default();
     let mut reader = BufReader::new(File::open(path)?);
-    let mut hasher = Sha256::new();
+    let mut hasher = Context::new(&SHA256);
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     loop {
         let read_started = PROFILE.then(Instant::now);
@@ -51,14 +52,18 @@ fn hash_file<const PROFILE: bool>(path: &Path) -> io::Result<(String, FileTiming
         }
     }
     let hash_started = PROFILE.then(Instant::now);
-    let digest = hasher.finalize();
+    let digest = hasher.finish();
     if let Some(started) = hash_started {
         timing.hash += started.elapsed();
     }
     if let Some(started) = started {
         timing.elapsed = started.elapsed();
     }
-    Ok((format!("{digest:x}"), timing))
+    let mut hex = String::with_capacity(64);
+    for byte in digest.as_ref() {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok((hex, timing))
 }
 
 pub(super) fn verify_installed_files(
@@ -190,6 +195,7 @@ fn verify_observed<const PROFILE: bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::io::{Seek, SeekFrom, Write};
 
     fn fixture() -> (tempfile::TempDir, BTreeMap<String, String>) {
@@ -257,6 +263,7 @@ mod tests {
         std::fs::create_dir(root.path().join("missing")).unwrap();
         assert!(!verify_with_workers(root.path(), &files, 4).unwrap());
     }
+
     #[test]
     fn diagnostic_reads_all_bytes_and_rejects_changed_digest_and_replacement() {
         let (root, mut files) = fixture();
@@ -340,6 +347,7 @@ mod tests {
             assert_eq!(hash_file::<true>(&path).unwrap().0, expected);
         }
     }
+
     #[test]
     fn worker_panic_is_an_error_and_other_workers_are_joined() {
         let (root, files) = fixture();
@@ -366,5 +374,39 @@ mod tests {
         // Opening or reading a directory fails across the supported hosts.
         assert!(hash_file::<true>(root.path()).is_err());
         assert!(sha256_file(root.path()).is_err());
+    }
+
+    #[test]
+    fn matches_reference_sha256_at_padding_and_read_boundaries() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("reference");
+        for size in [
+            0,
+            1,
+            55,
+            56,
+            63,
+            64,
+            65,
+            119,
+            120,
+            127,
+            128,
+            129,
+            COPY_BUFFER_BYTES - 1,
+            COPY_BUFFER_BYTES,
+            COPY_BUFFER_BYTES + 1,
+            2 * COPY_BUFFER_BYTES + 73,
+        ] {
+            let bytes: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            let expected = format!("{:x}", Sha256::digest(&bytes));
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(sha256_file(&path).unwrap(), expected, "size {size}");
+            assert_eq!(
+                hash_file::<true>(&path).unwrap().0,
+                expected,
+                "profiled size {size}"
+            );
+        }
     }
 }

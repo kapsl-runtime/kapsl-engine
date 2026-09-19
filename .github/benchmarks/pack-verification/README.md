@@ -1,7 +1,7 @@
 # Installed pack verification diagnostics
 
 This CPU-only harness compiles the production checksum module with the engine's
-locked SHA-256 dependency. Correctness tests do not require ORT, a GPU, or an
+locked SHA-256 implementation (`ring =0.17.14`). Correctness tests do not require ORT, a GPU, or an
 engine build:
 
 ```sh
@@ -53,3 +53,12 @@ It warms both routes, then runs 10 ABBA blocks (40 samples) by default and emits
 raw times, medians, and the parallel/serial ratio. Stop builds, inference and
 compression before manual timings. Signature checks, adapter loading and total
 startup remain the engine's responsibility.
+
+The checksum implementation uses `ring` already present in the engine's TLS
+dependency graph. Every required byte is still read and hashed on every load;
+SHA-256 digests, signed manifests, worker scheduling and file buffers retain
+their existing meaning. Tests compare against the independent `sha2 0.10.9`
+implementation at SHA padding, block and file read boundaries. To compare
+implementations, build each reviewed revision separately and use identical
+signed inputs and alternating sessions. Local ARM64 improvements do not prove
+an x86 Linux startup improvement; qualification requires the full startup gate.

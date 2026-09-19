@@ -2361,6 +2361,7 @@ dependencies = [
  "parking_lot",
  "prometheus",
  "rand 0.8.7",
+ "ring",
  "rust-embed",
  "semver",
  "serde",
