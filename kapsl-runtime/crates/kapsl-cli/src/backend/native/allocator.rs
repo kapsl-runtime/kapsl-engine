@@ -838,13 +838,7 @@ impl DeviceAllocator for GpuAllocator {
             _ => return Err("unknown device allocation class".into()),
         };
         let owner = PoolOwner::new(self.backend, self.model_id, self.replica_id, class);
-        if !self
-            .pool
-            .snapshot()
-            .owners
-            .iter()
-            .any(|entry| entry.owner.workload() == owner.workload() && entry.admitted)
-        {
+        if !self.pool.is_owner_admitted(owner) {
             return Err(format!(
                 "native device owner {owner:?} has no engine memory admission"
             ));
