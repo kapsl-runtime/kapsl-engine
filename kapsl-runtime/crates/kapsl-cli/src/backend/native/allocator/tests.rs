@@ -534,3 +534,92 @@ fn host_without_a_device_pool_does_not_advertise_allocator_callbacks() {
     assert!(host.table.base.free_device.is_none());
     assert!(host.table.base.synchronize_device.is_none());
 }
+
+#[cfg(feature = "gpu-device-pool")]
+#[test]
+#[ignore = "manual CUDA driver regression; hosted PR checks remain CPU-only"]
+fn native_context_fence_waits_for_nonblocking_backend_stream() {
+    use cudarc::driver::{sys, CudaDevice};
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    struct PendingWork {
+        release: AtomicBool,
+        completed: AtomicBool,
+        timed_out: AtomicBool,
+    }
+    unsafe extern "C" fn pending_work(data: *mut c_void) {
+        // SAFETY: the test retains this box until context synchronization below.
+        let pending = unsafe { &*data.cast::<PendingWork>() };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.release.load(Ordering::Acquire) {
+            if Instant::now() >= deadline {
+                pending.timed_out.store(true, Ordering::Release);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // CUDA callbacks must not call CUDA APIs; this only signals host state.
+        pending.completed.store(true, Ordering::Release);
+    }
+
+    let device = CudaDevice::new(0).unwrap();
+    let pool = Arc::new(GpuDevicePool::new(device.clone(), 1024 * 1024).unwrap());
+    let allocator = GpuAllocator {
+        pool,
+        backend: PoolBackend::Native,
+        model_id: 0,
+        replica_id: 0,
+    };
+    let mut pending = Box::new(PendingWork {
+        release: AtomicBool::new(false),
+        completed: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
+    });
+    // SAFETY: the retained primary context is current. This stream is destroyed
+    // only after its callback completes, including when an assertion fails.
+    unsafe {
+        let driver = sys::lib();
+        let mut stream = std::ptr::null_mut();
+        driver
+            .cuStreamCreate(
+                &mut stream,
+                sys::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
+            )
+            .result()
+            .unwrap();
+        let submitted = driver
+            .cuLaunchHostFunc(
+                stream,
+                Some(pending_work),
+                (&mut *pending as *mut PendingWork).cast(),
+            )
+            .result();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            submitted.unwrap();
+            // Demonstrate the old primitive leaves the backend stream pending.
+            device.synchronize().unwrap();
+            assert_eq!(
+                driver.cuStreamQuery(stream),
+                sys::CUresult::CUDA_ERROR_NOT_READY
+            );
+            assert!(!pending.completed.load(Ordering::Acquire));
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    pending.release.store(true, Ordering::Release);
+                });
+                allocator.synchronize().unwrap();
+                assert!(pending.completed.load(Ordering::Acquire));
+                assert_eq!(driver.cuStreamQuery(stream), sys::CUresult::CUDA_SUCCESS);
+            });
+            assert!(!pending.timed_out.load(Ordering::Acquire));
+        }));
+        pending.release.store(true, Ordering::Release);
+        driver.cuCtxSynchronize().result().unwrap();
+        driver.cuStreamDestroy_v2(stream).result().unwrap();
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
