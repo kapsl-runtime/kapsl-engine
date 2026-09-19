@@ -1741,7 +1741,41 @@ impl BackendManager {
             return Ok(false);
         }
         let started = Instant::now();
-        let valid = checksums::verify_installed_files(&root, &expected.files)?;
+        let valid = if std::env::var_os("KAPSL_PACK_VERIFICATION_PROFILING")
+            .is_some_and(|value| value == "1")
+        {
+            let observations = std::sync::Mutex::new(Vec::new());
+            let valid = checksums::verify_installed_files_profiled(
+                &root,
+                &expected.files,
+                &|worker, path, timing, valid| {
+                    observations.lock().unwrap_or_else(|p| p.into_inner()).push(
+                        serde_json::json!({
+                            "worker": worker,
+                            "path": path.strip_prefix(&root).unwrap_or(path),
+                            "bytes": timing.bytes,
+                            "read_ms": timing.read.as_secs_f64() * 1000.0,
+                            "hash_ms": timing.hash.as_secs_f64() * 1000.0,
+                            "elapsed_ms": timing.elapsed.as_secs_f64() * 1000.0,
+                            "valid": valid,
+                        }),
+                    );
+                },
+            )?;
+            log::info!(
+                "Pack verification diagnostic {}",
+                serde_json::json!({
+                    "backend": expected.backend,
+                    "profile": expected.profile,
+                    "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    "files": observations.into_inner().unwrap_or_else(|p| p.into_inner()),
+                    "valid": valid,
+                })
+            );
+            valid
+        } else {
+            checksums::verify_installed_files(&root, &expected.files)?
+        };
         log::debug!(
             "Installed backend pack checksums {}/{} files={} valid={} elapsed_ms={:.3}",
             expected.backend,

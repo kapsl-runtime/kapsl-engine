@@ -31,16 +31,59 @@ fn median(values: &mut [f64]) -> f64 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    let diagnostic = args.first().is_some_and(|arg| arg == "--diagnostic");
+    if diagnostic {
+        args.remove(0);
+    }
     if !(2..=3).contains(&args.len()) {
         return Err(
-            "usage: kapsl-pack-verification-bench PACK_ROOT CHECKSUMS_JSON [ABBA_BLOCKS]".into(),
+            "usage: kapsl-pack-verification-bench [--diagnostic] PACK_ROOT CHECKSUMS_JSON [ABBA_BLOCKS]".into(),
         );
     }
     let root = Path::new(&args[0]);
     let files: BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&args[1])?)?;
     if files.is_empty() {
         return Err("the checksum map must contain at least one file".into());
+    }
+    if diagnostic {
+        if args.len() != 2 {
+            return Err("--diagnostic performs one validation; omit ABBA_BLOCKS".into());
+        }
+        let started = Instant::now();
+        let rows = std::sync::Mutex::new(Vec::new());
+        let valid = checksums::verify_installed_files_profiled(
+            root,
+            &files,
+            &|worker, path, timing, valid| {
+                rows.lock().unwrap().push(serde_json::json!({
+                    "worker": worker,
+                    "path": path.strip_prefix(root).unwrap_or(path),
+                    "bytes": timing.bytes,
+                    "read_ms": timing.read.as_secs_f64() * 1000.0,
+                    "hash_ms": timing.hash.as_secs_f64() * 1000.0,
+                    "elapsed_ms": timing.elapsed.as_secs_f64() * 1000.0,
+                    "completed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                    "valid": valid,
+                }));
+            },
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "diagnostic_only": true,
+                "os": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "available_parallelism": std::thread::available_parallelism()?.get(),
+                "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "files": rows.into_inner().unwrap(),
+                "valid": valid,
+            }))?
+        );
+        if !valid {
+            return Err("input files failed checksum verification".into());
+        }
+        return Ok(());
     }
     let blocks = args.get(2).map_or(Ok(10_usize), |value| value.parse())?;
     if !(1..=100).contains(&blocks) {
