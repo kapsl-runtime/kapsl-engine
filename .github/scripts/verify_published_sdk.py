@@ -17,7 +17,7 @@ CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 EXPECTED_VERSIONS = {
     "kapsl-backend-abi": "0.2.0",
     "kapsl-engine-api": "0.3.0",
-    "kapsl-hal": "0.3.0",
+    "kapsl-hal": "0.3.1",
     "kapsl-ipc": "0.4.0",
     "kapsl-kv-abi": "0.6.0",
     "kapsl-llm": "0.3.4",
