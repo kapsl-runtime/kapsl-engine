@@ -1267,6 +1267,7 @@ mod tests {
             signature: sign_artifact(&signing, &digest),
             memory: BackendMemoryManifest::default(),
             installer: BackendInstaller::Extract,
+            files_blake3: None,
             files: BTreeMap::from([("bin/python".to_string(), sha256_bytes(b"#!/bin/sh\n"))]),
             licenses: Vec::new(),
             priority: 100,
@@ -1354,6 +1355,7 @@ mod tests {
             signature: sign_artifact(&signing, &onnx_digest),
             memory: BackendMemoryManifest::default(),
             installer: BackendInstaller::Extract,
+            files_blake3: None,
             files: BTreeMap::from([(
                 "libkapsl_backend_onnx.so".to_string(),
                 sha256_bytes(onnx_entrypoint),
@@ -1424,6 +1426,7 @@ mod tests {
             signature: sign_artifact(&signing, &llama_digest),
             memory: BackendMemoryManifest::default(),
             installer: BackendInstaller::Extract,
+            files_blake3: None,
             files: BTreeMap::from([(
                 "lib/libkapsl_backend_llama_cpp.so".to_string(),
                 sha256_bytes(llama_entrypoint),

@@ -77,6 +77,7 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 ureq = { version = "=3.1.4", default-features = false, features = ["native-tls", "rustls"] }
 rand = "0.8"
 sha2 = "0.10"
+blake3 = "=1.8.7"
 rust-embed = "8.0"
 mime_guess = "2.0"
 dirs = "6.0.0"
