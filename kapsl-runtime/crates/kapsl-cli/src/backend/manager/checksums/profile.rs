@@ -67,6 +67,12 @@ pub(super) fn verify(
     let validation_id = NEXT_VALIDATION.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let records = Mutex::new(Vec::with_capacity(files.len()));
+    // Preserve the manifest spelling, including Windows separators. Path
+    // component normalization is not a reversible lookup into the signed map.
+    let manifest_paths: BTreeMap<_, _> = files
+        .iter()
+        .map(|(relative, digest)| (root.join(relative).into_os_string(), (relative, digest)))
+        .collect();
     let result = verify_using(
         root,
         files,
@@ -76,21 +82,11 @@ pub(super) fn verify(
             let started_ns = ns(started);
             let (result, measurements) = hash_file_measured::<true>(path, algorithm);
             let finished_ns = ns(started);
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
+            let (relative, expected) = manifest_paths
+                .get(path.as_os_str())
+                .expect("verifier only hashes paths from this manifest");
             let outcome = match &result {
-                Ok(digest)
-                    if files
-                        .get(&relative)
-                        .is_some_and(|expected| digest.eq_ignore_ascii_case(expected)) =>
-                {
-                    "matched"
-                }
+                Ok(digest) if digest.eq_ignore_ascii_case(expected) => "matched",
                 Ok(_) => "mismatch",
                 Err(_) => "io_error",
             };
@@ -98,7 +94,7 @@ pub(super) fn verify(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(FileRecord {
-                    path: relative,
+                    path: (*relative).clone(),
                     worker: format!("{:?}", std::thread::current().id()),
                     started_ns,
                     finished_ns,
@@ -194,18 +190,25 @@ mod tests {
     }
 
     #[test]
-    fn nested_manifest_paths_are_reported_with_portable_separators() {
+    fn nested_manifest_paths_retain_the_signed_spelling() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("nested")).unwrap();
         std::fs::write(root.path().join("nested/data"), b"test").unwrap();
-        let files = BTreeMap::from([(
-            "nested/data".into(),
-            blake3::hash(b"test").to_hex().to_string(),
-        )]);
-        let (result, report) = verify(root.path(), &files, 1, Algorithm::Blake3);
-        assert!(result.unwrap());
-        assert_eq!(report.files[0].path, "nested/data");
-        assert_eq!(report.files[0].outcome, "matched");
+        let spellings = vec!["nested/data", "nested//data"];
+        #[cfg(windows)]
+        let spellings = {
+            let mut spellings = spellings;
+            spellings.push(r"nested\data");
+            spellings
+        };
+        for relative in spellings {
+            let files =
+                BTreeMap::from([(relative.into(), blake3::hash(b"test").to_hex().to_string())]);
+            let (result, report) = verify(root.path(), &files, 1, Algorithm::Blake3);
+            assert!(result.unwrap());
+            assert_eq!(report.files[0].path, relative);
+            assert_eq!(report.files[0].outcome, "matched");
+        }
     }
 
     #[test]
