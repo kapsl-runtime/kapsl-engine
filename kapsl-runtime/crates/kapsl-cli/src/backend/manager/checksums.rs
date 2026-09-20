@@ -10,6 +10,8 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod profile;
+
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_CHECKSUM_WORKERS: usize = 4;
 const MIN_PARALLEL_BYTES: u64 = 32 * 1024 * 1024;
@@ -25,26 +27,48 @@ pub(super) fn sha256_file(path: &Path) -> io::Result<String> {
 }
 
 fn hash_file(path: &Path, algorithm: Algorithm) -> io::Result<String> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut sha256 = Sha256::new();
-    let mut blake3 = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        match algorithm {
-            Algorithm::Sha256 => sha256.update(&buffer[..read]),
-            Algorithm::Blake3 => {
-                blake3.update(&buffer[..read]);
+    hash_file_measured::<false>(path, algorithm).0
+}
+
+// Const specialization keeps clock reads out of normal verification, including
+// its inner read/hash loop. Both modes hash the same bytes with the same buffers.
+fn hash_file_measured<const PROFILE: bool>(
+    path: &Path,
+    algorithm: Algorithm,
+) -> (io::Result<String>, profile::HashMeasurements) {
+    let mut measurements = profile::HashMeasurements::default();
+    let result = (|| {
+        let opened = profile::measure::<PROFILE, _>(&mut measurements.open_ns, || File::open(path));
+        let mut reader = BufReader::new(opened?);
+        let mut sha256 = Sha256::new();
+        let mut blake3 = blake3::Hasher::new();
+        let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+        loop {
+            let read = profile::measure::<PROFILE, _>(&mut measurements.read_ns, || {
+                reader.read(&mut buffer)
+            })?;
+            if read == 0 {
+                break;
             }
+            if PROFILE {
+                measurements.bytes_read += read as u64;
+            }
+            profile::measure::<PROFILE, _>(&mut measurements.hash_ns, || match algorithm {
+                Algorithm::Sha256 => sha256.update(&buffer[..read]),
+                Algorithm::Blake3 => {
+                    blake3.update(&buffer[..read]);
+                }
+            });
         }
-    }
-    Ok(match algorithm {
-        Algorithm::Sha256 => format!("{:x}", sha256.finalize()),
-        Algorithm::Blake3 => blake3.finalize().to_hex().to_string(),
-    })
+        Ok(profile::measure::<PROFILE, _>(
+            &mut measurements.hash_ns,
+            || match algorithm {
+                Algorithm::Sha256 => format!("{:x}", sha256.finalize()),
+                Algorithm::Blake3 => blake3.finalize().to_hex().to_string(),
+            },
+        ))
+    })();
+    (result, measurements)
 }
 
 pub(super) fn verify_installed_files(
@@ -53,7 +77,17 @@ pub(super) fn verify_installed_files(
     algorithm: Algorithm,
 ) -> io::Result<bool> {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    verify_with_workers(root, files, available, algorithm)
+    if std::env::var("KAPSL_PACK_VERIFICATION_PROFILING").as_deref() == Ok("1") {
+        let (result, report) = profile::verify(root, files, available, algorithm);
+        // Emit only after every worker has joined. Logging cannot serialize
+        // file reads or inflate an individual file's measured hash time.
+        if let Ok(json) = serde_json::to_string(&report) {
+            log::info!("KAPSL_PACK_VERIFICATION_PROFILE {json}");
+        }
+        result
+    } else {
+        verify_with_workers(root, files, available, algorithm)
+    }
 }
 
 struct FileCheck<'a> {
@@ -163,7 +197,7 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
-    fn fixture(algorithm: Algorithm) -> (tempfile::TempDir, BTreeMap<String, String>) {
+    pub(super) fn fixture(algorithm: Algorithm) -> (tempfile::TempDir, BTreeMap<String, String>) {
         let root = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
         for (index, bytes) in [20 * 1024 * 1024, 12 * 1024 * 1024, 17, 0]
