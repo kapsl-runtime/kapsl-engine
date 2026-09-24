@@ -24,11 +24,17 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tar::Archive;
 
+mod archive;
 mod checksums;
+mod files;
 #[cfg(test)]
 mod tests;
 mod types;
 
+pub(crate) use archive::safe_extract_tar_gz;
+use archive::*;
+pub(crate) use files::sha256_file;
+use files::*;
 pub(crate) use types::*;
 
 pub(crate) const BACKEND_INDEX_SCHEMA_VERSION: u32 = 1;
@@ -1887,21 +1893,6 @@ fn validate_sha256(value: &str) -> ManagerResult<()> {
     Ok(())
 }
 
-fn lock_file(path: &Path) -> ManagerResult<File> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| {
-            BackendManagerError::new(format!("open lock file {}: {error}", path.display()))
-        })
-}
-
 fn ensure_available_space(path: &Path, required: u64, operation: &str) -> ManagerResult<()> {
     let available = fs2::available_space(path).map_err(|error| {
         BackendManagerError::new(format!(
@@ -1918,291 +1909,9 @@ fn ensure_available_space(path: &Path, required: u64, operation: &str) -> Manage
     Ok(())
 }
 
-fn process_path_lock(path: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut locks = locks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
 fn backend_maintenance_lock() -> &'static RwLock<()> {
     static LOCK: OnceLock<RwLock<()>> = OnceLock::new();
     LOCK.get_or_init(|| RwLock::new(()))
-}
-
-fn read_file_bounded(path: &Path, limit: u64) -> ManagerResult<Vec<u8>> {
-    let file = File::open(path)
-        .map_err(|error| BackendManagerError::new(format!("open {}: {error}", path.display())))?;
-    if file.metadata()?.len() > limit {
-        return Err(BackendManagerError::new(format!(
-            "{} exceeds the {} byte limit",
-            path.display(),
-            limit
-        )));
-    }
-    let mut bytes = Vec::new();
-    file.take(limit + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(BackendManagerError::new(format!(
-            "{} exceeds the {} byte limit",
-            path.display(),
-            limit
-        )));
-    }
-    Ok(bytes)
-}
-
-fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path, limit: u64) -> ManagerResult<T> {
-    let bytes = read_file_bounded(path, limit)?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        BackendManagerError::new(format!("invalid JSON in {}: {error}", path.display()))
-    })
-}
-
-fn download_bytes(url: &str, limit: u64) -> ManagerResult<Vec<u8>> {
-    let agent = http_client::http_agent_for_transfer();
-    let mut response = agent.get(url).call().map_err(|error| {
-        BackendManagerError::new(format!(
-            "download {url}: {}",
-            http_client::format_remote_http_error(error)
-        ))
-    })?;
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .as_reader()
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(BackendManagerError::new(format!(
-            "download from {url} exceeds the {limit} byte limit"
-        )));
-    }
-    Ok(bytes)
-}
-
-pub(crate) fn sha256_file(path: &Path) -> ManagerResult<String> {
-    Ok(checksums::sha256_file(path)?)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> ManagerResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        BackendManagerError::new(format!("{} has no parent directory", path.display()))
-    })?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.tmp-{}",
-        path.file_name().and_then(OsStr::to_str).unwrap_or("file"),
-        unique_nonce()
-    ));
-    {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    if path.exists() {
-        quarantine_file(path)?;
-    }
-    fs::rename(&temporary, path)?;
-    sync_parent(path)
-}
-
-fn quarantine_file(path: &Path) -> ManagerResult<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| BackendManagerError::new(format!("{} has no parent", path.display())))?;
-    let name = path.file_name().and_then(OsStr::to_str).unwrap_or("file");
-    let destination = parent.join(format!(".{name}.invalid-{}", unique_nonce()));
-    fs::rename(path, destination)?;
-    Ok(())
-}
-
-fn unique_nonce() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    )
-}
-
-pub(crate) fn safe_extract_tar_gz(
-    archive: &Path,
-    destination: &Path,
-    max_bytes: u64,
-) -> ManagerResult<()> {
-    let file = File::open(archive)?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
-    let mut total = 0_u64;
-    for (position, entry) in archive
-        .entries()
-        .map_err(|error| BackendManagerError::new(format!("read backend archive: {error}")))?
-        .enumerate()
-    {
-        if position >= MAX_ARCHIVE_ENTRIES {
-            return Err(BackendManagerError::new(format!(
-                "backend archive contains more than {MAX_ARCHIVE_ENTRIES} entries"
-            )));
-        }
-        let mut entry = entry.map_err(|error| {
-            BackendManagerError::new(format!("read backend archive entry: {error}"))
-        })?;
-        let relative = entry
-            .path()
-            .map_err(|error| BackendManagerError::new(error.to_string()))?
-            .into_owned();
-        if relative.is_absolute()
-            || relative.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(BackendManagerError::new(format!(
-                "backend archive contains unsafe path {}",
-                relative.display()
-            )));
-        }
-        let entry_type = entry.header().entry_type();
-        if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_symlink()) {
-            return Err(BackendManagerError::new(format!(
-                "backend archive contains unsupported entry type for {}",
-                relative.display()
-            )));
-        }
-        total = total.saturating_add(entry.size());
-        if total > max_bytes {
-            return Err(BackendManagerError::new(format!(
-                "backend archive expands beyond its signed {} byte limit",
-                max_bytes
-            )));
-        }
-        ensure_no_symlink_ancestor(destination, &relative)?;
-        if !entry.unpack_in(destination).map_err(|error| {
-            BackendManagerError::new(format!(
-                "extract backend archive entry {}: {error}",
-                relative.display()
-            ))
-        })? {
-            return Err(BackendManagerError::new(format!(
-                "backend archive entry escaped the staging directory: {}",
-                relative.display()
-            )));
-        }
-    }
-    validate_tree_symlinks(destination, destination)?;
-    Ok(())
-}
-
-fn ensure_no_symlink_ancestor(root: &Path, relative: &Path) -> ManagerResult<()> {
-    let mut current = root.to_path_buf();
-    let mut components = relative.components().peekable();
-    while let Some(component) = components.next() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        if components.peek().is_none() {
-            break;
-        }
-        current.push(component);
-        if fs::symlink_metadata(&current)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return Err(BackendManagerError::new(format!(
-                "backend archive writes through symlink {}",
-                current.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_tree_symlinks(root: &Path, directory: &Path) -> ManagerResult<()> {
-    for entry in read_dirs(directory)? {
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            let target = fs::read_link(&path)?;
-            if target.is_absolute() || !lexical_target_stays_inside(root, &path, &target) {
-                return Err(BackendManagerError::new(format!(
-                    "backend archive contains escaping symlink {} -> {}",
-                    path.display(),
-                    target.display()
-                )));
-            }
-        } else if metadata.is_dir() {
-            validate_tree_symlinks(root, &path)?;
-        }
-    }
-    Ok(())
-}
-
-fn lexical_target_stays_inside(root: &Path, link: &Path, target: &Path) -> bool {
-    let Ok(relative_parent) = link.parent().unwrap_or(root).strip_prefix(root) else {
-        return false;
-    };
-    let mut depth = 0_i64;
-    for component in relative_parent.components().chain(target.components()) {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(_) => depth += 1,
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            Component::RootDir | Component::Prefix(_) => return false,
-        }
-    }
-    true
-}
-
-fn find_payload_root(root: &Path) -> ManagerResult<PathBuf> {
-    fn visit(root: &Path, depth: usize, found: &mut Vec<PathBuf>) -> ManagerResult<()> {
-        if depth > 4 {
-            return Ok(());
-        }
-        if root.join(PAYLOAD_MANIFEST_NAME).is_file() {
-            found.push(root.to_path_buf());
-            return Ok(());
-        }
-        for entry in read_dirs(root)? {
-            let path = entry.path();
-            if path.is_dir() && !fs::symlink_metadata(&path)?.file_type().is_symlink() {
-                visit(&path, depth + 1, found)?;
-            }
-        }
-        Ok(())
-    }
-
-    let mut found = Vec::new();
-    visit(root, 0, &mut found)?;
-    match found.as_slice() {
-        [path] => Ok(path.clone()),
-        [] => Err(BackendManagerError::new(format!(
-            "backend archive does not contain {PAYLOAD_MANIFEST_NAME}"
-        ))),
-        _ => Err(BackendManagerError::new(format!(
-            "backend archive contains multiple {PAYLOAD_MANIFEST_NAME} files"
-        ))),
-    }
 }
 
 fn validate_payload_manifest(
@@ -2271,38 +1980,6 @@ fn sync_tree_security(root: &Path) -> ManagerResult<()> {
         visit(root)?;
     }
     Ok(())
-}
-
-fn sync_parent(path: &Path) -> ManagerResult<()> {
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn read_dirs(path: &Path) -> ManagerResult<Vec<fs::DirEntry>> {
-    let mut entries = fs::read_dir(path)
-        .map_err(|error| {
-            BackendManagerError::new(format!("read directory {}: {error}", path.display()))
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| BackendManagerError::new(error.to_string()))?;
-    entries.sort_by_key(|entry| entry.file_name());
-    Ok(entries)
-}
-
-fn directory_size(path: &Path) -> ManagerResult<u64> {
-    let mut total = 0_u64;
-    for entry in read_dirs(path)? {
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
-            total = total.saturating_add(directory_size(&entry.path())?);
-        } else {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Ok(total)
 }
 
 fn is_internal_name(name: &OsStr) -> bool {
