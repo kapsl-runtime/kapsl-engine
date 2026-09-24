@@ -3,6 +3,7 @@
 use super::*;
 
 mod bundle;
+mod command;
 mod llama_cpp;
 mod manager;
 mod native;
@@ -11,6 +12,7 @@ pub(crate) mod request_profile;
 mod selection;
 
 pub(crate) use bundle::*;
+pub(crate) use command::*;
 pub(crate) use llama_cpp::*;
 pub(crate) use manager::*;
 pub(crate) use native::*;
