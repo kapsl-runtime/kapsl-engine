@@ -4,6 +4,16 @@
 //! executable or URL.  Those deployment details come only from the signed
 //! runtime-specific backend index handled here.
 
+use crate::backend::{
+    embedded_onnx_rollback_reason, expand_run_bundles, generic_native_backend_packs_enabled,
+    inspect_serving_manifest, lazy_llama_cpp_packs_enabled, lazy_onnx_packs_enabled,
+    llama_cpp_pack_profile_for_manifest, onnx_backend_pack_requirements,
+    onnx_pack_profile_for_manifest, preliminary_llama_cpp_memory_admission,
+    preliminary_memory_admission, resolve_serving_backend, validate_model_contract,
+    validate_runtime_serving_backend, BackendSubcommand, MemoryAdmissionStatus,
+    ResolvedServingBackend, GENERIC_NATIVE_PACKS_ENV,
+};
+use crate::features::http_client;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL_SAFE};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -78,7 +88,12 @@ pub(crate) type ManagerResult<T> = Result<T, BackendManagerError>;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum BackendExecutionMode {
+    /// The entrypoint is a shared library loaded into the runtime process.
+    /// Used by ONNX and llama.cpp packs; the only mode that may declare an
+    /// `adapter_abi`.
     Native,
+    /// The entrypoint is an executable run as a separate process. Used by the
+    /// managed vLLM pack.
     External,
 }
 
@@ -222,10 +237,17 @@ pub(crate) struct BackendLicenseNotice {
 /// One signed entry in `backend-index.json`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct BackendPackManifest {
+    /// Manifest format version; must equal `BACKEND_PACK_SCHEMA_VERSION`.
     pub(crate) schema_version: u32,
+    /// Backend family, for example `onnx`, `llama-cpp`, or `vllm`. Also names
+    /// the pack's cache directory.
     pub(crate) backend: String,
+    /// Build variant within the backend, for example `cpu` or `cuda12`. Also
+    /// names the cache subdirectory under `backend`.
     pub(crate) profile: String,
+    /// Version of this pack build; the newer version wins a priority tie.
     pub(crate) pack_version: String,
+    /// Host/pack interface version; must equal `BACKEND_RUNTIME_ABI`.
     pub(crate) runtime_abi: u32,
     /// Standard in-process adapter contract. Legacy provider-only packs omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,53 +256,81 @@ pub(crate) struct BackendPackManifest {
     pub(crate) compatible_kapsl: String,
     /// Canonical OS/architecture pair, for example `linux-x86_64`.
     pub(crate) platform: String,
+    /// CPU architecture, for example `x86_64`. The `amd64` and `arm64`
+    /// aliases are normalized before matching.
     pub(crate) architecture: String,
-    /// `cpu`, `cuda`, or `tensorrt`.
+    /// `cpu`, `cuda`, or `tensorrt`. A `cuda` pack also serves TensorRT
+    /// targets.
     pub(crate) accelerator_profile: String,
+    /// Execution providers and CPU-fallback policy the pack producer signs.
     #[serde(default)]
     pub(crate) accelerator_requirements: BackendAcceleratorRequirements,
+    /// Lowest CUDA version the target must report. `None` skips the check.
     #[serde(default)]
     pub(crate) minimum_cuda: Option<String>,
+    /// Lowest GPU driver version the target must report. `None` skips the
+    /// check.
     #[serde(default)]
     pub(crate) minimum_driver: Option<String>,
+    /// Whether the entrypoint is loaded in-process or run as its own process.
     pub(crate) execution_mode: BackendExecutionMode,
-    /// KV allocation authority for llama.cpp packs. Omitted by non-llama
-    /// backends and legacy native-KV records.
+    /// KV allocation authority for llama.cpp packs (`native` or
+    /// `shared_pool`). Omitted by non-llama backends and legacy native-KV
+    /// records.
     #[serde(default)]
     pub(crate) kv_mode: Option<String>,
-    /// Model contracts this signed pack can execute. Empty lists are accepted
-    /// only for legacy packs that do not use the standard native adapter ABI.
+    /// Model formats this pack can execute. Must be non-empty for standard
+    /// native adapter packs; only legacy packs leave it empty.
     #[serde(default)]
     pub(crate) formats: Vec<String>,
+    /// Model types this pack can execute. Empty means any model type.
     #[serde(default)]
     pub(crate) model_types: Vec<String>,
+    /// Tasks this pack can serve. Must be non-empty for standard native
+    /// adapter packs.
     #[serde(default)]
     pub(crate) tasks: Vec<String>,
+    /// Runtime features the pack claims; the adapter must confirm them when
+    /// it is loaded.
     #[serde(default)]
     pub(crate) capabilities: BackendPackCapabilities,
+    /// How the pack allocates, reports, and frees memory.
     #[serde(default)]
     pub(crate) memory_behavior: BackendMemoryBehavior,
-    /// Pack-local native library or external executable.
+    /// Pack-local native library or external executable. Must have a
+    /// checksum in `files`.
     pub(crate) entrypoint: String,
+    /// Archive download URL. Must be `https://`; `file://` is accepted only
+    /// when local artifacts are allowed.
     pub(crate) artifact: String,
+    /// Exact archive size; a download of any other length is rejected.
     pub(crate) download_bytes: u64,
+    /// Expected size after extraction. Used for the free-space check, and an
+    /// install more than 5% (at least 64 MiB) larger is rejected.
     pub(crate) installed_bytes: u64,
+    /// Hex-encoded SHA-256 of the archive.
     pub(crate) sha256: String,
     /// Ed25519 signature over the domain-separated artifact digest.
     pub(crate) signature: String,
+    /// Fixed and per-model memory the pack needs, used for memory admission.
     #[serde(default)]
     pub(crate) memory: BackendMemoryManifest,
+    /// How the extracted archive becomes an installed pack.
     #[serde(default)]
     pub(crate) installer: BackendInstaller,
-    /// Optional hashes for security-sensitive installed files.
+    /// SHA-256 digests of security-sensitive installed files, keyed by
+    /// pack-relative path. Must include the entrypoint.
     #[serde(default)]
     pub(crate) files: BTreeMap<String, String>,
     /// Optional complete BLAKE3 digests authenticated by the signed index.
     /// SHA-256 remains required for installation and older engine versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) files_blake3: Option<BTreeMap<String, String>>,
+    /// Third-party license notices; any notice `path` must exist in the
+    /// installed pack.
     #[serde(default)]
     pub(crate) licenses: Vec<BackendLicenseNotice>,
+    /// Rank among compatible packs; the highest priority is selected.
     #[serde(default)]
     pub(crate) priority: i32,
 }
@@ -1810,12 +1860,12 @@ impl BackendManager {
                     pack.artifact
                 )));
             }
-            let agent = crate::features::http_client::http_agent_for_transfer();
+            let agent = http_client::http_agent_for_transfer();
             let mut response = agent.get(&pack.artifact).call().map_err(|error| {
                 BackendManagerError::new(format!(
                     "download backend artifact {}: {}",
                     pack.artifact,
-                    crate::features::http_client::format_remote_http_error(error)
+                    http_client::format_remote_http_error(error)
                 ))
             })?;
             let file = File::create(destination)?;
@@ -2068,7 +2118,7 @@ pub(crate) fn execute_backend_command(
         crate::app::BackendSubcommand::Ensure(args) => {
             let device_info = DeviceInfo::probe();
             let target = BackendTarget::current(&device_info);
-            let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;
+            let model_paths = expand_run_bundles(&args.model, &device_info)?;
             let manager = BackendManager::from_env(args.offline)?;
             let mut ensured = HashSet::<(String, String)>::new();
             for model in model_paths {
@@ -2078,18 +2128,13 @@ pub(crate) fn execute_backend_command(
                         model.display()
                     ))
                 })?;
-                let manifest = crate::backend::inspect_serving_manifest(&absolute)?;
-                crate::backend::validate_model_contract(&manifest)?;
-                let decision =
-                    crate::backend::resolve_serving_backend(&manifest, device_info.has_cuda)?;
-                crate::backend::validate_runtime_serving_backend(&manifest, decision)?;
-                let memory = crate::backend::preliminary_memory_admission(
-                    &absolute,
-                    &manifest,
-                    decision,
-                    &device_info,
-                )?;
-                if memory.status == crate::backend::MemoryAdmissionStatus::Rejected {
+                let manifest = inspect_serving_manifest(&absolute)?;
+                validate_model_contract(&manifest)?;
+                let decision = resolve_serving_backend(&manifest, device_info.has_cuda)?;
+                validate_runtime_serving_backend(&manifest, decision)?;
+                let memory =
+                    preliminary_memory_admission(&absolute, &manifest, decision, &device_info)?;
+                if memory.status == MemoryAdmissionStatus::Rejected {
                     return Err(format!(
                         "preliminary memory admission rejected `{}` before backend download: {}",
                         manifest.project_name, memory.reason
@@ -2097,27 +2142,27 @@ pub(crate) fn execute_backend_command(
                     .into());
                 }
                 let uses_onnx = kapsl_core::EngineKind::resolve(&manifest).uses_onnx_session();
-                let signed_onnx_route = crate::backend::generic_native_backend_packs_enabled()?;
+                let signed_onnx_route = generic_native_backend_packs_enabled()?;
                 let onnx_profile = if uses_onnx && signed_onnx_route {
-                    if !crate::backend::lazy_onnx_packs_enabled() {
+                    if !lazy_onnx_packs_enabled() {
                         return Err(format!(
                             "model `{}` requires a signed native backend pack, but ONNX pack installation is disabled or unsupported on {}; set {}=0 only for an explicit embedded ORT rollback",
                             manifest.project_name,
-                            crate::backend::current_platform(),
-                            crate::backend::GENERIC_NATIVE_PACKS_ENV
+                            current_platform(),
+                            GENERIC_NATIVE_PACKS_ENV
                         )
                         .into());
                     }
-                    crate::backend::onnx_pack_profile_for_manifest(&manifest, &device_info)?
+                    onnx_pack_profile_for_manifest(&manifest, &device_info)?
                 } else {
                     None
                 };
-                let llama_profile = if crate::backend::lazy_llama_cpp_packs_enabled() {
-                    crate::backend::llama_cpp_pack_profile_for_manifest(&manifest, &device_info)
+                let llama_profile = if lazy_llama_cpp_packs_enabled() {
+                    llama_cpp_pack_profile_for_manifest(&manifest, &device_info)
                 } else {
                     None
                 };
-                if decision.selected == crate::backend::ResolvedServingBackend::Vllm
+                if decision.selected == ResolvedServingBackend::Vllm
                     && ensured.insert(("vllm".to_string(), MANAGED_VLLM_PACK_PROFILE.to_string()))
                 {
                     let installed = manager.ensure_vllm(&target)?;
@@ -2133,8 +2178,7 @@ pub(crate) fn execute_backend_command(
                         onnx_target.cuda_version = None;
                         onnx_target.driver_version = None;
                     }
-                    let requirements =
-                        crate::backend::onnx_backend_pack_requirements(&manifest, profile)?;
+                    let requirements = onnx_backend_pack_requirements(&manifest, profile)?;
                     let plan = manager.plan_compatible_backend(&requirements, &onnx_target)?;
                     let identity = (plan.selected_backend.clone(), plan.profile.clone());
                     if ensured.insert(identity) {
@@ -2157,7 +2201,7 @@ pub(crate) fn execute_backend_command(
                             llama_target.driver_version = None;
                         }
                         let plan = manager.plan_llama_cpp(profile, &llama_target)?;
-                        let admission = crate::backend::preliminary_llama_cpp_memory_admission(
+                        let admission = preliminary_llama_cpp_memory_admission(
                             profile,
                             &absolute,
                             &manifest,
@@ -2165,7 +2209,7 @@ pub(crate) fn execute_backend_command(
                             &plan.manifest,
                             None,
                         )?;
-                        if admission.status == crate::backend::MemoryAdmissionStatus::Rejected {
+                        if admission.status == MemoryAdmissionStatus::Rejected {
                             return Err(format!(
                                 "preliminary memory admission rejected `{}` before backend download: {}",
                                 manifest.project_name, admission.reason
@@ -2180,12 +2224,12 @@ pub(crate) fn execute_backend_command(
                         );
                     }
                 } else if uses_onnx && !signed_onnx_route {
-                    let reason = crate::backend::embedded_onnx_rollback_reason(&manifest)?;
+                    let reason = embedded_onnx_rollback_reason(&manifest)?;
                     println!(
                         "{} uses the embedded ORT rollback ({})",
                         manifest.project_name, reason
                     );
-                } else if decision.selected != crate::backend::ResolvedServingBackend::Vllm {
+                } else if decision.selected != ResolvedServingBackend::Vllm {
                     println!(
                         "{} uses the in-process {} backend; no lazy pack is required by this runtime build",
                         manifest.project_name,
@@ -2195,7 +2239,7 @@ pub(crate) fn execute_backend_command(
             }
             Ok(())
         }
-        crate::app::BackendSubcommand::List(args) => {
+        BackendSubcommand::List(args) => {
             let manager = BackendManager::from_env(true)?;
             let entries = manager.list()?;
             if args.json {
@@ -2220,7 +2264,7 @@ pub(crate) fn execute_backend_command(
             }
             Ok(())
         }
-        crate::app::BackendSubcommand::Prune(args) => {
+        BackendSubcommand::Prune(args) => {
             let manager = BackendManager::from_env(true)?;
             let (bytes, entries) = manager.prune(args.old_versions)?;
             println!("Pruned {entries} backend cache item(s), reclaiming {bytes} bytes.");
@@ -2533,11 +2577,11 @@ fn read_json_bounded<T: for<'de> Deserialize<'de>>(path: &Path, limit: u64) -> M
 }
 
 fn download_bytes(url: &str, limit: u64) -> ManagerResult<Vec<u8>> {
-    let agent = crate::features::http_client::http_agent_for_transfer();
+    let agent = http_client::http_agent_for_transfer();
     let mut response = agent.get(url).call().map_err(|error| {
         BackendManagerError::new(format!(
             "download {url}: {}",
-            crate::features::http_client::format_remote_http_error(error)
+            http_client::format_remote_http_error(error)
         ))
     })?;
     let mut bytes = Vec::new();
