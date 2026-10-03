@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::features::http_client::format_remote_http_error;
+use std::collections::HashMap;
 
 #[derive(Debug, serde::Deserialize, PartialEq, Eq)]
 pub(crate) struct ListedModel {
@@ -81,15 +82,112 @@ fn table_cell(value: &str) -> &str {
     }
 }
 
-fn render_model_table(models: &[ListedModel]) -> String {
+/// Memory-authority view from `GET /api/system/stats`, reduced to what the
+/// model commands print. Every field is optional so older runtimes still parse.
+#[derive(Debug, Default, serde::Deserialize)]
+struct StatsBody {
+    #[serde(default)]
+    memory_authority: Option<AuthorityBody>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct AuthorityBody {
+    #[serde(default)]
+    models: Vec<AuthorityModel>,
+    #[serde(default)]
+    domains: Vec<AuthorityDomain>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct AuthorityModel {
+    model_id: u32,
+    #[serde(default)]
+    reserved_bytes: usize,
+    #[serde(default)]
+    committed_bytes: usize,
+    #[serde(default)]
+    observed_bytes: usize,
+    #[serde(default)]
+    used_bytes: usize,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct AuthorityDomain {
+    domain: String,
+    #[serde(default)]
+    available_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct MemoryView {
+    /// model_id -> bytes held, using the runtime's own rule: the largest of
+    /// reserved, committed, observed and used.
+    model_bytes: HashMap<u32, usize>,
+    /// domain name ("cuda:0", "host", ...) -> bytes still available
+    available: HashMap<String, usize>,
+}
+
+fn parse_memory_view(body: &str) -> Option<MemoryView> {
+    let stats: StatsBody = serde_json::from_str(body).ok()?;
+    let authority = stats.memory_authority?;
+    let mut view = MemoryView::default();
+    for model in authority.models {
+        let bytes = model
+            .reserved_bytes
+            .max(model.committed_bytes)
+            .max(model.observed_bytes)
+            .max(model.used_bytes);
+        let entry = view.model_bytes.entry(model.model_id).or_insert(0);
+        *entry = entry.saturating_add(bytes);
+    }
+    for domain in authority.domains {
+        view.available.insert(domain.domain, domain.available_bytes);
+    }
+    Some(view)
+}
+
+/// Best effort: a missing or old stats endpoint just means no memory figures.
+fn fetch_memory_view(
+    agent: &ureq::Agent,
+    base_url: &str,
+    auth_token: Option<&str>,
+) -> Option<MemoryView> {
+    let mut request = agent
+        .get(&format!("{}/api/system/stats", base_url))
+        .header("Accept", "application/json");
+    if let Some(token) = auth_token {
+        request = request.header("Authorization", &format!("Bearer {}", token));
+    }
+    let mut response = request.call().ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = response.body_mut().read_to_string().ok()?;
+    parse_memory_view(&body)
+}
+
+/// Decimal units: 980_000_000 -> "0.98 GB", below 0.1 GB -> "42 MB".
+fn format_memory(bytes: usize) -> String {
+    if bytes >= 100_000_000 {
+        format!("{:.2} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{} MB", (bytes as f64 / 1e6).round() as u64)
+    }
+}
+
+fn is_host_memory_domain(domain: &str) -> bool {
+    domain.starts_with("host")
+}
+
+fn render_model_table(models: &[ListedModel], memory: &HashMap<u32, usize>) -> String {
     if models.is_empty() {
         return "No models are loaded.\n".to_string();
     }
 
     let headers = [
-        "ID", "NAME", "VERSION", "FORMAT", "DEVICE", "STATUS", "HEALTH",
+        "ID", "NAME", "VERSION", "FORMAT", "DEVICE", "MEMORY", "STATUS", "HEALTH",
     ];
-    let mut rows: Vec<[String; 7]> = models
+    let mut rows: Vec<[String; 8]> = models
         .iter()
         .map(|model| {
             let format = model.format.as_deref().unwrap_or(&model.framework);
@@ -99,6 +197,11 @@ fn render_model_table(models: &[ListedModel]) -> String {
                 table_cell(&model.version).to_string(),
                 table_cell(format).to_string(),
                 table_cell(&model.device).to_string(),
+                memory
+                    .get(&model.id)
+                    .filter(|bytes| **bytes > 0)
+                    .map(|bytes| format_memory(*bytes))
+                    .unwrap_or_else(|| "-".to_string()),
                 table_cell(&model.status).to_string(),
                 match model.healthy {
                     Some(true) => "healthy",
@@ -118,7 +221,7 @@ fn render_model_table(models: &[ListedModel]) -> String {
         }
     }
 
-    let render_row = |row: &[String; 7]| {
+    let render_row = |row: &[String; 8]| {
         row.iter()
             .enumerate()
             .map(|(index, cell)| {
@@ -186,7 +289,10 @@ pub(crate) fn execute_list_command(args: ListCommandArgs) -> Result<(), DynError
             })?
         );
     } else {
-        print!("{}", render_model_table(&models));
+        let memory = fetch_memory_view(&agent, &base_url, args.auth_token.as_deref())
+            .map(|view| view.model_bytes)
+            .unwrap_or_default();
+        print!("{}", render_model_table(&models, &memory));
     }
     Ok(())
 }
@@ -213,6 +319,221 @@ pub(crate) fn execute_remove_model_command(args: RemoveModelCommandArgs) -> Resu
     Ok(())
 }
 
+/// How one `add-model` request ended, as printed on its result line.
+#[derive(Debug, PartialEq)]
+enum AddModelResult {
+    /// Admitted and active. `bytes` is its lease when the stats endpoint reports it.
+    Granted { model_id: u32, bytes: Option<usize> },
+    /// Queued only (`--no-wait`).
+    Queued { model_id: u32 },
+    /// Rejected by the memory authority. `free` is only set when the request
+    /// really exceeds the domain's free memory; when a narrower budget (for
+    /// example a per-class cap) blocked it, `free` is None so the line never
+    /// reads "needs 0.27 GB, 0.48 GB free".
+    Denied {
+        needed: Option<usize>,
+        free: Option<usize>,
+        domain: Option<String>,
+    },
+    /// Any other failure, with a short reason.
+    Failed { reason: String },
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct StartModelReply {
+    #[serde(default)]
+    model_id: Option<u32>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    requested: Vec<RequestedMemory>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RequestedMemory {
+    domain: String,
+    #[serde(default)]
+    bytes: usize,
+}
+
+/// Picks the accelerator domain that actually blocked the load: the first
+/// non-host domain where the request exceeds what is free, else the first
+/// non-host domain, else whatever was requested.
+fn denial_from_reply(reply: &StartModelReply, memory: Option<&MemoryView>) -> AddModelResult {
+    let free_for = |domain: &str| memory.and_then(|view| view.available.get(domain).copied());
+    let mut candidates: Vec<&RequestedMemory> = reply
+        .requested
+        .iter()
+        .filter(|r| !is_host_memory_domain(&r.domain))
+        .collect();
+    if candidates.is_empty() {
+        candidates = reply.requested.iter().collect();
+    }
+    let chosen = candidates
+        .iter()
+        .find(|r| free_for(&r.domain).is_some_and(|free| r.bytes > free))
+        .or_else(|| candidates.first())
+        .copied();
+    match chosen {
+        Some(r) => AddModelResult::Denied {
+            needed: Some(r.bytes).filter(|bytes| *bytes > 0),
+            free: free_for(&r.domain).filter(|free| r.bytes > *free),
+            domain: Some(r.domain.clone()),
+        },
+        None => AddModelResult::Denied {
+            needed: None,
+            free: None,
+            domain: None,
+        },
+    }
+}
+
+/// Maps a start reply (any status) onto a result. `memory` is a stats snapshot
+/// taken after the reply, used for the granted lease or the free figure.
+fn add_model_result(status: u16, body: &str, memory: Option<&MemoryView>) -> AddModelResult {
+    let reply: StartModelReply = serde_json::from_str(body).unwrap_or_default();
+    match (status, reply.status.as_deref()) {
+        (200, Some("active")) => {
+            let model_id = reply.model_id.unwrap_or_default();
+            AddModelResult::Granted {
+                model_id,
+                bytes: memory.and_then(|view| view.model_bytes.get(&model_id).copied()),
+            }
+        }
+        (409, _) if reply.reason.as_deref() == Some("memory_admission") => {
+            denial_from_reply(&reply, memory)
+        }
+        (200..=299, _) => match reply.model_id {
+            Some(model_id) => AddModelResult::Queued { model_id },
+            None => AddModelResult::Failed {
+                reason: "runtime returned no model id".to_string(),
+            },
+        },
+        _ => AddModelResult::Failed {
+            reason: reply
+                .error
+                .unwrap_or_else(|| format!("the running engine returned HTTP {}", status)),
+        },
+    }
+}
+
+/// Older runtimes ignore `?wait=true` and answer 202. Poll the model until it
+/// settles so the result line still tells the truth (without denial details).
+fn poll_until_settled(
+    agent: &ureq::Agent,
+    base_url: &str,
+    auth_token: Option<&str>,
+    model_id: u32,
+    timeout: std::time::Duration,
+) -> AddModelResult {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let mut request = agent
+            .get(&format!("{}/api/models/{}", base_url, model_id))
+            .header("Accept", "application/json");
+        if let Some(token) = auth_token {
+            request = request.header("Authorization", &format!("Bearer {}", token));
+        }
+        if let Ok(mut response) = request.call() {
+            let code = response.status().as_u16();
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            if code == 404 || value.get("error").is_some() {
+                return AddModelResult::Failed {
+                    reason: "not loaded; this runtime predates admission results, see its log"
+                        .to_string(),
+                };
+            }
+            match value.get("status").and_then(|s| s.as_str()) {
+                Some("starting") | Some("loading") | None => {}
+                Some("active") => {
+                    let bytes = fetch_memory_view(agent, base_url, auth_token)
+                        .and_then(|view| view.model_bytes.get(&model_id).copied());
+                    return AddModelResult::Granted { model_id, bytes };
+                }
+                Some(other) => {
+                    return AddModelResult::Failed {
+                        reason: format!("status {}", other),
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return AddModelResult::Failed {
+                reason: "timed out waiting for the load".to_string(),
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn add_model_result_line(display: &str, result: &AddModelResult, a: &Ansi) -> String {
+    match result {
+        AddModelResult::Granted { model_id, bytes } => {
+            let lease = bytes
+                .filter(|b| *b > 0)
+                .map(|b| format!(" · {}", format_memory(b)))
+                .unwrap_or_default();
+            format!(
+                "  {}  {} {}  {}{}",
+                a.green("✓"),
+                display,
+                a.dim(&format!("(id={})", model_id)),
+                a.green("granted"),
+                a.dim(&lease)
+            )
+        }
+        AddModelResult::Queued { model_id } => format!(
+            "  {}  {} {}  {}",
+            a.green("✓"),
+            display,
+            a.dim(&format!("(id={})", model_id)),
+            a.dim("load started")
+        ),
+        AddModelResult::Denied {
+            needed,
+            free,
+            domain,
+        } => {
+            let place = domain.as_deref().filter(|d| !d.is_empty());
+            let detail = match (needed, free) {
+                (Some(n), Some(f)) => {
+                    format!(" · needs {}, {} free", format_memory(*n), format_memory(*f))
+                }
+                (Some(n), None) => match place {
+                    Some(d) => format!(" · needs {}, over the {} budget", format_memory(*n), d),
+                    None => format!(" · needs {}", format_memory(*n)),
+                },
+                _ => String::new(),
+            };
+            // "free" lines name the GPU only when it isn't the default one.
+            let on = match (free, place) {
+                (Some(_), Some(d)) if d != "cuda:0" => format!(" on {}", d),
+                _ => String::new(),
+            };
+            format!(
+                "  {}  {}  {}{}",
+                a.red("✗"),
+                display,
+                a.red("denied"),
+                a.dim(&format!("{}{}", detail, on))
+            )
+        }
+        AddModelResult::Failed { reason } => {
+            format!(
+                "  {}  {}  {}",
+                a.red("✗"),
+                display,
+                a.dim(&format!("({})", reason))
+            )
+        }
+    }
+}
+
 pub(crate) fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(), DynError> {
     if args.model.is_empty() {
         return Err(dyn_error_from_message(
@@ -221,10 +542,20 @@ pub(crate) fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(),
     }
 
     let base_url = runtime_base_url(args.http_url.as_deref(), &args.http_host, args.http_port)?;
-
-    let agent = runtime_http_agent(args.timeout_ms);
-
-    let start_url = format!("{}/api/models/start", base_url);
+    // Status codes are results here (409 = denied), so read every body.
+    let timeout = std::time::Duration::from_millis(args.timeout_ms.max(1));
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .timeout_per_call(Some(timeout))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let start_url = if args.no_wait {
+        format!("{}/api/models/start", base_url)
+    } else {
+        format!("{}/api/models/start?wait=true", base_url)
+    };
+    let token = args.auth_token.as_deref();
 
     let a = Ansi::new();
     let mut any_error = false;
@@ -237,12 +568,10 @@ pub(crate) fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(),
         let absolute_path = match model_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "  {}  {}  {}",
-                    a.red("✗"),
-                    display,
-                    a.dim(&format!("({})", e))
-                );
+                let result = AddModelResult::Failed {
+                    reason: e.to_string(),
+                };
+                eprintln!("{}", add_model_result_line(display, &result, &a));
                 any_error = true;
                 continue;
             }
@@ -253,50 +582,47 @@ pub(crate) fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(),
             "topology": args.topology,
             "tp_degree": args.tp_degree,
         });
-
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| dyn_error_from_message(format!("Failed to serialize request: {}", e)))?;
 
         let mut request = agent
             .post(&start_url)
             .header("Content-Type", "application/json");
-        if let Some(token) = &args.auth_token {
+        if let Some(token) = token {
             request = request.header("Authorization", &format!("Bearer {}", token));
         }
 
-        match request.send(payload_str) {
+        let result = match request.send(payload_str) {
             Ok(mut response) => {
-                let body = response
-                    .body_mut()
-                    .read_to_string()
-                    .unwrap_or_else(|_| String::new());
-                // Extract model_id from JSON if present for a nicer summary line.
-                let model_id = serde_json::from_str::<serde_json::Value>(&body)
-                    .ok()
-                    .and_then(|json| json.get("model_id").and_then(|v| v.as_u64()))
-                    .map(|id| format!(" (id={})", id))
-                    .unwrap_or_default();
-                eprintln!("  {}  {}{}", a.green("✓"), display, a.dim(&model_id));
+                let status = response.status().as_u16();
+                let body = response.body_mut().read_to_string().unwrap_or_default();
+                let memory = fetch_memory_view(&agent, &base_url, token);
+                match add_model_result(status, &body, memory.as_ref()) {
+                    AddModelResult::Queued { model_id } if !args.no_wait => {
+                        poll_until_settled(&agent, &base_url, token, model_id, timeout)
+                    }
+                    other => other,
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "  {}  {}  {}",
-                    a.red("✗"),
-                    display,
-                    a.dim(&format!("({})", format_remote_http_error(e)))
-                );
-                any_error = true;
-            }
+            Err(e) => AddModelResult::Failed {
+                reason: format_remote_http_error(e),
+            },
+        };
+        if matches!(
+            result,
+            AddModelResult::Denied { .. } | AddModelResult::Failed { .. }
+        ) {
+            any_error = true;
         }
+        eprintln!("{}", add_model_result_line(display, &result, &a));
     }
 
     if any_error {
-        Err(dyn_error_from_message(
-            "One or more models could not be added.",
-        ))
-    } else {
-        Ok(())
+        // The result lines already explain what happened; exit non-zero
+        // without the Debug-formatted error main() would print.
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 pub(crate) fn env_flag(name: &str) -> bool {
@@ -603,7 +929,7 @@ mod command_tests {
         second.healthy = Some(false);
         let first = listed_model(2, "qwen");
 
-        let output = render_model_table(&[second, first]);
+        let output = render_model_table(&[second, first], &HashMap::new());
         let lines: Vec<&str> = output.lines().collect();
 
         assert_eq!(lines.len(), 3);
@@ -615,6 +941,193 @@ mod command_tests {
 
     #[test]
     fn empty_model_table_has_a_clear_message() {
-        assert_eq!(render_model_table(&[]), "No models are loaded.\n");
+        assert_eq!(
+            render_model_table(&[], &HashMap::new()),
+            "No models are loaded.\n"
+        );
+    }
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    const STATS: &str = r#"{"memory_authority":{"models":[
+        {"model_id":1,"name":"chat","reserved_bytes":980000000,"committed_bytes":970000000,"observed_bytes":0,"used_bytes":975000000},
+        {"model_id":2,"name":"summarizer","reserved_bytes":0,"committed_bytes":960000000,"observed_bytes":966000000,"used_bytes":0}],
+        "domains":[{"domain":"host","available_bytes":50000000000},{"domain":"cuda:0","available_bytes":1090000000}]}}"#;
+
+    #[test]
+    fn memory_view_takes_the_largest_accounting_state() {
+        let view = parse_memory_view(STATS).expect("parse stats");
+        assert_eq!(view.model_bytes[&1], 980_000_000);
+        assert_eq!(view.model_bytes[&2], 966_000_000);
+        assert_eq!(view.available["cuda:0"], 1_090_000_000);
+        assert!(parse_memory_view(r#"{"pressure_state":"normal"}"#).is_none());
+    }
+
+    #[test]
+    fn memory_is_formatted_in_decimal_units() {
+        assert_eq!(format_memory(980_000_000), "0.98 GB");
+        assert_eq!(format_memory(2_450_000_000), "2.45 GB");
+        assert_eq!(format_memory(42_000_000), "42 MB");
+    }
+
+    #[test]
+    fn model_table_shows_memory_per_model() {
+        let view = parse_memory_view(STATS).expect("parse stats");
+        let output = render_model_table(
+            &[listed_model(1, "chat"), listed_model(3, "no-lease")],
+            &view.model_bytes,
+        );
+        let lines: Vec<&str> = output.lines().collect();
+        assert!(lines[0].contains("MEMORY"));
+        assert!(lines[1].contains("0.98 GB"));
+        assert!(lines[2].contains(" - "));
+    }
+
+    #[test]
+    fn add_model_waits_by_default_with_room_for_large_loads() {
+        let cli = Cli::try_parse_from(["kapsl", "add-model", "--model", "a.aimod"])
+            .expect("parse add-model");
+        assert!(matches!(
+            cli.command,
+            Some(KapslCommand::AddModel(AddModelCommandArgs {
+                no_wait: false,
+                timeout_ms: 600000,
+                ..
+            }))
+        ));
+        let cli = Cli::try_parse_from(["kapsl", "add-model", "--model", "a.aimod", "--no-wait"])
+            .expect("parse add-model --no-wait");
+        assert!(matches!(
+            cli.command,
+            Some(KapslCommand::AddModel(AddModelCommandArgs {
+                no_wait: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn waited_start_reports_the_granted_lease() {
+        let view = parse_memory_view(STATS).expect("parse stats");
+        let result = add_model_result(
+            200,
+            r#"{"message":"Model loaded","model_id":2,"status":"active"}"#,
+            Some(&view),
+        );
+        assert_eq!(
+            result,
+            AddModelResult::Granted {
+                model_id: 2,
+                bytes: Some(966_000_000)
+            }
+        );
+        let line = strip_ansi(&add_model_result_line(
+            "summarizer.aimod",
+            &result,
+            &Ansi::new(),
+        ));
+        assert_eq!(line, "  ✓  summarizer.aimod (id=2)  granted · 0.97 GB");
+    }
+
+    #[test]
+    fn admission_denial_names_the_blocking_accelerator_domain() {
+        let view = parse_memory_view(STATS).expect("parse stats");
+        let result = add_model_result(
+            409,
+            r#"{"error":"memory admission failed","model_id":3,"status":"denied","reason":"memory_admission",
+                "requested":[{"domain":"host","bytes":120000000},{"domain":"cuda:0","bytes":2450000000}]}"#,
+            Some(&view),
+        );
+        assert_eq!(
+            result,
+            AddModelResult::Denied {
+                needed: Some(2_450_000_000),
+                free: Some(1_090_000_000),
+                domain: Some("cuda:0".to_string())
+            }
+        );
+        let line = strip_ansi(&add_model_result_line(
+            "assistant-3b.aimod",
+            &result,
+            &Ansi::new(),
+        ));
+        assert_eq!(
+            line,
+            "  ✗  assistant-3b.aimod  denied · needs 2.45 GB, 1.09 GB free"
+        );
+    }
+
+    #[test]
+    fn denial_on_another_gpu_says_which_one() {
+        let result = AddModelResult::Denied {
+            needed: Some(2_000_000_000),
+            free: Some(500_000_000),
+            domain: Some("cuda:1".to_string()),
+        };
+        let line = strip_ansi(&add_model_result_line("big.aimod", &result, &Ansi::new()));
+        assert!(line.ends_with("needs 2.00 GB, 0.50 GB free on cuda:1"));
+    }
+
+    #[test]
+    fn unwaited_or_legacy_start_is_queued_and_other_errors_fail() {
+        assert_eq!(
+            add_model_result(
+                202,
+                r#"{"message":"Model load started","model_id":4}"#,
+                None
+            ),
+            AddModelResult::Queued { model_id: 4 }
+        );
+        assert_eq!(
+            add_model_result(400, r#"{"error":"Model path does not exist"}"#, None),
+            AddModelResult::Failed {
+                reason: "Model path does not exist".to_string()
+            }
+        );
+        assert_eq!(
+            add_model_result(500, "", None),
+            AddModelResult::Failed {
+                reason: "the running engine returned HTTP 500".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn denial_under_a_narrower_budget_never_claims_enough_free_memory() {
+        let view = parse_memory_view(STATS).expect("parse stats");
+        // 0.30 GB requested, 1.09 GB free on cuda:0: a class budget blocked it.
+        let result = add_model_result(
+            409,
+            r#"{"status":"denied","reason":"memory_admission","requested":[{"domain":"cuda:0","bytes":300000000}]}"#,
+            Some(&view),
+        );
+        assert_eq!(
+            result,
+            AddModelResult::Denied {
+                needed: Some(300_000_000),
+                free: None,
+                domain: Some("cuda:0".to_string())
+            }
+        );
+        let line = strip_ansi(&add_model_result_line("small.aimod", &result, &Ansi::new()));
+        assert_eq!(
+            line,
+            "  ✗  small.aimod  denied · needs 0.30 GB, over the cuda:0 budget"
+        );
     }
 }

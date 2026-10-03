@@ -798,6 +798,9 @@ pub(crate) struct MemoryAdmissionFailure {
     owner: MemoryOwner,
     priority_weight: u32,
     domains: Vec<MemoryDomain>,
+    /// Bytes the rejected plan asked for, summed per domain, so clients can
+    /// explain a denial ("needs X, Y free") without parsing `message`.
+    requested: Vec<(MemoryDomain, usize)>,
     message: String,
 }
 
@@ -816,12 +819,28 @@ impl MemoryAdmissionFailure {
             .collect::<Vec<_>>();
         domains.sort_by_key(ToString::to_string);
         domains.dedup();
+        let requested = domains
+            .iter()
+            .map(|domain| {
+                let bytes = plan
+                    .claims()
+                    .iter()
+                    .filter(|claim| &claim.domain == domain)
+                    .fold(0usize, |total, claim| total.saturating_add(claim.bytes));
+                (domain.clone(), bytes)
+            })
+            .collect();
         Self {
             owner,
             priority_weight: priority_weight.max(1),
             domains,
+            requested,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn requested_bytes(&self) -> &[(MemoryDomain, usize)] {
+        &self.requested
     }
 
     pub(crate) fn owner(&self) -> MemoryOwner {
