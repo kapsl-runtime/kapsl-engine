@@ -15,11 +15,17 @@ mod device;
 mod device_budget;
 mod device_limits;
 pub(crate) mod host;
+#[cfg(any(feature = "gpu-device-pool", test))]
+mod pool_clients;
 mod priority;
 
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use device::*;
 pub(crate) use device_limits::*;
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) use pool_clients::PoolClientCleanup;
+#[cfg(any(feature = "gpu-device-pool", test))]
+pub(crate) use pool_clients::{PoolClientLease, PoolClients};
 pub(crate) use priority::*;
 
 use self::host::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
@@ -2410,6 +2416,21 @@ impl MemoryAuthority {
         self.cuda
             .as_ref()
             .is_some_and(|manager| manager.has_pool(device_id))
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn acquire_cuda_pool_client(
+        &self,
+        device_id: usize,
+        client: &'static str,
+        register: impl FnOnce(
+            &Arc<kapsl_hal::gpu_arena::GpuDevicePool>,
+        ) -> Result<PoolClientCleanup, String>,
+    ) -> Result<Option<PoolClientLease>, String> {
+        match self.cuda.as_ref() {
+            Some(manager) => manager.acquire_pool_client(device_id, client, register),
+            None => Ok(None),
+        }
     }
 
     #[cfg(feature = "gpu-device-pool")]

@@ -48,6 +48,7 @@ The runtime binary depends on those crates through normal Cargo dependencies.
 
 - `kapsl-runtime/`: main Rust workspace for the runtime binary
 - `kapsl-runtime/crates/kapsl-cli/`: `kapsl` CLI, server orchestration, HTTP API, and runtime entry point
+- `kapsl-runtime/crates/kapsl-mcp/`: optional backend-neutral MCP Streamable HTTP adapter
 - `kapsl-runtime/ui/`: embedded web dashboard assets
 - `kapsl-runtime/docs/`: runtime-specific user and API docs
 - `kapsl-runtime/patches/`: active third-party crate patches used only by this workspace
@@ -65,6 +66,11 @@ The runtime binary depends on those crates through normal Cargo dependencies.
 
 Reusable Rust libraries, client bindings, transports, schedulers, backend abstractions,
 RAG primitives, and Python packaging belong in `kapsl-sdk`.
+
+The optional MCP adapter is a northbound runtime protocol and remains in this
+repository. It calls the same governed inference service as HTTP and native
+transports and has no dependency on a concrete inference backend. See
+[MCP Server](kapsl-runtime/docs/mcp.md).
 
 ## Requirements
 

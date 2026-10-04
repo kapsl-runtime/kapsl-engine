@@ -278,3 +278,28 @@ connected machine.
 `KAPSL_VLLM_PYTHON` and `KAPSL_VLLM_BUNDLE` remain development and legacy
 layout overrides. Every discovered vLLM environment still has to match the
 certified Python, PyTorch, CUDA, vLLM, connector, and shared-pool profile tuple.
+
+## Installed-file verification diagnostics
+
+For a manual diagnostic launch, set `KAPSL_PACK_VERIFICATION_PROFILING=1`
+and enable info logging. Each installed-file verification emits one
+`KAPSL_PACK_VERIFICATION_PROFILE` JSON record after its workers have joined.
+Normal verification does not collect these measurements. Leave this variable
+unset for performance qualification; the diagnostic clocks and report add work.
+
+The record identifies the process, validation call, cache root, hash algorithm,
+expected file count and overall outcome. Each attempted file includes its
+manifest-relative path, worker identity, start/finish offsets, bytes actually
+read, and separate open, read and hash wall times in nanoseconds. Hash time
+includes finalization and digest encoding. The same read buffers, worker limit,
+checksums and fail-closed behavior apply in both modes. Missing entries can fail
+metadata preflight before any file record exists; an incomplete or empty file
+list is not a successful verification unless the overall outcome is `valid`.
+
+Group records by `(process_id, validation_id)` to identify repeated validation.
+Worker start/finish intervals show overlap and idle gaps; do not add overlapping
+worker durations to total startup time. Read time includes kernel and page-cache
+behavior, and is not a physical-disk or CPU-time measurement. Collect CPU quota,
+I/O and cache-state evidence separately. These reports contain cache paths and
+filenames, but no file contents. Verification still occurs on the ordinary
+launch-to-ready path and every load still checks file contents.

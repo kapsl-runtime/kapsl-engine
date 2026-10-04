@@ -2,9 +2,11 @@
 members = [
     "crates/kapsl-backend-llama-cpp",
     "crates/kapsl-cli",
+    "crates/kapsl-mcp",
 ]
 exclude = [
     "patches/esaxx-rs",
+    "tests/native-adapter",
 ]
 
 resolver = "2"

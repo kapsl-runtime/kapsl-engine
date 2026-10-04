@@ -32,6 +32,7 @@ release_workflow=".github/workflows/release-runtime-installers.yml"
 build_workflow=".github/workflows/build-linux-accelerators.yml"
 runtime_backend="kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs"
 native_host="kapsl-runtime/crates/kapsl-cli/src/backend/native.rs"
+native_allocator="kapsl-runtime/crates/kapsl-cli/src/backend/native/allocator.rs"
 bundle="kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
 cli_manifest="kapsl-runtime/crates/kapsl-cli/Cargo.toml"
 
@@ -57,9 +58,17 @@ require_literal "$native_host" 'KAPSL_BACKEND_ENTRYPOINT_SYMBOL'
 require_literal "$native_host" 'KAPSL_BACKEND_CAP_GOVERNED_DEVICE_ALLOCATOR'
 require_literal "$native_host" 'KAPSL_BACKEND_CAP_SCOPED_DEVICE_ALLOCATOR'
 require_literal "$native_host" 'KAPSL_BACKEND_DESCRIPTOR_SCHEMA_V1'
-require_literal "$native_host" 'GpuDevicePool'
+require_literal "$native_host" 'mod allocator;'
+require_literal "$native_allocator" 'GpuDevicePool'
+require_literal "$native_allocator" 'KapslBackendHostScopedAllocatorV1'
+require_literal "$native_allocator" 'allocate_device_scoped'
 require_literal "$native_host" '"pack_root": pack.root'
-require_literal "$native_host" '"onnx_tuning": tuning.map'
+require_literal "$activator" 'pub(crate) fn onnx_adapter_options('
+require_literal "$runtime_backend" '&onnx_adapter_options(tuning)'
+if grep -Eq 'kapsl_backends|OnnxRuntimeTuning|onnx_tuning' "$native_host"; then
+  echo "$native_host must not depend on ONNX configuration types or translation" >&2
+  exit 1
+fi
 require_literal "$native_host" 'pointer.cast::<KapslBackendApiPrefixV1>().read()'
 require_literal "$native_host" 'pack.api.shutdown'
 require_literal "$cli_manifest" 'kapsl-backend-abi = "=0.2.0"'

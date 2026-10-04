@@ -1,0 +1,2 @@
+# Build-time verification of optional signed BLAKE3 file digests.
+blake3==1.0.8

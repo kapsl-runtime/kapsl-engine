@@ -155,7 +155,15 @@ pub(crate) fn start_http_server(
     let routes = static_routes
         .or(metrics_route)
         .or(auth_routes.login)
-        .or(api_routes);
+        .or(api_routes)
+        .with(warp::log::custom(|info| {
+            crate::observability::record_request(
+                "http",
+                info.method().as_str(),
+                info.status().as_u16(),
+                info.elapsed(),
+            );
+        }));
 
     let bind = (bind_addr, port);
     let (bound_addr, server) = warp::serve(routes)

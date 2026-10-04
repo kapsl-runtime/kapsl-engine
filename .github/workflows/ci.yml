@@ -48,7 +48,7 @@ jobs:
 
       - name: Check runtime workspace
         if: runner.os != 'Windows'
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server,mcp-server
 
       # Exercise the optional CUDA memory authority without requiring nvcc or a
       # GPU on the hosted runner. The gpu-device-pool feature pins the stable
@@ -75,7 +75,7 @@ jobs:
         shell: pwsh
         env:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server,mcp-server
 
   msrv:
     name: Cargo check (MSRV)
@@ -94,7 +94,7 @@ jobs:
           key: ci-msrv
 
       - name: Check runtime workspace on its minimum Rust version
-        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --locked
+        run: cargo check --manifest-path kapsl-runtime/Cargo.toml --workspace --locked --features grpc-server,mcp-server
 
   test:
     name: Cargo test (${{ matrix.os }})
@@ -129,11 +129,11 @@ jobs:
 
       - name: Test runtime workspace
         if: runner.os != 'Windows'
-        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server
+        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --workspace --features grpc-server,mcp-server
 
       - name: Test runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
           INCLUDE: ${{ github.workspace }}/kapsl-runtime/crates/kapsl-cli;$env:INCLUDE
-        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server
+        run: cargo test --manifest-path kapsl-runtime/Cargo.toml --target x86_64-pc-windows-msvc -p kapsl --features grpc-server,mcp-server

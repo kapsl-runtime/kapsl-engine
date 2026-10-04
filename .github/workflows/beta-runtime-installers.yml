@@ -1,27 +1,9 @@
 name: Beta Runtime Installers
 
 on:
+  # Packaging is deliberate. Runtime changes on develop are validated by CI;
+  # they must not publish an intermediate installer during the neutral migration.
   workflow_dispatch:
-  push:
-    branches:
-      - develop
-    # CI/authentication-only changes use host-only checks. Full beta packaging
-    # remains available deliberately through workflow_dispatch on develop.
-    paths:
-      - "kapsl-runtime/**"
-      - "rust-toolchain.toml"
-      - ".cargo/**"
-      - "installers/**"
-      - ".github/licenses/**"
-      - ".github/ort*.lock*"
-      - ".github/ort-release-public-key.txt"
-      - ".github/scripts/package-*"
-      - ".github/scripts/collect-*"
-      - ".github/scripts/bootstrap-vllm-backend.sh"
-      - ".github/scripts/managed-vllm-cu130.lock"
-      - ".github/scripts/generate-backend-index.py"
-      - "LICENSE"
-      - "NOTICE"
 
 permissions:
   contents: write
@@ -43,7 +25,7 @@ env:
 jobs:
   prepare-version:
     name: Resolve beta version
-    if: github.ref == 'refs/heads/develop'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}

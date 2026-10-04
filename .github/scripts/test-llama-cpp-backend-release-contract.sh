@@ -26,7 +26,7 @@ require_literal "$manager" 'pub(crate) const LLAMA_CPP_CUDA12_PACK_PROFILE: &str
 require_literal "$loader" 'KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV'
 require_literal "$loader" 'preliminary memory admission rejected llama.cpp/'
 require_literal "$manifest" 'kapsl-engine-api = "0.3.0"'
-require_literal "$manifest" 'kapsl-llm = { version = "0.3.0"'
+require_literal "$manifest" 'kapsl-llm = { version = "0.3.4"'
 require_literal "$packager" 'package_profile cpu cpu cpu'
 require_literal "$packager" 'package_profile cuda12 cuda cuda12-shared-pool "${KAPSL_LLAMA_CUDA_LIBRARY:-}" shared_pool'
 require_literal "$packager" '--locked'

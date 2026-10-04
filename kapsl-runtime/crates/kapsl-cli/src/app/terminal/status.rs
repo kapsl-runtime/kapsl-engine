@@ -3,6 +3,13 @@
 use super::Ansi;
 
 pub(crate) fn print_startup_banner() {
+    if crate::observability::uses_json_format() {
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            "Kapsl runtime starting"
+        );
+        return;
+    }
     let ansi = Ansi::new();
     let version = env!("CARGO_PKG_VERSION");
     eprintln!();
@@ -20,6 +27,16 @@ pub(crate) fn print_startup_ready(
     http_ip: &str,
     http_port: u16,
 ) {
+    if crate::observability::uses_json_format() {
+        tracing::info!(
+            elapsed_ms = elapsed_ms as u64,
+            serving_endpoint,
+            http_ip,
+            http_port,
+            "Kapsl runtime ready"
+        );
+        return;
+    }
     let ansi = Ansi::new();
     let url_base = format!("http://{}:{}", http_ip, http_port);
 

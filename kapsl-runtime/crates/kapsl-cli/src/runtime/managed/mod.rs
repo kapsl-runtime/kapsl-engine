@@ -2930,23 +2930,6 @@ impl ManagedVllmProcess {
     }
 
     fn build_command(&self) -> Result<Command, EngineError> {
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.spec.log_path)
-            .map_err(|error| {
-                EngineError::backend(format!(
-                    "open managed vLLM log {}: {error}",
-                    self.spec.log_path.display()
-                ))
-            })?;
-        let stderr = log_file.try_clone().map_err(|error| {
-            EngineError::backend(format!(
-                "clone managed vLLM log {}: {error}",
-                self.spec.log_path.display()
-            ))
-        })?;
-
         let launch = self.launch.lock().clone();
         if launch.kv_transfer_config.trim().is_empty() {
             return Err(EngineError::backend(
@@ -2971,9 +2954,7 @@ impl ManagedVllmProcess {
             .arg("--enable-prefix-caching")
             .args(["--kv-transfer-config", &launch.kv_transfer_config])
             .env("CUDA_VISIBLE_DEVICES", &self.spec.cuda_visible_devices)
-            .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(stderr));
+            .env("VLLM_WORKER_MULTIPROC_METHOD", "spawn");
         match launch.memory_argument {
             ManagedVllmMemoryArgument::LegacyFraction(utilization) => {
                 command.args(["--gpu-memory-utilization", &utilization.to_string()]);
@@ -3224,7 +3205,11 @@ impl ManagedVllmProcess {
                 return Err(error);
             }
         };
-        let child = match command.spawn() {
+        let child = match crate::observability::spawn_logged_child(
+            &mut command,
+            &self.spec.log_path,
+            "vllm",
+        ) {
             Ok(child) => child,
             Err(error) => {
                 self.mark_suspect_locked();
