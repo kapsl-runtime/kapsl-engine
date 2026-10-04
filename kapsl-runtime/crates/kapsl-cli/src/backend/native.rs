@@ -2190,6 +2190,7 @@ mod tests {
             signature: "signature".to_string(),
             memory: Default::default(),
             installer: Default::default(),
+            files_blake3: None,
             files: Default::default(),
             licenses: Vec::new(),
             priority: 0,

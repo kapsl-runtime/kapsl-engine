@@ -123,11 +123,12 @@ class PublishedSdkTests(TestCase):
         for name in ("kapsl-ipc", "kapsl-shm", "kapsl-transport"):
             self.assertEqual(sdk.EXPECTED_VERSIONS[name], "0.4.0")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-engine-api"], "0.3.0")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-hal"], "0.3.1")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-backend-abi"], "0.2.0")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-kv-abi"], "0.6.0")
 
     def test_stale_or_uniform_sdk_versions_are_rejected(self):
-        for name, wrong in (("kapsl-transport", "0.3.0"), ("kapsl-engine-api", "0.4.0"),
+        for name, wrong in (("kapsl-hal", "0.3.0"), ("kapsl-transport", "0.3.0"), ("kapsl-engine-api", "0.4.0"),
                             ("kapsl-kv-abi", "0.6.1"), ("kapsl-ipc", "0.4.1-beta.1")):
             packages = self.packages()
             next(p for p in packages if p["name"] == name)["version"] = wrong

@@ -7,13 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       keep_latest:
-        description: "Number of most recent versions to keep"
+        description: "Number of most recent beta versions to keep (official releases are never deleted)"
         required: false
         default: "3"
       beta_retention_days:
         description: "Delete superseded beta versions older than this many days"
         required: false
         default: "1"
+
+permissions:
+  contents: read
 
 jobs:
   cleanup:
@@ -26,45 +29,8 @@ jobs:
             pip install --quiet awscli
           fi
 
-      - name: List and delete old installer versions
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-1
-          R2_ENDPOINT: https://b93d1b956d4a35c986540bb51f7404a2.r2.cloudflarestorage.com
-          KEEP_LATEST: ${{ github.event.inputs.keep_latest || '3' }}
-        run: |
-          echo "Listing installer versions in R2..."
-
-          # List all version prefixes under runtime/v*
-          versions=$(aws s3 ls s3://kapsl-installer/runtime/ \
-            --endpoint-url "$R2_ENDPOINT" \
-            | awk '{print $NF}' \
-            | grep '^v' \
-            | sed 's|/$||' \
-            | sort -V)
-
-          total=$(echo "$versions" | grep -c .)
-          echo "Found $total version(s): $(echo $versions | tr '\n' ' ')"
-
-          if [ "$total" -le "$KEEP_LATEST" ]; then
-            echo "Nothing to delete — $total version(s) present, keeping $KEEP_LATEST."
-            exit 0
-          fi
-
-          to_delete=$(echo "$versions" | head -n $(( total - KEEP_LATEST )))
-          echo "Deleting $(echo "$to_delete" | grep -c .): $(echo $to_delete | tr '\n' ' ')"
-
-          for version in $to_delete; do
-            echo "  Deleting s3://kapsl-installer/runtime/$version/"
-            aws s3 rm "s3://kapsl-installer/runtime/$version/" \
-              --recursive \
-              --only-show-errors \
-              --endpoint-url "$R2_ENDPOINT"
-          done
-
-          echo "Done. Retained: $(echo "$versions" | tail -n "$KEEP_LATEST" | tr '\n' ' ')"
-
+      # Official releases under runtime/v*/ are permanent. Only the separate
+      # runtime/beta/ namespace is eligible for automated retention cleanup.
       - name: Delete expired beta installer versions
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

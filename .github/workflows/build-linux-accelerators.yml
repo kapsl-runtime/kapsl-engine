@@ -219,6 +219,9 @@ jobs:
             --version "$KAPSL_VERSION" --lock .github/ort-release.lock.json \
             --artifacts-dir dist --expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"
 
+      - name: Install backend-index hash verifier
+        run: python3 -m pip install -r .github/requirements-backend-index.txt
+
       - name: Generate signed backend index
         env:
           KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}

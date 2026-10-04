@@ -838,13 +838,7 @@ impl DeviceAllocator for GpuAllocator {
             _ => return Err("unknown device allocation class".into()),
         };
         let owner = PoolOwner::new(self.backend, self.model_id, self.replica_id, class);
-        if !self
-            .pool
-            .snapshot()
-            .owners
-            .iter()
-            .any(|entry| entry.owner.workload() == owner.workload() && entry.admitted)
-        {
+        if !self.pool.is_owner_admitted(owner) {
             return Err(format!(
                 "native device owner {owner:?} has no engine memory admission"
             ));
@@ -872,7 +866,13 @@ impl DeviceAllocator for GpuAllocator {
             .device()
             .bind_to_thread()
             .map_err(|e| e.to_string())?;
-        self.pool.device().synchronize().map_err(|e| e.to_string())
+        // CudaDevice::synchronize waits only for the pool's stream. Native
+        // backends may use independent nonblocking streams in this context;
+        // every preceding use must finish before governed memory is reusable.
+        // SAFETY: bind_to_thread above made the retained pool context current.
+        unsafe { cudarc::driver::sys::lib().cuCtxSynchronize() }
+            .result()
+            .map_err(|e| e.to_string())
     }
 }
 

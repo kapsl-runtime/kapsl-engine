@@ -30,6 +30,7 @@ jobs:
           python3 .github/scripts/test_import_signed_backend_release.py
           python3 .github/scripts/test_preflight_ort_release.py
           python3 .github/scripts/test_release_pipeline.py
+          python3 .github/scripts/test_cleanup_r2_installers.py
       - name: Verify published ORT metadata, signatures, compatibility and availability
         run: python3 .github/scripts/preflight-ort-release.py
 
