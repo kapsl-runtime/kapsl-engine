@@ -76,6 +76,8 @@ on:
       - ".github/scripts/test_validate_model_package_backend.py"
       - "docs/gcp-ephemeral-gpu-conformance.md"
       - ".github/scripts/generate-backend-index.py"
+      - ".github/scripts/test_backend_index_blake3.py"
+      - ".github/requirements-backend-index.txt"
       - ".github/scripts/test-generate-backend-index.sh"
       - ".github/scripts/verify-public-backend-release.sh"
       - ".github/workflows/installer-smoke.yml"
@@ -297,6 +299,12 @@ jobs:
 
       - name: Test model-package serving contract validation
         run: python3 .github/scripts/test_validate_model_package_backend.py
+
+      - name: Install backend-index hash verifier
+        run: python3 -m pip install -r .github/requirements-backend-index.txt
+
+      - name: Test signed BLAKE3 metadata validation
+        run: python3 .github/scripts/test_backend_index_blake3.py
 
       - name: Test signed backend-index generation
         run: .github/scripts/test-generate-backend-index.sh
