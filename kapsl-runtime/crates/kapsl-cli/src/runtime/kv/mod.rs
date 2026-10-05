@@ -1,17 +1,15 @@
 //! Resolved external KV-control configuration and listener startup.
 
 use super::*;
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+use crate::runtime::memory::GpuSharedPoolProvisioner;
 
 // Coordinator and accounting types are portable; control.rs gates the Unix
 // socket transport internally so non-Unix fail-closed paths still compile.
 mod control;
-#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
-mod cuda_ipc;
 mod shared;
 
 pub(crate) use control::*;
-#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
-pub(crate) use cuda_ipc::*;
 pub(crate) use shared::*;
 
 #[derive(Clone, Debug)]
@@ -71,9 +69,7 @@ impl KvControlConfig {
         let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
             resources.memory().clone(),
             Duration::from_millis(self.lease_ttl_ms),
-            Some(CudaIpcSharedPoolProvisioner::new(
-                resources.memory().clone(),
-            )),
+            Some(GpuSharedPoolProvisioner::new(resources.memory().clone())),
             parse_shared_pool_profiles(&self.shared_pool_profiles)?,
         )?;
         #[cfg(not(all(feature = "gpu-device-pool", any(target_os = "linux", test))))]
