@@ -7,11 +7,10 @@
 //! participate in ownership and lifetime now, without pretending that the
 //! runtime physically allocates their memory.
 //!
-//! GPU physical backing is managed here in two forms: `device` manages the HAL
-//! `GpuDevicePool` arena shared by in-process backends, and `gpu_shared_pool`
-//! provisions isolated `GpuIpcPoolAllocation` / `GpuVmmPoolAllocation` backings
-//! for external KV workers. Each device's region registry observes both forms;
-//! their existing owners and authority charges retain the physical lifetimes.
+//! Each CUDA device's `gpu_pool::GpuDevicePool` owns HAL arena, IPC and VMM
+//! regions. Local allocation leases reuse admitted arena capacity;
+//! `gpu_shared_pool` adapts isolated exported leases to the external KV protocol.
+//! Authority grants cover physical backing until fenced retirement succeeds.
 
 use super::*;
 
@@ -20,9 +19,11 @@ mod device;
 #[cfg(any(feature = "gpu-device-pool", test))]
 mod device_budget;
 mod device_limits;
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) mod gpu_pool;
 mod gpu_region_metrics;
 mod gpu_regions;
-#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", all(test, unix))))]
 mod gpu_shared_pool;
 pub(crate) mod host;
 #[cfg(any(feature = "gpu-device-pool", test))]
@@ -34,7 +35,7 @@ pub(crate) use device::*;
 pub(crate) use device_limits::*;
 pub(crate) use gpu_region_metrics::GpuRegionMetrics;
 pub(crate) use gpu_regions::GpuRegionSnapshot;
-#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", all(test, unix))))]
 pub(crate) use gpu_shared_pool::GpuSharedPoolProvisioner;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use pool_clients::PoolClientCleanup;
@@ -1424,7 +1425,7 @@ impl MemoryAuthority {
             .unwrap_or(MemoryDomain::Host)
     }
 
-    #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+    #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", all(test, unix))))]
     pub(crate) fn cuda_device(
         &self,
         device_id: usize,
@@ -1435,18 +1436,15 @@ impl MemoryAuthority {
             .cuda_device(device_id)
     }
 
-    #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
-    fn register_gpu_region(
+    #[cfg(feature = "gpu-device-pool")]
+    pub(crate) fn gpu_device_pool(
         &self,
         device_id: usize,
-        kind: gpu_regions::GpuRegionKind,
-        isolation: gpu_regions::GpuRegionIsolation,
-        backing: &Arc<dyn gpu_regions::GpuRegionSource>,
-    ) -> Result<gpu_regions::GpuRegionId, String> {
+    ) -> Result<Arc<gpu_pool::GpuDevicePool>, String> {
         self.cuda
             .as_ref()
-            .ok_or_else(|| "runtime has no CUDA memory authority".to_string())?
-            .register_region(device_id, kind, isolation, backing)
+            .and_then(|manager| manager.device_pool(device_id))
+            .ok_or_else(|| format!("CUDA device {device_id} has no runtime memory authority"))
     }
 
     /// KV policy capacity for one HAL device. The authority owns the physical

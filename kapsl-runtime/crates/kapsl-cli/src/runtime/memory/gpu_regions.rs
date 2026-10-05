@@ -1,8 +1,8 @@
 //! Runtime region identity and physical observations, independent of CUDA.
 //!
-//! This is the first migration layer, not a second allocator or budget ledger.
-//! Existing owners retain backing and completion contracts. Weak registrations
-//! let us observe them without extending a backing's lifetime past its charge.
+//! The per-device pool owns backing and leases; this registry supplies opaque
+//! identities and observations without another budget ledger. Retirement waits
+//! for weak observer pins before releasing physical storage and its charge.
 
 use super::{MemoryAllocationClass, MemoryOwner};
 use parking_lot::Mutex;
@@ -119,6 +119,7 @@ struct RegionEntry {
     kind: GpuRegionKind,
     isolation: GpuRegionIsolation,
     backing: Weak<dyn GpuRegionSource>,
+    active: Arc<Mutex<bool>>,
 }
 
 /// One registry per managed device, including devices without a local arena.
@@ -165,9 +166,35 @@ impl GpuRegionRegistry {
                 kind,
                 isolation,
                 backing: Arc::downgrade(backing),
+                active: Arc::new(Mutex::new(true)),
             },
         );
         id
+    }
+
+    /// Stop future samples and wait for an in-flight backing observation before
+    /// the owner drops physical storage and relinquishes its budget charge.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+    pub(crate) fn retire(&self, id: GpuRegionId) {
+        self.retire_if(id, || true);
+    }
+
+    /// Exclude sampler pins while the owner checks its final leases. A failed
+    /// retirement leaves the entry available to subsequent observations.
+    pub(crate) fn retire_if(&self, id: GpuRegionId, retire: impl FnOnce() -> bool) -> bool {
+        let active = self
+            .entries
+            .lock()
+            .get(&id)
+            .map(|entry| entry.active.clone());
+        let Some(active) = active else { return false };
+        let mut active = active.lock();
+        if !*active || !retire() {
+            return false;
+        }
+        *active = false;
+        self.entries.lock().remove(&id);
+        true
     }
 
     pub(crate) fn snapshots(&self) -> Vec<GpuRegionSnapshot> {
@@ -182,13 +209,22 @@ impl GpuRegionRegistry {
                     entry.kind,
                     entry.isolation.clone(),
                     entry.backing.clone(),
+                    entry.active.clone(),
                 )
             })
             .collect();
         let mut snapshots = Vec::with_capacity(entries.len());
         let mut retired = Vec::new();
-        for (id, kind, isolation, backing) in entries {
-            match backing.upgrade().and_then(|backing| backing.region_usage()) {
+        for (id, kind, isolation, backing, active) in entries {
+            let usage = {
+                let active = active.lock();
+                if *active {
+                    backing.upgrade().and_then(|backing| backing.region_usage())
+                } else {
+                    None
+                }
+            };
+            match usage {
                 Some(usage) => snapshots.push(GpuRegionSnapshot {
                     id,
                     device_id: self.device_id,
@@ -213,6 +249,50 @@ mod tests {
     use crate::runtime::memory::device_budget::DeviceBudgetLedger;
 
     const GIB: usize = 1024 * 1024 * 1024;
+
+    #[test]
+    fn retirement_waits_for_existing_observers_and_excludes_future_samples() {
+        use std::sync::{mpsc, Barrier};
+        use std::time::Duration;
+        struct BlockingSource {
+            entered: Barrier,
+            resume: Barrier,
+        }
+        impl GpuRegionSource for BlockingSource {
+            fn region_usage(&self) -> Option<GpuRegionUsage> {
+                self.entered.wait();
+                self.resume.wait();
+                Some(GpuRegionUsage::exported(128, 128, 0))
+            }
+        }
+        let registry = Arc::new(GpuRegionRegistry::new(0));
+        let backing = Arc::new(BlockingSource {
+            entered: Barrier::new(2),
+            resume: Barrier::new(2),
+        });
+        let source: Arc<dyn GpuRegionSource> = backing.clone();
+        let id = registry.register(GpuRegionKind::Ipc, GpuRegionIsolation::Local, &source);
+        let sampling = registry.clone();
+        let sample = std::thread::spawn(move || sampling.snapshots());
+        backing.entered.wait();
+        let retiring = registry.clone();
+        let (started, has_started) = mpsc::channel();
+        let (finished, has_finished) = mpsc::channel();
+        let retire = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            retiring.retire(id);
+            finished.send(()).unwrap();
+        });
+        has_started.recv().unwrap();
+        assert!(has_finished
+            .recv_timeout(Duration::from_millis(30))
+            .is_err());
+        backing.resume.wait();
+        sample.join().unwrap();
+        has_finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        retire.join().unwrap();
+        assert!(registry.snapshots().is_empty());
+    }
 
     struct TestBacking(Mutex<Option<GpuRegionUsage>>);
 

@@ -1,7 +1,7 @@
 //! Resolved external KV-control configuration and listener startup.
 
 use super::*;
-#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", all(test, unix))))]
 use crate::runtime::memory::GpuSharedPoolProvisioner;
 
 // Coordinator and accounting types are portable; control.rs gates the Unix
@@ -65,14 +65,14 @@ impl KvControlConfig {
             return Ok(None);
         };
 
-        #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+        #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", all(test, unix))))]
         let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
             resources.memory().clone(),
             Duration::from_millis(self.lease_ttl_ms),
             Some(GpuSharedPoolProvisioner::new(resources.memory().clone())),
             parse_shared_pool_profiles(&self.shared_pool_profiles)?,
         )?;
-        #[cfg(not(all(feature = "gpu-device-pool", any(target_os = "linux", test))))]
+        #[cfg(not(all(feature = "gpu-device-pool", any(target_os = "linux", all(test, unix)))))]
         let coordinator = ExternalKvCoordinator::new(
             resources.memory().clone(),
             Duration::from_millis(self.lease_ttl_ms),

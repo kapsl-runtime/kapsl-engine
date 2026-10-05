@@ -1,16 +1,14 @@
 //! Isolated GPU pool backing for out-of-process shared KV participants.
 //!
-//! The GPU pool family has three physical backing implementations:
-//! - `kapsl_hal::gpu_arena::GpuDevicePool`: the general in-process CUDA arena;
-//! - `GpuIpcPoolAllocation`: isolated fixed backing exported through CUDA IPC;
-//! - `GpuVmmPoolAllocation`: isolated elastic backing exported through CUDA VMM.
+//! The common per-device pool owns HAL arena, IPC and VMM regions. This module
+//! adapts isolated region leases to KV descriptors and the worker protocol.
 //!
 //! `GpuSharedPoolProvisioner` admits the isolated backings through the same
 //! `MemoryAuthority` that budgets the general arena. They use separate physical
 //! allocations because CUDA IPC exports the entire allocation: exporting the
 //! general arena would expose unrelated models and sessions to the importer.
 
-use super::gpu_regions::{GpuRegionIsolation, GpuRegionKind, GpuRegionSource, GpuRegionUsage};
+use super::gpu_regions::GpuRegionIsolation;
 use super::{
     MemoryAllocationClass, MemoryAuthority, MemoryClaim, MemoryClaimSource, MemoryDomain,
     MemoryLease, MemoryOwner, MemoryPlan,
@@ -18,7 +16,7 @@ use super::{
 use crate::runtime::kv::{ProvisionedSharedPools, SharedPoolBacking, SharedPoolProvisioner};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use cudarc::driver::{result as cuda_result, sys as cuda_sys, CudaDevice};
+use cudarc::driver::CudaDevice;
 use kapsl_kv_abi::{
     KvContractError, KvElasticPoolDescriptor, KvFeature, KvMemoryDomain, KvParticipantRegistration,
     KvSharedPoolAllocationMode, KvSharedPoolDescriptor, KvTransport, KvVmmSegmentDescriptor,
@@ -26,18 +24,110 @@ use kapsl_kv_abi::{
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 /// Creates fixed IPC or elastic VMM GPU pools under runtime memory authority.
 pub(crate) struct GpuSharedPoolProvisioner {
     memory: Arc<MemoryAuthority>,
+    failed_setup: Arc<Mutex<Vec<FailedGpuSetup>>>,
 }
 
 impl GpuSharedPoolProvisioner {
     pub(crate) fn new(memory: Arc<MemoryAuthority>) -> Arc<Self> {
-        Arc::new(Self { memory })
+        Arc::new(Self {
+            memory,
+            failed_setup: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+
+    fn retry_failed_setup(&self) {
+        // These handles were never sent to an importer. Driver operations run
+        // outside the queue lock and successful cleanup precedes grant release.
+        let failed = std::mem::take(&mut *self.failed_setup.lock());
+        for mut setup in failed {
+            if setup
+                .backing
+                .as_ref()
+                .expect("retained backing")
+                .release_after_fence()
+                .is_ok()
+            {
+                drop(setup.backing.take());
+                drop(setup.grant.take());
+            } else {
+                self.failed_setup.lock().push(setup);
+            }
+        }
+    }
+}
+
+struct FailedGpuSetup {
+    backing: Option<Arc<dyn SharedPoolBacking>>,
+    grant: Option<MemoryLease>,
+}
+
+impl Drop for FailedGpuSetup {
+    fn drop(&mut self) {
+        let Some(backing) = self.backing.take() else {
+            return;
+        };
+        let grant = self.grant.take();
+        if let Err(error) = backing.release_after_fence() {
+            log::error!(
+                "[gpu-pool] setup cleanup failed at shutdown; retaining backing and grant: {error}"
+            );
+            std::mem::forget((backing, grant));
+        } else {
+            drop(backing);
+            drop(grant);
+        }
+    }
+}
+
+struct GpuSetup {
+    backing: Option<GpuSharedPoolBacking>,
+    grant: Option<MemoryLease>,
+    failed: Arc<Mutex<Vec<FailedGpuSetup>>>,
+}
+
+impl GpuSetup {
+    fn new(grant: MemoryLease, failed: Arc<Mutex<Vec<FailedGpuSetup>>>) -> Self {
+        Self {
+            backing: Some(GpuSharedPoolBacking {
+                allocations: HashMap::new(),
+                vmm_allocations: HashMap::new(),
+            }),
+            grant: Some(grant),
+            failed,
+        }
+    }
+
+    fn finish(mut self, descriptors: Vec<KvSharedPoolDescriptor>) -> ProvisionedSharedPools {
+        ProvisionedSharedPools {
+            descriptors,
+            backing: Arc::new(self.backing.take().expect("setup owns backing")),
+            memory_lease: self.grant.take(),
+        }
+    }
+}
+
+impl Drop for GpuSetup {
+    fn drop(&mut self) {
+        let Some(backing) = self.backing.take() else {
+            return;
+        };
+        if let Err(error) = backing.release_after_fence() {
+            if let Some(grant) = self.grant.as_mut() {
+                grant.commit_capacity();
+            }
+            log::error!("[gpu-pool] failed setup retained backing and budget for retry: {error}");
+            self.failed.lock().push(FailedGpuSetup {
+                backing: Some(Arc::new(backing)),
+                grant: self.grant.take(),
+            });
+        }
+        // Successful physical release occurs before the grant field drops.
     }
 }
 
@@ -179,605 +269,8 @@ fn plan_bindings(
     Ok(planned)
 }
 
-/// One isolated fixed GPU pool allocation, exportable through CUDA IPC.
-struct GpuIpcPoolAllocation {
-    device: Arc<CudaDevice>,
-    pointer: cuda_sys::CUdeviceptr,
-    observation: Arc<GpuIpcRegionObservation>,
-}
-
-// Observers share synchronization and counters, never CUDA ownership. Holding
-// a snapshot source must not defer final cleanup past the authority lease.
-struct GpuIpcRegionObservation {
-    bytes: usize,
-    operations: Mutex<()>,
-    released: AtomicBool,
-}
-
-impl GpuIpcPoolAllocation {
-    fn allocate(device: Arc<CudaDevice>, bytes: usize) -> Result<Self, KvContractError> {
-        device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA IPC allocation context"))?;
-        // Legacy synchronous allocations are intentional: CUDA IPC memory
-        // handles are not guaranteed for stream-ordered cudaMallocAsync memory.
-        let pointer = unsafe { cuda_result::malloc_sync(bytes) }
-            .map_err(cuda_internal("allocate isolated CUDA IPC KV region"))?;
-        if let Err(error) = unsafe { cuda_result::memset_d8_sync(pointer, 0, bytes) } {
-            let _ = unsafe { cuda_result::free_sync(pointer) };
-            return Err(cuda_internal("zero isolated CUDA IPC KV region")(error));
-        }
-        Ok(Self {
-            device,
-            pointer,
-            observation: Arc::new(GpuIpcRegionObservation {
-                bytes,
-                operations: Mutex::new(()),
-                released: AtomicBool::new(false),
-            }),
-        })
-    }
-
-    fn release_after_fence(&self) -> Result<(), KvContractError> {
-        let _operations = self.observation.operations.lock();
-        if self.observation.released.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA IPC release context"))?;
-        self.device
-            .synchronize()
-            .map_err(cuda_internal("synchronize CUDA IPC release"))?;
-        unsafe { cuda_result::free_sync(self.pointer) }
-            .map_err(cuda_internal("free isolated CUDA IPC KV region"))?;
-        self.observation.released.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    fn export_handle(&self) -> Result<String, KvContractError> {
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA IPC export context"))?;
-        let mut handle = cuda_sys::CUipcMemHandle::default();
-        unsafe {
-            cuda_sys::lib()
-                .cuIpcGetMemHandle(&mut handle, self.pointer)
-                .result()
-        }
-        .map_err(cuda_internal("export CUDA IPC memory handle"))?;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(handle.reserved.as_ptr().cast::<u8>(), handle.reserved.len())
-        };
-        Ok(BASE64.encode(bytes))
-    }
-
-    fn zero_blocks(
-        &self,
-        bytes_per_block: u64,
-        block_indices: &[u64],
-    ) -> Result<(), KvContractError> {
-        let bytes_per_block = usize::try_from(bytes_per_block).map_err(|_| {
-            KvContractError::invalid_capabilities(
-                "CUDA IPC block stride does not fit the runtime address space",
-            )
-        })?;
-        let _operations = self.observation.operations.lock();
-        if self.observation.released.load(Ordering::Acquire) {
-            return Err(KvContractError::invalid_request(
-                "CUDA IPC backing was already released",
-            ));
-        }
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA IPC zeroing context"))?;
-        for &block_index in block_indices {
-            let block_index = usize::try_from(block_index).map_err(|_| {
-                KvContractError::invalid_request("CUDA IPC block index is too large")
-            })?;
-            let offset = block_index.checked_mul(bytes_per_block).ok_or_else(|| {
-                KvContractError::invalid_request("CUDA IPC block offset overflows")
-            })?;
-            let end = offset.checked_add(bytes_per_block).ok_or_else(|| {
-                KvContractError::invalid_request("CUDA IPC block range overflows")
-            })?;
-            if end > self.observation.bytes {
-                return Err(KvContractError::invalid_request(
-                    "CUDA IPC block index is outside the exported allocation",
-                ));
-            }
-            let pointer = self.pointer.checked_add(offset as u64).ok_or_else(|| {
-                KvContractError::invalid_request("CUDA IPC device pointer overflows")
-            })?;
-            unsafe { cuda_result::memset_d8_sync(pointer, 0, bytes_per_block) }
-                .map_err(cuda_internal("zero leased CUDA IPC KV block"))?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for GpuIpcPoolAllocation {
-    fn drop(&mut self) {
-        if let Err(error) = self.release_after_fence() {
-            log::error!(
-                "[kv-control] failed to release CUDA IPC allocation during final drop: {error}"
-            );
-        }
-    }
-}
-
-impl GpuRegionSource for GpuIpcRegionObservation {
-    fn region_usage(&self) -> Option<GpuRegionUsage> {
-        let _operations = self.operations.lock();
-        (!self.released.load(Ordering::Acquire))
-            .then(|| GpuRegionUsage::exported(self.bytes, self.bytes, 0))
-    }
-}
-
-struct GpuVmmPoolSegment {
-    descriptor: KvVmmSegmentDescriptor,
-    handle: cuda_sys::CUmemGenericAllocationHandle,
-    mapped: bool,
-}
-
-struct GpuVmmPoolState {
-    segments: Vec<GpuVmmPoolSegment>,
-}
-
-impl GpuVmmPoolState {
-    fn region_usage(&self, virtual_bytes: usize) -> GpuRegionUsage {
-        let (committed, mapped) = self.segments.iter().fold((0usize, 0usize), |acc, segment| {
-            let bytes = segment.descriptor.length_bytes as usize;
-            (
-                acc.0.saturating_add(bytes),
-                acc.1.saturating_add(if segment.mapped { bytes } else { 0 }),
-            )
-        });
-        GpuRegionUsage::exported(committed, mapped, virtual_bytes)
-    }
-}
-
-/// One isolated GPU pool with stable CUDA VMM addresses and elastic backing.
-struct GpuVmmPoolAllocation {
-    device: Arc<CudaDevice>,
-    pointer: cuda_sys::CUdeviceptr,
-    minimum_bytes: usize,
-    granularity: usize,
-    observation: Arc<GpuVmmRegionObservation>,
-}
-
-struct GpuVmmRegionObservation {
-    virtual_bytes: usize,
-    state: Mutex<GpuVmmPoolState>,
-    released: AtomicBool,
-}
-
-impl GpuVmmPoolAllocation {
-    fn allocation_properties(
-        device_id: usize,
-    ) -> Result<cuda_sys::CUmemAllocationProp, KvContractError> {
-        let device_id = i32::try_from(device_id).map_err(|_| {
-            KvContractError::invalid_capabilities("CUDA VMM device ordinal is too large")
-        })?;
-        Ok(cuda_sys::CUmemAllocationProp {
-            type_: cuda_sys::CUmemAllocationType::CU_MEM_ALLOCATION_TYPE_PINNED,
-            requestedHandleTypes:
-                cuda_sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-            location: cuda_sys::CUmemLocation {
-                type_: cuda_sys::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-                id: device_id,
-            },
-            ..Default::default()
-        })
-    }
-
-    fn allocation_granularity(device: &Arc<CudaDevice>) -> Result<usize, KvContractError> {
-        device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA VMM granularity context"))?;
-        let properties = Self::allocation_properties(device.ordinal())?;
-        let mut granularity = 0usize;
-        unsafe {
-            cuda_sys::lib().cuMemGetAllocationGranularity(
-                &mut granularity,
-                &properties,
-                cuda_sys::CUmemAllocationGranularity_flags::CU_MEM_ALLOC_GRANULARITY_MINIMUM,
-            )
-        }
-        .result()
-        .map_err(cuda_internal("query CUDA VMM allocation granularity"))?;
-        if granularity == 0 {
-            return Err(KvContractError::Internal {
-                message: "CUDA VMM returned zero allocation granularity".to_string(),
-            });
-        }
-        Ok(granularity)
-    }
-
-    fn allocate(
-        device: Arc<CudaDevice>,
-        virtual_bytes: usize,
-        minimum_bytes: usize,
-        initial_bytes: usize,
-        segment_prefix: String,
-    ) -> Result<Self, KvContractError> {
-        device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA VMM allocation context"))?;
-        let granularity = Self::allocation_granularity(&device)?;
-        if minimum_bytes == 0
-            || minimum_bytes > initial_bytes
-            || initial_bytes > virtual_bytes
-            || !minimum_bytes.is_multiple_of(granularity)
-            || !initial_bytes.is_multiple_of(granularity)
-            || !virtual_bytes.is_multiple_of(granularity)
-        {
-            return Err(KvContractError::invalid_capabilities(format!(
-                "CUDA VMM minimum ({minimum_bytes}), initial ({initial_bytes}), and virtual ({virtual_bytes}) bytes must be ordered and align to granularity {granularity}"
-            )));
-        }
-        let mut pointer = 0;
-        unsafe {
-            cuda_sys::lib().cuMemAddressReserve(&mut pointer, virtual_bytes, granularity, 0, 0)
-        }
-        .result()
-        .map_err(cuda_internal("reserve CUDA VMM address range"))?;
-        let allocation = Self {
-            device,
-            pointer,
-            minimum_bytes,
-            granularity,
-            observation: Arc::new(GpuVmmRegionObservation {
-                virtual_bytes,
-                state: Mutex::new(GpuVmmPoolState {
-                    segments: Vec::new(),
-                }),
-                released: AtomicBool::new(false),
-            }),
-        };
-        allocation.grow_to(minimum_bytes, format!("{segment_prefix}:minimum"))?;
-        if initial_bytes > minimum_bytes {
-            allocation.grow_to(initial_bytes, format!("{segment_prefix}:initial-headroom"))?;
-        }
-        Ok(allocation)
-    }
-
-    fn grow_to(
-        &self,
-        target_bytes: usize,
-        segment_id: String,
-    ) -> Result<KvVmmSegmentDescriptor, KvContractError> {
-        if self.observation.released.load(Ordering::Acquire) {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM backing was already released",
-            ));
-        }
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA VMM growth context"))?;
-        let mut state = self.observation.state.lock();
-        let current_bytes = state
-            .segments
-            .last()
-            .map(|segment| {
-                usize::try_from(segment.descriptor.offset_bytes + segment.descriptor.length_bytes)
-                    .expect("validated VMM segment range fits usize")
-            })
-            .unwrap_or(0);
-        if target_bytes <= current_bytes
-            || target_bytes > self.observation.virtual_bytes
-            || !target_bytes.is_multiple_of(self.granularity)
-        {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM growth target is outside or misaligned with virtual capacity",
-            ));
-        }
-        let length = target_bytes - current_bytes;
-        let descriptor = KvVmmSegmentDescriptor {
-            segment_id,
-            offset_bytes: current_bytes as u64,
-            length_bytes: length as u64,
-            handle_index: 0,
-        };
-        let properties = Self::allocation_properties(self.device.ordinal())?;
-        let mut handle = 0;
-        unsafe { cuda_sys::lib().cuMemCreate(&mut handle, length, &properties, 0) }
-            .result()
-            .map_err(cuda_internal("create CUDA VMM physical segment"))?;
-        let address = self
-            .pointer
-            .checked_add(current_bytes as u64)
-            .ok_or_else(|| KvContractError::Internal {
-                message: "CUDA VMM address overflowed".to_string(),
-            })?;
-        if let Err(error) =
-            unsafe { cuda_sys::lib().cuMemMap(address, length, 0, handle, 0) }.result()
-        {
-            let release = unsafe { cuda_sys::lib().cuMemRelease(handle).result() };
-            if let Err(release_error) = release {
-                // Retain an unmapped handle so release_binding_tail can retry.
-                // The authority growth must remain charged unless that retry
-                // succeeds.
-                state.segments.push(GpuVmmPoolSegment {
-                    descriptor,
-                    handle,
-                    mapped: false,
-                });
-                return Err(KvContractError::Internal {
-                    message: format!(
-                        "failed to map CUDA VMM physical segment ({error}) and could not release its handle ({release_error})"
-                    ),
-                });
-            }
-            return Err(cuda_internal("map CUDA VMM physical segment")(error));
-        }
-        let access = cuda_sys::CUmemAccessDesc {
-            location: properties.location,
-            flags: cuda_sys::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-        };
-        let initialized = unsafe {
-            cuda_sys::lib()
-                .cuMemSetAccess(address, length, &access, 1)
-                .result()
-                .and_then(|()| cuda_result::memset_d8_sync(address, 0, length))
-        };
-        if let Err(error) = initialized {
-            let unmap = unsafe { cuda_sys::lib().cuMemUnmap(address, length).result() };
-            match unmap {
-                Ok(()) => {
-                    if let Err(release_error) =
-                        unsafe { cuda_sys::lib().cuMemRelease(handle).result() }
-                    {
-                        // The address is clean, but the physical handle still
-                        // consumes capacity. Preserve it for transactional
-                        // rollback instead of silently lowering accounting.
-                        state.segments.push(GpuVmmPoolSegment {
-                            descriptor,
-                            handle,
-                            mapped: false,
-                        });
-                        return Err(KvContractError::Internal {
-                            message: format!(
-                                "failed to initialize CUDA VMM physical segment ({error}) and could not release its handle ({release_error})"
-                            ),
-                        });
-                    }
-                }
-                Err(unmap_error) => {
-                    // Keep both the mapping and handle represented. The
-                    // coordinator will retain the authority charge unless its
-                    // rollback can conclusively unmap and release this tail.
-                    state.segments.push(GpuVmmPoolSegment {
-                        descriptor,
-                        handle,
-                        mapped: true,
-                    });
-                    return Err(KvContractError::Internal {
-                        message: format!(
-                            "failed to initialize CUDA VMM physical segment ({error}) and could not unmap it ({unmap_error})"
-                        ),
-                    });
-                }
-            }
-            return Err(cuda_internal("initialize CUDA VMM physical segment")(error));
-        }
-        state.segments.push(GpuVmmPoolSegment {
-            descriptor: descriptor.clone(),
-            handle,
-            mapped: true,
-        });
-        Ok(descriptor)
-    }
-
-    fn shrink_segments(
-        &self,
-        target_bytes: usize,
-    ) -> Result<Vec<KvVmmSegmentDescriptor>, KvContractError> {
-        if self.observation.released.load(Ordering::Acquire) {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM backing was already released",
-            ));
-        }
-        let state = self.observation.state.lock();
-        let current = state
-            .segments
-            .last()
-            .map(|segment| segment.descriptor.offset_bytes + segment.descriptor.length_bytes)
-            .unwrap_or(0);
-        if target_bytes < self.minimum_bytes
-            || target_bytes as u64 >= current
-            || !target_bytes.is_multiple_of(self.granularity)
-        {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM shrink target is outside the releasable mapped tail",
-            ));
-        }
-        let segments = state
-            .segments
-            .iter()
-            .filter(|segment| segment.descriptor.offset_bytes >= target_bytes as u64)
-            .map(|segment| segment.descriptor.clone())
-            .collect::<Vec<_>>();
-        if segments.is_empty()
-            || segments
-                .first()
-                .is_none_or(|segment| segment.offset_bytes != target_bytes as u64)
-        {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM shrink target is not a committed segment boundary",
-            ));
-        }
-        Ok(segments)
-    }
-
-    fn shrink_boundary(&self, requested_bytes: usize) -> Result<usize, KvContractError> {
-        if self.observation.released.load(Ordering::Acquire) {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM backing was already released",
-            ));
-        }
-        let state = self.observation.state.lock();
-        let current = state
-            .segments
-            .last()
-            .map(|segment| segment.descriptor.offset_bytes + segment.descriptor.length_bytes)
-            .unwrap_or(0);
-        if requested_bytes < self.minimum_bytes
-            || requested_bytes as u64 >= current
-            || !requested_bytes.is_multiple_of(self.granularity)
-        {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM shrink request is outside the releasable mapped tail",
-            ));
-        }
-        state
-            .segments
-            .iter()
-            .map(|segment| segment.descriptor.offset_bytes as usize)
-            .filter(|offset| *offset >= self.minimum_bytes && *offset <= requested_bytes)
-            .max()
-            .ok_or_else(|| KvContractError::Internal {
-                message: "CUDA VMM allocation has no certified minimum segment boundary"
-                    .to_string(),
-            })
-    }
-
-    fn release_tail(&self, target_bytes: usize) -> Result<(), KvContractError> {
-        let mut state = self.observation.state.lock();
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA VMM shrink context"))?;
-        self.device
-            .synchronize()
-            .map_err(cuda_internal("synchronize CUDA VMM shrink"))?;
-        while state
-            .segments
-            .last()
-            .is_some_and(|segment| segment.descriptor.offset_bytes >= target_bytes as u64)
-        {
-            let segment = state.segments.last_mut().expect("tail existence checked");
-            let address = self.pointer + segment.descriptor.offset_bytes;
-            let length = segment.descriptor.length_bytes as usize;
-            if segment.mapped {
-                unsafe { cuda_sys::lib().cuMemUnmap(address, length) }
-                    .result()
-                    .map_err(cuda_internal("unmap CUDA VMM tail segment"))?;
-                segment.mapped = false;
-            }
-            unsafe { cuda_sys::lib().cuMemRelease(segment.handle) }
-                .result()
-                .map_err(cuda_internal("release CUDA VMM tail segment"))?;
-            state.segments.pop();
-        }
-        let mapped = state
-            .segments
-            .last()
-            .map(|segment| segment.descriptor.offset_bytes + segment.descriptor.length_bytes)
-            .unwrap_or(0);
-        if mapped != target_bytes as u64 {
-            return Err(KvContractError::Internal {
-                message: "CUDA VMM tail release ended at the wrong boundary".to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    fn release_after_fence(&self) -> Result<(), KvContractError> {
-        if self.observation.released.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let mut state = self.observation.state.lock();
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA VMM release context"))?;
-        self.device
-            .synchronize()
-            .map_err(cuda_internal("synchronize CUDA VMM release"))?;
-        while let Some(segment) = state.segments.last_mut() {
-            if segment.mapped {
-                let address = self.pointer + segment.descriptor.offset_bytes;
-                unsafe {
-                    cuda_sys::lib()
-                        .cuMemUnmap(address, segment.descriptor.length_bytes as usize)
-                        .result()
-                }
-                .map_err(cuda_internal("unmap CUDA VMM segment during release"))?;
-                segment.mapped = false;
-            }
-            unsafe { cuda_sys::lib().cuMemRelease(segment.handle) }
-                .result()
-                .map_err(cuda_internal("release CUDA VMM physical handle"))?;
-            state.segments.pop();
-        }
-        unsafe {
-            cuda_sys::lib()
-                .cuMemAddressFree(self.pointer, self.observation.virtual_bytes)
-                .result()
-        }
-        .map_err(cuda_internal("free CUDA VMM address range"))?;
-        self.observation.released.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    fn export_segment(&self, segment_id: &str) -> Result<OwnedFd, KvContractError> {
-        if self.observation.released.load(Ordering::Acquire) {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM backing was already released",
-            ));
-        }
-        self.device
-            .bind_to_thread()
-            .map_err(cuda_internal("bind CUDA VMM export context"))?;
-        let state = self.observation.state.lock();
-        let segment = state
-            .segments
-            .iter()
-            .find(|segment| segment.descriptor.segment_id == segment_id)
-            .ok_or_else(|| KvContractError::NotFound {
-                message: format!("CUDA VMM segment '{segment_id}' is not live"),
-            })?;
-        if !segment.mapped {
-            return Err(KvContractError::invalid_request(
-                "CUDA VMM segment is no longer mapped",
-            ));
-        }
-        let mut descriptor = -1i32;
-        unsafe {
-            cuda_sys::lib().cuMemExportToShareableHandle(
-                (&mut descriptor as *mut i32).cast(),
-                segment.handle,
-                cuda_sys::CUmemAllocationHandleType::CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
-                0,
-            )
-        }
-        .result()
-        .map_err(cuda_internal("export CUDA VMM POSIX handle"))?;
-        if descriptor < 0 {
-            return Err(KvContractError::Internal {
-                message: "CUDA VMM export returned an invalid descriptor".to_string(),
-            });
-        }
-        Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
-    }
-}
-
-impl Drop for GpuVmmPoolAllocation {
-    fn drop(&mut self) {
-        if let Err(error) = self.release_after_fence() {
-            log::error!(
-                "[kv-control] failed to release CUDA VMM allocation during final drop: {error}"
-            );
-        }
-    }
-}
-
-impl GpuRegionSource for GpuVmmRegionObservation {
-    fn region_usage(&self) -> Option<GpuRegionUsage> {
-        let state = self.state.lock();
-        (!self.released.load(Ordering::Acquire)).then(|| state.region_usage(self.virtual_bytes))
-    }
-}
+mod regions;
+use regions::{GpuIpcPoolAllocation, GpuVmmPoolAllocation};
 
 struct GpuSharedPoolBacking {
     allocations: HashMap<String, GpuIpcPoolAllocation>,
@@ -916,15 +409,7 @@ impl SharedPoolBacking for GpuSharedPoolBacking {
             .map(|segment| {
                 self.vmm_allocations
                     .values()
-                    .find(|allocation| {
-                        allocation
-                            .observation
-                            .state
-                            .lock()
-                            .segments
-                            .iter()
-                            .any(|candidate| candidate.descriptor.segment_id == segment.segment_id)
-                    })
+                    .find(|allocation| allocation.contains_segment(&segment.segment_id))
                     .ok_or_else(|| KvContractError::NotFound {
                         message: format!(
                             "CUDA VMM segment '{}' has no live backing",
@@ -946,6 +431,7 @@ impl SharedPoolProvisioner for GpuSharedPoolProvisioner {
         precharged: Option<MemoryLease>,
         minimum_block_count: Option<u64>,
     ) -> Result<ProvisionedSharedPools, KvContractError> {
+        self.retry_failed_setup();
         let planned = plan_bindings(registration, participant_epoch)?;
         let live_resize = planned.first().is_some_and(|binding| binding.live_resize);
         if live_resize
@@ -992,16 +478,22 @@ impl SharedPoolProvisioner for GpuSharedPoolProvisioner {
         };
 
         let mut descriptors = Vec::with_capacity(planned.len());
-        let mut allocations = HashMap::with_capacity(planned.len());
-        let mut vmm_allocations = HashMap::with_capacity(planned.len());
+        let mut setup = GpuSetup::new(memory_lease, self.failed_setup.clone());
+        let backing = setup.backing.as_mut().expect("setup owns backing");
         let mut next_handle_index = 0u32;
         for binding in planned {
-            let device = self
+            let pool = self
                 .memory
-                .cuda_device(binding.device_id)
+                .gpu_device_pool(binding.device_id)
                 .map_err(|message| KvContractError::Internal { message })?;
+            let isolation = GpuRegionIsolation::Participant {
+                owner,
+                participant_id: registration.participant_id.clone(),
+                binding_id: binding.descriptor.binding_id.clone(),
+                generation: binding.descriptor.generation,
+            };
             let mut descriptor = binding.descriptor;
-            let source: Arc<dyn GpuRegionSource> = if binding.live_resize {
+            if binding.live_resize {
                 let domain = MemoryDomain::Cuda {
                     device_id: binding.device_id,
                 };
@@ -1049,21 +541,18 @@ impl SharedPoolProvisioner for GpuSharedPoolProvisioner {
                         "live CUDA VMM minimum is too large for this runtime",
                     )
                 })?;
-                let allocation = GpuVmmPoolAllocation::allocate(
-                    device,
+                let allocation = GpuVmmPoolAllocation::reserve(
+                    pool,
+                    isolation,
                     binding.allocation_bytes,
                     minimum_bytes,
-                    initial_bytes,
-                    descriptor.binding_id.clone(),
                 )?;
-                let mut segments = allocation
-                    .observation
-                    .state
-                    .lock()
-                    .segments
-                    .iter()
-                    .map(|segment| segment.descriptor.clone())
-                    .collect::<Vec<_>>();
+                backing
+                    .vmm_allocations
+                    .insert(descriptor.binding_id.clone(), allocation);
+                let allocation = &backing.vmm_allocations[&descriptor.binding_id];
+                allocation.initialize(initial_bytes, &descriptor.binding_id)?;
+                let mut segments = allocation.segments();
                 for segment in &mut segments {
                     segment.handle_index = next_handle_index;
                     next_handle_index = next_handle_index.checked_add(1).ok_or_else(|| {
@@ -1093,33 +582,16 @@ impl SharedPoolProvisioner for GpuSharedPoolProvisioner {
                     resize_alignment_blocks,
                     segments,
                 });
-                let source = allocation.observation.clone();
-                vmm_allocations.insert(descriptor.binding_id.clone(), allocation);
-                source
             } else {
-                let allocation = GpuIpcPoolAllocation::allocate(device, binding.allocation_bytes)?;
+                let allocation =
+                    GpuIpcPoolAllocation::allocate(pool, isolation, binding.allocation_bytes)?;
+                backing
+                    .allocations
+                    .insert(descriptor.binding_id.clone(), allocation);
+                let allocation = &backing.allocations[&descriptor.binding_id];
+                allocation.initialize()?;
                 descriptor.descriptor = allocation.export_handle()?;
-                let source = allocation.observation.clone();
-                allocations.insert(descriptor.binding_id.clone(), allocation);
-                source
             };
-            self.memory
-                .register_gpu_region(
-                    binding.device_id,
-                    if binding.live_resize {
-                        GpuRegionKind::Vmm
-                    } else {
-                        GpuRegionKind::Ipc
-                    },
-                    GpuRegionIsolation::Participant {
-                        owner,
-                        participant_id: registration.participant_id.clone(),
-                        binding_id: descriptor.binding_id.clone(),
-                        generation: descriptor.generation,
-                    },
-                    &source,
-                )
-                .map_err(|message| KvContractError::Internal { message })?;
             descriptors.push(descriptor);
         }
         log::info!(
@@ -1129,14 +601,7 @@ impl SharedPoolProvisioner for GpuSharedPoolProvisioner {
             registration.participant_id,
             participant_epoch,
         );
-        Ok(ProvisionedSharedPools {
-            descriptors,
-            backing: Arc::new(GpuSharedPoolBacking {
-                allocations,
-                vmm_allocations,
-            }),
-            memory_lease: Some(memory_lease),
-        })
+        Ok(setup.finish(descriptors))
     }
 
     fn live_resize_alignment_blocks(
@@ -1170,7 +635,7 @@ impl SharedPoolProvisioner for GpuSharedPoolProvisioner {
                 .memory
                 .cuda_device(device_id)
                 .map_err(|message| KvContractError::Internal { message })?;
-            let granularity = GpuVmmPoolAllocation::allocation_granularity(&device)?;
+            let granularity = GpuVmmPoolAllocation::granularity(&device)?;
             let blocks = u64::try_from(granularity / gcd(granularity, stride)).map_err(|_| {
                 KvContractError::invalid_capabilities("CUDA VMM block alignment exceeds uint64")
             })?;
@@ -1252,82 +717,94 @@ fn gcd(mut left: usize, mut right: usize) -> usize {
     left
 }
 
-fn cuda_internal(
-    operation: &'static str,
-) -> impl FnOnce(cuda_result::DriverError) -> KvContractError {
-    move |error| KvContractError::Internal {
-        message: format!("failed to {operation}: {error}"),
-    }
-}
-
 #[cfg(test)]
-mod region_tests {
+mod tests {
     use super::*;
+    use kapsl_hal::device::DeviceInfo;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Weak;
 
-    #[test]
-    fn ipc_observation_retires_while_observers_still_hold_its_state() {
-        let observation = Arc::new(GpuIpcRegionObservation {
-            bytes: 4096,
-            operations: Mutex::new(()),
-            released: AtomicBool::new(false),
-        });
-        let sampler = observation.clone();
-        assert_eq!(
-            sampler.region_usage(),
-            Some(GpuRegionUsage::exported(4096, 4096, 0))
-        );
-        // The allocation's successful release publishes retirement under the
-        // same lock; retaining observation state cannot keep backing live.
-        {
-            let _operations = observation.operations.lock();
-            observation.released.store(true, Ordering::Release);
+    struct RetainedBacking {
+        memory: Weak<MemoryAuthority>,
+        fail: AtomicBool,
+        charges_at_release: Mutex<Vec<usize>>,
+    }
+
+    fn committed(memory: &MemoryAuthority) -> usize {
+        memory
+            .snapshot()
+            .rows
+            .iter()
+            .map(|row| row.committed_bytes)
+            .sum()
+    }
+
+    impl SharedPoolBacking for RetainedBacking {
+        fn zero_blocks(
+            &self,
+            _: &KvSharedPoolDescriptor,
+            _: &[u64],
+        ) -> Result<(), KvContractError> {
+            Ok(())
         }
-        drop(observation);
-        assert_eq!(sampler.region_usage(), None);
+
+        fn release_after_fence(&self) -> Result<(), KvContractError> {
+            self.charges_at_release
+                .lock()
+                .push(committed(&self.memory.upgrade().unwrap()));
+            if self.fail.load(Ordering::Acquire) {
+                Err(KvContractError::Internal {
+                    message: "injected cleanup failure".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
-    fn vmm_observation_tracks_retained_handles_through_partial_release() {
-        let segment = |offset, length, mapped| GpuVmmPoolSegment {
-            descriptor: KvVmmSegmentDescriptor {
-                segment_id: format!("segment:{offset}"),
-                offset_bytes: offset,
-                length_bytes: length,
-                handle_index: 0,
-            },
-            handle: 1,
-            mapped,
-        };
-        let mut state = GpuVmmPoolState {
-            segments: vec![segment(0, 1024, true), segment(1024, 2048, false)],
-        };
-        let usage = state.region_usage(8192);
-        assert_eq!(usage.committed_bytes, 3072);
-        assert_eq!(usage.mapped_bytes, 1024);
-        assert_eq!(usage.virtual_reserved_bytes, 8192);
-        assert_eq!(usage.logical_allocated_bytes, None);
-        assert_eq!(usage.reusable_bytes, None);
-        // Unmap succeeded, cuMemRelease failed: the physical charge remains.
-        state.segments[0].mapped = false;
-        assert_eq!(state.region_usage(8192).committed_bytes, 3072);
-        assert_eq!(state.region_usage(8192).mapped_bytes, 0);
-        // Only successful handle release removes physical capacity.
-        state.segments.pop();
-        assert_eq!(state.region_usage(8192).committed_bytes, 1024);
-        state.segments.clear();
-        assert_eq!(state.region_usage(8192).committed_bytes, 0);
-        // The address reservation can outlive the last physical handle.
-        assert_eq!(state.region_usage(8192).virtual_reserved_bytes, 8192);
-        let observation = GpuVmmRegionObservation {
-            virtual_bytes: 8192,
-            state: Mutex::new(state),
-            released: AtomicBool::new(false),
-        };
-        assert_eq!(
-            observation.region_usage(),
-            Some(GpuRegionUsage::exported(0, 0, 8192))
-        );
-        observation.released.store(true, Ordering::Release);
-        assert_eq!(observation.region_usage(), None);
+    fn failed_setup_keeps_its_grant_until_a_successful_cleanup_retry() {
+        let memory = MemoryAuthority::new(&DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 1024 * 1024,
+            os_type: "test".into(),
+            os_release: "test".into(),
+            has_cuda: false,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: Vec::new(),
+        })
+        .unwrap();
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::external(
+            MemoryDomain::Host,
+            MemoryOwner::new(9, 1),
+            MemoryAllocationClass::KvCache,
+            "failed-gpu-setup",
+            4096,
+        ));
+        let mut grant = memory.admit(&plan).unwrap();
+        grant.commit_capacity();
+        let backing = Arc::new(RetainedBacking {
+            memory: Arc::downgrade(&memory),
+            fail: AtomicBool::new(true),
+            charges_at_release: Mutex::new(Vec::new()),
+        });
+        let provisioner = GpuSharedPoolProvisioner::new(memory.clone());
+        provisioner.failed_setup.lock().push(FailedGpuSetup {
+            backing: Some(backing.clone()),
+            grant: Some(grant),
+        });
+
+        provisioner.retry_failed_setup();
+        assert_eq!(provisioner.failed_setup.lock().len(), 1);
+        assert_eq!(committed(&memory), 4096);
+
+        backing.fail.store(false, Ordering::Release);
+        provisioner.retry_failed_setup();
+        assert!(provisioner.failed_setup.lock().is_empty());
+        assert_eq!(committed(&memory), 0);
+        assert_eq!(*backing.charges_at_release.lock(), vec![4096, 4096]);
     }
 }

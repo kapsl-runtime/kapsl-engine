@@ -109,6 +109,23 @@ pub(crate) struct ProvisionedSharedPools {
     pub(crate) memory_lease: Option<MemoryLease>,
 }
 
+impl Drop for ProvisionedSharedPools {
+    fn drop(&mut self) {
+        let Some(mut lease) = self.memory_lease.take() else {
+            return;
+        };
+        // A provisioned result has not reached a participant until validated
+        // and transferred into SharedPoolSet. Its imported-user set is empty.
+        if let Err(error) = self.backing.release_after_fence() {
+            lease.commit_capacity();
+            log::error!(
+                "[kv-control] rejected setup retained backing and authority grant: {error}"
+            );
+            std::mem::forget((self.backing.clone(), lease));
+        }
+    }
+}
+
 /// Transport-specific provider boundary. A CUDA IPC implementation must
 /// allocate an isolated exportable allocation per participant; exporting the
 /// runtime's process-wide CUDA pool would violate model/session isolation. The
@@ -163,6 +180,20 @@ struct SharedPoolSet {
     state: Mutex<SharedPoolAllocatorState>,
     backing: Arc<dyn SharedPoolBacking>,
     memory_lease: Option<Mutex<MemoryLease>>,
+    backing_released: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for SharedPoolSet {
+    fn drop(&mut self) {
+        if !self.backing_released.load(Ordering::Acquire) {
+            if let Some(lease) = self.memory_lease.take() {
+                // Destroying the coordinator is not proof that a remote CUDA
+                // context has stopped. Keep the charge with the backing.
+                log::error!("[kv-control] shared pool dropped without fenced retirement; backing and grant retained");
+                std::mem::forget((self.backing.clone(), lease));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -221,7 +252,7 @@ impl SharedPoolSet {
             .collect::<HashMap<_, _>>();
 
         let mut bindings_by_pool = HashMap::<String, Vec<KvSharedPoolDescriptor>>::new();
-        for descriptor in provisioned.descriptors {
+        for descriptor in std::mem::take(&mut provisioned.descriptors) {
             bindings_by_pool
                 .entry(descriptor.capacity_pool_id.clone())
                 .or_default()
@@ -308,13 +339,16 @@ impl SharedPoolSet {
                 quarantined_by_pool,
                 mapped_blocks_by_pool,
             }),
-            backing: provisioned.backing,
+            backing: provisioned.backing.clone(),
             memory_lease,
+            backing_released: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     fn release_backing_after_fence(&self) -> Result<(), KvContractError> {
-        self.backing.release_after_fence()
+        self.backing.release_after_fence()?;
+        self.backing_released.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn elastic_shape(&self) -> Result<ElasticPoolShape<'_>, KvContractError> {
@@ -4684,6 +4718,47 @@ mod tests {
         assert_eq!(coordinator.participant_count(), 0);
         assert_eq!(kv_snapshot_bytes(&memory), (0, 0));
         assert_eq!(backing.release_attempts.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn coordinator_drop_is_not_an_importer_fence_or_permission_to_release_a_grant() {
+        let (memory, coordinator, backing, _registration, _receipt) = elastic_coordinator();
+        drop(coordinator);
+        assert_eq!(backing.release_attempts.load(Ordering::Acquire), 0);
+        assert_eq!(backing.mapped_blocks.load(Ordering::Acquire), 4);
+        assert_eq!(kv_snapshot_bytes(&memory), (4 * 4096, 4 * 4096));
+    }
+
+    #[test]
+    fn rejected_unpublished_backing_releases_its_grant_only_after_cleanup() {
+        for fail in [false, true] {
+            let memory = test_memory();
+            let mut plan = MemoryPlan::new();
+            plan.push(MemoryClaim::external(
+                MemoryDomain::Host,
+                MemoryOwner::new(99, 1),
+                MemoryAllocationClass::KvCache,
+                "rejected-setup",
+                4096,
+            ));
+            let lease = memory.admit(&plan).unwrap();
+            let backing = Arc::new(TestElasticBacking::default());
+            backing.mapped_blocks.store(1, Ordering::Release);
+            backing.fail_release.store(fail, Ordering::Release);
+            drop(ProvisionedSharedPools {
+                descriptors: Vec::new(),
+                backing: backing.clone(),
+                memory_lease: Some(lease),
+            });
+            assert_eq!(backing.release_attempts.load(Ordering::Acquire), 1);
+            if fail {
+                assert_eq!(backing.mapped_blocks.load(Ordering::Acquire), 1);
+                assert_eq!(kv_snapshot_bytes(&memory), (4096, 4096));
+            } else {
+                assert_eq!(backing.mapped_blocks.load(Ordering::Acquire), 0);
+                assert_eq!(kv_snapshot_bytes(&memory), (0, 0));
+            }
+        }
     }
 
     #[test]
