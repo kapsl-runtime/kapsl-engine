@@ -672,6 +672,7 @@ impl RuntimeMonitor {
         let mut cotenancy_exporter =
             cotenancy_guard.then(|| CotenancyCeilingExporter::new(&registry));
         let memory_exporter = MemorySnapshotExporter::new(&registry);
+        let gpu_region_metrics = GpuRegionMetrics::new(&registry);
 
         let task = tokio::spawn(async move {
             let pid = Pid::from_u32(std::process::id());
@@ -757,6 +758,7 @@ impl RuntimeMonitor {
                 }
                 let memory_snapshot = memory.snapshot();
                 memory_exporter.observe(&memory_snapshot);
+                gpu_region_metrics.observe(&memory.gpu_region_snapshots());
                 let next_state = evaluate_authority_pressure_state(
                     &memory_snapshot,
                     snapshot.gpu_utilization,
