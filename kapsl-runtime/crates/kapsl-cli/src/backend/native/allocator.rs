@@ -151,9 +151,12 @@ impl NativeBackendHost {
         }
         #[cfg(feature = "gpu-device-pool")]
         {
-            let pool = resources.device_pool(device_id as usize).ok_or_else(|| format!(
-                "native {backend} pack requires governed device memory, but device {device_id} has no runtime-owned pool"
-            ))?;
+            if resources.device_pool(device_id as usize).is_none() {
+                return Err(format!(
+                    "native {backend} pack requires governed device memory, but device {device_id} has no runtime-owned pool"
+                ));
+            }
+            let pool = resources.memory().gpu_device_pool(device_id as usize)?;
             let allocator = Arc::new(GpuAllocator {
                 pool,
                 backend: pool_backend(backend),
@@ -794,9 +797,9 @@ unsafe extern "C" fn synchronize_device(user_data: *mut c_void, device_id: u32) 
 }
 
 #[cfg(feature = "gpu-device-pool")]
-use kapsl_hal::gpu_arena::{
-    GpuAllocation, GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner,
-};
+use crate::runtime::memory::gpu_pool::{GpuAllocationLease, GpuDevicePool, GpuRegionRequest};
+#[cfg(feature = "gpu-device-pool")]
+use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolBackend, PoolOwner};
 
 #[cfg(feature = "gpu-device-pool")]
 fn pool_backend(backend: &str) -> PoolBackend {
@@ -817,8 +820,7 @@ struct GpuAllocator {
 
 #[cfg(feature = "gpu-device-pool")]
 struct GpuStorage {
-    pool: Arc<GpuDevicePool>,
-    allocation: GpuAllocation,
+    allocation: GpuAllocationLease,
 }
 
 #[cfg(feature = "gpu-device-pool")]
@@ -838,29 +840,15 @@ impl DeviceAllocator for GpuAllocator {
             _ => return Err("unknown device allocation class".into()),
         };
         let owner = PoolOwner::new(self.backend, self.model_id, self.replica_id, class);
-        if !self.pool.is_owner_admitted(owner) {
-            return Err(format!(
-                "native device owner {owner:?} has no engine memory admission"
-            ));
-        }
-        // The engine holds this owner's memory lease through unload. The pool
-        // atomically enforces its aggregate quota and other owners' guarantees.
-        let allocation = self
-            .pool
-            .alloc(owner, bytes, alignment)
-            .map_err(|e| e.to_string())?;
-        // The HAL aligns offsets in its arena; validate the absolute address
-        // as well before publishing an alignment promise through the ABI.
-        let pointer = self.pool.allocation_ptr(&allocation) as usize;
-        if pointer == 0 || !pointer.is_multiple_of(alignment) {
-            self.pool.free(allocation).map_err(|e| e.to_string())?;
-            return Err("device pool cannot satisfy the requested pointer alignment".into());
-        }
-        Ok(Box::new(GpuStorage {
-            pool: Arc::clone(&self.pool),
-            allocation,
-        }))
+        let region = self.pool.acquire_region(GpuRegionRequest::Local {
+            owner,
+            bytes,
+            alignment,
+        })?;
+        let allocation = region.allocate(owner, bytes, alignment)?;
+        Ok(Box::new(GpuStorage { allocation }))
     }
+
     fn synchronize(&self) -> Result<(), String> {
         self.pool
             .device()
@@ -879,15 +867,15 @@ impl DeviceAllocator for GpuAllocator {
 #[cfg(feature = "gpu-device-pool")]
 impl DeviceAllocation for GpuStorage {
     fn pointer(&self) -> usize {
-        self.pool.allocation_ptr(&self.allocation) as usize
+        self.allocation.pointer().unwrap_or(0)
     }
     fn bytes(&self) -> usize {
         self.allocation.bytes()
     }
     fn free(&self) -> Result<(), String> {
-        self.pool
-            .free(self.allocation.clone())
-            .map_err(|e| e.to_string())
+        // SAFETY: GovernedDeviceHost fences every CUDA context user before
+        // releasing these allocations, including backend nonblocking streams.
+        unsafe { self.allocation.release_after_fence() }
     }
 }
 

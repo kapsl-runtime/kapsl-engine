@@ -1,11 +1,12 @@
 # One GPU allocation model, multiple backing regions
 
-Status: incremental implementation. The runtime now implements the first migration
-step: per-device region identity and physical snapshots for the existing arena,
-IPC, and VMM backings. The SDK now also contains the HAL region extraction and
-an arena compatibility alias, pending release and engine adoption. The common
-per-device allocation interface remains a target architecture. The initial scope
-is Kapsl-managed CUDA memory.
+Status: incremental implementation. The runtime has one `GpuDevicePool` per
+managed CUDA device, owning HAL 0.3.2 arena, IPC and VMM regions. Region selection,
+local allocation leases and exported-region adapters use this common interface.
+Existing arena callbacks and llama.cpp's single-base KV view remain compatibility
+paths. The engine pins the published HAL 0.3.2 package and registry checksum.
+Automatic multi-arena capacity policy and hardware qualification are still
+pending. The scope is Kapsl-managed CUDA memory.
 
 ## The model
 
@@ -303,14 +304,14 @@ lower latency, remove fragmentation, or provide live compaction.
 1. **Introduce common region identity and snapshots (implemented).** Register the existing arena,
    IPC, and VMM allocations through `DeviceMemoryManager`, preserving allocation
    behavior and ownership charges. Extend owner attribution to exported workloads.
-2. **Extract reusable physical regions into HAL (SDK implementation prepared).** Move allocation, mapping,
+2. **Extract reusable physical regions into HAL (implemented in HAL 0.3.2).** Move allocation, mapping,
    export, and release primitives behind capability-aware region implementations.
    Keep KV descriptors and participant coordination in the engine. Ship the SDK
    changes before updating the engine's published crate dependencies.
-3. **Generalize the per-device allocation facade.** Make region selection and
+3. **Generalize the per-device allocation facade (implemented).** Make region selection and
    allocation handles consistent, preserving a single-arena compatibility view
    for existing HAL consumers. Avoid introducing another independent budget ledger.
-4. **Route existing adapters through the facade.** Keep llama.cpp's KV view pinned
+4. **Route existing adapters through the facade (implemented with compatibility views).** Keep llama.cpp's KV view pinned
    to a compatible arena, retain ONNX allocator callbacks, and retain the vLLM
    control protocol and native block allocator.
 5. **Add capacity policy separately.** Evaluate more local regions, warm-region
@@ -325,18 +326,18 @@ queued inference work. API consistency alone is not a performance result.
 
 ## Implemented runtime observation layer
 
-Each managed CUDA device now has a `GpuRegionRegistry`, including devices with no
-local arena. Registration gives each backing a process-local, opaque identity.
+Each managed CUDA device has a `GpuDevicePool` containing a `GpuRegionRegistry`,
+including devices with no local arena. Registration gives each backing a
+process-local, opaque identity.
 Rematerializing an arena or provisioning another participant generation creates
 a new identity. IPC and VMM snapshots include the participant, binding, owner,
 and participant generation; arena snapshots retain scoped backend, owner, and
 allocation-class usage, including explicitly unattributed provider callbacks.
 
-This first layer observes the existing backing owners through weak registrations.
-It does not replace the HAL allocator, acquire a second authority lease, select
-regions for new allocations, or change worker retirement/resize coordination.
-Exported backing observations share state without retaining the CUDA allocation,
-so a telemetry sample cannot postpone cleanup beyond the existing authority lease.
+The observation layer uses weak registrations into the pool's owned region
+catalog. It acquires no additional authority lease. Retirement excludes new
+observations and waits for active samples before dropping physical storage and
+releasing its charge. Failed retirement leaves the region visible and charged.
 Snapshots are sampled separately from admission accounting, without holding the
 registry or authority mutation lock across backing operations. They are per-region
 observations, not an atomic device-wide budget transaction.
@@ -370,7 +371,7 @@ cleanup. The existing KV coordinator tests continue to cover provisional grants,
 resize acknowledgments, rollback, and failed-release quarantine. CUDA hardware
 validation is still required for address stability, isolation, and resize latency.
 
-## HAL extraction prepared for release
+## HAL physical regions
 
 The SDK now provides `GpuArenaRegion`, `GpuIpcRegion`, and `GpuVmmRegion`, with
 backend-neutral capabilities, physical snapshots, errors and segment identities.
@@ -394,19 +395,60 @@ no dependency on the KV ABI or `MemoryAuthority`. Its exported observation handl
 share state without prolonging physical backing lifetime.
 
 The source and lifecycle contract are documented in
-`kapsl-sdk/crates/kapsl-hal/README.md`. The SDK candidate must be assigned and
-published under a new version before replacing the engine's existing physical
-implementation and updating its published crate dependency. Engine adoption and
-the common allocation facade are still pending; this preparation does not claim
-CUDA hardware qualification.
+`kapsl-sdk/crates/kapsl-hal/README.md`. The engine pins
+[HAL 0.3.2 on crates.io](https://crates.io/crates/kapsl-hal/0.3.2), published from
+the merged SDK source tagged
+[`kapsl-hal-v0.3.2`](https://github.com/kapsl-runtime/kapsl-sdk/tree/kapsl-hal-v0.3.2).
+The downloaded crate matches the uploaded archive and records the merged source
+commit. The KV adapter retains wire segment identities and descriptor ordering
+while delegating CUDA allocation, initialization, export and release to HAL.
+
+## Implemented allocation facade
+
+`runtime::memory::gpu_pool::GpuDevicePool` owns multiple region records per
+device. A local request supplies workload ownership, size and alignment and
+selects an admitted arena with ready capacity. It never creates or grows backing
+on an ordinary allocation. An explicit exported request creates dedicated IPC
+backing or reserves a VMM virtual range for one participant generation, after
+the provisioner obtains its authority grant. Free arena extents cannot satisfy
+that isolated export request.
+
+Opaque region leases pin backing and scope local allocations to their workload.
+Allocation leases carry nonreused identities, retain the physical region and
+require explicit fenced release. Foreign-pool leases, wrong workload owners and
+repeated releases are rejected. Failed frees retain their extent for retry;
+abandoning an allocation without a fence leaves it allocated and charged.
+
+The native governed allocator obtains region and allocation leases from the
+common pool. The llama.cpp adapter pins one arena for its existing `GpuKvPoolView`
+and allocates its block table through an allocation lease. ONNX's registered
+allocator callbacks continue using a pinned arena under the existing admission
+and client-retirement contract. No backend gains permission to export another
+workload's arena or replace vLLM's native block allocator.
+
+Arena reclamation requires empty backing, retired backend clients, no admission,
+and no outstanding region or compatibility views. The pool removes its catalog
+entry and waits for telemetry before physical destruction and budget release.
+Exported setup failures retain backing and grants together; subsequent provisioning
+retries cleanup before admitting new backing. Worker retirement and VMM shrink
+still require the existing acknowledgments and completion fences. Dropping a KV
+coordinator cannot stand in for those fences and retains unreleased backing and
+its charge.
+
+Host tests cover region compatibility, stale and foreign leases, reused pointer
+addresses, failed frees, cleanup retries, shutdown retention and concurrent
+telemetry retirement. CUDA hardware validation remains required for actual
+address stability, cross-process isolation and resize behavior under load.
 
 ## Current implementation references
 
 - [Device pool ownership and lifecycle](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/device.rs)
+- [Common per-device pool and leases](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/gpu_pool.rs)
 - [Runtime region identity and snapshots](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/gpu_regions.rs)
 - [Region metrics](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/gpu_region_metrics.rs)
 - [Device budget ledger](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/device_budget.rs)
 - [Exported IPC and VMM backing](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/gpu_shared_pool.rs)
+- [KV descriptor adapters over HAL regions](../kapsl-runtime/crates/kapsl-cli/src/runtime/memory/gpu_shared_pool/regions.rs)
 - [KV backing and provisioner contracts](../kapsl-runtime/crates/kapsl-cli/src/runtime/kv/control.rs)
 - [llama.cpp shared-pool adapter](../kapsl-runtime/crates/kapsl-cli/src/backend/llama_cpp/shared_pool.rs)
 - [Native allocator bridge](../kapsl-runtime/crates/kapsl-cli/src/backend/native/allocator.rs)

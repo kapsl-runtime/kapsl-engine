@@ -1,13 +1,12 @@
 use super::device_budget::{
     choose_auto_pool_capacity, AutoPoolSizingDecision, AutoPoolSizingInput, DeviceBudgetLedger,
 };
-use super::gpu_regions::{
-    GpuRegionId, GpuRegionIsolation, GpuRegionKind, GpuRegionOwnerUsage, GpuRegionRegistry,
-    GpuRegionSource, GpuRegionUsage,
-};
+use super::gpu_pool::{GpuDevicePool, GpuRegionLease};
+use super::gpu_regions::{GpuRegionOwnerUsage, GpuRegionSource, GpuRegionUsage};
 use super::*;
 use cudarc::driver::{result as cuda_result, CudaDevice};
-use kapsl_hal::gpu_arena::{GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner};
+use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolBackend, PoolOwner};
+use kapsl_hal::gpu_arena_region::GpuArenaRegion;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,7 +18,7 @@ const RELEASE_RETRY_ATTEMPTS: usize = 400;
 
 struct DeviceAuthority {
     cuda: Arc<CudaDevice>,
-    regions: GpuRegionRegistry,
+    regions: Arc<GpuDevicePool>,
     load_lock: Arc<AsyncMutex<()>>,
     pool_init_lock: Mutex<()>,
     pool_mode: DevicePoolMode,
@@ -28,7 +27,7 @@ struct DeviceAuthority {
     implicit_auto_attempted: AtomicBool,
 }
 
-impl GpuRegionSource for GpuDevicePool {
+impl GpuRegionSource for GpuArenaRegion {
     fn region_usage(&self) -> Option<GpuRegionUsage> {
         Some(arena_region_usage(self.snapshot()))
     }
@@ -167,15 +166,17 @@ struct ExternalReservation {
 }
 
 struct ManagedDevicePool {
-    backing: Arc<GpuDevicePool>,
+    region: GpuRegionLease,
     clients: Arc<PoolClients>,
 }
 
 impl std::ops::Deref for ManagedDevicePool {
-    type Target = GpuDevicePool;
+    type Target = GpuArenaRegion;
 
     fn deref(&self) -> &Self::Target {
-        &self.backing
+        self.region
+            .arena()
+            .expect("managed arena remains registered")
     }
 }
 
@@ -241,8 +242,8 @@ impl DeviceMemoryManager {
             devices.insert(
                 device.id,
                 DeviceAuthority {
+                    regions: GpuDevicePool::new(cuda.clone()),
                     cuda,
-                    regions: GpuRegionRegistry::new(device.id),
                     load_lock: Arc::new(AsyncMutex::new(())),
                     pool_init_lock: Mutex::new(()),
                     pool_mode,
@@ -528,7 +529,22 @@ impl DeviceMemoryManager {
                 "cannot rematerialize automatic CUDA pool on device {device_id}: backend clients are still live"
             ));
         }
-        self.pools.lock().unwrap().remove(&device_id);
+        {
+            let mut pools = self.pools.lock().unwrap();
+            if Arc::strong_count(&pool) != 2 {
+                return Err("arena still has a runtime observer; retry capacity change".into());
+            }
+            pools.remove(&device_id);
+        }
+        match authority.regions.retire_arena(&pool.region) {
+            Ok(true) => {}
+            result => {
+                self.pools.lock().unwrap().insert(device_id, pool);
+                return Err(result.err().unwrap_or_else(|| {
+                    "arena still has live region or compatibility leases".into()
+                }));
+            }
+        }
         if let Some(metrics) = self.metrics.lock().unwrap().clone() {
             metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
         }
@@ -624,7 +640,7 @@ impl DeviceMemoryManager {
             .lock()
             .unwrap()
             .set_pooled_bytes(device_id, capacity)?;
-        let pool = match GpuDevicePool::new(Arc::clone(&authority.cuda), capacity) {
+        let pool = match GpuArenaRegion::new(Arc::clone(&authority.cuda), capacity) {
             Ok(pool) => Arc::new(pool),
             Err(error) => {
                 let _ = self
@@ -646,15 +662,22 @@ impl DeviceMemoryManager {
                 ));
             }
         };
-        authority.regions.register(
-            GpuRegionKind::Arena,
-            GpuRegionIsolation::Local,
-            &(pool.clone() as Arc<dyn GpuRegionSource>),
-        );
+        let region = match authority.regions.install_arena(pool) {
+            Ok(region) => region,
+            Err(error) => {
+                // install_arena consumes and drops rejected backing before its
+                // physical charge can be rolled back.
+                self.budget
+                    .lock()
+                    .unwrap()
+                    .set_pooled_bytes(device_id, previous.pooled_bytes)?;
+                return Err(error);
+            }
+        };
         self.pools.lock().unwrap().insert(
             device_id,
             Arc::new(ManagedDevicePool {
-                backing: pool,
+                region,
                 clients: Arc::new(PoolClients::default()),
             }),
         );
@@ -695,10 +718,9 @@ impl DeviceMemoryManager {
             .lock()
             .unwrap()
             .iter()
-            .map(|(&device_id, pool)| (device_id, Arc::clone(pool)))
+            .map(|(&device_id, pool)| (device_id, pool.snapshot()))
             .collect();
-        for (device_id, pool) in pools {
-            let snapshot = pool.snapshot();
+        for (device_id, snapshot) in pools {
             metrics.set_gpu_device_pool_metrics(
                 &device_id.to_string(),
                 &pool_snapshot_metrics(snapshot),
@@ -707,19 +729,19 @@ impl DeviceMemoryManager {
     }
 
     #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn pool(&self, device_id: usize) -> Option<Arc<GpuDevicePool>> {
+    pub(crate) fn pool(&self, device_id: usize) -> Option<Arc<GpuArenaRegion>> {
         self.pools
             .lock()
             .unwrap()
             .get(&device_id)
-            .map(|pool| pool.backing.clone())
+            .map(|pool| pool.region.arena().expect("managed arena is live").clone())
     }
 
     pub(crate) fn acquire_pool_client(
         self: &Arc<Self>,
         device_id: usize,
         client: &'static str,
-        register: impl FnOnce(&Arc<GpuDevicePool>) -> Result<PoolClientCleanup, String>,
+        register: impl FnOnce(&Arc<GpuArenaRegion>) -> Result<PoolClientCleanup, String>,
     ) -> Result<Option<PoolClientLease>, String> {
         let Some(authority) = self.devices.get(&device_id) else {
             return Ok(None);
@@ -730,7 +752,7 @@ impl DeviceMemoryManager {
         };
         let manager = Arc::downgrade(self);
         pool.clients
-            .acquire(client, || register(&pool.backing))
+            .acquire(client, || register(pool.region.arena()?))
             .map(|lease| {
                 Some(lease.on_release(move || {
                     if let Some(manager) = manager.upgrade() {
@@ -779,19 +801,10 @@ impl DeviceMemoryManager {
             .collect()
     }
 
-    #[cfg(any(target_os = "linux", test))]
-    pub(crate) fn register_region(
-        &self,
-        device_id: usize,
-        kind: GpuRegionKind,
-        isolation: GpuRegionIsolation,
-        backing: &Arc<dyn GpuRegionSource>,
-    ) -> Result<GpuRegionId, String> {
-        let authority = self
-            .devices
+    pub(crate) fn device_pool(&self, device_id: usize) -> Option<Arc<GpuDevicePool>> {
+        self.devices
             .get(&device_id)
-            .ok_or_else(|| format!("CUDA device {device_id} is not managed by this runtime"))?;
-        Ok(authority.regions.register(kind, isolation, backing))
+            .map(|authority| authority.regions.clone())
     }
 
     pub(crate) fn region_snapshots(&self) -> Vec<GpuRegionSnapshot> {
@@ -810,11 +823,11 @@ impl DeviceMemoryManager {
             .lock()
             .unwrap()
             .iter()
-            .map(|(&device_id, pool)| (device_id, Arc::clone(pool)))
+            .map(|(&device_id, pool)| (device_id, pool.snapshot()))
             .collect();
         let mut claims = Vec::new();
-        for (device_id, pool) in pools {
-            for owner in pool.snapshot().owners {
+        for (device_id, snapshot) in pools {
+            for owner in snapshot.owners {
                 let (Some(model_id), Some(replica_id)) =
                     (owner.owner.model_id(), owner.owner.replica_id())
                 else {
@@ -844,7 +857,8 @@ impl DeviceMemoryManager {
                 claim.domain
             ));
         };
-        let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
+        let pools = self.pools.lock().unwrap();
+        let Some(pool) = pools.get(&device_id) else {
             return Err(format!(
                 "runtime-managed CUDA claim for {} targets device {} without a physical pool",
                 claim.owner, device_id
@@ -1362,6 +1376,7 @@ impl DeviceMemoryManager {
                     device_id
                 );
                 drop(refs);
+                drop(pool);
                 self.try_reclaim_pool(device_id);
                 true
             }
@@ -1412,7 +1427,19 @@ impl DeviceMemoryManager {
                 return;
             }
         }
-        self.pools.lock().unwrap().remove(&device_id);
+        {
+            let mut pools = self.pools.lock().unwrap();
+            if Arc::strong_count(&pool) != 2 {
+                return;
+            }
+            pools.remove(&device_id);
+        }
+        if !matches!(authority.regions.retire_arena(&pool.region), Ok(true)) {
+            self.pools.lock().unwrap().insert(device_id, pool);
+            return;
+        }
+        // Physical Drop and trimming complete before the authority charge is removed.
+        drop(pool);
         if let Some(metrics) = self.metrics.lock().unwrap().clone() {
             metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
         }
@@ -1804,7 +1831,7 @@ fn pool_snapshot_metrics(
 }
 
 fn configured_quota(
-    pool: &GpuDevicePool,
+    pool: &GpuArenaRegion,
     owner: PoolOwner,
     device_id: usize,
 ) -> Result<(usize, usize), String> {
