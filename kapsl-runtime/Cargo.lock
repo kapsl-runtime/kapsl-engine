@@ -2515,9 +2515,9 @@ dependencies = [
 
 [[package]]
 name = "kapsl-hal"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17c010312aa6fc8ce4d685d4325c3405a488966dd4d3d11b99edf7ebe947de5"
+checksum = "f41ab2e95a6d5652552771b4b976d8bcff029c0a654850be8dd48a093e40ceea"
 dependencies = [
  "cudarc",
  "half",

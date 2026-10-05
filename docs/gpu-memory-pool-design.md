@@ -1,12 +1,12 @@
 # One GPU allocation model, multiple backing regions
 
-Status: incremental implementation. This branch prepares one `GpuDevicePool` per
+Status: incremental implementation. The runtime has one `GpuDevicePool` per
 managed CUDA device, owning HAL 0.3.2 arena, IPC and VMM regions. Region selection,
 local allocation leases and exported-region adapters use this common interface.
 Existing arena callbacks and llama.cpp's single-base KV view remain compatibility
-paths. The SDK release is awaiting its required GitHub review; engine lockfile
-resolution and verification against the published package remain pending.
-Automatic multi-arena capacity policy and hardware qualification are still pending. The scope is Kapsl-managed CUDA memory.
+paths. The engine pins the published HAL 0.3.2 package and registry checksum.
+Automatic multi-arena capacity policy and hardware qualification are still
+pending. The scope is Kapsl-managed CUDA memory.
 
 ## The model
 
@@ -395,11 +395,12 @@ no dependency on the KV ABI or `MemoryAuthority`. Its exported observation handl
 share state without prolonging physical backing lifetime.
 
 The source and lifecycle contract are documented in
-`kapsl-sdk/crates/kapsl-hal/README.md`. The engine manifest targets HAL 0.3.2. Release is blocked on the required
-review of [SDK PR #165](https://github.com/kapsl-runtime/kapsl-sdk/pull/165); the
-engine lockfile must be resolved after publication. Host validation currently
-uses a temporary command-line path override to the exact SDK candidate, without
-a manifest override. Its KV adapter retains wire segment identities and descriptor ordering
+`kapsl-sdk/crates/kapsl-hal/README.md`. The engine pins
+[HAL 0.3.2 on crates.io](https://crates.io/crates/kapsl-hal/0.3.2), published from
+the merged SDK source tagged
+[`kapsl-hal-v0.3.2`](https://github.com/kapsl-runtime/kapsl-sdk/tree/kapsl-hal-v0.3.2).
+The downloaded crate matches the uploaded archive and records the merged source
+commit. The KV adapter retains wire segment identities and descriptor ordering
 while delegating CUDA allocation, initialization, export and release to HAL.
 
 ## Implemented allocation facade
