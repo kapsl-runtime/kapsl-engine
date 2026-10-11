@@ -24,6 +24,10 @@ gpu-device-pool = [
     "cudarc/cuda-12060",
     "kapsl-backends/onnx-cuda-pool",
     "kapsl-hal/cuda",
+    # Probe CUDA devices through NVML. `nvidia-smi` takes 1.4-1.8 s on Cloud
+    # Run L4, past the 800 ms probe timeout, which reported has_cuda=false.
+    # NVML failure falls back to the nvidia-smi probe.
+    "kapsl-hal/nvml",
 ]
 
 # Advanced backend profiles used by development and targeted deployments.
@@ -39,6 +43,7 @@ cc = "1"
 kapsl-grpc = { version = "0.3.0", optional = true }
 kapsl-core = "=0.3.1"
 kapsl-hal = "=0.3.2"
+nvml-wrapper = "0.10"
 kapsl-engine-api = "0.3.0"
 kapsl-backends = "0.3.0"
 kapsl-scheduler = "0.3.0"
