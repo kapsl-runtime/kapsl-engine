@@ -449,6 +449,82 @@ impl BackendTarget {
             driver_version: cuda.and_then(|device| device.driver_version.clone()),
         }
     }
+
+    /// Parse `<os>-<architecture>-<cpu|cuda|tensorrt>` into a synthetic target
+    /// that names a runtime family rather than a particular host.
+    pub(crate) fn from_triple(requested: &str) -> Result<Self, String> {
+        let (platform, accelerator) = [
+            ("-tensorrt", BackendAccelerator::TensorRt),
+            ("-cuda", BackendAccelerator::Cuda),
+            ("-cpu", BackendAccelerator::Cpu),
+        ]
+        .into_iter()
+        .find_map(|(suffix, accelerator)| {
+            requested
+                .strip_suffix(suffix)
+                .map(|platform| (platform.to_string(), accelerator))
+        })
+        .ok_or_else(|| {
+            format!(
+                "Invalid target `{requested}`; expected <os>-<architecture>-cpu, -cuda, or -tensorrt"
+            )
+        })?;
+        let architecture = platform
+            .rsplit_once('-')
+            .map(|(_, architecture)| architecture.to_string())
+            .ok_or_else(|| format!("Invalid target platform `{platform}`"))?;
+        Ok(Self {
+            platform,
+            architecture,
+            accelerator,
+            // A cross-target names a runtime family, not a particular host.
+            // Actual minimum versions are enforced again on bundle activation.
+            cuda_version: (accelerator != BackendAccelerator::Cpu).then(|| "999.0".to_string()),
+            driver_version: (accelerator != BackendAccelerator::Cpu).then(|| "9999.0".to_string()),
+        })
+    }
+}
+
+/// Whether `backend ensure` should plan for CUDA. An explicit target replaces
+/// hardware probing entirely.
+fn ensure_has_cuda(device_info: &DeviceInfo, requested: Option<&BackendTarget>) -> bool {
+    requested.map_or(device_info.has_cuda, |target| {
+        target.accelerator != BackendAccelerator::Cpu
+    })
+}
+
+fn ensure_onnx_profile(
+    manifest: &kapsl_core::Manifest,
+    device_info: &DeviceInfo,
+    requested: Option<&BackendTarget>,
+) -> Result<Option<OnnxBackendPackProfile>, String> {
+    match requested {
+        Some(target) => crate::backend::onnx_pack_profile_for_target(manifest, target.accelerator),
+        None => crate::backend::onnx_pack_profile_for_manifest(manifest, device_info),
+    }
+}
+
+fn ensure_llama_profile(
+    manifest: &kapsl_core::Manifest,
+    device_info: &DeviceInfo,
+    requested: Option<&BackendTarget>,
+) -> Option<LlamaCppBackendPackProfile> {
+    match requested {
+        Some(target) => {
+            crate::backend::llama_cpp_pack_profile_for_target(manifest, target.accelerator)
+        }
+        None => crate::backend::llama_cpp_pack_profile_for_manifest(manifest, device_info),
+    }
+}
+
+/// Constraints a signed pack declares, for comparison against a host later.
+fn describe_pack_constraints(pack: &BackendPackManifest) -> String {
+    format!(
+        "accelerator={} minimum_cuda={} minimum_driver={}",
+        pack.accelerator_profile,
+        pack.minimum_cuda.as_deref().unwrap_or("none"),
+        pack.minimum_driver.as_deref().unwrap_or("none"),
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2067,7 +2143,15 @@ pub(crate) fn execute_backend_command(
     match args.command {
         crate::app::BackendSubcommand::Ensure(args) => {
             let device_info = DeviceInfo::probe();
-            let target = BackendTarget::current(&device_info);
+            let requested = args
+                .target
+                .as_deref()
+                .map(BackendTarget::from_triple)
+                .transpose()?;
+            let target = requested
+                .clone()
+                .unwrap_or_else(|| BackendTarget::current(&device_info));
+            let has_cuda = ensure_has_cuda(&device_info, requested.as_ref());
             let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;
             let manager = BackendManager::from_env(args.offline)?;
             let mut ensured = HashSet::<(String, String)>::new();
@@ -2080,8 +2164,7 @@ pub(crate) fn execute_backend_command(
                 })?;
                 let manifest = crate::backend::inspect_serving_manifest(&absolute)?;
                 crate::backend::validate_model_contract(&manifest)?;
-                let decision =
-                    crate::backend::resolve_serving_backend(&manifest, device_info.has_cuda)?;
+                let decision = crate::backend::resolve_serving_backend(&manifest, has_cuda)?;
                 crate::backend::validate_runtime_serving_backend(&manifest, decision)?;
                 let memory = crate::backend::preliminary_memory_admission(
                     &absolute,
@@ -2089,7 +2172,11 @@ pub(crate) fn execute_backend_command(
                     decision,
                     &device_info,
                 )?;
-                if memory.status == crate::backend::MemoryAdmissionStatus::Rejected {
+                // An explicit target is prepared on a host that need not own the
+                // accelerator, so admission is deferred to the serving host.
+                if requested.is_none()
+                    && memory.status == crate::backend::MemoryAdmissionStatus::Rejected
+                {
                     return Err(format!(
                         "preliminary memory admission rejected `{}` before backend download: {}",
                         manifest.project_name, memory.reason
@@ -2098,8 +2185,14 @@ pub(crate) fn execute_backend_command(
                 }
                 let uses_onnx = kapsl_core::EngineKind::resolve(&manifest).uses_onnx_session();
                 let signed_onnx_route = crate::backend::generic_native_backend_packs_enabled()?;
+                let lazy_onnx = match requested.as_ref() {
+                    Some(target) => {
+                        crate::backend::onnx_lazy_packs_supported_for_platform(&target.platform)
+                    }
+                    None => crate::backend::lazy_onnx_packs_enabled(),
+                };
                 let onnx_profile = if uses_onnx && signed_onnx_route {
-                    if !crate::backend::lazy_onnx_packs_enabled() {
+                    if !lazy_onnx {
                         return Err(format!(
                             "model `{}` requires a signed native backend pack, but ONNX pack installation is disabled or unsupported on {}; set {}=0 only for an explicit embedded ORT rollback",
                             manifest.project_name,
@@ -2108,12 +2201,18 @@ pub(crate) fn execute_backend_command(
                         )
                         .into());
                     }
-                    crate::backend::onnx_pack_profile_for_manifest(&manifest, &device_info)?
+                    ensure_onnx_profile(&manifest, &device_info, requested.as_ref())?
                 } else {
                     None
                 };
-                let llama_profile = if crate::backend::lazy_llama_cpp_packs_enabled() {
-                    crate::backend::llama_cpp_pack_profile_for_manifest(&manifest, &device_info)
+                let lazy_llama = match requested.as_ref() {
+                    Some(target) => crate::backend::llama_cpp_lazy_packs_supported_for_platform(
+                        &target.platform,
+                    ),
+                    None => crate::backend::lazy_llama_cpp_packs_enabled(),
+                };
+                let llama_profile = if lazy_llama {
+                    ensure_llama_profile(&manifest, &device_info, requested.as_ref())
                 } else {
                     None
                 };
@@ -2146,6 +2245,12 @@ pub(crate) fn execute_backend_command(
                             installed.display(),
                             plan.selection_reason
                         );
+                        if requested.is_some() {
+                            println!(
+                                "  constraints: {}",
+                                describe_pack_constraints(&plan.manifest)
+                            );
+                        }
                     }
                 } else if let Some(profile) = llama_profile {
                     let identity = ("llama-cpp".to_string(), profile.profile().to_string());
@@ -2157,20 +2262,22 @@ pub(crate) fn execute_backend_command(
                             llama_target.driver_version = None;
                         }
                         let plan = manager.plan_llama_cpp(profile, &llama_target)?;
-                        let admission = crate::backend::preliminary_llama_cpp_memory_admission(
-                            profile,
-                            &absolute,
-                            &manifest,
-                            &device_info,
-                            &plan.manifest,
-                            None,
-                        )?;
-                        if admission.status == crate::backend::MemoryAdmissionStatus::Rejected {
-                            return Err(format!(
-                                "preliminary memory admission rejected `{}` before backend download: {}",
-                                manifest.project_name, admission.reason
-                            )
-                            .into());
+                        if requested.is_none() {
+                            let admission = crate::backend::preliminary_llama_cpp_memory_admission(
+                                profile,
+                                &absolute,
+                                &manifest,
+                                &device_info,
+                                &plan.manifest,
+                                None,
+                            )?;
+                            if admission.status == crate::backend::MemoryAdmissionStatus::Rejected {
+                                return Err(format!(
+                                    "preliminary memory admission rejected `{}` before backend download: {}",
+                                    manifest.project_name, admission.reason
+                                )
+                                .into());
+                            }
                         }
                         let installed = manager.ensure_pack(&plan.manifest)?;
                         println!(
@@ -2178,6 +2285,12 @@ pub(crate) fn execute_backend_command(
                             profile.profile(),
                             installed.display()
                         );
+                        if requested.is_some() {
+                            println!(
+                                "  constraints: {}",
+                                describe_pack_constraints(&plan.manifest)
+                            );
+                        }
                     }
                 } else if uses_onnx && !signed_onnx_route {
                     let reason = crate::backend::embedded_onnx_rollback_reason(&manifest)?;
@@ -3736,5 +3849,122 @@ mod tests {
         assert!(version_at_least("13.0", "12.6"));
         assert!(version_at_least("580.10.2", "580.9"));
         assert!(!version_at_least("12.1", "12.10"));
+    }
+    fn no_gpu_device_info() -> DeviceInfo {
+        DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 0,
+            os_type: "test".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: false,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: Vec::new(),
+        }
+    }
+
+    fn cuda_preferring_onnx_manifest() -> kapsl_core::Manifest {
+        kapsl_core::Manifest {
+            project_name: "ensure-target-test".to_string(),
+            framework: "onnx".to_string(),
+            version: "1.0.0".to_string(),
+            created_at: "2026-08-25T00:00:00Z".to_string(),
+            format: Some("onnx".to_string()),
+            model_type: Some("embedding".to_string()),
+            task: Some("embed".to_string()),
+            model_file: "model.onnx".to_string(),
+            metadata: None,
+            hardware_requirements: kapsl_core::HardwareRequirements {
+                preferred_provider: Some("cuda".to_string()),
+                fallback_providers: vec!["cpu".to_string()],
+                ..kapsl_core::HardwareRequirements::default()
+            },
+            cron_jobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parses_explicit_target_triples() {
+        let cuda = BackendTarget::from_triple("linux-x86_64-cuda").unwrap();
+        assert_eq!(cuda.platform, "linux-x86_64");
+        assert_eq!(cuda.architecture, "x86_64");
+        assert_eq!(cuda.accelerator, BackendAccelerator::Cuda);
+        // Synthetic targets satisfy any minimum; packs declare the real floor.
+        assert_eq!(cuda.cuda_version.as_deref(), Some("999.0"));
+        assert_eq!(cuda.driver_version.as_deref(), Some("9999.0"));
+
+        let cpu = BackendTarget::from_triple("linux-aarch64-cpu").unwrap();
+        assert_eq!(cpu.platform, "linux-aarch64");
+        assert_eq!(cpu.accelerator, BackendAccelerator::Cpu);
+        assert_eq!(cpu.cuda_version, None);
+        assert_eq!(cpu.driver_version, None);
+
+        let trt = BackendTarget::from_triple("linux-x86_64-tensorrt").unwrap();
+        assert_eq!(trt.accelerator, BackendAccelerator::TensorRt);
+    }
+
+    #[test]
+    fn rejects_malformed_target_triples() {
+        for bad in ["", "cuda", "-cuda", "linux-x86_64", "linux-x86_64-rocm"] {
+            assert!(BackendTarget::from_triple(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_cuda_target_selects_cuda_pack_without_a_gpu() {
+        let info = no_gpu_device_info();
+        let manifest = cuda_preferring_onnx_manifest();
+        let target = BackendTarget::from_triple("linux-x86_64-cuda").unwrap();
+
+        assert!(ensure_has_cuda(&info, Some(&target)));
+        assert_eq!(
+            ensure_onnx_profile(&manifest, &info, Some(&target)).unwrap(),
+            Some(OnnxBackendPackProfile::Cuda12)
+        );
+    }
+
+    #[test]
+    fn no_target_keeps_probed_device_selection() {
+        let info = no_gpu_device_info();
+        let manifest = cuda_preferring_onnx_manifest();
+
+        assert!(!ensure_has_cuda(&info, None));
+        assert_eq!(
+            ensure_onnx_profile(&manifest, &info, None),
+            crate::backend::onnx_pack_profile_for_manifest(&manifest, &info)
+        );
+    }
+
+    #[test]
+    fn explicit_cpu_target_selects_cpu_pack_even_for_cuda_preferring_model() {
+        let info = no_gpu_device_info();
+        let manifest = cuda_preferring_onnx_manifest();
+        let target = BackendTarget::from_triple("linux-x86_64-cpu").unwrap();
+
+        assert!(!ensure_has_cuda(&info, Some(&target)));
+        assert_eq!(
+            ensure_onnx_profile(&manifest, &info, Some(&target)).unwrap(),
+            Some(OnnxBackendPackProfile::Cpu)
+        );
+    }
+
+    #[test]
+    fn describes_declared_pack_constraints() {
+        let (_root, _manager, mut pack, _signing) = fixture();
+        pack.accelerator_profile = "cuda".to_string();
+        pack.minimum_cuda = Some("12.0".to_string());
+        pack.minimum_driver = Some("525.60".to_string());
+        assert_eq!(
+            describe_pack_constraints(&pack),
+            "accelerator=cuda minimum_cuda=12.0 minimum_driver=525.60"
+        );
+        pack.accelerator_profile = "cpu".to_string();
+        pack.minimum_cuda = None;
+        pack.minimum_driver = None;
+        assert_eq!(
+            describe_pack_constraints(&pack),
+            "accelerator=cpu minimum_cuda=none minimum_driver=none"
+        );
     }
 }
