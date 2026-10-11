@@ -238,21 +238,33 @@ pub(crate) fn update_throughput(
     }
 }
 
-pub(crate) fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
-    let output = Command::new("nvidia-smi")
-        .args([
+/// Blocking GPU sample: NVML first (microseconds, no process spawn), then a
+/// bounded `nvidia-smi` call. Callers must run this off the async runtime; see
+/// [`GpuSampler`].
+pub(crate) fn sample_gpu_blocking(smi_timeout: Duration) -> Option<GpuSample> {
+    if let Some(rows) = nvml_device_rows() {
+        if let Some(sample) = aggregate_gpu_rows(rows, device_vram_cap_bytes) {
+            return Some(sample);
+        }
+    }
+    let stdout = run_command_with_timeout(
+        "nvidia-smi",
+        &[
             "--query-gpu=utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+        smi_timeout,
+    )?;
     aggregate_gpu_samples(&stdout, device_vram_cap_bytes)
+}
+
+pub(crate) fn production_gpu_sampler() -> GpuSampler {
+    let timeout = nvidia_smi_timeout();
+    GpuSampler::new(
+        Arc::new(move || sample_gpu_blocking(timeout)),
+        timeout,
+        GPU_SAMPLE_BACKOFF,
+    )
 }
 
 /// Parse `nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total` CSV
@@ -266,37 +278,44 @@ pub(crate) fn sample_nvidia_smi() -> Option<(f64, usize, usize)> {
 fn aggregate_gpu_samples(
     stdout: &str,
     cap_for_device: impl Fn(usize) -> Option<usize>,
-) -> Option<(f64, usize, usize)> {
+) -> Option<GpuSample> {
+    aggregate_gpu_rows(
+        stdout.lines().map(|line| {
+            let mut parts = line.split(',').map(str::trim);
+            let (util, mem_mb, mem_total_mb) = (parts.next()?, parts.next()?, parts.next()?);
+            Some((
+                util.parse::<f64>().ok()?,
+                (mem_mb.parse::<f64>().ok()? * 1024.0 * 1024.0) as usize,
+                (mem_total_mb.parse::<f64>().ok()? * 1024.0 * 1024.0) as usize,
+            ))
+        }),
+        cap_for_device,
+    )
+}
+
+/// Shared aggregation for both telemetry sources. Each row is
+/// `(utilization percent, used bytes, total bytes)` for the device at that
+/// position (`None` for an unreadable device, which keeps later indices
+/// aligned with the physical device index the cap lookup uses).
+fn aggregate_gpu_rows(
+    rows: impl IntoIterator<Item = Option<(f64, usize, usize)>>,
+    cap_for_device: impl Fn(usize) -> Option<usize>,
+) -> Option<GpuSample> {
     let mut total_util = 0.0;
     let mut total_mem_bytes: usize = 0;
     let mut total_mem_capacity_bytes: usize = 0;
     let mut count = 0.0;
 
-    for (device_index, line) in stdout.lines().enumerate() {
-        let mut parts = line.split(',');
-        let util_str = parts.next().map(|s| s.trim());
-        let mem_str = parts.next().map(|s| s.trim());
-        let mem_total_str = parts.next().map(|s| s.trim());
-        let (util_str, mem_str, mem_total_str) = match (util_str, mem_str, mem_total_str) {
-            (Some(util_str), Some(mem_str), Some(mem_total_str)) => {
-                (util_str, mem_str, mem_total_str)
-            }
-            _ => continue,
+    for (device_index, row) in rows.into_iter().enumerate() {
+        let Some((util, used_bytes, total_bytes)) = row else {
+            continue;
         };
-
-        if let (Ok(util), Ok(mem_mb), Ok(mem_total_mb)) = (
-            util_str.parse::<f64>(),
-            mem_str.parse::<f64>(),
-            mem_total_str.parse::<f64>(),
-        ) {
-            let mem_total_bytes = (mem_total_mb * 1024.0 * 1024.0) as usize;
-            let capped_total = cap_for_device(device_index)
-                .map_or(mem_total_bytes, |cap| mem_total_bytes.min(cap));
-            total_util += util;
-            total_mem_bytes = total_mem_bytes.saturating_add((mem_mb * 1024.0 * 1024.0) as usize);
-            total_mem_capacity_bytes = total_mem_capacity_bytes.saturating_add(capped_total);
-            count += 1.0;
-        }
+        let capped_total =
+            cap_for_device(device_index).map_or(total_bytes, |cap| total_bytes.min(cap));
+        total_util += util;
+        total_mem_bytes = total_mem_bytes.saturating_add(used_bytes);
+        total_mem_capacity_bytes = total_mem_capacity_bytes.saturating_add(capped_total);
+        count += 1.0;
     }
 
     if count == 0.0 {
@@ -322,20 +341,23 @@ fn aggregate_gpu_samples(
 /// Caveat: under CUDA MPS every client's memory is attributed to the MPS server
 /// PID, so per-process filtering collapses. In that mode callers should fall
 /// back to device-wide `memory.used` minus kapsl's own known block bytes.
-pub(crate) fn sample_foreign_vram() -> HashMap<usize, usize> {
-    let uuid_to_index = query_gpu_uuid_index();
+///
+/// Blocking: each `nvidia-smi` call is bounded by `smi_timeout`, and callers
+/// run it via [`sample_foreign_vram_async`].
+fn sample_foreign_vram(smi_timeout: Duration) -> HashMap<usize, usize> {
+    let uuid_to_index = query_gpu_uuid_index(smi_timeout);
     if uuid_to_index.is_empty() {
         return HashMap::new();
     }
-    let output = Command::new("nvidia-smi")
-        .args([
+    let Some(stdout) = run_command_with_timeout(
+        "nvidia-smi",
+        &[
             "--query-compute-apps=pid,process_name,used_memory,gpu_uuid",
             "--format=csv,noheader,nounits",
-        ])
-        .output();
-    let stdout = match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        _ => return HashMap::new(),
+        ],
+        smi_timeout,
+    ) else {
+        return HashMap::new();
     };
     // Under CUDA MPS every client's memory is attributed to the MPS server
     // process, so the per-PID split below cannot separate our own bytes from a
@@ -371,15 +393,23 @@ fn compute_apps_show_mps(stdout: &str) -> bool {
 /// Map each GPU's UUID to its device index. The compute-apps query reports a
 /// UUID rather than the index the rest of the runtime keys on, so this bridges
 /// the two. Empty on any failure.
-fn query_gpu_uuid_index() -> HashMap<String, usize> {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=uuid,index", "--format=csv,noheader,nounits"])
-        .output();
-    let stdout = match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        _ => return HashMap::new(),
-    };
-    parse_uuid_index(&stdout)
+fn query_gpu_uuid_index(smi_timeout: Duration) -> HashMap<String, usize> {
+    run_command_with_timeout(
+        "nvidia-smi",
+        &["--query-gpu=uuid,index", "--format=csv,noheader,nounits"],
+        smi_timeout,
+    )
+    .map(|stdout| parse_uuid_index(&stdout))
+    .unwrap_or_default()
+}
+
+/// [`sample_foreign_vram`] on the blocking pool. A timeout yields an empty map,
+/// the same "no co-tenant signal" a failed probe already produced.
+pub(crate) async fn sample_foreign_vram_async(smi_timeout: Duration) -> HashMap<usize, usize> {
+    // Two sequential bounded calls.
+    run_blocking_with_timeout(smi_timeout * 2, move || sample_foreign_vram(smi_timeout))
+        .await
+        .unwrap_or_default()
 }
 
 /// Parse `nvidia-smi --query-gpu=uuid,index` CSV into a UUID→index map. Split
@@ -678,7 +708,8 @@ impl RuntimeMonitor {
             let pid = Pid::from_u32(std::process::id());
             let mut system = System::new();
             let mut interval = tokio::time::interval(Duration::from_secs(2));
-            let mut nvidia_smi_retry_after: Option<Instant> = None;
+            let mut gpu_sampler = production_gpu_sampler();
+            let smi_timeout = nvidia_smi_timeout();
             system.refresh_memory();
             let total_system_memory_bytes = system_memory_bytes_from_sysinfo(system.total_memory());
 
@@ -698,43 +729,33 @@ impl RuntimeMonitor {
 
                 let now = Instant::now();
                 let (gpu_utilization, gpu_memory_bytes, gpu_memory_total_bytes) = if has_cuda {
-                    if nvidia_smi_retry_after.is_some_and(|retry_after| now < retry_after) {
-                        (0.0, None, None)
-                    } else {
-                        match sample_nvidia_smi() {
-                            Some((utilization, used_bytes, total_bytes)) => {
-                                nvidia_smi_retry_after = None;
-                                (utilization, Some(used_bytes), Some(total_bytes))
-                            }
-                            None => {
-                                nvidia_smi_retry_after = Some(now + Duration::from_secs(30));
-                                (0.0, None, None)
-                            }
+                    match gpu_sampler.sample(now).await {
+                        Some((utilization, used_bytes, total_bytes)) => {
+                            (utilization, Some(used_bytes), Some(total_bytes))
                         }
+                        None => (0.0, None, None),
                     }
                 } else {
                     (0.0, None, None)
                 };
 
-                let foreign_gpu_memory_bytes = if cotenancy_guard
-                    && has_cuda
-                    && nvidia_smi_retry_after.is_none_or(|retry_after| now >= retry_after)
-                {
-                    let foreign = sample_foreign_vram();
-                    let ceilings = memory.reconcile_external_device_memory(&foreign);
-                    if ceilings
-                        .iter()
-                        .any(|sample| sample.smoothed_bytes != sample.previous_bytes)
-                    {
-                        kv.rebalance_kv_caps();
-                    }
-                    if let Some(exporter) = cotenancy_exporter.as_mut() {
-                        exporter.observe(&ceilings);
-                    }
-                    Some(foreign.values().sum::<usize>())
-                } else {
-                    None
-                };
+                let foreign_gpu_memory_bytes =
+                    if cotenancy_guard && has_cuda && !gpu_sampler.backing_off(now) {
+                        let foreign = sample_foreign_vram_async(smi_timeout).await;
+                        let ceilings = memory.reconcile_external_device_memory(&foreign);
+                        if ceilings
+                            .iter()
+                            .any(|sample| sample.smoothed_bytes != sample.previous_bytes)
+                        {
+                            kv.rebalance_kv_caps();
+                        }
+                        if let Some(exporter) = cotenancy_exporter.as_mut() {
+                            exporter.observe(&ceilings);
+                        }
+                        Some(foreign.values().sum::<usize>())
+                    } else {
+                        None
+                    };
 
                 let snapshot = RuntimeSamples {
                     process_memory_bytes,
