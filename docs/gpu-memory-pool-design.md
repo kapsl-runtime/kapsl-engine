@@ -1,10 +1,10 @@
 # One GPU allocation model, multiple backing regions
 
 Status: incremental implementation. The runtime has one `GpuDevicePool` per
-managed CUDA device, owning HAL 0.3.2 arena, IPC and VMM regions. Region selection,
+managed CUDA device, owning HAL 0.3.3 arena, IPC and VMM regions. Region selection,
 local allocation leases and exported-region adapters use this common interface.
 Existing arena callbacks and llama.cpp's single-base KV view remain compatibility
-paths. The engine pins the published HAL 0.3.2 package and registry checksum.
+paths. The engine pins the published HAL 0.3.3 package and registry checksum.
 Automatic multi-arena capacity policy and hardware qualification are still
 pending. The scope is Kapsl-managed CUDA memory.
 
@@ -396,9 +396,9 @@ share state without prolonging physical backing lifetime.
 
 The source and lifecycle contract are documented in
 `kapsl-sdk/crates/kapsl-hal/README.md`. The engine pins
-[HAL 0.3.2 on crates.io](https://crates.io/crates/kapsl-hal/0.3.2), published from
+[HAL 0.3.3 on crates.io](https://crates.io/crates/kapsl-hal/0.3.3), published from
 the merged SDK source tagged
-[`kapsl-hal-v0.3.2`](https://github.com/kapsl-runtime/kapsl-sdk/tree/kapsl-hal-v0.3.2).
+[`kapsl-hal-v0.3.3`](https://github.com/kapsl-runtime/kapsl-sdk/tree/kapsl-hal-v0.3.3).
 The downloaded crate matches the uploaded archive and records the merged source
 commit. The KV adapter retains wire segment identities and descriptor ordering
 while delegating CUDA allocation, initialization, export and release to HAL.
