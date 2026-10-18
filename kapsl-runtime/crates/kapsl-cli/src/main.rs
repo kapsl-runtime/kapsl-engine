@@ -105,7 +105,19 @@ async fn main() -> Result<(), DynError> {
     observability::init()?;
     config.validate_and_log()?;
 
-    let device_info = Arc::new(DeviceInfo::probe());
+    let mut device_info = DeviceInfo::probe();
+    // kapsl-hal reads the CUDA version from `nvidia-smi`, which can exceed its
+    // probe timeout (Cloud Run L4: 1.4 s). Without a version, manifests with
+    // `min_cuda_version` reject the device, so fill it from NVML.
+    fill_cuda_versions(
+        device_info
+            .devices
+            .iter_mut()
+            .filter(|device| matches!(device.backend, kapsl_hal::device::DeviceBackend::Cuda))
+            .map(|device| &mut device.cuda_version),
+        nvml_cuda_version,
+    );
+    let device_info = Arc::new(device_info);
     RuntimeBootstrap::new(config, device_info)
         .prepare()
         .await?

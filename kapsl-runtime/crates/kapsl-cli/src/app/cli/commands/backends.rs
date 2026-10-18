@@ -29,6 +29,12 @@ pub(crate) struct BackendEnsureCommandArgs {
     /// Refuse network access and report any missing pack
     #[arg(long)]
     pub(crate) offline: bool,
+
+    /// Install the pack for this target without probing hardware, for example
+    /// linux-x86_64-cuda, linux-x86_64-cpu, or linux-x86_64-tensorrt. Intended
+    /// for image builds on hosts that lack the accelerator.
+    #[arg(long, value_name = "TARGET")]
+    pub(crate) target: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]

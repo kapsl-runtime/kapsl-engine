@@ -2,8 +2,10 @@
 
 use super::*;
 
+mod gpu_sampler;
 mod monitor;
 
+pub(crate) use gpu_sampler::*;
 pub(crate) use monitor::*;
 
 /// Shared pressure snapshot consumed by ingress and resource policy.

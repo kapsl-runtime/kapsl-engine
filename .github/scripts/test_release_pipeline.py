@@ -123,7 +123,7 @@ class PublishedSdkTests(TestCase):
         for name in ("kapsl-ipc", "kapsl-shm", "kapsl-transport"):
             self.assertEqual(sdk.EXPECTED_VERSIONS[name], "0.4.0")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-engine-api"], "0.3.0")
-        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-hal"], "0.3.2")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-hal"], "0.3.3")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-backend-abi"], "0.2.0")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-kv-abi"], "0.6.0")
 

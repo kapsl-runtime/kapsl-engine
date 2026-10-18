@@ -169,6 +169,26 @@ kapsl backend prune
 kapsl backend prune --old-versions
 ```
 
+### Installing a pack for a host you are not on
+
+`--target` selects the pack for a runtime family instead of probing hardware,
+so a GPU-less image build can pre-install the CUDA pack into
+`KAPSL_BACKEND_CACHE_DIR`:
+
+```bash
+KAPSL_BACKEND_CACHE_DIR=/opt/kapsl/backends \
+  kapsl backend ensure model.aimod --target linux-x86_64-cuda
+```
+
+Targets are `<os>-<architecture>-cpu`, `-cuda`, or `-tensorrt`. Signature and
+hash verification are unchanged. The command prints the installed path and the
+constraints the pack declares (`accelerator`, `minimum_cuda`,
+`minimum_driver`). The pack's minimums are not checked against the build host;
+compare the printed values with the serving host. Preliminary memory admission
+is also deferred to the serving host. Like `kapsl bundle --target`, an explicit
+target ignores the `KAPSL_LAZY_BACKENDS` switches and only requires that the
+target platform supports packaged adapters.
+
 ## Cache and installation safety
 
 The default cache is:
