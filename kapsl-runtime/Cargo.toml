@@ -6,7 +6,6 @@ members = [
 ]
 exclude = [
     "patches/esaxx-rs",
-    "patches/kapsl-hal",
     "tests/native-adapter",
 ]
 
@@ -17,4 +16,3 @@ rust-version = "1.92"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-kapsl-hal = { path = "patches/kapsl-hal" }
