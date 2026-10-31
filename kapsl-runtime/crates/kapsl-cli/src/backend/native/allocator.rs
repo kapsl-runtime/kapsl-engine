@@ -2,6 +2,10 @@
 //! in host-only tests; ABI validation, attribution and lifecycle are shared.
 
 use super::*;
+use crate::runtime::{
+    GovernedHostLease, MemoryAllocationClass as RuntimeMemoryClass, MemoryAuthority, MemoryOwner,
+};
+use std::alloc::Layout;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -40,6 +44,7 @@ struct AllocationScope {
 
 struct LiveAllocation {
     storage: Box<dyn DeviceAllocation>,
+    memory_kind: u32,
     class: u32,
     scope: Arc<AllocationScope>,
 }
@@ -97,7 +102,11 @@ impl AllocationLedger {
 }
 
 pub(super) struct GovernedDeviceHost {
-    allocator: Arc<dyn DeviceAllocator>,
+    /// Serves `KAPSL_MEMORY_CUDA`; absent for CPU packs.
+    device: Option<Arc<dyn DeviceAllocator>>,
+    /// Serves `KAPSL_MEMORY_HOST` when present. Frees still fence `device`,
+    /// since device work may be reading host staging memory.
+    host_memory: Option<Arc<dyn DeviceAllocator>>,
     device_id: u32,
     model_id: u32,
     replica_id: u32,
@@ -139,6 +148,7 @@ impl NativeBackendHost {
     pub(super) fn new(
         resources: &RuntimeResources,
         backend: &str,
+        provider: &str,
         device_id: usize,
         model_id: u32,
         replica_id: u32,
@@ -148,6 +158,22 @@ impl NativeBackendHost {
         let device_id = u32::try_from(device_id).map_err(|_| "device ID exceeds native ABI")?;
         if !require_governed {
             return Ok(Self::from_allocator(None));
+        }
+        let host_memory: Arc<dyn DeviceAllocator> = Arc::new(HostAllocator::new(
+            Arc::clone(resources.memory()),
+            model_id,
+            replica_id,
+        ));
+        if provider == "cpu" {
+            // CPU packs allocate only host memory, so they need no device pool.
+            return Ok(Self::with_allocator(
+                None,
+                Some(host_memory),
+                device_id,
+                model_id,
+                replica_id,
+                require_scoped,
+            ));
         }
         #[cfg(feature = "gpu-device-pool")]
         {
@@ -164,7 +190,8 @@ impl NativeBackendHost {
                 replica_id,
             });
             Ok(Self::with_allocator(
-                allocator,
+                Some(allocator),
+                Some(host_memory),
                 device_id,
                 model_id,
                 replica_id,
@@ -173,28 +200,22 @@ impl NativeBackendHost {
         }
         #[cfg(not(feature = "gpu-device-pool"))]
         {
-            let _ = (
-                resources,
-                backend,
-                device_id,
-                model_id,
-                replica_id,
-                require_scoped,
-            );
+            let _ = (backend, host_memory);
             Err("native pack requires governed device memory, but this runtime was built without GPU pool authority".into())
         }
     }
 
-    #[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
     pub(super) fn with_allocator(
-        allocator: Arc<dyn DeviceAllocator>,
+        device: Option<Arc<dyn DeviceAllocator>>,
+        host_memory: Option<Arc<dyn DeviceAllocator>>,
         device_id: u32,
         model_id: u32,
         replica_id: u32,
         require_scoped: bool,
     ) -> Self {
         Self::from_allocator(Some(Arc::new(GovernedDeviceHost {
-            allocator,
+            device,
+            host_memory,
             device_id,
             model_id,
             replica_id,
@@ -341,19 +362,26 @@ impl NativeBackendHost {
 
     pub(super) fn actual_memory(&self, mut report: MemoryReport) -> MemoryReport {
         use kapsl_engine_api::{MemoryAllocationClass as Class, MemoryDomain};
-        let Some(host) = &self.allocator else {
+        // Host-only instances own no device rows, so the adapter's stay.
+        let Some(host) = self.allocator.as_ref().filter(|host| host.device.is_some()) else {
             return report;
         };
         let domain = MemoryDomain::Cuda {
             device_id: host.device_id as usize,
         };
         // Governed device bytes come from the engine's live ledger. Adapter
-        // reports remain authoritative for its other memory domains.
+        // reports remain authoritative for its other memory domains. Governed
+        // host bytes hold their own host leases and are left out, so the
+        // model lease never charges them a second time.
         report
             .allocations
             .retain(|allocation| allocation.domain != domain);
         let ledger = host.ledger.lock().unwrap_or_else(|p| p.into_inner());
-        let mut allocations: Vec<_> = ledger.allocations.iter().collect();
+        let mut allocations: Vec<_> = ledger
+            .allocations
+            .iter()
+            .filter(|(_, allocation)| allocation.memory_kind == KAPSL_MEMORY_CUDA)
+            .collect();
         allocations.sort_by_key(|(id, _)| **id);
         for (id, allocation) in allocations {
             let scope = &allocation.scope;
@@ -374,6 +402,23 @@ impl NativeBackendHost {
 }
 
 impl GovernedDeviceHost {
+    /// The allocator serving `memory_kind`, if this instance governs it.
+    fn allocator_for(&self, memory_kind: u32) -> Option<&Arc<dyn DeviceAllocator>> {
+        match memory_kind {
+            KAPSL_MEMORY_CUDA => self.device.as_ref(),
+            KAPSL_MEMORY_HOST => self.host_memory.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Waits for device work that may still touch governed memory. Host-only
+    /// instances have none to wait for.
+    fn fence(&self) -> Result<(), String> {
+        self.device
+            .as_ref()
+            .map_or(Ok(()), |device| device.synchronize())
+    }
+
     pub(super) fn cancel(&self, id: u64) {
         if let Some(request) = self
             .ledger
@@ -551,18 +596,17 @@ impl GovernedDeviceHost {
         bytes: u64,
         alignment: u64,
     ) -> Result<KapslDeviceAllocationV1, String> {
-        if memory_kind != KAPSL_MEMORY_CUDA
-            || !matches!(
-                class,
-                KAPSL_ALLOCATION_CLASS_WEIGHTS
-                    | KAPSL_ALLOCATION_CLASS_WORKSPACE
-                    | KAPSL_ALLOCATION_CLASS_KV
-                    | KAPSL_ALLOCATION_CLASS_REQUEST
-                    | KAPSL_ALLOCATION_CLASS_OTHER
-            )
-        {
+        let supported_class = matches!(
+            class,
+            KAPSL_ALLOCATION_CLASS_WEIGHTS
+                | KAPSL_ALLOCATION_CLASS_WORKSPACE
+                | KAPSL_ALLOCATION_CLASS_KV
+                | KAPSL_ALLOCATION_CLASS_REQUEST
+                | KAPSL_ALLOCATION_CLASS_OTHER
+        );
+        let Some(allocator) = self.allocator_for(memory_kind).filter(|_| supported_class) else {
             return Err("unsupported device memory kind or allocation class".into());
-        }
+        };
         let bytes = usize::try_from(bytes).map_err(|_| "allocation bytes exceed this platform")?;
         let alignment =
             usize::try_from(alignment).map_err(|_| "allocation alignment exceeds this platform")?;
@@ -573,8 +617,7 @@ impl GovernedDeviceHost {
         let id = NEXT_ALLOCATION_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| "native allocation IDs exhausted")?;
-        let storage = self
-            .allocator
+        let storage = allocator
             .allocate(class, bytes, alignment)
             .map_err(|error| format!("device {} scope {scope:?}: {error}", self.device_id))?;
         let allocation = KapslDeviceAllocationV1 {
@@ -593,6 +636,7 @@ impl GovernedDeviceHost {
             id,
             LiveAllocation {
                 storage,
+                memory_kind,
                 class,
                 scope,
             },
@@ -616,7 +660,7 @@ impl GovernedDeviceHost {
         }
         // A successful free makes the range immediately reusable by another
         // model. Never rely on an adapter's declaration that it synchronized.
-        self.allocator.synchronize()?;
+        self.fence()?;
         allocation.storage.free()?;
         log::debug!(
             "native governed free id={} device={} class={} bytes={} scope={:?}",
@@ -641,7 +685,7 @@ impl GovernedDeviceHost {
             ledger.cleanup_pending = false;
             return Ok(());
         }
-        self.allocator.synchronize()?;
+        self.fence()?;
         let ids: Vec<_> = ledger.allocations.keys().copied().collect();
         let mut failure = None;
         for id in ids {
@@ -785,7 +829,7 @@ unsafe extern "C" fn synchronize_device(user_data: *mut c_void, device_id: u32) 
         if device_id != host.device_id {
             return KAPSL_STATUS_INVALID_ARGUMENT;
         }
-        match host.allocator.synchronize() {
+        match host.fence() {
             Ok(()) => KAPSL_STATUS_OK,
             Err(error) => {
                 log::error!("native device synchronization failed: {error}");
@@ -794,6 +838,86 @@ unsafe extern "C" fn synchronize_device(user_data: *mut c_void, device_id: u32) 
         }
     }))
     .unwrap_or(KAPSL_STATUS_PANIC)
+}
+
+/// Serves `KAPSL_MEMORY_HOST` from the process heap. Each allocation is
+/// admitted against the runtime's host budget before it is made, and its
+/// reservation is released only after the memory is.
+pub(super) struct HostAllocator {
+    memory: Arc<MemoryAuthority>,
+    owner: MemoryOwner,
+}
+
+impl HostAllocator {
+    pub(super) fn new(memory: Arc<MemoryAuthority>, model_id: u32, replica_id: u32) -> Self {
+        Self {
+            memory,
+            owner: MemoryOwner::new(model_id, replica_id),
+        }
+    }
+}
+
+struct HostStorage {
+    pointer: usize,
+    layout: Layout,
+    /// Taken by `free`, so a repeated free is an error, not a double free.
+    lease: Mutex<Option<GovernedHostLease>>,
+}
+
+impl DeviceAllocator for HostAllocator {
+    fn allocate(
+        &self,
+        class: u32,
+        bytes: usize,
+        alignment: usize,
+    ) -> Result<Box<dyn DeviceAllocation>, String> {
+        let class = match class {
+            KAPSL_ALLOCATION_CLASS_WEIGHTS => RuntimeMemoryClass::PersistentWeights,
+            KAPSL_ALLOCATION_CLASS_WORKSPACE => RuntimeMemoryClass::TransientWorkspace,
+            KAPSL_ALLOCATION_CLASS_KV => RuntimeMemoryClass::KvCache,
+            KAPSL_ALLOCATION_CLASS_REQUEST => RuntimeMemoryClass::RequestTransient,
+            KAPSL_ALLOCATION_CLASS_OTHER => RuntimeMemoryClass::ExternallyOwned,
+            _ => return Err("unknown host allocation class".into()),
+        };
+        let layout = Layout::from_size_align(bytes, alignment).map_err(|e| e.to_string())?;
+        let lease = self.memory.admit_governed_host(self.owner, class, bytes)?;
+        // SAFETY: allocate_locked rejects zero-byte requests, so the layout is non-empty.
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        if pointer.is_null() {
+            return Err(format!("host allocation of {bytes} bytes failed"));
+        }
+        Ok(Box::new(HostStorage {
+            pointer: pointer as usize,
+            layout,
+            lease: Mutex::new(Some(lease)),
+        }))
+    }
+
+    fn synchronize(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl DeviceAllocation for HostStorage {
+    fn pointer(&self) -> usize {
+        self.pointer
+    }
+    fn bytes(&self) -> usize {
+        self.layout.size()
+    }
+    fn free(&self) -> Result<(), String> {
+        let lease = self
+            .lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or("host allocation was already freed")?;
+        // SAFETY: allocated in HostAllocator::allocate with this layout, and
+        // taking the lease above makes this the only free.
+        unsafe { std::alloc::dealloc(self.pointer as *mut u8, self.layout) };
+        drop(lease);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "gpu-device-pool")]

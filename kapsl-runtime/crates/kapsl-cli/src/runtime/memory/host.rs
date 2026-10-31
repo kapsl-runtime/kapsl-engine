@@ -4,6 +4,7 @@ use crate::app::config::constants::KAPSL_CPU_MEMORY_LIMIT_MB_ENV;
 use crate::runtime::memory::{MemoryAllocationClass, MemoryClaim, MemoryDomain, MemoryOwner};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use sysinfo::{Pid, System};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -23,6 +24,9 @@ pub(crate) struct HostMemoryManager {
     budget: HostMemoryBudget,
     reservations: Mutex<HostReservations>,
     load_lock: Arc<AsyncMutex<()>>,
+    /// Bytes reserved for governed native allocations. They hold their own
+    /// leases, so load reconciliation must not attribute them to a model.
+    governed_bytes: AtomicUsize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -78,11 +82,34 @@ impl HostMemoryManager {
             budget: HostMemoryBudget::detect(device_info.total_memory),
             reservations: Mutex::new(HostReservations::default()),
             load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
         })
     }
 
     pub(crate) fn budget(&self) -> HostMemoryBudget {
         self.budget
+    }
+
+    pub(crate) fn governed_bytes(&self) -> usize {
+        self.governed_bytes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn add_governed(&self, bytes: usize) {
+        self.governed_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    pub(crate) fn sub_governed(&self, bytes: usize) {
+        self.governed_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_budget(budget: HostMemoryBudget) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
+        })
     }
 
     pub(crate) fn admit(
@@ -160,6 +187,7 @@ impl HostMemoryManager {
         HostMemoryLoadAdmission {
             manager: Arc::clone(self),
             rss_before: process_rss_bytes(),
+            governed_before: self.governed_bytes(),
             _guard: Some(guard),
         }
     }
@@ -243,6 +271,7 @@ impl HostMemoryLease {
 pub(crate) struct HostMemoryLoadAdmission {
     manager: Arc<HostMemoryManager>,
     rss_before: Option<usize>,
+    governed_before: usize,
     _guard: Option<OwnedMutexGuard<()>>,
 }
 
@@ -253,10 +282,12 @@ impl HostMemoryLoadAdmission {
             .filter(|lease| budget_group(lease.key.class) == HostBudgetGroup::Model)
             .map(|lease| lease.bytes)
             .fold(0usize, usize::saturating_add);
-        let observed_delta = self
-            .rss_before
-            .zip(process_rss_bytes())
-            .map(|(before, after)| after.saturating_sub(before));
+        let governed_growth = self
+            .manager
+            .governed_bytes()
+            .saturating_sub(self.governed_before);
+        let observed_delta =
+            attributable_rss_delta(self.rss_before, process_rss_bytes(), governed_growth);
         let target_total = observed_delta.map_or(planned_total, |bytes| bytes.max(planned_total));
 
         if target_total > planned_total {
@@ -284,6 +315,18 @@ impl HostMemoryLoadAdmission {
         self._guard.take();
         Ok(())
     }
+}
+
+/// RSS growth a load caused, net of governed host allocations made while it
+/// ran: those already hold their own leases and must not be charged twice.
+fn attributable_rss_delta(
+    rss_before: Option<usize>,
+    rss_after: Option<usize>,
+    governed_growth: usize,
+) -> Option<usize> {
+    rss_before
+        .zip(rss_after)
+        .map(|(before, after)| after.saturating_sub(before).saturating_sub(governed_growth))
 }
 
 pub(crate) fn process_rss_bytes() -> Option<usize> {
@@ -368,9 +411,10 @@ fn cgroup_memory_limit_bytes() -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostMemoryBudget, HostMemoryManager, HostReservations};
+    use super::{attributable_rss_delta, HostMemoryBudget, HostMemoryManager, HostReservations};
     use crate::runtime::memory::{MemoryAllocationClass, MemoryClaim, MemoryDomain, MemoryOwner};
     use parking_lot::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
 
@@ -405,6 +449,7 @@ mod tests {
             },
             reservations: Mutex::new(HostReservations::default()),
             load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
         });
         let first = MemoryClaim::runtime(
             MemoryDomain::Host,
@@ -434,6 +479,7 @@ mod tests {
             },
             reservations: Mutex::new(HostReservations::default()),
             load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
         });
         let claim = MemoryClaim::runtime(
             MemoryDomain::Host,
@@ -451,6 +497,23 @@ mod tests {
     }
 
     #[test]
+    fn governed_growth_is_not_attributed_to_a_loading_model() {
+        assert_eq!(
+            attributable_rss_delta(Some(GIB), Some(4 * GIB), 0),
+            Some(3 * GIB)
+        );
+        assert_eq!(
+            attributable_rss_delta(Some(GIB), Some(4 * GIB), 2 * GIB),
+            Some(GIB)
+        );
+        assert_eq!(
+            attributable_rss_delta(Some(GIB), Some(2 * GIB), 2 * GIB),
+            Some(0)
+        );
+        assert_eq!(attributable_rss_delta(None, Some(4 * GIB), 0), None);
+    }
+
+    #[test]
     fn kv_and_model_classes_have_independent_half_budgets() {
         let manager = Arc::new(HostMemoryManager {
             budget: HostMemoryBudget {
@@ -459,6 +522,7 @@ mod tests {
             },
             reservations: Mutex::new(HostReservations::default()),
             load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
         });
         let model = MemoryClaim::runtime(
             MemoryDomain::Host,
@@ -488,6 +552,7 @@ mod tests {
             },
             reservations: Mutex::new(HostReservations::default()),
             load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
         });
         let model = MemoryClaim::runtime(
             MemoryDomain::Host,
@@ -517,6 +582,7 @@ mod tests {
             },
             reservations: Mutex::new(HostReservations::default()),
             load_lock: Arc::new(AsyncMutex::new(())),
+            governed_bytes: AtomicUsize::new(0),
         });
         let claim = MemoryClaim::runtime(
             MemoryDomain::Cuda { device_id: 1 },

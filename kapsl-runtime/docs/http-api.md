@@ -163,6 +163,9 @@ Full optional fields:
 }
 ```
 
+`metadata.force_cpu` is ignored unless the runtime was started with
+`KAPSL_ALLOW_CLIENT_FORCE_CPU=1`.
+
 #### Media payload (images / video)
 
 ```json

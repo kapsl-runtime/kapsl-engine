@@ -109,6 +109,7 @@ impl RuntimeBootstrap {
             resources.pressure().clone(),
             monitor.telemetry(),
             model_runtime.shared_metrics().clone(),
+            self.config.allow_client_force_cpu,
         );
         load_startup_models(startup_plans, &model_runtime, &models, &auto_scaler).await?;
 
