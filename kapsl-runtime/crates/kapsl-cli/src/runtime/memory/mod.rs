@@ -2286,8 +2286,12 @@ impl MemoryAuthority {
             class,
             bytes,
         ));
+        let lease = self.admit(&plan)?;
+        self.host.add_governed(bytes);
         Ok(GovernedHostLease {
-            _lease: self.admit(&plan)?,
+            _lease: lease,
+            host: Arc::clone(&self.host),
+            bytes,
         })
     }
 
@@ -2567,6 +2571,14 @@ fn owner_for_device(plan: &MemoryPlan, device_id: usize) -> Result<MemoryOwner, 
 #[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
 pub(crate) struct GovernedHostLease {
     _lease: MemoryLease,
+    host: Arc<HostMemoryManager>,
+    bytes: usize,
+}
+
+impl Drop for GovernedHostLease {
+    fn drop(&mut self) {
+        self.host.sub_governed(self.bytes);
+    }
 }
 
 /// In-flight load transaction. Dropping it rolls back every domain.
@@ -3538,6 +3550,23 @@ mod tests {
                 bytes,
             }],
         }
+    }
+
+    #[test]
+    fn governed_host_leases_are_tracked_apart_until_dropped() {
+        let authority = MemoryAuthority::with_host_budget_for_test(8 * MIB);
+        let lease = authority
+            .admit_governed_host(
+                MemoryOwner::new(7, 2),
+                MemoryAllocationClass::TransientWorkspace,
+                MIB,
+            )
+            .unwrap();
+        assert_eq!(authority.host.governed_bytes(), MIB);
+        assert_eq!(authority.host.reserved_bytes(), MIB);
+        drop(lease);
+        assert_eq!(authority.host.governed_bytes(), 0);
+        assert_eq!(authority.host.reserved_bytes(), 0);
     }
 
     fn authority_with_provider_budget(domain: MemoryDomain, budget: usize) -> Arc<MemoryAuthority> {
