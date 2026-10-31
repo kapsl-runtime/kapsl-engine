@@ -374,6 +374,11 @@ impl NativeBackendHost {
 }
 
 impl GovernedDeviceHost {
+    /// The allocator serving `memory_kind`, if this instance governs it.
+    fn allocator_for(&self, memory_kind: u32) -> Option<&Arc<dyn DeviceAllocator>> {
+        (memory_kind == KAPSL_MEMORY_CUDA).then_some(&self.allocator)
+    }
+
     pub(super) fn cancel(&self, id: u64) {
         if let Some(request) = self
             .ledger
@@ -551,18 +556,17 @@ impl GovernedDeviceHost {
         bytes: u64,
         alignment: u64,
     ) -> Result<KapslDeviceAllocationV1, String> {
-        if memory_kind != KAPSL_MEMORY_CUDA
-            || !matches!(
-                class,
-                KAPSL_ALLOCATION_CLASS_WEIGHTS
-                    | KAPSL_ALLOCATION_CLASS_WORKSPACE
-                    | KAPSL_ALLOCATION_CLASS_KV
-                    | KAPSL_ALLOCATION_CLASS_REQUEST
-                    | KAPSL_ALLOCATION_CLASS_OTHER
-            )
-        {
+        let supported_class = matches!(
+            class,
+            KAPSL_ALLOCATION_CLASS_WEIGHTS
+                | KAPSL_ALLOCATION_CLASS_WORKSPACE
+                | KAPSL_ALLOCATION_CLASS_KV
+                | KAPSL_ALLOCATION_CLASS_REQUEST
+                | KAPSL_ALLOCATION_CLASS_OTHER
+        );
+        let Some(allocator) = self.allocator_for(memory_kind).filter(|_| supported_class) else {
             return Err("unsupported device memory kind or allocation class".into());
-        }
+        };
         let bytes = usize::try_from(bytes).map_err(|_| "allocation bytes exceed this platform")?;
         let alignment =
             usize::try_from(alignment).map_err(|_| "allocation alignment exceeds this platform")?;
@@ -573,8 +577,7 @@ impl GovernedDeviceHost {
         let id = NEXT_ALLOCATION_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| "native allocation IDs exhausted")?;
-        let storage = self
-            .allocator
+        let storage = allocator
             .allocate(class, bytes, alignment)
             .map_err(|error| format!("device {} scope {scope:?}: {error}", self.device_id))?;
         let allocation = KapslDeviceAllocationV1 {
