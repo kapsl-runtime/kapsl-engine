@@ -33,10 +33,10 @@ impl FakePool {
             .owners
             .insert((model, replica), quota);
         NativeBackendHost::with_allocator(
-            Arc::new(FakeAllocator {
+            Some(Arc::new(FakeAllocator {
                 pool: Arc::clone(self),
                 owner: (model, replica),
-            }),
+            })),
             None,
             0,
             model,
@@ -234,10 +234,10 @@ fn host_memory_host(host_budget: usize) -> (NativeBackendHost, Arc<MemoryAuthori
     pool.state.lock().unwrap().owners.insert((7, 2), 1024);
     let memory = MemoryAuthority::with_host_budget_for_test(host_budget);
     let host = NativeBackendHost::with_allocator(
-        Arc::new(FakeAllocator {
+        Some(Arc::new(FakeAllocator {
             pool,
             owner: (7, 2),
-        }),
+        })),
         Some(Arc::new(HostAllocator::new(Arc::clone(&memory), 7, 2))),
         0,
         7,
@@ -298,6 +298,60 @@ fn reclaim_returns_governed_host_memory_to_the_budget() {
     host.reclaim().unwrap();
     assert_eq!(host.live_allocations(), 0);
     assert!(host_budget_has_room(&memory, 400 * KIB));
+}
+
+#[test]
+fn host_only_instances_serve_host_memory_without_a_device() {
+    let memory = MemoryAuthority::with_host_budget_for_test(1024 * KIB);
+    let host = NativeBackendHost::with_allocator(
+        None,
+        Some(Arc::new(HostAllocator::new(memory, 7, 2))),
+        0,
+        7,
+        2,
+        true,
+    );
+    let _call = host.begin_model_call().unwrap();
+    let allocation = allocate(&host, &host_request(1, 64 * KIB)).unwrap();
+    assert!(
+        allocate(&host, &request(KAPSL_ALLOCATION_SCOPE_MODEL, 2, &[])).is_err(),
+        "a host-only instance has no device memory to give"
+    );
+    let synchronize = host.table.base.synchronize_device.unwrap();
+    assert_eq!(
+        unsafe { synchronize(host.table.base.user_data, 0) },
+        KAPSL_STATUS_OK
+    );
+
+    // With no device allocator, the adapter's own CUDA rows are left alone.
+    let adapter = MemoryReport::runtime(
+        "adapter",
+        kapsl_engine_api::MemoryDomain::Cuda { device_id: 0 },
+        kapsl_engine_api::MemoryAllocationClass::KvCache,
+        1,
+    );
+    assert_eq!(host.actual_memory(adapter.clone()), adapter);
+    assert_eq!(free(&host, &allocation), KAPSL_STATUS_OK);
+}
+
+#[test]
+fn governed_cpu_packs_get_a_host_only_allocator() {
+    let resources = RuntimeResources::new(&kapsl_hal::device::DeviceInfo {
+        cpu_cores: 1,
+        total_memory: 10 * 1024 * 1024,
+        os_type: "test".to_string(),
+        os_release: "test".to_string(),
+        has_cuda: false,
+        has_metal: false,
+        has_rocm: false,
+        has_directml: false,
+        devices: Vec::new(),
+    })
+    .unwrap();
+    let host = NativeBackendHost::new(&resources, "onnx", "cpu", 0, 7, 2, true, true).unwrap();
+    let governed = host.allocator.as_ref().expect("governed host");
+    assert!(governed.device.is_none());
+    assert!(governed.host_memory.is_some());
 }
 
 #[test]

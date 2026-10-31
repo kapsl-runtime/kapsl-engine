@@ -2272,7 +2272,6 @@ impl MemoryAuthority {
 
     /// Reserve host memory for one allocation the runtime makes on a native
     /// backend's behalf, before the allocation exists.
-    #[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
     pub(crate) fn admit_governed_host(
         self: &Arc<Self>,
         owner: MemoryOwner,
@@ -2568,7 +2567,6 @@ fn owner_for_device(plan: &MemoryPlan, device_id: usize) -> Result<MemoryOwner, 
 /// like any lease, so the host budget and pressure see it, and it is kept out
 /// of the backend's memory report so lease reconciliation never charges the
 /// same bytes again.
-#[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
 pub(crate) struct GovernedHostLease {
     _lease: MemoryLease,
     host: Arc<HostMemoryManager>,

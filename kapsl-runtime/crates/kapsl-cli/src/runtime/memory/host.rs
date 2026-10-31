@@ -98,7 +98,6 @@ impl HostMemoryManager {
         self.governed_bytes.fetch_add(bytes, Ordering::AcqRel);
     }
 
-    #[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
     pub(crate) fn sub_governed(&self, bytes: usize) {
         self.governed_bytes.fetch_sub(bytes, Ordering::AcqRel);
     }
