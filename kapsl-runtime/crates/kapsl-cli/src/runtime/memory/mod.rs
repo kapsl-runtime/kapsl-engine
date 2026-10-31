@@ -1355,6 +1355,27 @@ impl MemoryAuthority {
         }))
     }
 
+    /// A host-only authority whose host budget is exactly `safe_bytes`.
+    #[cfg(test)]
+    pub(crate) fn with_host_budget_for_test(safe_bytes: usize) -> Arc<Self> {
+        let host = HostMemoryManager::with_budget(host::HostMemoryBudget {
+            limit_bytes: safe_bytes,
+            safe_bytes,
+        });
+        Arc::new(Self {
+            host,
+            #[cfg(feature = "gpu-device-pool")]
+            cuda: None,
+            providers: Arc::new(ProviderMemoryLedger::with_budgets(HashMap::new())),
+            operations: Mutex::new(()),
+            accounting: Mutex::new(AuthorityAccounting::default()),
+            next_lease_id: AtomicU64::new(1),
+            device_domains: HashMap::new(),
+            domain_budgets: HashMap::from([(MemoryDomain::Host, safe_bytes)]),
+            live_ceiling: Mutex::new(HashMap::new()),
+        })
+    }
+
     #[cfg_attr(feature = "gpu-device-pool", allow(dead_code))]
     pub(crate) fn new(device_info: &DeviceInfo) -> Result<Arc<Self>, String> {
         #[cfg(feature = "gpu-device-pool")]
@@ -2249,6 +2270,27 @@ impl MemoryAuthority {
         Ok(lease)
     }
 
+    /// Reserve host memory for one allocation the runtime makes on a native
+    /// backend's behalf, before the allocation exists.
+    #[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
+    pub(crate) fn admit_governed_host(
+        self: &Arc<Self>,
+        owner: MemoryOwner,
+        class: MemoryAllocationClass,
+        bytes: usize,
+    ) -> Result<GovernedHostLease, String> {
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            class,
+            bytes,
+        ));
+        Ok(GovernedHostLease {
+            _lease: self.admit(&plan)?,
+        })
+    }
+
     /// Admit the first candidate that fits, preserving caller order.
     ///
     /// All candidates are evaluated and the winner is reserved while holding
@@ -2516,6 +2558,15 @@ fn owner_for_device(plan: &MemoryPlan, device_id: usize) -> Result<MemoryOwner, 
         ));
     }
     Ok(owner)
+}
+
+/// Host reservation backing one governed native allocation. It is charged
+/// like any lease, so the host budget and pressure see it, and it is kept out
+/// of the backend's memory report so lease reconciliation never charges the
+/// same bytes again.
+#[cfg_attr(not(any(test, feature = "gpu-device-pool")), allow(dead_code))]
+pub(crate) struct GovernedHostLease {
+    _lease: MemoryLease,
 }
 
 /// In-flight load transaction. Dropping it rolls back every domain.

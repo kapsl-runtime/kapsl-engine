@@ -85,6 +85,15 @@ impl HostMemoryManager {
         self.budget
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_budget(budget: HostMemoryBudget) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            reservations: Mutex::new(HostReservations::default()),
+            load_lock: Arc::new(AsyncMutex::new(())),
+        })
+    }
+
     pub(crate) fn admit(
         self: &Arc<Self>,
         claim: &MemoryClaim,

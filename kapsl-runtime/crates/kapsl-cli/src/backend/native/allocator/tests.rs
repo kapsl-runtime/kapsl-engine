@@ -37,6 +37,7 @@ impl FakePool {
                 pool: Arc::clone(self),
                 owner: (model, replica),
             }),
+            None,
             0,
             model,
             replica,
@@ -222,6 +223,81 @@ fn extended_table_and_all_scopes_preserve_charge_until_matching_free() {
         .actual_memory(MemoryReport::default())
         .allocations
         .is_empty());
+}
+
+const KIB: usize = 1024;
+
+/// A governed host for owner (7, 2) whose host allocations draw on a
+/// `host_budget`-byte authority; each budget group gets half of it.
+fn host_memory_host(host_budget: usize) -> (NativeBackendHost, Arc<MemoryAuthority>) {
+    let pool = Arc::new(FakePool::default());
+    pool.state.lock().unwrap().owners.insert((7, 2), 1024);
+    let memory = MemoryAuthority::with_host_budget_for_test(host_budget);
+    let host = NativeBackendHost::with_allocator(
+        Arc::new(FakeAllocator {
+            pool,
+            owner: (7, 2),
+        }),
+        Some(Arc::new(HostAllocator::new(Arc::clone(&memory), 7, 2))),
+        0,
+        7,
+        2,
+        true,
+    );
+    (host, memory)
+}
+
+fn host_request(id: u64, bytes: usize) -> KapslScopedDeviceAllocationRequestV1 {
+    let mut request = request(KAPSL_ALLOCATION_SCOPE_MODEL, id, &[]);
+    request.memory_kind = KAPSL_MEMORY_HOST;
+    request.bytes = bytes as u64;
+    request
+}
+
+fn host_budget_has_room(memory: &Arc<MemoryAuthority>, bytes: usize) -> bool {
+    memory
+        .admit_governed_host(
+            MemoryOwner::new(7, 2),
+            RuntimeMemoryClass::TransientWorkspace,
+            bytes,
+        )
+        .is_ok()
+}
+
+#[test]
+fn governed_host_allocations_are_charged_to_the_host_budget_until_freed() {
+    let (host, memory) = host_memory_host(1024 * KIB);
+    let _call = host.begin_model_call().unwrap();
+
+    let first = allocate(&host, &host_request(1, 256 * KIB)).unwrap();
+    assert!((first.device_ptr as usize).is_multiple_of(64));
+    // The engine hands out real, writable host memory.
+    unsafe { std::ptr::write_bytes(first.device_ptr.cast::<u8>(), 0xab, 256 * KIB) };
+    // 256 KiB of the 512 KiB workspace group is taken.
+    assert!(allocate(&host, &host_request(2, 300 * KIB)).is_err());
+    assert!(!host_budget_has_room(&memory, 300 * KIB));
+    // Host bytes hold their own leases and stay out of the CUDA report.
+    assert!(host
+        .actual_memory(MemoryReport::default())
+        .allocations
+        .is_empty());
+
+    assert_eq!(free(&host, &first), KAPSL_STATUS_OK);
+    assert_ne!(free(&host, &first), KAPSL_STATUS_OK, "second free");
+    assert!(host_budget_has_room(&memory, 300 * KIB));
+}
+
+#[test]
+fn reclaim_returns_governed_host_memory_to_the_budget() {
+    let (host, memory) = host_memory_host(1024 * KIB);
+    let call = host.begin_model_call().unwrap();
+    allocate(&host, &host_request(1, 400 * KIB)).unwrap();
+    drop(call);
+    assert!(!host_budget_has_room(&memory, 400 * KIB));
+
+    host.reclaim().unwrap();
+    assert_eq!(host.live_allocations(), 0);
+    assert!(host_budget_has_room(&memory, 400 * KIB));
 }
 
 #[test]
