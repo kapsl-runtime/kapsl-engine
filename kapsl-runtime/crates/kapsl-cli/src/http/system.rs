@@ -58,14 +58,25 @@ fn is_host_domain(domain: &MemoryDomain) -> bool {
     )
 }
 
+/// `owner_kind` reported for a memory owner in `/api/system/stats`.
+fn owner_kind_label(owner: MemoryOwner) -> &'static str {
+    if owner.is_external_kv() {
+        "external_kv_participant"
+    } else if owner.is_runtime() {
+        "runtime"
+    } else {
+        "model"
+    }
+}
+
 fn summarize_memory_authority(
     models: &ModelManager,
     snapshot: MemorySnapshot,
 ) -> MemoryAuthorityResponse {
-    let mut by_model = BTreeMap::<(bool, u32), ModelMemoryAggregate>::new();
+    let mut by_model = BTreeMap::<(&'static str, u32), ModelMemoryAggregate>::new();
     for row in &snapshot.rows {
         let aggregate = by_model
-            .entry((row.owner.is_external_kv(), row.owner.model_id))
+            .entry((owner_kind_label(row.owner), row.owner.model_id))
             .or_default();
         aggregate.replicas.insert(row.owner.replica_id);
         aggregate.planned_bytes = aggregate.planned_bytes.saturating_add(row.planned_bytes);
@@ -82,11 +93,16 @@ fn summarize_memory_authority(
     });
     let mut model_usage = by_model
         .into_iter()
-        .map(|((external_kv, model_id), aggregate)| {
-            let name = if external_kv {
+        .map(|((owner_kind, model_id), aggregate)| {
+            let name = if owner_kind == "external_kv_participant" {
                 format!(
                     "External KV participant {}",
                     model_id & !MemoryOwner::EXTERNAL_KV_BASE
+                )
+            } else if owner_kind == "runtime" {
+                format!(
+                    "Runtime overhead (CUDA {})",
+                    model_id & !MemoryOwner::RUNTIME_BASE
                 )
             } else {
                 models
@@ -102,11 +118,7 @@ fn summarize_memory_authority(
             };
             ModelMemoryUsageResponse {
                 model_id,
-                owner_kind: if external_kv {
-                    "external_kv_participant"
-                } else {
-                    "model"
-                },
+                owner_kind,
                 name,
                 replica_count: aggregate.replicas.len(),
                 planned_bytes: aggregate.planned_bytes,
@@ -301,4 +313,19 @@ pub(crate) fn build_system_routes(
         .or(system_stats)
         .map(reply_into_response)
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_kinds_are_labelled_for_the_stats_response() {
+        assert_eq!(owner_kind_label(MemoryOwner::new(3, 0)), "model");
+        assert_eq!(owner_kind_label(MemoryOwner::runtime(0)), "runtime");
+        assert_eq!(
+            owner_kind_label(MemoryOwner::external_kv(2).unwrap()),
+            "external_kv_participant"
+        );
+    }
 }
