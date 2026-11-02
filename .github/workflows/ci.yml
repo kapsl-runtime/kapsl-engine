@@ -70,6 +70,10 @@ jobs:
         if: runner.os == 'Linux'
         run: .github/scripts/test-gpu-device-pool-integration.sh --self-test
 
+      - name: Test GGUF ledger-closure harness contract
+        if: runner.os == 'Linux'
+        run: .github/scripts/test-gguf-ledger-closure.sh --self-test
+
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
