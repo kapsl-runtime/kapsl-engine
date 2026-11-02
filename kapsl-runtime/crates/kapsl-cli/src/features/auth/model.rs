@@ -101,6 +101,38 @@ impl ApiRoleTokenConfig {
     }
 }
 
+/// Whether one role has a token configured. Responses carry this instead of
+/// the token, so reading the role configuration never reveals a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ApiRoleTokenState {
+    pub(crate) configured: bool,
+}
+
+/// What `GET` and `POST /api/auth/roles` return. Token values are accepted on
+/// `POST` through [`ApiRoleTokenConfig`] and are never serialized back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ApiRoleTokenStatus {
+    pub(crate) reader: ApiRoleTokenState,
+    pub(crate) writer: ApiRoleTokenState,
+    pub(crate) admin: ApiRoleTokenState,
+}
+
+impl ApiRoleTokenConfig {
+    pub(crate) fn status(&self) -> ApiRoleTokenStatus {
+        ApiRoleTokenStatus {
+            reader: ApiRoleTokenState {
+                configured: self.reader_token.is_some(),
+            },
+            writer: ApiRoleTokenState {
+                configured: self.writer_token.is_some(),
+            },
+            admin: ApiRoleTokenState {
+                configured: self.admin_token.is_some(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ApiUserStatus {
