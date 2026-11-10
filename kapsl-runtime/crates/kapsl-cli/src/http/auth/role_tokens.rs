@@ -10,8 +10,8 @@ pub(super) fn build_role_token_routes(
         .and(warp::get())
         .map(move || {
             use warp::http::StatusCode;
-            let config = auth_state_for_get.read().role_token_config();
-            warp::reply::with_status(warp::reply::json(&config), StatusCode::OK)
+            let status = auth_state_for_get.read().role_token_status();
+            warp::reply::with_status(warp::reply::json(&status), StatusCode::OK)
         });
 
     let set_role_tokens = warp::path!("api" / "auth" / "roles")
@@ -22,7 +22,7 @@ pub(super) fn build_role_token_routes(
 
             let mut auth_state = auth_state.write();
             match auth_state.update_role_token_config(payload) {
-                Ok(config) => warp::reply::with_status(warp::reply::json(&config), StatusCode::OK),
+                Ok(status) => warp::reply::with_status(warp::reply::json(&status), StatusCode::OK),
                 Err(error) => warp::reply::with_status(
                     warp::reply::json(&serde_json::json!({ "error": error })),
                     StatusCode::BAD_REQUEST,
