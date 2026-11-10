@@ -564,7 +564,7 @@ fn native_context_fence_waits_for_nonblocking_backend_stream() {
     }
 
     let device = CudaDevice::new(0).unwrap();
-    let pool = GpuDevicePool::new(device.clone());
+    let pool = GpuDevicePool::new(device.clone(), 0);
     let _arena = pool
         .install_arena(Arc::new(
             kapsl_hal::gpu_arena_region::GpuArenaRegion::new(device.clone(), 1024 * 1024).unwrap(),

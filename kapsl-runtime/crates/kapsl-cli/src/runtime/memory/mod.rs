@@ -29,6 +29,7 @@ pub(crate) mod host;
 #[cfg(any(feature = "gpu-device-pool", test))]
 mod pool_clients;
 mod priority;
+mod runtime_overhead;
 
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use device::*;
@@ -297,6 +298,8 @@ pub(crate) enum MemoryAllocationClass {
     BlockTable,
     RequestTransient,
     ExternallyOwned,
+    /// Per-process overhead owned by the runtime (CUDA context and the like).
+    RuntimeOverhead,
 }
 
 impl MemoryAllocationClass {
@@ -323,6 +326,7 @@ impl fmt::Display for MemoryAllocationClass {
             Self::BlockTable => "block-table",
             Self::RequestTransient => "request-transient",
             Self::ExternallyOwned => "externally-owned",
+            Self::RuntimeOverhead => "runtime-overhead",
         })
     }
 }
@@ -332,6 +336,9 @@ impl fmt::Display for MemoryAllocationClass {
 enum MemoryOwnerKind {
     Model,
     ExternalKv,
+    /// The runtime process itself (CUDA context, library workspaces), not any
+    /// model or participant it hosts.
+    Runtime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -343,6 +350,9 @@ pub(crate) struct MemoryOwner {
 
 impl MemoryOwner {
     pub(crate) const EXTERNAL_KV_BASE: u32 = 1 << 31;
+    /// Runtime-owned rows live in their own id range (below external KV, far
+    /// above real model ids) so they can never be mistaken for a model.
+    pub(crate) const RUNTIME_BASE: u32 = 1 << 30;
 
     pub(crate) const fn new(model_id: u32, replica_id: u32) -> Self {
         Self {
@@ -358,6 +368,28 @@ impl MemoryOwner {
             model_id: Self::EXTERNAL_KV_BASE | participant_slot,
             replica_id: 0,
         })
+    }
+
+    /// The runtime's own per-process overhead on one accelerator device.
+    pub(crate) const fn runtime(device_id: u32) -> Self {
+        Self {
+            kind: MemoryOwnerKind::Runtime,
+            model_id: Self::RUNTIME_BASE | (device_id & (Self::RUNTIME_BASE - 1)),
+            replica_id: 0,
+        }
+    }
+
+    pub(crate) const fn is_runtime(self) -> bool {
+        matches!(self.kind, MemoryOwnerKind::Runtime)
+    }
+
+    /// Device id of a runtime-owned row.
+    pub(crate) const fn runtime_device(self) -> Option<u32> {
+        if self.is_runtime() {
+            Some(self.model_id & !Self::RUNTIME_BASE)
+        } else {
+            None
+        }
     }
 
     pub(crate) const fn is_external_kv(self) -> bool {
@@ -377,6 +409,8 @@ impl fmt::Display for MemoryOwner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(slot) = self.external_kv_slot() {
             write!(formatter, "external KV participant {slot}")
+        } else if let Some(device) = self.runtime_device() {
+            write!(formatter, "runtime (device {device})")
         } else {
             write!(
                 formatter,
@@ -571,6 +605,11 @@ struct MemoryAccountingBytes {
 struct AuthorityAccounting {
     leases: HashMap<u64, HashMap<MemoryRowKey, MemoryAccountingBytes>>,
     observed_domains: HashMap<MemoryDomain, usize>,
+    /// Per-process overhead the runtime itself holds on each CUDA device
+    /// (context and library workspaces), measured once after CUDA init and
+    /// before any pool or model exists. Attribution only: it appears as an
+    /// observed row but never changes a domain's budget or availability.
+    runtime_overhead: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -813,6 +852,9 @@ pub(crate) struct MemoryAdmissionFailure {
     owner: MemoryOwner,
     priority_weight: u32,
     domains: Vec<MemoryDomain>,
+    /// Bytes the rejected plan asked for, summed per domain, so clients can
+    /// explain a denial ("needs X, Y free") without parsing `message`.
+    requested: Vec<(MemoryDomain, usize)>,
     message: String,
 }
 
@@ -831,12 +873,28 @@ impl MemoryAdmissionFailure {
             .collect::<Vec<_>>();
         domains.sort_by_key(ToString::to_string);
         domains.dedup();
+        let requested = domains
+            .iter()
+            .map(|domain| {
+                let bytes = plan
+                    .claims()
+                    .iter()
+                    .filter(|claim| &claim.domain == domain)
+                    .fold(0usize, |total, claim| total.saturating_add(claim.bytes));
+                (domain.clone(), bytes)
+            })
+            .collect();
         Self {
             owner,
             priority_weight: priority_weight.max(1),
             domains,
+            requested,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn requested_bytes(&self) -> &[(MemoryDomain, usize)] {
+        &self.requested
     }
 
     pub(crate) fn owner(&self) -> MemoryOwner {
@@ -1405,7 +1463,7 @@ impl MemoryAuthority {
             }
         }
         let provider_budgets = provider_domain_budgets(&domain_budgets);
-        Ok(Arc::new(Self {
+        let authority = Arc::new(Self {
             host,
             cuda,
             providers: Arc::new(ProviderMemoryLedger::with_budgets(provider_budgets)),
@@ -1415,7 +1473,13 @@ impl MemoryAuthority {
             device_domains,
             domain_budgets,
             live_ceiling: Mutex::new(HashMap::new()),
-        }))
+        });
+        if let Some(manager) = authority.cuda.as_ref() {
+            for (device_id, bytes) in manager.runtime_overhead() {
+                authority.record_runtime_overhead(device_id, bytes);
+            }
+        }
+        Ok(authority)
     }
 
     pub(crate) fn domain_for_device(&self, device_id: usize) -> MemoryDomain {
@@ -1679,6 +1743,20 @@ impl MemoryAuthority {
         self.accounting.lock().leases.remove(&lease_id);
     }
 
+    #[cfg(any(test, feature = "gpu-device-pool"))]
+    /// Record the runtime's own per-process footprint on a CUDA device so the
+    /// unified snapshot attributes it instead of leaving an unexplained gap
+    /// between model leases and the device's observed usage. Zero clears it.
+    pub(crate) fn record_runtime_overhead(&self, device_id: usize, bytes: usize) {
+        let _operation = self.operations.lock();
+        let mut accounting = self.accounting.lock();
+        if bytes == 0 {
+            accounting.runtime_overhead.remove(&device_id);
+        } else {
+            accounting.runtime_overhead.insert(device_id, bytes);
+        }
+    }
+
     pub(crate) fn snapshot(&self) -> MemorySnapshot {
         let _operation = self.operations.lock();
         self.snapshot_unlocked()
@@ -1730,6 +1808,14 @@ impl MemoryAuthority {
             let row = rows.entry(MemoryRowKey::from_claim(claim)).or_default();
             row.observed = row.observed.max(claim.bytes);
         }
+        for (&device_id, &bytes) in &accounting.runtime_overhead {
+            let key = MemoryRowKey {
+                domain: MemoryDomain::Cuda { device_id },
+                owner: MemoryOwner::runtime(device_id as u32),
+                class: MemoryAllocationClass::RuntimeOverhead,
+            };
+            rows.entry(key).or_default().observed = bytes;
+        }
         let mut snapshot_rows: Vec<_> = rows
             .iter()
             .map(|(key, value)| MemorySnapshotRow {
@@ -1776,11 +1862,20 @@ impl MemoryAuthority {
                 .iter()
                 .filter(|row| row.domain == domain)
                 .fold((0usize, 0usize, 0usize, 0usize), |acc, row| {
+                    // Runtime overhead is attribution only: it stays visible as
+                    // a row but never feeds the domain's observed figure, which
+                    // would otherwise lower `available` whenever no sampled
+                    // value dominates the attributed sum.
+                    let attributed = if row.owner.is_runtime() {
+                        0
+                    } else {
+                        row.observed_bytes
+                    };
                     (
                         acc.0.saturating_add(row.planned_bytes),
                         acc.1.saturating_add(row.reserved_bytes),
                         acc.2.saturating_add(row.committed_bytes),
-                        acc.3.saturating_add(row.observed_bytes),
+                        acc.3.saturating_add(attributed),
                     )
                 });
             let sampled_observed = accounting
@@ -2868,7 +2963,7 @@ impl MemoryLease {
                 // observation even when the authority cannot raise its
                 // reservation, so pressure and every subsequent admission see
                 // the overage instead of stale planned values.
-                self.observed = actual;
+                self.observed = overlay_reported_rows(&self.observed, &actual);
                 self.refresh_accounting(false);
                 return Err(error);
             }
@@ -2898,18 +2993,25 @@ impl MemoryLease {
             // Reconciliation is observational after the backend has allocated.
             // A rejected reservation must not erase evidence of the physical
             // footprint; retaining it drives pressure and closes admission.
-            self.observed = actual;
+            self.observed = overlay_reported_rows(&self.observed, &actual);
             self.refresh_accounting(false);
             return Err(error);
         }
 
         // Publish the new observed floors before shrinking so a concurrent or
         // stale report can never release authority below known physical use.
-        self.observed = actual.clone();
+        self.observed = overlay_reported_rows(&self.observed, &actual);
         let after_growth = aggregate_claim_rows(&self.claims);
         let mut shrink = MemoryPlan::new();
         for (key, current_bytes) in after_growth {
-            let target = actual.get(&key).copied().unwrap_or(0);
+            // Only rows the backend reported (or moved to another domain) may
+            // shrink. Anything else (e.g. the transient workspace admitted for
+            // the load) keeps its admitted bytes until unload.
+            let target = match actual.get(&key) {
+                Some(&target) => target,
+                None if row_migrated_by_report(&key, &actual) => 0,
+                None => continue,
+            };
             if current_bytes > target {
                 shrink.push(MemoryClaim::runtime(
                     key.domain.clone(),
@@ -2920,7 +3022,7 @@ impl MemoryLease {
             }
         }
         self.shrink_locked(&shrink)?;
-        self.committed = actual;
+        self.committed = overlay_reported_rows(&self.committed, &actual);
         self.refresh_accounting(false);
         Ok(())
     }
@@ -3103,9 +3205,13 @@ impl MemoryLease {
         for template in actual_plan.claims() {
             self.ensure_claim_template(template);
         }
+        // Unreported rows keep their admitted bytes; only reported rows (and
+        // rows the report moved to another domain) change.
         let existing: Vec<_> = aggregate_claim_rows(&self.claims).into_keys().collect();
         for key in existing {
-            self.set_claim_row_bytes(&key, actual.get(&key).copied().unwrap_or(0));
+            if !actual.contains_key(&key) && row_migrated_by_report(&key, &actual) {
+                self.set_claim_row_bytes(&key, 0);
+            }
         }
         for (key, bytes) in &actual {
             self.set_claim_row_bytes(key, *bytes);
@@ -3126,7 +3232,7 @@ impl MemoryLease {
                 .unwrap_or(0);
             self.set_claim_row_bytes(&key, reported.max(bytes));
         }
-        self.observed = actual;
+        self.observed = overlay_reported_rows(&self.observed, &actual);
         self.committed = aggregate_claim_rows(&self.claims);
         self.refresh_accounting(false);
         Ok(())
@@ -3266,6 +3372,32 @@ fn aggregate_claim_rows(claims: &[MemoryClaim]) -> HashMap<MemoryRowKey, usize> 
         *bytes = bytes.saturating_add(claim.bytes);
     }
     rows
+}
+
+/// True when `reported` carries the same owner and class in another domain,
+/// i.e. the backend moved that allocation (host to pinned, device to device)
+/// rather than merely omitting it from a partial report.
+fn row_migrated_by_report(key: &MemoryRowKey, reported: &HashMap<MemoryRowKey, usize>) -> bool {
+    reported.keys().any(|other| {
+        other.owner == key.owner && other.class == key.class && other.domain != key.domain
+    })
+}
+
+/// Overlay a backend report on the previous per-row accounting. Rows the
+/// backend did not report keep their prior value: a partial report is not
+/// evidence that the omitted rows were released. Rows the report moved to a
+/// different domain are dropped from the source domain.
+fn overlay_reported_rows(
+    previous: &HashMap<MemoryRowKey, usize>,
+    reported: &HashMap<MemoryRowKey, usize>,
+) -> HashMap<MemoryRowKey, usize> {
+    let mut merged: HashMap<_, _> = previous
+        .iter()
+        .filter(|(key, _)| reported.contains_key(*key) || !row_migrated_by_report(key, reported))
+        .map(|(key, bytes)| (key.clone(), *bytes))
+        .collect();
+    merged.extend(reported.iter().map(|(key, bytes)| (key.clone(), *bytes)));
+    merged
 }
 
 fn resize_host_leases(
@@ -3509,6 +3641,199 @@ mod tests {
             domain_budgets,
             live_ceiling: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// An authority with a hard budget per listed accelerator domain, standing in
+    /// for a multi-GPU host (no device is touched).
+    fn authority_with_budgets(budgets: &[(MemoryDomain, usize)]) -> Arc<MemoryAuthority> {
+        let host = HostMemoryManager::new(&cpu_device_info());
+        let mut domain_budgets = HashMap::from([(MemoryDomain::Host, host.budget().safe_bytes)]);
+        for (domain, budget) in budgets {
+            domain_budgets.insert(domain.clone(), *budget);
+        }
+        Arc::new(MemoryAuthority {
+            host,
+            #[cfg(feature = "gpu-device-pool")]
+            cuda: None,
+            providers: Arc::new(ProviderMemoryLedger::with_budgets(
+                budgets.iter().cloned().collect(),
+            )),
+            operations: Mutex::new(()),
+            accounting: Mutex::new(AuthorityAccounting::default()),
+            next_lease_id: AtomicU64::new(1),
+            device_domains: HashMap::new(),
+            domain_budgets,
+            live_ceiling: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn accel(index: usize) -> MemoryDomain {
+        MemoryDomain::Provider {
+            provider: "rocm".to_string(),
+            device_id: Some(index),
+        }
+    }
+
+    /// A model split over `domains`: one weights row and one KV row per device,
+    /// each `weights`/`kv` bytes, plus a host row for the host-resident part.
+    fn split_plan(
+        owner: MemoryOwner,
+        domains: &[MemoryDomain],
+        weights: usize,
+        kv: usize,
+        host: usize,
+    ) -> MemoryPlan {
+        let mut plan = MemoryPlan::new();
+        for domain in domains {
+            plan.push(MemoryClaim::runtime(
+                domain.clone(),
+                owner,
+                MemoryAllocationClass::PersistentWeights,
+                weights,
+            ));
+            plan.push(MemoryClaim::runtime(
+                domain.clone(),
+                owner,
+                MemoryAllocationClass::KvCache,
+                kv,
+            ));
+        }
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::ModelSession,
+            host,
+        ));
+        plan
+    }
+
+    fn available(authority: &MemoryAuthority, domain: &MemoryDomain) -> usize {
+        authority
+            .snapshot()
+            .domain(domain)
+            .unwrap_or_else(|| panic!("{domain} missing from snapshot"))
+            .available_bytes
+    }
+
+    #[test]
+    fn a_split_model_is_leased_as_one_row_per_device_on_two_identical_devices() {
+        let (d0, d1) = (accel(0), accel(1));
+        let authority = authority_with_budgets(&[(d0.clone(), 100), (d1.clone(), 100)]);
+        let owner = MemoryOwner::new(90, 0);
+        let lease = authority
+            .admit(&split_plan(owner, &[d0.clone(), d1.clone()], 60, 20, 10))
+            .expect("both devices have room");
+
+        assert_eq!(
+            available(&authority, &d0),
+            20,
+            "weights 60 + kv 20 on device 0"
+        );
+        assert_eq!(
+            available(&authority, &d1),
+            20,
+            "weights 60 + kv 20 on device 1"
+        );
+        let snapshot = authority.snapshot();
+        for domain in [&d0, &d1] {
+            let rows: Vec<_> = snapshot
+                .rows
+                .iter()
+                .filter(|row| &row.domain == domain)
+                .collect();
+            assert_eq!(rows.len(), 2, "weights and kv row for {domain}");
+        }
+        drop(lease);
+        assert_eq!(available(&authority, &d0), 100);
+        assert_eq!(available(&authority, &d1), 100);
+    }
+
+    #[test]
+    fn a_split_model_is_admitted_on_two_different_devices_by_each_devices_own_budget() {
+        let (big, small) = (accel(0), accel(1));
+        let authority = authority_with_budgets(&[(big.clone(), 240), (small.clone(), 80)]);
+        let owner = MemoryOwner::new(91, 0);
+        let mut plan = MemoryPlan::new();
+        for (domain, bytes) in [(big.clone(), 180usize), (small.clone(), 60)] {
+            plan.push(MemoryClaim::runtime(
+                domain,
+                owner,
+                MemoryAllocationClass::PersistentWeights,
+                bytes,
+            ));
+        }
+        let _lease = authority
+            .admit(&plan)
+            .expect("each device fits its own share");
+        assert_eq!(available(&authority, &big), 60);
+        assert_eq!(available(&authority, &small), 20);
+    }
+
+    #[test]
+    fn a_split_model_is_denied_whole_when_one_device_lacks_room_and_nothing_is_reserved() {
+        let (d0, d1) = (accel(0), accel(1));
+        let authority = authority_with_budgets(&[(d0.clone(), 100), (d1.clone(), 50)]);
+        let owner = MemoryOwner::new(92, 0);
+        let host_before = authority
+            .snapshot()
+            .domain(&MemoryDomain::Host)
+            .unwrap()
+            .available_bytes;
+
+        let error = match authority.admit(&split_plan(owner, &[d0.clone(), d1.clone()], 60, 20, 10))
+        {
+            Ok(_) => panic!("device 1 only has 50 bytes for a 80 byte share"),
+            Err(error) => error,
+        };
+        assert!(!error.is_empty());
+
+        assert!(
+            authority.snapshot().rows.is_empty(),
+            "a denied split model must leave no rows on any device"
+        );
+        assert_eq!(available(&authority, &d0), 100, "device 0 was not charged");
+        assert_eq!(available(&authority, &d1), 50);
+        assert_eq!(
+            authority
+                .snapshot()
+                .domain(&MemoryDomain::Host)
+                .unwrap()
+                .available_bytes,
+            host_before,
+            "the host part was not charged either"
+        );
+        // Nothing leaked: the same devices still admit a plan that does fit.
+        let _lease = authority
+            .admit(&split_plan(owner, &[d0, d1], 30, 10, 10))
+            .expect("a smaller split fits afterwards");
+    }
+
+    #[test]
+    fn a_cuda_split_preflight_denies_the_whole_plan_when_the_second_gpu_lacks_room() {
+        let (cuda0, cuda1) = (
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+        );
+        let authority = authority_with_budgets(&[(cuda0.clone(), 4 * GIB), (cuda1.clone(), GIB)]);
+        let owner = MemoryOwner::new(93, 0);
+        let preflight = |plan: &MemoryPlan| {
+            let _operation = authority.operations.lock();
+            authority.preflight_growth_locked(plan)
+        };
+
+        let too_big = split_plan(owner, &[cuda0.clone(), cuda1.clone()], 3 * GIB, 0, 0);
+        let error = preflight(&too_big).expect_err("3 GiB does not fit the 1 GiB second GPU");
+        assert!(
+            error.contains("cuda:1"),
+            "the denial names the device that lacks room: {error}"
+        );
+
+        let fits = split_plan(owner, &[cuda0, cuda1], GIB / 2, 0, 0);
+        preflight(&fits).expect("a split that fits both GPUs preflights");
+        assert!(
+            authority.snapshot().rows.is_empty(),
+            "preflight reserves nothing"
+        );
     }
 
     #[test]
@@ -4484,6 +4809,238 @@ mod tests {
             GIB + MIB
         );
         assert_eq!(rows, before);
+    }
+
+    #[test]
+    fn runtime_overhead_is_attributed_without_changing_any_domain() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(46, 7);
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::KvCache,
+            GIB,
+        ));
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+        let host_before = authority.snapshot().domain(&MemoryDomain::Host).cloned();
+
+        authority.record_runtime_overhead(0, 360 * MIB);
+
+        let snapshot = authority.snapshot();
+        let cuda0 = MemoryDomain::Cuda { device_id: 0 };
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.owner.is_runtime())
+            .expect("runtime overhead row");
+        assert_eq!(row.domain, cuda0);
+        assert_eq!(row.class, MemoryAllocationClass::RuntimeOverhead);
+        assert_eq!(row.owner.runtime_device(), Some(0));
+        assert_eq!(row.observed_bytes, 360 * MIB);
+        assert_eq!(
+            (row.planned_bytes, row.reserved_bytes, row.committed_bytes),
+            (0, 0, 0),
+            "attribution only: nothing is planned, reserved, or committed"
+        );
+        // Never confusable with a model or an external-KV participant.
+        assert!(!row.owner.is_external_kv());
+        assert!(row.owner.model_id >= MemoryOwner::RUNTIME_BASE);
+        assert!(row.owner.model_id < MemoryOwner::EXTERNAL_KV_BASE);
+        assert_eq!(
+            snapshot
+                .rows
+                .iter()
+                .filter(|row| !row.owner.is_runtime())
+                .count(),
+            1,
+            "the model lease row is untouched"
+        );
+        // No admission-visible change to any pre-existing domain.
+        assert_eq!(snapshot.domain(&MemoryDomain::Host).cloned(), host_before);
+
+        // Zero clears it again.
+        authority.record_runtime_overhead(0, 0);
+        assert!(authority
+            .snapshot()
+            .rows
+            .iter()
+            .all(|row| !row.owner.is_runtime()));
+        drop(lease);
+    }
+
+    #[test]
+    fn runtime_overhead_row_leaves_availability_unchanged_without_an_nvml_sample() {
+        // No NVML sample is ever recorded here, so the domain's observed value
+        // falls back to the sum of its attributed rows. The runtime row must not
+        // be part of that sum, or an attribution-only row would shrink
+        // `available` by the process overhead.
+        let cuda0 = MemoryDomain::Cuda { device_id: 0 };
+        let authority = authority_with_provider_budget(cuda0.clone(), 4 * GIB);
+        let whole_budget = {
+            let mut plan = MemoryPlan::new();
+            plan.push(MemoryClaim::runtime(
+                cuda0.clone(),
+                MemoryOwner::new(1, 0),
+                MemoryAllocationClass::PersistentWeights,
+                4 * GIB,
+            ));
+            plan
+        };
+        let domain = |authority: &MemoryAuthority| {
+            authority
+                .snapshot()
+                .domain(&MemoryDomain::Cuda { device_id: 0 })
+                .cloned()
+                .expect("cuda:0 domain")
+        };
+        let preflight = |authority: &MemoryAuthority| {
+            let _operation = authority.operations.lock();
+            authority.preflight_growth_locked(&whole_budget)
+        };
+
+        let before = domain(&authority);
+        assert_eq!(before.available_bytes, 4 * GIB);
+        assert_eq!(before.observed_bytes, 0);
+        preflight(&authority).expect("the whole budget is requestable before the row");
+
+        authority.record_runtime_overhead(0, 360 * MIB);
+
+        let after = domain(&authority);
+        assert_eq!(after, before, "the row must not change any domain figure");
+        assert_eq!(after.available_bytes, 4 * GIB);
+        assert_eq!(after.observed_bytes, 0);
+        preflight(&authority).expect("the whole budget is still requestable after the row");
+
+        // Still attributed: the row is visible and carries its bytes.
+        let snapshot = authority.snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.owner.is_runtime())
+            .expect("runtime overhead row");
+        assert_eq!(row.observed_bytes, 360 * MIB);
+    }
+
+    #[test]
+    fn runtime_owners_are_per_device_and_never_alias_models() {
+        let zero = MemoryOwner::runtime(0);
+        let one = MemoryOwner::runtime(1);
+        assert_ne!(zero, one);
+        assert_eq!(zero.runtime_device(), Some(0));
+        assert_eq!(one.runtime_device(), Some(1));
+        assert_eq!(MemoryOwner::new(0, 0).runtime_device(), None);
+        assert!(!MemoryOwner::new(0, 0).is_runtime());
+        assert_eq!(zero.to_string(), "runtime (device 0)");
+        assert!(!MemoryOwner::external_kv(0).unwrap().is_runtime());
+    }
+
+    #[test]
+    fn partial_loaded_report_keeps_unreported_scratch_row() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(46, 6);
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::KvCache,
+            2 * GIB,
+        ));
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::TransientWorkspace,
+            512 * MIB,
+        ));
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+
+        // The load path records the first backend report and then reconciles
+        // it; scratch is absent from both.
+        let report = BackendMemoryReport {
+            allocations: vec![kapsl_engine_api::MemoryAllocation {
+                allocation_id: "host-kv".to_string(),
+                domain: BackendMemoryDomain::Host,
+                class: BackendMemoryAllocationClass::KvCache,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes: GIB,
+            }],
+        };
+        lease.record_loaded_report(&report).unwrap();
+        let scratch_after_record = authority
+            .snapshot()
+            .rows
+            .iter()
+            .find(|row| row.class == MemoryAllocationClass::TransientWorkspace)
+            .map(|row| row.reserved_bytes);
+        assert_eq!(scratch_after_record, Some(512 * MIB));
+        lease.reconcile(&report).unwrap();
+
+        let rows = authority.snapshot().rows;
+        let reserved = |class| {
+            rows.iter()
+                .find(|row| row.class == class)
+                .map(|row| row.reserved_bytes)
+        };
+        assert_eq!(reserved(MemoryAllocationClass::KvCache), Some(GIB));
+        assert_eq!(
+            reserved(MemoryAllocationClass::TransientWorkspace),
+            Some(512 * MIB)
+        );
+    }
+
+    #[test]
+    fn partial_backend_report_keeps_unreported_rows_and_shrinks_reported_ones() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(46, 5);
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::KvCache,
+            2 * GIB,
+        ));
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            owner,
+            MemoryAllocationClass::TransientWorkspace,
+            512 * MIB,
+        ));
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+
+        // The backend reports only its KV row; it says nothing about the
+        // transient workspace admitted for the load.
+        lease
+            .reconcile(&BackendMemoryReport {
+                allocations: vec![kapsl_engine_api::MemoryAllocation {
+                    allocation_id: "host-kv".to_string(),
+                    domain: BackendMemoryDomain::Host,
+                    class: BackendMemoryAllocationClass::KvCache,
+                    source: BackendMemoryAllocationSource::BackendManaged,
+                    bytes: GIB,
+                }],
+            })
+            .unwrap();
+
+        let rows = authority.snapshot().rows;
+        let row = |class: MemoryAllocationClass| {
+            rows.iter()
+                .find(|row| row.class == class)
+                .unwrap_or_else(|| panic!("missing {class} row"))
+        };
+        let kv = row(MemoryAllocationClass::KvCache);
+        assert_eq!(kv.reserved_bytes, GIB, "a reported row still shrinks");
+        assert_eq!(kv.observed_bytes, GIB);
+        let scratch = row(MemoryAllocationClass::TransientWorkspace);
+        assert_eq!(
+            scratch.reserved_bytes,
+            512 * MIB,
+            "an unreported row keeps its admitted bytes until unload"
+        );
+        assert_eq!(scratch.committed_bytes, 512 * MIB);
+        assert_eq!(authority.host.reserved_bytes(), GIB + 512 * MIB);
     }
 
     #[test]

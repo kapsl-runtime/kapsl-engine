@@ -364,10 +364,13 @@ impl NativeBackendHost {
                 KAPSL_ALLOCATION_CLASS_REQUEST => Class::RequestTransient,
                 _ => Class::ExternallyOwned,
             };
-            report.extend(MemoryReport::runtime(
-                format!("native/device-{}/model-{}/replica-{}/scope-{}-{}/requests-{:?}/allocation-{id}", host.device_id, scope.model_id, scope.replica_id, scope.kind, scope.id, scope.request_ids),
-                domain.clone(), class, allocation.storage.bytes(),
-            ));
+            report.allocations.push(kapsl_engine_api::MemoryAllocation {
+                allocation_id: format!("native/device-{}/model-{}/replica-{}/scope-{}-{}/requests-{:?}/allocation-{id}", host.device_id, scope.model_id, scope.replica_id, scope.kind, scope.id, scope.request_ids),
+                domain: domain.clone(),
+                class,
+                source: kapsl_engine_api::MemoryAllocationSource::RuntimeManaged,
+                bytes: allocation.storage.bytes(),
+            });
         }
         report
     }

@@ -111,6 +111,7 @@ impl AllocationStorage for FakeAllocation {
 fn pool(device_id: usize) -> Arc<GpuDevicePool> {
     Arc::new(GpuDevicePool {
         device_id,
+        ordinal: device_id,
         device: None,
         registry: GpuRegionRegistry::new(device_id),
         regions: Mutex::new(BTreeMap::new()),

@@ -73,6 +73,10 @@ jobs:
           python3 .github/scripts/test_live_kv_owner.py
           python3 .github/scripts/test_gpu_process_vram.py
 
+      - name: Test GGUF ledger-closure harness contract
+        if: runner.os == 'Linux'
+        run: .github/scripts/test-gguf-ledger-closure.sh --self-test
+
       - name: Check runtime CLI (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

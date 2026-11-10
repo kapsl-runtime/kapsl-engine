@@ -291,9 +291,19 @@ Options:
 - `--auth-token <TOKEN>` — bearer token for authenticated runtimes
 - `--topology <TOPOLOGY>` — mesh topology for added models (default: `data-parallel`)
 - `--tp-degree <N>` — tensor parallelism degree (default: `1`)
-- `--timeout-ms <MS>` — per-request timeout when contacting the runtime API (default: `30000`)
+- `--timeout-ms <MS>` — request timeout; without `--no-wait` it covers memory admission and the full load (default: `600000`)
+- `--no-wait` — return as soon as the runtime queues the load, without waiting for the result
 
-The command sends `POST /api/models/start` for each model. The runtime loads it asynchronously and returns the assigned `model_id`. All transport, port, and scheduler configuration of the running instance is preserved.
+By default the command waits for the memory authority's decision and prints one result line per model:
+
+```text
+  ✓  summarizer.aimod (id=2)  granted · 0.98 GB
+  ✗  assistant-3b.aimod  denied · needs 2.45 GB, 1.09 GB free
+```
+
+A granted line shows the model's memory lease. A denied line shows what the load asked for and what was free in the domain that blocked it. When a narrower budget (such as a per-class cap) blocked the load instead, the line reads `needs …, over the <domain> budget`. The command exits non-zero if any model was denied or failed, and the runtime and its other models keep running.
+
+The command sends `POST /api/models/start?wait=true` for each model. Without `?wait=true` (and with `--no-wait`) the endpoint keeps its asynchronous behaviour: it returns `202` with the assigned `model_id` as soon as the load is queued. With it, the endpoint answers `200` once the model is active, `409` with `"reason": "memory_admission"` and the per-domain `requested` bytes when the memory authority denies it, or `500` for other load failures. Against an older runtime that ignores `?wait=true`, the command polls the model until it settles. All transport, port, and scheduler configuration of the running instance is preserved.
 
 ## 4) List Models in a Running Runtime (`kapsl list`)
 
@@ -304,7 +314,9 @@ kapsl list
 ```
 
 The default table includes each model's ID, name, version, format, device,
-status, and health. To target another runtime or one with API authentication:
+memory, status, and health. MEMORY is the model's current lease from the
+memory authority (`GET /api/system/stats`), shown as `-` when the runtime
+doesn't report one. To target another runtime or one with API authentication:
 
 ```bash
 kapsl list \

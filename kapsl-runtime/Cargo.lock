@@ -2428,8 +2428,7 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15a95d5b3937685af8de1dd5fe82bdd8fe46ac66b6fe1fff4f3c519172822e35"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2451,16 +2450,15 @@ dependencies = [
  "rand 0.8.7",
  "rustfft",
  "serde",
+ "serde_json",
  "serde_yaml",
- "thiserror 1.0.69",
  "tokio",
 ]
 
 [[package]]
 name = "kapsl-core"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4328c2d4b6cec499618ecce62fdc852c6c1ee3f7b67f78fc573e0acfbf6b4192"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "flate2",
  "fs2",
@@ -2480,8 +2478,7 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "279a1f1abe9afc205c22bc0951df3ccd165cd3010ee4f0f360bad47f399f9931"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2517,8 +2514,7 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f1b7b8a3351e923bcacc167b8c72d6351a6b092b67a84445ead4030302bfee"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "cudarc",
  "half",
@@ -2550,22 +2546,19 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfaab8553d5dc308ce2dc8ea43c382fd8af6eaac7a43a6ff27c22d3f7364a064"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "cudarc",
  "half",
  "kapsl-hal",
  "log",
  "rayon",
- "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "kapsl-kv-abi"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "975e66b4912d45b0e8aaf6c9ea787c68966b0141174ffc435fe202ff7c406ffc"
+version = "0.6.1"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2574,8 +2567,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llama-cpp-2"
 version = "0.1.146-kapsl.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d245de5d93bb962efcdbcdde51e9f13cbb56cd30a6d79e39976ae9a6f0e3db1"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2588,8 +2580,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llama-cpp-sys-2"
 version = "0.1.146-kapsl.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "765c5401676911eda782c7a3f9f9dec068f820f31c6f4c49b7442f126f395beb"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "bindgen",
  "cc",
@@ -2601,9 +2592,8 @@ dependencies = [
 
 [[package]]
 name = "kapsl-llm"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4806cb5c7885a47e9bbc12cc55c684f8ca9b0d2840071234ec3a71d293e1f155"
+version = "0.3.7"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2633,11 +2623,9 @@ dependencies = [
 [[package]]
 name = "kapsl-loader"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23edc362f06b73d4dfb5584303bc561f81bd268ac535c44cf559b3b5a589a566"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "half",
- "kapsl-hal",
  "log",
  "memmap2",
  "safetensors 0.4.5",
@@ -2688,16 +2676,12 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ed8c61bfb668efaf29ad2b541baa80513e33ba1f9abf9b88cfa44d4abbd1606"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=da01f3b486ef1c8b51dfca9862dc1826477c245f#da01f3b486ef1c8b51dfca9862dc1826477c245f"
 dependencies = [
  "anyhow",
  "half",
- "log",
  "safetensors 0.3.3",
  "serde",
- "serde_json",
- "thiserror 1.0.69",
  "turboquant-rs",
 ]
 
