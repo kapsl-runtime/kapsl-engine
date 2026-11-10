@@ -1155,3 +1155,49 @@ async fn test_openai_embeddings_base64_encodes_requested_dimensions() {
     assert!((first - (3.0 / 13.0f32.sqrt())).abs() < 1e-6);
     assert!((second - (2.0 / 13.0f32.sqrt())).abs() < 1e-6);
 }
+
+#[tokio::test]
+async fn test_role_token_routes_never_return_token_values() {
+    let auth_state = Arc::new(RwLock::new(ApiAuthState {
+        role_tokens: ApiRoleTokenConfig {
+            reader_token: Some("reader-secret-value".into()),
+            writer_token: None,
+            admin_token: Some("admin-secret-value".into()),
+        },
+        store_path: unique_temp_path("role-token-redaction").join("auth-store.json"),
+        store: ApiAuthStoreFile::default(),
+        key_hash_index: HashMap::new(),
+    }));
+    let routes = build_auth_routes(auth_state).admin;
+
+    let read = warp::test::request()
+        .method("GET")
+        .path("/api/auth/roles")
+        .reply(&routes)
+        .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(read.body()).to_string();
+    for secret in ["reader-secret-value", "admin-secret-value"] {
+        assert!(!body.contains(secret), "GET leaked a token: {body}");
+    }
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["reader"]["configured"], true);
+    assert_eq!(json["writer"]["configured"], false);
+    assert_eq!(json["admin"]["configured"], true);
+
+    let update = warp::test::request()
+        .method("POST")
+        .path("/api/auth/roles")
+        .json(&serde_json::json!({
+            "reader_token": "rotated-reader-value",
+            "writer_token": "rotated-writer-value",
+            "admin_token": "rotated-admin-value",
+        }))
+        .reply(&routes)
+        .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(update.body()).to_string();
+    assert!(!body.contains("rotated-"), "POST leaked a token: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["writer"]["configured"], true);
+}
