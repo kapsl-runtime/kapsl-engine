@@ -68,7 +68,8 @@ fn budget_group(class: MemoryAllocationClass) -> HostBudgetGroup {
         | MemoryAllocationClass::TransientWorkspace
         | MemoryAllocationClass::BlockTable
         | MemoryAllocationClass::RequestTransient
-        | MemoryAllocationClass::ExternallyOwned => HostBudgetGroup::Model,
+        | MemoryAllocationClass::ExternallyOwned
+        | MemoryAllocationClass::RuntimeOverhead => HostBudgetGroup::Model,
     }
 }
 

@@ -1,5 +1,72 @@
 use super::*;
 
+/// Final result of an asynchronous model load, reported to `?wait=true` callers.
+enum ModelLoadOutcome {
+    Active,
+    /// Rejected by the memory authority. `requested` is (domain, bytes) per domain.
+    Denied {
+        message: String,
+        requested: Vec<(String, usize)>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl ModelLoadOutcome {
+    fn from_load_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        match error.downcast_ref::<MemoryAdmissionFailure>() {
+            Some(failure) => Self::Denied {
+                message: error.to_string(),
+                requested: failure
+                    .requested_bytes()
+                    .iter()
+                    .map(|(domain, bytes)| (domain.to_string(), *bytes))
+                    .collect(),
+            },
+            None => Self::Failed {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    /// HTTP status and JSON body for a waited start request.
+    fn into_reply(self, model_id: u32) -> (warp::http::StatusCode, serde_json::Value) {
+        use warp::http::StatusCode;
+        match self {
+            Self::Active => (
+                StatusCode::OK,
+                serde_json::json!({
+                    "message": "Model loaded",
+                    "model_id": model_id,
+                    "status": "active",
+                }),
+            ),
+            Self::Denied { message, requested } => (
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": message,
+                    "model_id": model_id,
+                    "status": "denied",
+                    "reason": "memory_admission",
+                    "requested": requested
+                        .into_iter()
+                        .map(|(domain, bytes)| serde_json::json!({"domain": domain, "bytes": bytes}))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            Self::Failed { message } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": message,
+                    "model_id": model_id,
+                    "status": "failed",
+                }),
+            ),
+        }
+    }
+}
+
 pub(crate) struct ModelLifecycleRoutesConfig {
     pub(crate) model_runtime: Arc<ModelRuntime>,
 }
@@ -21,6 +88,15 @@ pub(crate) fn build_model_lifecycle_routes(
         tp_degree: usize,
     }
 
+    /// `?wait=true` holds the response until the load is admitted and active,
+    /// denied by the memory authority, or failed. Without it the request
+    /// returns 202 as soon as the load is queued (unchanged behaviour).
+    #[derive(Deserialize, Default)]
+    struct StartModelQuery {
+        #[serde(default)]
+        wait: bool,
+    }
+
     fn default_topology() -> String {
         "data-parallel".to_string()
     }
@@ -35,7 +111,8 @@ pub(crate) fn build_model_lifecycle_routes(
     let start_model = warp::path!("api" / "models" / "start")
         .and(warp::post())
         .and(warp::body::json())
-        .then(move |req: StartModelRequest| {
+        .and(warp::query::<StartModelQuery>())
+        .then(move |req: StartModelRequest, query: StartModelQuery| {
             let models = models_for_start.clone();
             let model_runtime = model_runtime_for_start.clone();
 
@@ -168,7 +245,7 @@ pub(crate) fn build_model_lifecycle_routes(
                 );
                 model_info.status = ModelStatus::Starting;
                 models.registry().upsert(model_info);
-                tokio::spawn({
+                let load_task = tokio::spawn({
                     let models = models.clone();
                     let model_registry = models.registry().clone();
                     let model_path = model_path.clone();
@@ -219,15 +296,18 @@ pub(crate) fn build_model_lifecycle_routes(
                         match res {
                             Ok(Err(e)) => {
                                 log::error!("Failed to load model {}: {}", model_id, e);
+                                let outcome = ModelLoadOutcome::from_load_error(e.as_ref());
                                 let _ = model_registry.set_status(model_id, ModelStatus::Inactive);
                                 if auto_assigned {
                                     model_registry.unregister(model_id);
                                     models.release_model_id(model_id);
                                 }
+                                outcome
                             }
                             Ok(Ok((pool, handles))) => {
                                 models.install_loaded(model_id, model_path, pool, handles);
                                 let _ = model_registry.set_status(model_id, ModelStatus::Active);
+                                ModelLoadOutcome::Active
                             }
                             Err(join_err) => {
                                 log::error!(
@@ -240,10 +320,24 @@ pub(crate) fn build_model_lifecycle_routes(
                                     model_registry.unregister(model_id);
                                     models.release_model_id(model_id);
                                 }
+                                ModelLoadOutcome::Failed {
+                                    message: format!("loader task failed: {join_err}"),
+                                }
                             }
                         }
                     }
                 });
+
+                if query.wait {
+                    let outcome = load_task.await.unwrap_or_else(|join_err| {
+                        ModelLoadOutcome::Failed {
+                            message: format!("loader task failed: {join_err}"),
+                        }
+                    });
+                    let (status, body) = outcome.into_reply(model_id);
+                    return warp::reply::with_status(warp::reply::json(&body), status);
+                }
+
                 warp::reply::with_status(
                     warp::reply::json(&SuccessResponse {
                         message: "Model load started".to_string(),

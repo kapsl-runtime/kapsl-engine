@@ -267,6 +267,14 @@ impl DeviceBudgetLedger {
         Ok(current)
     }
 
+    /// Bytes currently charged to one external allocation, or 0 if unknown.
+    pub(crate) fn external_bytes(&self, device_id: usize, allocation_id: &str) -> usize {
+        self.devices
+            .get(&device_id)
+            .and_then(|device| device.allocations.get(allocation_id))
+            .map_or(0, |allocation| allocation.bytes)
+    }
+
     pub(crate) fn release_external(
         &mut self,
         device_id: usize,
@@ -517,6 +525,22 @@ mod tests {
 
         ledger.release_external(DEVICE, "weights", OWNER);
         assert_eq!(ledger.snapshot(DEVICE).expect("device").external_bytes, 0);
+    }
+
+    #[test]
+    fn external_bytes_reports_the_current_charge_of_one_allocation() {
+        let mut ledger = ledger();
+        reserve(&mut ledger, "weights", 8 * GIB).expect("planned load");
+        reserve(&mut ledger, "gguf-scratch:m", GIB).expect("planned scratch");
+        ledger
+            .reconcile_external(DEVICE, "weights", 7 * GIB)
+            .expect("actual weights");
+
+        assert_eq!(ledger.external_bytes(DEVICE, "weights"), 7 * GIB);
+        // Never reconciled: still the admitted (planned) bytes.
+        assert_eq!(ledger.external_bytes(DEVICE, "gguf-scratch:m"), GIB);
+        assert_eq!(ledger.external_bytes(DEVICE, "missing"), 0);
+        assert_eq!(ledger.external_bytes(DEVICE + 1, "weights"), 0);
     }
 
     #[test]

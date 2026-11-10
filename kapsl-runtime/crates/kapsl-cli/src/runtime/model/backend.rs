@@ -69,8 +69,10 @@ pub(super) fn acquire_embedded_ort_pool_clients(
     }
     let mut clients = Vec::new();
     for &device_id in device_ids {
-        let device =
-            i32::try_from(device_id).map_err(|_| "ORT device ID exceeds i32".to_string())?;
+        // ORT identifies the device by CUDA ordinal; the pool is keyed by the
+        // inventory id, so register the allocator under the mapped ordinal.
+        let device = i32::try_from(kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id))
+            .map_err(|_| "ORT device ID exceeds i32".to_string())?;
         if let Some(client) =
             resources
                 .memory()

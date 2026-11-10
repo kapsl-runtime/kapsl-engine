@@ -7,6 +7,7 @@ use super::*;
 use cudarc::driver::{result as cuda_result, CudaDevice};
 use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolBackend, PoolOwner};
 use kapsl_hal::gpu_arena_region::GpuArenaRegion;
+use kapsl_llm::cuda_ordinal::CudaMatch;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -192,6 +193,87 @@ pub(crate) struct DeviceMemoryManager {
     admission_refs: Mutex<HashMap<(usize, PoolOwner), usize>>,
     next_fallback_allocation: AtomicU64,
     metrics: Mutex<Option<kapsl_monitor::metrics::KapslMetrics>>,
+    /// Driver-reported per-process footprint per device, sampled right after
+    /// the CUDA context was created and before any pool or model.
+    runtime_overhead: HashMap<usize, usize>,
+}
+
+/// Read the PCI bus id the CUDA driver reports for each visible ordinal.
+#[cfg(feature = "gpu-device-pool")]
+fn enumerate_cuda_pci_ids() -> Result<Vec<Option<String>>, String> {
+    use cudarc::driver::{result, sys};
+    result::init().map_err(|error| format!("CUDA init failed: {error}"))?;
+    let count =
+        result::device::get_count().map_err(|error| format!("CUDA device count: {error}"))?;
+    (0..count)
+        .map(|ordinal| {
+            let handle = result::device::get(ordinal)
+                .map_err(|error| format!("CUDA device {ordinal}: {error}"))?;
+            let mut buffer = [0 as std::os::raw::c_char; 32];
+            // SAFETY: the buffer outlives the call and its length is passed.
+            let status = unsafe {
+                sys::lib().cuDeviceGetPCIBusId(
+                    buffer.as_mut_ptr(),
+                    buffer.len() as std::os::raw::c_int,
+                    handle,
+                )
+            };
+            if status != sys::CUresult::CUDA_SUCCESS {
+                return Ok(None);
+            }
+            // SAFETY: the driver NUL-terminates the id within the buffer.
+            Ok(Some(
+                unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Join the inventory's CUDA devices to the CUDA runtime's visible ordinals by
+/// PCI bus id, install the result for every library call that converts between
+/// the two, and log the full mapping. `None` when there are no CUDA devices or
+/// the runtime cannot be enumerated (then the historical id == ordinal behavior
+/// applies and a failure to open a device is reported as before).
+fn install_cuda_ordinal_map(
+    device_info: &DeviceInfo,
+) -> Option<std::sync::Arc<kapsl_llm::cuda_ordinal::CudaOrdinalMap>> {
+    let engine: Vec<_> = device_info
+        .devices
+        .iter()
+        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+        .map(|device| kapsl_llm::cuda_ordinal::EngineCudaDevice {
+            id: device.id,
+            pci_bus_id: device.pci_bus_id.clone(),
+        })
+        .collect();
+    if engine.is_empty() {
+        return None;
+    }
+    #[cfg(feature = "gpu-device-pool")]
+    let ordinal_pci = match enumerate_cuda_pci_ids() {
+        Ok(ids) => ids,
+        Err(error) => {
+            log::warn!("[device-memory] cannot enumerate CUDA devices ({error}); assuming inventory id == CUDA ordinal");
+            return None;
+        }
+    };
+    #[cfg(not(feature = "gpu-device-pool"))]
+    let ordinal_pci: Vec<Option<String>> = Vec::new();
+    let map = kapsl_llm::cuda_ordinal::install(kapsl_llm::cuda_ordinal::CudaOrdinalMap::build(
+        &engine,
+        &ordinal_pci,
+    ));
+    log::info!(
+        "[device-memory] CUDA_VISIBLE_DEVICES={:?} CUDA_DEVICE_ORDER={:?}",
+        std::env::var("CUDA_VISIBLE_DEVICES").ok(),
+        std::env::var("CUDA_DEVICE_ORDER").ok()
+    );
+    for line in map.describe() {
+        log::info!("[device-memory] {line}");
+    }
+    Some(map)
 }
 
 impl DeviceMemoryManager {
@@ -205,6 +287,7 @@ impl DeviceMemoryManager {
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<Option<Arc<Self>>, String> {
         let mut devices = HashMap::new();
+        let mut runtime_overhead = HashMap::new();
         let mut budget = DeviceBudgetLedger::default();
         let pooling_disabled = env_flag(GPU_DEVICE_POOL_DISABLED_ENV);
         if pooling_disabled {
@@ -213,13 +296,67 @@ impl DeviceMemoryManager {
                 GPU_DEVICE_POOL_DISABLED_ENV
             );
         }
+        let cuda_map = install_cuda_ordinal_map(device_info);
         for device in &device_info.devices {
             if !device.backend.to_string().eq_ignore_ascii_case("cuda") {
                 continue;
             }
+            // The inventory id (NVML) is the key for budgets, pools and leases; the
+            // CUDA runtime numbers the same GPU differently, so open it by the
+            // ordinal the PCI-bus-id mapping gives. A device this process cannot see
+            // or cannot match is left unmanaged, never opened under another GPU's
+            // number.
+            let ordinal = match cuda_map.as_ref().map(|map| map.status(device.id)) {
+                Some(Some(CudaMatch::Visible { ordinal })) => *ordinal,
+                Some(Some(CudaMatch::Hidden)) => {
+                    log::info!(
+                        "[device-memory] CUDA device {} is not visible to this process; not managed",
+                        device.id
+                    );
+                    continue;
+                }
+                Some(Some(CudaMatch::Unmatched(reason))) => {
+                    log::warn!(
+                        "[device-memory] CUDA device {} could not be matched to a CUDA ordinal ({reason}); not managed",
+                        device.id
+                    );
+                    continue;
+                }
+                _ => device.id,
+            };
             let physical_bytes = (device.memory_mb as usize).saturating_mul(1024 * 1024);
-            let cuda = CudaDevice::new(device.id)
-                .map_err(|error| format!("failed to open CUDA device {}: {error}", device.id))?;
+            let cuda = CudaDevice::new(ordinal).map_err(|error| {
+                format!(
+                    "failed to open CUDA device {} (ordinal {ordinal}): {error}",
+                    device.id
+                )
+            })?;
+            if let Err(error) = super::runtime_overhead::verify_cuda_identity(
+                device.id,
+                device.pci_bus_id.as_deref(),
+                super::runtime_overhead::cuda_pci_bus_id(&cuda).as_deref(),
+            ) {
+                // Defensive: the mapping should make this impossible.
+                log::error!("[device-memory] {error}; not managed");
+                continue;
+            }
+            // The context now exists but no pool or model does: whatever the
+            // driver attributes to this process here is the runtime's own
+            // overhead, independent of every lease taken later.
+            match super::runtime_overhead::sample_process_gpu_bytes(&cuda) {
+                Some(bytes) => {
+                    log::info!(
+                        "[device-memory] CUDA device {}: runtime process overhead after init = {} bytes",
+                        device.id,
+                        bytes
+                    );
+                    runtime_overhead.insert(device.id, bytes);
+                }
+                None => log::debug!(
+                    "[device-memory] CUDA device {}: per-process overhead unavailable; no runtime row",
+                    device.id
+                ),
+            }
             let pool_mode = resolve_device_pool_mode(device.id, pooling_disabled)?;
             let unpooled_reserve_bytes = if matches!(pool_mode, DevicePoolMode::Auto { .. }) {
                 configured_nonnegative_bytes(GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES_ENV, device.id)?
@@ -242,7 +379,7 @@ impl DeviceMemoryManager {
             devices.insert(
                 device.id,
                 DeviceAuthority {
-                    regions: GpuDevicePool::new(cuda.clone()),
+                    regions: GpuDevicePool::new(cuda.clone(), device.id),
                     cuda,
                     load_lock: Arc::new(AsyncMutex::new(())),
                     pool_init_lock: Mutex::new(()),
@@ -264,6 +401,7 @@ impl DeviceMemoryManager {
             admission_refs: Mutex::new(HashMap::new()),
             next_fallback_allocation: AtomicU64::new(1),
             metrics: Mutex::new(None),
+            runtime_overhead,
         });
         manager.materialize_configured_pools(bootstrap)?;
         if manager.pools.lock().unwrap().is_empty() {
@@ -787,6 +925,14 @@ impl DeviceMemoryManager {
             .get(&device_id)
             .map(|authority| Arc::clone(&authority.cuda))
             .ok_or_else(|| format!("CUDA device {device_id} is not managed by this runtime"))
+    }
+
+    /// Per-process overhead measured once after CUDA init, by device id.
+    pub(crate) fn runtime_overhead(&self) -> Vec<(usize, usize)> {
+        self.runtime_overhead
+            .iter()
+            .map(|(&device_id, &bytes)| (device_id, bytes))
+            .collect()
     }
 
     pub(crate) fn domain_budgets(&self) -> Vec<(usize, usize)> {
@@ -1517,19 +1663,62 @@ impl DeviceMemoryAdmission {
         }
         let mut newly_charged_reported_bytes = 0usize;
 
+        // Decide per planned reservation how this report applies (see
+        // `reservation_outcome`). The classes of reported allocations that match
+        // no reservation tell us which unreported reservations were renamed or
+        // migrated rather than omitted.
+        let planned_ids: std::collections::HashSet<&str> = self
+            .reservations
+            .iter()
+            .map(|reservation| reservation.allocation_id.as_str())
+            .collect();
+        let unmatched_report_classes: Vec<MemoryAllocationClass> = actual_by_id
+            .keys()
+            .filter(|id| !planned_ids.contains(id.as_str()))
+            .map(|id| classify_external_allocation(id))
+            .collect();
+        let report_has_device_allocations = !actual_by_id.is_empty();
+        // Bytes of reservations kept despite not being reported. They stay
+        // charged until unload and come out of the residual below, since the
+        // load-time free-memory sample already contains them.
+        let mut retained_unreported_bytes = 0usize;
         for reservation in &self.reservations {
-            let actual_bytes = actual_by_id.remove(&reservation.allocation_id).unwrap_or(0);
-            if reservation.owns_charge {
-                newly_charged_reported_bytes =
-                    newly_charged_reported_bytes.saturating_add(actual_bytes);
-                self.manager.reconcile_external(
-                    self.device_id,
-                    &reservation.allocation_id,
-                    actual_bytes,
-                )?;
+            let reported = actual_by_id.remove(&reservation.allocation_id);
+            if !reservation.owns_charge {
+                continue;
+            }
+            let outcome = reservation_outcome(
+                reported,
+                report_has_device_allocations,
+                unmatched_report_classes
+                    .contains(&classify_external_allocation(&reservation.allocation_id)),
+            );
+            let reconcile_to = match outcome {
+                ReservationOutcome::Reconcile(bytes) => Some(bytes),
+                ReservationOutcome::Release => Some(0),
+                ReservationOutcome::Retain => None,
+            };
+            match reconcile_to {
+                Some(actual_bytes) => {
+                    newly_charged_reported_bytes =
+                        newly_charged_reported_bytes.saturating_add(actual_bytes);
+                    self.manager.reconcile_external(
+                        self.device_id,
+                        &reservation.allocation_id,
+                        actual_bytes,
+                    )?;
+                }
+                None => {
+                    let retained = self
+                        .manager
+                        .budget
+                        .lock()
+                        .unwrap()
+                        .external_bytes(self.device_id, &reservation.allocation_id);
+                    retained_unreported_bytes = retained_unreported_bytes.saturating_add(retained);
+                }
             }
         }
-
         for (allocation_id, actual_bytes) in actual_by_id {
             let (_, owns_charge) = self.manager.budget.lock().unwrap().reserve_external(
                 self.device_id,
@@ -1553,7 +1742,7 @@ impl DeviceMemoryAdmission {
 
         let residual_bytes = untracked_observed_bytes(
             observed_external_bytes,
-            newly_charged_reported_bytes,
+            newly_charged_reported_bytes.saturating_add(retained_unreported_bytes),
             newly_authorized_bytes,
         );
         if newly_authorized_bytes > 0 {
@@ -1605,6 +1794,36 @@ impl DeviceMemoryAdmission {
             pool_owner: self.pool_owner,
             reservations: std::mem::take(&mut self.reservations),
         }
+    }
+}
+
+/// How a load-time backend report applies to one planned reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationOutcome {
+    /// The backend reported this allocation: charge exactly the reported bytes.
+    Reconcile(usize),
+    /// Not reported, but the backend reported nothing on this device, or
+    /// reported the same class under a different id (renamed or migrated):
+    /// release it. The measured residual is then attributed separately.
+    Release,
+    /// Not reported while the rest of the report is partial: the backend simply
+    /// omitted it (for example a transient workspace it cannot attribute), so
+    /// the admitted bytes stay charged until unload.
+    Retain,
+}
+
+fn reservation_outcome(
+    reported: Option<usize>,
+    report_has_device_allocations: bool,
+    class_reported_under_another_id: bool,
+) -> ReservationOutcome {
+    match reported {
+        Some(bytes) => ReservationOutcome::Reconcile(bytes),
+        // An empty per-device report is the "no telemetry" signal (legacy and
+        // shared-allocator ONNX wrappers): behave exactly as before.
+        None if !report_has_device_allocations => ReservationOutcome::Release,
+        None if class_reported_under_another_id => ReservationOutcome::Release,
+        None => ReservationOutcome::Retain,
     }
 }
 
@@ -1763,7 +1982,11 @@ fn pool_class(class: MemoryAllocationClass) -> PoolAllocationClass {
         MemoryAllocationClass::TransientWorkspace => PoolAllocationClass::TransientWorkspace,
         MemoryAllocationClass::BlockTable => PoolAllocationClass::BlockTable,
         MemoryAllocationClass::RequestTransient => PoolAllocationClass::RequestTransient,
-        MemoryAllocationClass::ExternallyOwned => PoolAllocationClass::ExternallyOwned,
+        // Runtime overhead is attribution only and is never admitted through an
+        // adapter; the closest pool class keeps the match total.
+        MemoryAllocationClass::ExternallyOwned | MemoryAllocationClass::RuntimeOverhead => {
+            PoolAllocationClass::ExternallyOwned
+        }
     }
 }
 
@@ -2171,6 +2394,76 @@ mod tests {
             5 * 1024 * MIB,
             5 * 1024 * MIB
         ));
+    }
+
+    #[test]
+    fn partial_report_retains_unreported_reservations() {
+        // Weights reported, scratch omitted, nothing else of that class: keep.
+        assert_eq!(
+            reservation_outcome(None, true, false),
+            ReservationOutcome::Retain
+        );
+    }
+
+    #[test]
+    fn reported_reservation_reconciles_to_the_reported_bytes() {
+        assert_eq!(
+            reservation_outcome(Some(7), true, false),
+            ReservationOutcome::Reconcile(7)
+        );
+        // A reported zero still reconciles (and so shrinks) the row.
+        assert_eq!(
+            reservation_outcome(Some(0), true, true),
+            ReservationOutcome::Reconcile(0)
+        );
+    }
+
+    #[test]
+    fn empty_report_releases_every_reservation_as_before() {
+        // The "no telemetry" signal: legacy behaviour is unchanged.
+        assert_eq!(
+            reservation_outcome(None, false, false),
+            ReservationOutcome::Release
+        );
+    }
+
+    #[test]
+    fn renamed_allocation_of_the_same_class_releases_the_planned_one() {
+        // Planned `gguf-kv:<key>` vs reported `gguf:active-kv`: the report
+        // carries a KV allocation under another id, so the planned row would
+        // otherwise be charged on top of the reported one.
+        assert_eq!(
+            reservation_outcome(None, true, true),
+            ReservationOutcome::Release
+        );
+        assert_eq!(
+            classify_external_allocation("gguf-kv:/m.gguf"),
+            classify_external_allocation("gguf:active-kv")
+        );
+        assert_ne!(
+            classify_external_allocation("gguf-scratch:/m.gguf"),
+            classify_external_allocation("gguf:active-kv")
+        );
+    }
+
+    #[test]
+    fn retained_unreported_reservation_is_not_double_counted_as_residual() {
+        const MIB: usize = 1024 * 1024;
+        // The load grew device usage by 1,000 MiB: 400 weights reported, 600
+        // transient workspace admitted but not reported. Keeping the workspace
+        // reservation means it must come out of the residual, or the same
+        // bytes would be charged twice (once planned, once as runtime-observed).
+        let reported = 400 * MIB;
+        let retained_unreported = 600 * MIB;
+        assert_eq!(
+            untracked_observed_bytes(1_000 * MIB, reported + retained_unreported, 0),
+            0
+        );
+        // Genuine overhead beyond both is still attributed.
+        assert_eq!(
+            untracked_observed_bytes(1_360 * MIB, reported + retained_unreported, 0),
+            360 * MIB
+        );
     }
 
     #[test]
