@@ -5151,4 +5151,336 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("no target domains"));
     }
+
+    /// What `OnnxBackend::actual_memory` reports after load: the host session
+    /// and host workspace rows, measured.
+    fn onnx_host_report(session: usize, workspace: usize) -> BackendMemoryReport {
+        let row = |id: &str, class, bytes| kapsl_engine_api::MemoryAllocation {
+            allocation_id: id.to_string(),
+            domain: BackendMemoryDomain::Host,
+            class,
+            source: BackendMemoryAllocationSource::BackendManaged,
+            bytes,
+        };
+        BackendMemoryReport {
+            allocations: vec![
+                row(
+                    "onnx-session:0:1:host-session",
+                    BackendMemoryAllocationClass::ModelSession,
+                    session,
+                ),
+                row(
+                    "onnx-session:0:1:workspace",
+                    BackendMemoryAllocationClass::TransientWorkspace,
+                    workspace,
+                ),
+                // Present so a provider-domain weights estimate migrates here.
+                row(
+                    "onnx-session:0:1",
+                    BackendMemoryAllocationClass::PersistentWeights,
+                    0,
+                ),
+            ],
+        }
+    }
+
+    fn reserved_of(
+        authority: &MemoryAuthority,
+        owner: MemoryOwner,
+        domain: &MemoryDomain,
+        class: MemoryAllocationClass,
+    ) -> usize {
+        authority
+            .snapshot()
+            .rows
+            .iter()
+            .filter(|row| row.owner == owner && &row.domain == domain && row.class == class)
+            .map(|row| row.reserved_bytes)
+            .sum()
+    }
+
+    /// Every row's reservation is accounted for in the host domain, and the
+    /// domain holds nothing else: the ledger closes.
+    fn assert_host_ledger_closed(authority: &MemoryAuthority) {
+        let snapshot = authority.snapshot();
+        let rows: usize = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.domain == MemoryDomain::Host)
+            .map(|row| row.reserved_bytes)
+            .sum();
+        assert_eq!(
+            rows,
+            authority.host.reserved_bytes(),
+            "host ledger is not closed"
+        );
+    }
+
+    #[test]
+    fn onnx_measured_report_replaces_the_lease_echo_and_closes_the_ledger() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(60, 0);
+        // Admission: the backend plan is the file size (14 MiB); the engine
+        // adds its estimate rows (5/4 x file session, 256 MiB workspace).
+        let planned = BackendMemoryReport {
+            allocations: vec![kapsl_engine_api::MemoryAllocation {
+                allocation_id: "onnx-session:0:1:host-session".to_string(),
+                domain: BackendMemoryDomain::Host,
+                class: BackendMemoryAllocationClass::ModelSession,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes: 14 * MIB,
+            }],
+        };
+        let plan = authority
+            .model_load_plan_with_report(
+                &[MemoryDomain::Host],
+                owner,
+                14 * MIB * 5 / 4,
+                256 * MIB,
+                &planned,
+            )
+            .unwrap();
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+        let host = MemoryDomain::Host;
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &host,
+                MemoryAllocationClass::TransientWorkspace
+            ),
+            256 * MIB,
+            "before the report the workspace is the engine's estimate"
+        );
+
+        // Load report: 53 MiB session, 0 workspace (nothing has run yet).
+        lease
+            .record_loaded_report(&onnx_host_report(53 * MIB, 0))
+            .unwrap();
+        lease.reconcile(&onnx_host_report(53 * MIB, 0)).unwrap();
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &host,
+                MemoryAllocationClass::ModelSession
+            ),
+            53 * MIB,
+            "the lease follows the measured session bytes, not the plan"
+        );
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &host,
+                MemoryAllocationClass::TransientWorkspace
+            ),
+            0,
+            "a measured workspace replaces the 256 MiB estimate"
+        );
+        assert_host_ledger_closed(&authority);
+
+        // After warm-up the arena grew: the workspace row grows with it.
+        lease
+            .reconcile(&onnx_host_report(53 * MIB, 14 * MIB))
+            .unwrap();
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &host,
+                MemoryAllocationClass::TransientWorkspace
+            ),
+            14 * MIB
+        );
+        assert_eq!(authority.host.reserved_bytes(), 67 * MIB);
+        assert_host_ledger_closed(&authority);
+
+        // A smaller later measurement is honoured too (this is the reclaim).
+        lease
+            .reconcile(&onnx_host_report(40 * MIB, 14 * MIB))
+            .unwrap();
+        assert_eq!(authority.host.reserved_bytes(), 54 * MIB);
+        assert_host_ledger_closed(&authority);
+
+        drop(lease);
+        assert_eq!(
+            authority.host.reserved_bytes(),
+            0,
+            "unload releases everything"
+        );
+    }
+
+    #[test]
+    fn coreml_host_report_releases_every_estimate_row_of_the_provider_domain() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(61, 0);
+        let metal = MemoryDomain::Provider {
+            provider: "metal".to_string(),
+            device_id: Some(0),
+        };
+        // What the SDK plans for CoreML on Apple silicon: host rows only.
+        let planned = onnx_host_report(14 * MIB, 64 * MIB);
+        // The engine selects the device's `metal` domain and, finding no
+        // weights/workspace row there, adds its own estimates in it.
+        let plan = authority
+            .model_load_plan_with_report(
+                &[metal.clone()],
+                owner,
+                14 * MIB * 5 / 4,
+                256 * MIB,
+                &BackendMemoryReport {
+                    allocations: planned
+                        .allocations
+                        .into_iter()
+                        .filter(|row| row.class != BackendMemoryAllocationClass::PersistentWeights)
+                        .collect(),
+                },
+            )
+            .unwrap();
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+        let provider_bytes = |authority: &MemoryAuthority| {
+            [
+                MemoryAllocationClass::PersistentWeights,
+                MemoryAllocationClass::TransientWorkspace,
+                MemoryAllocationClass::ModelSession,
+            ]
+            .into_iter()
+            .map(|class| reserved_of(authority, owner, &metal, class))
+            .sum::<usize>()
+        };
+        assert!(
+            provider_bytes(&authority) > 256 * MIB,
+            "the engine's estimates sit in the metal domain before the report"
+        );
+
+        lease
+            .reconcile(&onnx_host_report(69 * MIB, 5 * MIB))
+            .unwrap();
+        assert_eq!(
+            provider_bytes(&authority),
+            0,
+            "no estimate may survive in the provider domain"
+        );
+        let host = MemoryDomain::Host;
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &host,
+                MemoryAllocationClass::ModelSession
+            ),
+            69 * MIB
+        );
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &host,
+                MemoryAllocationClass::TransientWorkspace
+            ),
+            5 * MIB
+        );
+        assert_host_ledger_closed(&authority);
+    }
+
+    #[test]
+    fn a_host_report_without_a_weights_row_leaves_the_provider_weights_estimate() {
+        // Documents why the SDK reports a zero PersistentWeights row for host
+        // placements: without it the engine's weights estimate in the
+        // provider domain has nothing to migrate to and stays until unload.
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let owner = MemoryOwner::new(62, 0);
+        let metal = MemoryDomain::Provider {
+            provider: "metal".to_string(),
+            device_id: Some(0),
+        };
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            metal.clone(),
+            owner,
+            MemoryAllocationClass::PersistentWeights,
+            17 * MIB,
+        ));
+        let mut lease = authority.admit(&plan).unwrap();
+        lease.mark_committed();
+        let mut report = onnx_host_report(69 * MIB, 5 * MIB);
+        report
+            .allocations
+            .retain(|row| row.class != BackendMemoryAllocationClass::PersistentWeights);
+        lease.reconcile(&report).unwrap();
+        assert_eq!(
+            reserved_of(
+                &authority,
+                owner,
+                &metal,
+                MemoryAllocationClass::PersistentWeights
+            ),
+            17 * MIB
+        );
+    }
+
+    #[test]
+    fn onnx_next_to_a_gguf_model_grants_and_denies_on_measured_bytes() {
+        let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
+        let budget = authority.host.budget().safe_bytes;
+        // Qwen2.5-0.5B GGUF as the memory admission work reports it:
+        // weights, KV and compute buffer, all in the host domain.
+        let gguf = MemoryOwner::new(70, 0);
+        let mut gguf_plan = MemoryPlan::new();
+        for (class, bytes) in [
+            (MemoryAllocationClass::PersistentWeights, 491_400_032),
+            (MemoryAllocationClass::KvCache, 402_653_184),
+            (MemoryAllocationClass::TransientWorkspace, 90_097_280),
+        ] {
+            gguf_plan.push(MemoryClaim::runtime(MemoryDomain::Host, gguf, class, bytes));
+        }
+        let mut gguf_lease = authority.admit(&gguf_plan).unwrap();
+        gguf_lease.mark_committed();
+        let gguf_bytes = authority.host.reserved_bytes();
+
+        // An ONNX model is granted and its measured rows add exactly their
+        // bytes next to the GGUF rows.
+        let onnx = MemoryOwner::new(71, 0);
+        let plan = authority
+            .model_load_plan_with_report(
+                &[MemoryDomain::Host],
+                onnx,
+                4 * MIB,
+                256 * MIB,
+                &BackendMemoryReport::default(),
+            )
+            .unwrap();
+        let mut onnx_lease = authority.admit(&plan).unwrap();
+        onnx_lease.mark_committed();
+        onnx_lease
+            .reconcile(&onnx_host_report(30 * MIB, 14 * MIB))
+            .unwrap();
+        assert_eq!(authority.host.reserved_bytes(), gguf_bytes + 44 * MIB);
+        assert_host_ledger_closed(&authority);
+
+        // A model that cannot fit next to them is denied and reserves nothing.
+        let before = authority.host.reserved_bytes();
+        let huge = authority
+            .model_load_plan_with_report(
+                &[MemoryDomain::Host],
+                MemoryOwner::new(72, 0),
+                budget,
+                MIB,
+                &BackendMemoryReport::default(),
+            )
+            .unwrap();
+        assert!(
+            authority.admit(&huge).is_err(),
+            "over-budget ONNX load must be denied"
+        );
+        assert_eq!(
+            authority.host.reserved_bytes(),
+            before,
+            "a denial reserves nothing"
+        );
+        assert_host_ledger_closed(&authority);
+    }
 }
