@@ -8,6 +8,11 @@ enum ModelLoadOutcome {
         message: String,
         requested: Vec<(String, usize)>,
     },
+    /// The model names a CUDA device this process cannot use.
+    DeviceUnavailable {
+        message: String,
+        device_id: usize,
+    },
     Failed {
         message: String,
     },
@@ -15,6 +20,12 @@ enum ModelLoadOutcome {
 
 impl ModelLoadOutcome {
     fn from_load_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        if let Some(unavailable) = error.downcast_ref::<DeviceUnavailable>() {
+            return Self::DeviceUnavailable {
+                message: error.to_string(),
+                device_id: unavailable.device_id,
+            };
+        }
         match error.downcast_ref::<MemoryAdmissionFailure>() {
             Some(failure) => Self::Denied {
                 message: error.to_string(),
@@ -53,6 +64,16 @@ impl ModelLoadOutcome {
                         .into_iter()
                         .map(|(domain, bytes)| serde_json::json!({"domain": domain, "bytes": bytes}))
                         .collect::<Vec<_>>(),
+                }),
+            ),
+            Self::DeviceUnavailable { message, device_id } => (
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": message,
+                    "model_id": model_id,
+                    "status": "denied",
+                    "reason": "device_unavailable",
+                    "device_id": device_id,
                 }),
             ),
             Self::Failed { message } => (
@@ -462,4 +483,31 @@ pub(crate) fn build_model_lifecycle_routes(
         .or(remove_model)
         .map(reply_into_response)
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hidden_device_request_is_rejected_as_device_unavailable_not_as_a_memory_denial() {
+        let error: Box<dyn std::error::Error + Send + Sync> = Box::new(DeviceUnavailable {
+            device_id: 1,
+            detail: "engine CUDA device 1 is not visible to this process".to_string(),
+        });
+        let outcome = ModelLoadOutcome::from_load_error(error.as_ref());
+        assert!(matches!(
+            outcome,
+            ModelLoadOutcome::DeviceUnavailable { device_id: 1, .. }
+        ));
+        let (status, body) = outcome.into_reply(7);
+        assert_eq!(status, warp::http::StatusCode::CONFLICT);
+        assert_eq!(body["reason"], "device_unavailable");
+        assert_eq!(body["status"], "denied");
+        assert_eq!(body["device_id"], 1);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requests CUDA device 1"));
+    }
 }

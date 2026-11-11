@@ -264,17 +264,14 @@ pub(super) async fn load_replica(
             )
         })?;
         logical_provider = Some(selection.logical_provider.clone());
+        // `select_mesh_devices` only returns devices this process can use, so
+        // there is no requested-id fallback: a raw manifest id could name a
+        // device the selection just excluded.
         let device_id = selection
             .devices
             .first()
             .map(|device| device.id)
-            .unwrap_or_else(|| {
-                plan.loader
-                    .manifest
-                    .hardware_requirements
-                    .device_id
-                    .unwrap_or(0) as usize
-            });
+            .ok_or_else(|| format!("No usable device for {}", role.selection_context(&plan)))?;
         // Use the exact provider selected from the manifest/fallback policy.
         // The generic factory's final CPU fallback would otherwise let an
         // autoscaled CUDA/TensorRT replica silently change execution mode.

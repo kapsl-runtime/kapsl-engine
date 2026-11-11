@@ -62,6 +62,12 @@ impl RuntimeBootstrap {
         }
         self.config.transport.preflight()?;
 
+        // Map engine CUDA devices to the CUDA runtime's visible ordinals before any
+        // model is planned: admission denies a request for a device this process
+        // cannot see (for example one hidden by `CUDA_VISIBLE_DEVICES`).
+        #[cfg(feature = "gpu-device-pool")]
+        let _ = install_cuda_ordinal_map(&self.device_info);
+
         let registry = Arc::new(Registry::new());
         let models = ModelManager::new(Arc::new(ModelRegistry::new()));
         let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);

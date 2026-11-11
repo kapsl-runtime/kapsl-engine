@@ -199,7 +199,6 @@ pub(crate) struct DeviceMemoryManager {
 }
 
 /// Read the PCI bus id the CUDA driver reports for each visible ordinal.
-#[cfg(feature = "gpu-device-pool")]
 fn enumerate_cuda_pci_ids() -> Result<Vec<Option<String>>, String> {
     use cudarc::driver::{result, sys};
     result::init().map_err(|error| format!("CUDA init failed: {error}"))?;
@@ -236,7 +235,7 @@ fn enumerate_cuda_pci_ids() -> Result<Vec<Option<String>>, String> {
 /// the two, and log the full mapping. `None` when there are no CUDA devices or
 /// the runtime cannot be enumerated (then the historical id == ordinal behavior
 /// applies and a failure to open a device is reported as before).
-fn install_cuda_ordinal_map(
+pub(crate) fn install_cuda_ordinal_map(
     device_info: &DeviceInfo,
 ) -> Option<std::sync::Arc<kapsl_llm::cuda_ordinal::CudaOrdinalMap>> {
     let engine: Vec<_> = device_info
@@ -251,7 +250,10 @@ fn install_cuda_ordinal_map(
     if engine.is_empty() {
         return None;
     }
-    #[cfg(feature = "gpu-device-pool")]
+    // This module only builds with `gpu-device-pool`, so the CUDA runtime is
+    // always enumerable here. An empty enumeration is a real answer (for example
+    // `CUDA_VISIBLE_DEVICES=""`) and marks every engine device hidden; a failed
+    // one installs no map rather than a map that would hide every device.
     let ordinal_pci = match enumerate_cuda_pci_ids() {
         Ok(ids) => ids,
         Err(error) => {
@@ -259,8 +261,6 @@ fn install_cuda_ordinal_map(
             return None;
         }
     };
-    #[cfg(not(feature = "gpu-device-pool"))]
-    let ordinal_pci: Vec<Option<String>> = Vec::new();
     let map = kapsl_llm::cuda_ordinal::install(kapsl_llm::cuda_ordinal::CudaOrdinalMap::build(
         &engine,
         &ordinal_pci,
@@ -296,7 +296,10 @@ impl DeviceMemoryManager {
                 GPU_DEVICE_POOL_DISABLED_ENV
             );
         }
-        let cuda_map = install_cuda_ordinal_map(device_info);
+        // Startup installs the map before models are planned (so a request for a
+        // hidden device is denied at admission); build it here only if it is absent.
+        let cuda_map =
+            kapsl_llm::cuda_ordinal::installed().or_else(|| install_cuda_ordinal_map(device_info));
         for device in &device_info.devices {
             if !device.backend.to_string().eq_ignore_ascii_case("cuda") {
                 continue;

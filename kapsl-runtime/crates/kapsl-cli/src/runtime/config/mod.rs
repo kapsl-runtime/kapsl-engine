@@ -593,29 +593,68 @@ pub(crate) struct MeshDeviceSelection {
     pub(crate) logical_provider: String,
 }
 
-pub(crate) fn select_mesh_devices(
+/// An explicitly requested CUDA device that this process cannot use.
+///
+/// Typed so the load path can reject the request at admission with a clear
+/// message instead of failing later inside a backend, and so it is never
+/// mistaken for a memory denial (which the priority arbiter retries by
+/// evicting lower-priority models; no eviction can make a hidden device appear).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceUnavailable {
+    pub(crate) device_id: usize,
+    pub(crate) detail: String,
+}
+
+impl std::fmt::Display for DeviceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model requests CUDA device {}, which this process cannot use: {}",
+            self.device_id, self.detail
+        )
+    }
+}
+
+impl std::error::Error for DeviceUnavailable {}
+
+fn is_cuda_device(device: &kapsl_hal::device::Device) -> bool {
+    device.backend.to_string().eq_ignore_ascii_case("cuda")
+}
+
+/// Why a CUDA inventory device cannot be used by this process, or `None` when
+/// it can (or when no CUDA mapping is installed, which is the legacy identity).
+fn cuda_device_problem(
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+    device: &kapsl_hal::device::Device,
+) -> Option<kapsl_llm::cuda_ordinal::CudaOrdinalError> {
+    if !is_cuda_device(device) {
+        return None;
+    }
+    map?.ordinal_or_error(device.id).err()
+}
+
+/// The inventory restricted to devices this process can use: CUDA devices that
+/// are hidden from the process (for example by `CUDA_VISIBLE_DEVICES`) or that
+/// could not be matched to a CUDA ordinal are not managed by the memory layer
+/// and must never be a placement target.
+fn usable_device_info(
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+) -> DeviceInfo {
+    let mut usable = device_info.clone();
+    usable
+        .devices
+        .retain(|device| cuda_device_problem(map, device).is_none());
+    if usable.has_cuda && !usable.devices.iter().any(is_cuda_device) {
+        usable.has_cuda = false;
+    }
+    usable
+}
+
+fn candidate_providers(
     requirements: &kapsl_core::HardwareRequirements,
     device_info: &DeviceInfo,
-) -> Result<MeshDeviceSelection, String> {
-    let strategy = requirements
-        .strategy
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let allow_multi = matches!(
-        strategy.as_str(),
-        "pool"
-            | "round-robin"
-            | "data-parallel"
-            | "pipeline"
-            | "pipeline-parallel"
-            | "tensor-parallel"
-            | "auto"
-    );
-    let mut preferred_device_id = requirements.device_id.map(|id| id as usize);
-    if allow_multi {
-        preferred_device_id = None;
-    }
+) -> Vec<String> {
     let mut providers: Vec<String> = Vec::new();
     if let Some(pref) = &requirements.preferred_provider {
         providers.push(pref.clone());
@@ -652,7 +691,101 @@ pub(crate) fn select_mesh_devices(
         }
         push_if_missing("cpu");
     }
+    providers
+}
 
+/// Deny a request that names a CUDA device this process cannot use. The
+/// request is checked whatever the topology: a pool or data-parallel strategy
+/// does not make an explicit `device_id` optional.
+pub(crate) fn check_requested_device_usable(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+) -> Result<(), DeviceUnavailable> {
+    let Some(requested) = requirements
+        .device_id
+        .and_then(|id| usize::try_from(id).ok())
+    else {
+        return Ok(());
+    };
+    let providers = candidate_providers(requirements, device_info);
+    let wants_cuda = providers.iter().any(|provider| {
+        matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "cuda" | "tensorrt"
+        )
+    }) || (providers.is_empty() && device_info.has_cuda);
+    if !wants_cuda {
+        return Ok(());
+    }
+    let Some(device) = device_info
+        .devices
+        .iter()
+        .find(|device| is_cuda_device(device) && device.id == requested)
+    else {
+        return Ok(());
+    };
+    let Some(problem) = cuda_device_problem(map, device) else {
+        return Ok(());
+    };
+    let usable: Vec<usize> = device_info
+        .devices
+        .iter()
+        .filter(|device| is_cuda_device(device) && cuda_device_problem(map, device).is_none())
+        .map(|device| device.id)
+        .collect();
+    Err(DeviceUnavailable {
+        device_id: requested,
+        detail: format!(
+            "{problem}; CUDA devices this process can use: {usable:?} \
+             (set CUDA_VISIBLE_DEVICES to include it, or request one of those devices)"
+        ),
+    })
+}
+
+pub(crate) fn select_mesh_devices(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+) -> Result<MeshDeviceSelection, String> {
+    select_mesh_devices_with(
+        requirements,
+        device_info,
+        kapsl_llm::cuda_ordinal::installed().as_deref(),
+    )
+}
+
+/// [`select_mesh_devices`] with the process's CUDA visibility passed in. Every
+/// placement path goes through here, so hidden or unmatched CUDA devices are
+/// removed once, before any provider branch or fallback can pick them.
+pub(crate) fn select_mesh_devices_with(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+) -> Result<MeshDeviceSelection, String> {
+    check_requested_device_usable(requirements, device_info, map)
+        .map_err(|error| error.to_string())?;
+    let usable = usable_device_info(device_info, map);
+    let device_info = &usable;
+    let strategy = requirements
+        .strategy
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let allow_multi = matches!(
+        strategy.as_str(),
+        "pool"
+            | "round-robin"
+            | "data-parallel"
+            | "pipeline"
+            | "pipeline-parallel"
+            | "tensor-parallel"
+            | "auto"
+    );
+    let mut preferred_device_id = requirements.device_id.map(|id| id as usize);
+    if allow_multi {
+        preferred_device_id = None;
+    }
+    let providers = candidate_providers(requirements, device_info);
     let mut selected: Vec<kapsl_hal::device::Device> = Vec::new();
     let mut selected_provider: Option<String> = None;
     if !providers.is_empty() {
@@ -749,3 +882,7 @@ pub(crate) fn select_mesh_devices(
         logical_provider,
     })
 }
+
+#[cfg(test)]
+#[path = "visibility_tests.rs"]
+mod visibility_tests;
