@@ -490,10 +490,23 @@ pub(crate) fn preliminary_memory_admission(
     };
     let allowed_ids = &manifest.hardware_requirements.gpu_device_ids;
     let requested_id = manifest.hardware_requirements.device_id;
+    let cuda_map = kapsl_llm::cuda_ordinal::installed();
+    check_requested_device_usable(
+        &manifest.hardware_requirements,
+        device_info,
+        cuda_map.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     let available = device_info
         .devices
         .iter()
         .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+        // Only devices this process can use count toward capacity.
+        .filter(|device| {
+            cuda_map
+                .as_deref()
+                .is_none_or(|map| map.ordinal_or_error(device.id).is_ok())
+        })
         .filter(|device| {
             (allowed_ids.is_empty() || allowed_ids.contains(&(device.id as i32)))
                 && requested_id.is_none_or(|id| id == device.id as i32)

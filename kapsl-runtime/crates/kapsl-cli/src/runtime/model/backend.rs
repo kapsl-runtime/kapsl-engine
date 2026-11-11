@@ -71,8 +71,11 @@ pub(super) fn acquire_embedded_ort_pool_clients(
     for &device_id in device_ids {
         // ORT identifies the device by CUDA ordinal; the pool is keyed by the
         // inventory id, so register the allocator under the mapped ordinal.
-        let device = i32::try_from(kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id))
-            .map_err(|_| "ORT device ID exceeds i32".to_string())?;
+        let device = kapsl_llm::cuda_ordinal::to_cuda_ordinal(device_id)
+            .map_err(|error| error.to_string())
+            .and_then(|ordinal| {
+                i32::try_from(ordinal).map_err(|_| "ORT device ID exceeds i32".to_string())
+            })?;
         if let Some(client) =
             resources
                 .memory()
@@ -470,6 +473,10 @@ pub(super) fn create_runtime_backend_for_device(
     let _ = (resources, model_id, replica_id);
 
     if engine_kind.is_gguf() {
+        // The `create_gguf_*` constructors below take no device list; give the GGUF
+        // placement code the inventory so it can map this engine device to a
+        // llama.cpp CUDA device by PCI bus id.
+        BackendFactory::register_gguf_engine_devices(device_info);
         if let Some(backend) = create_llama_cpp_pack_engine(
             manifest,
             device_info,

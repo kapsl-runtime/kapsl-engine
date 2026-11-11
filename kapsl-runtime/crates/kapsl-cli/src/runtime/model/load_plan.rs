@@ -194,6 +194,15 @@ pub(super) fn build_model_load_plan(
         },
     )?;
     let loader = resolve_package_loader(&absolute_path, base_model_id)?;
+    // Deny a request for a CUDA device this process cannot use (hidden by
+    // `CUDA_VISIBLE_DEVICES`, or not matched to a CUDA ordinal) here, before any
+    // backend, pack download or memory lease. The typed error is not a memory
+    // denial, so the arbiter never evicts models trying to make it fit.
+    check_requested_device_usable(
+        &loader.manifest.hardware_requirements,
+        device_info,
+        kapsl_llm::cuda_ordinal::installed().as_deref(),
+    )?;
     let model_file_path = loader.get_model_path();
     validate_model_contract(&loader.manifest).map_err(|error| {
         format!(
