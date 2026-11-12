@@ -298,7 +298,7 @@ By default the command waits for the memory authority's decision and prints one 
 
 ```text
   ✓  summarizer.aimod (id=2)  granted · 0.98 GB
-  ✗  assistant-3b.aimod  denied · needs 2.45 GB, 1.09 GB free
+  ✗  assistant-7b.aimod  denied · needs 5.30 GB, 1.09 GB free
 ```
 
 A granted line shows the model's memory lease. A denied line shows what the load asked for and what was free in the domain that blocked it. When a narrower budget (such as a per-class cap) blocked the load instead, the line reads `needs …, over the <domain> budget`. The command exits non-zero if any model was denied or failed, and the runtime and its other models keep running.
