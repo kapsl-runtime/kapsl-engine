@@ -1050,25 +1050,25 @@ mod command_tests {
         let result = add_model_result(
             409,
             r#"{"error":"memory admission failed","model_id":3,"status":"denied","reason":"memory_admission",
-                "requested":[{"domain":"host","bytes":120000000},{"domain":"cuda:0","bytes":2450000000}]}"#,
+                "requested":[{"domain":"host","bytes":120000000},{"domain":"cuda:0","bytes":5300000000}]}"#,
             Some(&view),
         );
         assert_eq!(
             result,
             AddModelResult::Denied {
-                needed: Some(2_450_000_000),
+                needed: Some(5_300_000_000),
                 free: Some(1_090_000_000),
                 domain: Some("cuda:0".to_string())
             }
         );
         let line = strip_ansi(&add_model_result_line(
-            "assistant-3b.aimod",
+            "assistant-7b.aimod",
             &result,
             &Ansi::new(),
         ));
         assert_eq!(
             line,
-            "  ✗  assistant-3b.aimod  denied · needs 2.45 GB, 1.09 GB free"
+            "  ✗  assistant-7b.aimod  denied · needs 5.30 GB, 1.09 GB free"
         );
     }
 
