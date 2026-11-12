@@ -1387,6 +1387,23 @@ fn provider_domain_budgets(budgets: &HashMap<MemoryDomain, usize>) -> HashMap<Me
         .collect()
 }
 
+/// Remove every CUDA domain whose device the CUDA manager does not manage
+/// (hidden by `CUDA_VISIBLE_DEVICES`, or not matched to a CUDA ordinal).
+#[cfg(feature = "gpu-device-pool")]
+fn drop_unmanaged_cuda_domains(
+    device_domains: &mut HashMap<usize, MemoryDomainPolicy>,
+    domain_budgets: &mut HashMap<MemoryDomain, usize>,
+    managed: &[usize],
+) {
+    device_domains.retain(|device_id, policy| {
+        !matches!(policy.domain, MemoryDomain::Cuda { .. }) || managed.contains(device_id)
+    });
+    domain_budgets.retain(|domain, _| match domain {
+        MemoryDomain::Cuda { device_id } => managed.contains(device_id),
+        _ => true,
+    });
+}
+
 impl MemoryAuthority {
     /// Build the policy/accounting half of a CUDA authority without opening a
     /// physical device. Synthetic-device unit tests use this constructor so
@@ -1450,6 +1467,16 @@ impl MemoryAuthority {
         let (mut device_domains, mut domain_budgets) =
             authority_domain_policies(device_info, host.budget(), &provider_limits);
         if let Some(manager) = cuda.as_ref() {
+            // The manager leaves devices this process cannot see (or could not
+            // match to a CUDA ordinal) unmanaged. They must not stay behind as
+            // domains either: `observe_cuda_memory_total` would split the
+            // process's usage over them and report bytes for a GPU it cannot use.
+            let managed: Vec<usize> = manager
+                .domain_budgets()
+                .into_iter()
+                .map(|(device_id, _)| device_id)
+                .collect();
+            drop_unmanaged_cuda_domains(&mut device_domains, &mut domain_budgets, &managed);
             for (device_id, budget_bytes) in manager.domain_budgets() {
                 let domain = MemoryDomain::Cuda { device_id };
                 device_domains.insert(
@@ -1620,6 +1647,33 @@ impl MemoryAuthority {
                 },
                 observed,
             );
+        }
+    }
+
+    /// Observed CUDA bytes per device (engine id), from per-device sampling:
+    /// this process's bytes on the device, or the device's used bytes minus other
+    /// processes'. An idle device therefore reports its own near-zero figure
+    /// instead of a share of every GPU's total. Devices without a domain are
+    /// ignored; managed devices missing from `per_device` keep their last value.
+    pub(crate) fn observe_cuda_memory_by_device(&self, per_device: &HashMap<usize, usize>) {
+        let mut accounting = self.accounting.lock();
+        for (&device_id, policy) in &self.device_domains {
+            if !matches!(policy.domain, MemoryDomain::Cuda { .. }) {
+                continue;
+            }
+            let Some(&bytes) = per_device.get(&device_id) else {
+                continue;
+            };
+            #[cfg(feature = "gpu-device-pool")]
+            let bytes = bytes.saturating_sub(
+                self.cuda
+                    .as_ref()
+                    .map(|manager| manager.pool_capacity_bytes(device_id))
+                    .unwrap_or(0),
+            );
+            accounting
+                .observed_domains
+                .insert(MemoryDomain::Cuda { device_id }, bytes);
         }
     }
 
@@ -4526,6 +4580,52 @@ mod tests {
             .iter()
             .all(|claim| !matches!(claim.domain, MemoryDomain::Cuda { .. })));
         assert_eq!(plan.claims().len(), 3);
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn a_device_the_cuda_manager_does_not_manage_keeps_no_cuda_domain() {
+        let policy = |device_id, domain: MemoryDomain| {
+            (
+                device_id,
+                MemoryDomainPolicy {
+                    domain,
+                    budget_bytes: 24 * GIB,
+                },
+            )
+        };
+        let mut device_domains: HashMap<usize, MemoryDomainPolicy> = [
+            policy(0, MemoryDomain::Cuda { device_id: 0 }),
+            policy(1, MemoryDomain::Cuda { device_id: 1 }),
+            policy(
+                2,
+                MemoryDomain::Provider {
+                    provider: "directml".into(),
+                    device_id: Some(2),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut domain_budgets: HashMap<MemoryDomain, usize> = device_domains
+            .values()
+            .map(|p| (p.domain.clone(), p.budget_bytes))
+            .collect();
+        domain_budgets.insert(MemoryDomain::Host, 8 * GIB);
+        // CUDA_VISIBLE_DEVICES=0: only device 0 is managed.
+        drop_unmanaged_cuda_domains(&mut device_domains, &mut domain_budgets, &[0]);
+        assert!(device_domains.contains_key(&0));
+        assert!(
+            !device_domains.contains_key(&1),
+            "hidden device kept a domain"
+        );
+        assert!(
+            device_domains.contains_key(&2),
+            "non-CUDA domains are untouched"
+        );
+        assert!(!domain_budgets.contains_key(&MemoryDomain::Cuda { device_id: 1 }));
+        assert!(domain_budgets.contains_key(&MemoryDomain::Cuda { device_id: 0 }));
+        assert!(domain_budgets.contains_key(&MemoryDomain::Host));
     }
 
     #[test]

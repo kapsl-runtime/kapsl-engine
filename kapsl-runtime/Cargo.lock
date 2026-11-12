@@ -2384,6 +2384,7 @@ dependencies = [
  "log",
  "mime_guess",
  "nvml-wrapper",
+ "nvml-wrapper-sys",
  "ort",
  "parking_lot",
  "prometheus",

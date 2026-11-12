@@ -74,6 +74,14 @@ impl RuntimeResources {
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<Arc<Self>, String> {
         let memory = MemoryAuthority::new_with_cuda_plan(device_info, bootstrap)?;
+        // Placement of unpinned models reads the room left under the ledger.
+        let room_source = memory.clone();
+        crate::runtime::config::install_device_room(move |device_id| {
+            room_source
+                .snapshot()
+                .domain(&crate::runtime::memory::MemoryDomain::Cuda { device_id })
+                .map_or(0, |domain| domain.available_bytes)
+        });
         Ok(Arc::new(Self {
             kv: KvCoordinatorInner::new(memory.clone()),
             memory,
