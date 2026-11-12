@@ -7,6 +7,11 @@ on:
       - ".github/scripts/test-install-script.sh"
       - ".github/scripts/package-linux-cuda-runtime.sh"
       - ".github/scripts/test-package-linux-cuda-runtime.sh"
+      - ".github/scripts/collect-ort-sidecars.sh"
+      - ".github/scripts/fetch-microsoft-ort-providers.sh"
+      - ".github/scripts/check-linux-glibc-floor.sh"
+      - ".github/scripts/test-ort-provider-glibc-gate.sh"
+      - ".github/ort-microsoft-providers.env"
       - ".github/scripts/package-linux-onnx-backend-packs.sh"
       - ".github/scripts/package-linux-ort-cpu-backend.sh"
       - ".github/scripts/package-linux-ort-accelerator-backends.sh"
@@ -186,6 +191,10 @@ jobs:
           sh -n .github/scripts/test-install-script.sh
           bash -n .github/scripts/package-linux-cuda-runtime.sh
           bash -n .github/scripts/test-package-linux-cuda-runtime.sh
+          bash -n .github/scripts/collect-ort-sidecars.sh
+          bash -n .github/scripts/fetch-microsoft-ort-providers.sh
+          bash -n .github/scripts/check-linux-glibc-floor.sh
+          bash -n .github/scripts/test-ort-provider-glibc-gate.sh
           bash -n .github/scripts/package-linux-onnx-backend-packs.sh
           bash -n .github/scripts/package-linux-ort-cpu-backend.sh
           bash -n .github/scripts/package-linux-ort-accelerator-backends.sh
@@ -239,6 +248,9 @@ jobs:
 
       - name: Test merged CUDA archive contents
         run: .github/scripts/test-package-linux-cuda-runtime.sh
+
+      - name: Test Microsoft ORT provider fetch and glibc floor gate
+        run: .github/scripts/test-ort-provider-glibc-gate.sh
 
       - name: Test certified ORT CPU release handoff
         run: .github/scripts/test-package-linux-ort-cpu-backend.sh

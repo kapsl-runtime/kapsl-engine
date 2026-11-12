@@ -114,6 +114,10 @@ jobs:
         if: matrix.component == 'engine' && !inputs.cache_only
         run: .github/scripts/package-linux-cuda-runtime.sh
 
+      - name: Gate CUDA bundle on the Ubuntu 22.04 glibc floor
+        if: matrix.component == 'engine' && !inputs.cache_only
+        run: .github/scripts/check-linux-glibc-floor.sh "$RUNNER_TEMP/kapsl-${KAPSL_VERSION}-linux-x86_64-cuda12"
+
       - name: Package llama.cpp backend packs from published SDK crates
         if: startsWith(matrix.component, 'llama-')
         env:

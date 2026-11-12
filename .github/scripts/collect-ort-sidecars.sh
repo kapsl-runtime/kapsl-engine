@@ -58,6 +58,34 @@ if [ "${RUNNER_OS:-}" = "Linux" ] && [ "${RUNNER_ARCH:-}" = "X64" ]; then
   fi
 fi
 
+# The ort crate's prebuilt CUDA/TensorRT providers (pyke, built on Ubuntu 24.04) need GLIBC_2.38 and
+# cannot load on Ubuntu 22.04. Ship Microsoft's official release of the same ONNX Runtime version
+# instead (pinned URL and SHA-256 in .github/ort-microsoft-providers.env). The statically linked ORT
+# core and libonnxruntime_providers_shared.so stay as the ort crate provides them.
+if [ "${RUNNER_OS:-}" = "Linux" ] && [ "${RUNNER_ARCH:-}" = "X64" ]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  swap_args=()
+  if [ -f ort-cuda-libs/libonnxruntime_providers_cuda.so ]; then
+    swap_args+=(cuda ort-cuda-libs)
+  fi
+  if [ -f ort-tensorrt-libs/libonnxruntime_providers_tensorrt.so ]; then
+    swap_args+=(tensorrt ort-tensorrt-libs)
+  fi
+  if [ "${#swap_args[@]}" -gt 0 ]; then
+    "$script_dir/fetch-microsoft-ort-providers.sh" "${swap_args[@]}"
+  fi
+
+  gate_dirs=()
+  for directory in ort-core-libs ort-cuda-libs ort-tensorrt-libs; do
+    if [ -n "$(find "$directory" -type f -print -quit)" ]; then
+      gate_dirs+=("$directory")
+    fi
+  done
+  if [ "${#gate_dirs[@]}" -gt 0 ]; then
+    "$script_dir/check-linux-glibc-floor.sh" "${gate_dirs[@]}"
+  fi
+fi
+
 for directory in ort-core-libs ort-cuda-libs ort-tensorrt-libs ort-rocm-libs; do
   if [ -n "$(find "$directory" -type f -print -quit)" ]; then
     find "$directory" -maxdepth 1 -type f -print | sort

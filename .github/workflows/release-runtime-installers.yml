@@ -302,6 +302,19 @@ jobs:
         shell: bash
         run: .github/scripts/package-linux-provider-packs.sh
 
+      - name: Gate provider packs on the Ubuntu 22.04 glibc floor
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          pack_roots=("$RUNNER_TEMP"/kapsl-provider-*-linux-x86_64)
+          if [ "${#pack_roots[@]}" -gt 0 ]; then
+            .github/scripts/check-linux-glibc-floor.sh "${pack_roots[@]}"
+          else
+            echo "No provider packs were built; nothing to gate."
+          fi
+
       - name: Import Apple signing certificate
         if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != '' && env.APPLE_CERTIFICATE_PASSWORD != '' && env.APPLE_TEAM_ID != ''
         run: |
