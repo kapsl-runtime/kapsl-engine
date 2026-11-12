@@ -10,10 +10,14 @@
 #   + runtime-overhead row                   (owner_kind "runtime")
 #   + free bytes of the device pool backing  (physical, but in no row)
 #
-# is within KAPSL_GPU_TEST_LEDGER_TOLERANCE_PCT (default 5) of BOTH
-#   * the process's own GPU memory as reported by the driver (nvidia-smi), which
-#     is independent of the ledger, and
-#   * the domain's `observed_bytes` in the stats response.
+# is within KAPSL_GPU_TEST_LEDGER_TOLERANCE_PCT (default 5) of the process's own
+# GPU memory as reported by the driver (nvidia-smi), which is independent of the
+# ledger. The domain's `observed_bytes` is compared with the same sum **without
+# the free pool backing**: the engine removes the pool's capacity from the
+# sampled device total and adds back only the bytes owners allocated from it
+# (`observe_cuda_memory_total`, the domain fold in `MemoryAuthority::snapshot`),
+# so an idle pool backing is deliberately in no observed figure. The budget
+# ledger (`DeviceBudgetLedger`) is where the backing is charged, in full.
 #
 # The nvidia-smi comparison is the one that cannot pass by construction: the
 # domain's observed figure is max(sampled, attributed), so an over-attributed
@@ -103,15 +107,16 @@ ledger_closure_report() {
     | if $d == null then error("domain \($domain) missing from stats") else . end
     | ([$d.reserved_bytes, $d.committed_bytes] | max) as $leases
     | ([$models[] | select(.owner_kind == "runtime") | .used_bytes] | add // 0) as $runtime
-    | ($leases + $runtime + $pool_free) as $ledger
+    | ($leases + $runtime) as $rows
+    | ($rows + $pool_free) as $ledger
     | ($d.observed_bytes) as $observed
     | ($process | if . == "unavailable" then null else tonumber end) as $proc
     | {
-        leases: $leases, runtime: $runtime, pool_free: $pool_free, ledger: $ledger,
-        observed: $observed, process: $proc,
+        leases: $leases, runtime: $runtime, pool_free: $pool_free, rows: $rows,
+        ledger: $ledger, observed: $observed, process: $proc,
         residual: (if $proc == null then null else ($proc - $ledger) end),
         models_sum_all_domains: ([$models[] | select(.owner_kind == "model") | .used_bytes] | add // 0),
-        vs_observed_ok: within($ledger; $observed),
+        vs_observed_ok: within($rows; $observed),
         vs_process_ok: (if $proc == null then true else within($ledger; $proc) end)
       }' "$stats"
 }
@@ -122,9 +127,10 @@ assert_ledger_closes() {
     || die "stats at $stats are not parseable or lack domain $domain"
   note "ledger figures: $(jq -c . <<<"$report")"
   jq -e '.vs_observed_ok' <<<"$report" >/dev/null \
-    || die "ledger ($(jq -r .ledger <<<"$report")) is not within ${tolerance_pct}% of domain observed ($(jq -r .observed <<<"$report"))"
+    || die "lease and runtime rows ($(jq -r .rows <<<"$report")) are not within ${tolerance_pct}% of domain observed ($(jq -r .observed <<<"$report"))"
   jq -e '.vs_process_ok' <<<"$report" >/dev/null \
-    || die "ledger ($(jq -r .ledger <<<"$report")) is not within ${tolerance_pct}% of driver-reported process memory ($(jq -r .process <<<"$report"))"
+    || die "ledger ($(jq -r .ledger <<<"$report")) is not within ${tolerance_pct}% of driver-reported process memory ($(jq -r .process <<<"$report"))$(
+      jq -r 'if .runtime == 0 then "; the runtime overhead row is absent (0 B), so the CUDA context the driver counts is in no row: look for a \"runtime overhead\" warning in the engine log" else "" end' <<<"$report")"
 }
 
 # fixture NAME LEASES_A LEASES_B RUNTIME OBSERVED [HOST_EXTRA]
@@ -172,13 +178,39 @@ run_self_test() {
     || die "self-test let host-domain rows break the cuda closure"
 
   # An auto pool's unused backing is in the driver's process figure but in no
-  # row: it must be added from the pool metrics, and omitting it must fail.
+  # row and in no observed figure (the engine subtracts the pool capacity from
+  # the sampled total): it must be added from the pool metrics for the driver
+  # comparison only, and omitting it must fail that comparison.
   local pooled
-  pooled="$(fixture pooled $((1065 * mib)) $((1065 * mib)) $((370 * mib)) $((4000 * mib)))"
+  pooled="$(fixture pooled $((1065 * mib)) $((1065 * mib)) $((370 * mib)) $((2500 * mib)))"
   ( assert_ledger_closes "$pooled" cuda:0 $((2495 * mib + 1500 * mib)) 5 $((1500 * mib)) ) >/dev/null 2>&1 \
     || die "self-test rejected a ledger that closes once pool backing is added"
   ( assert_ledger_closes "$pooled" cuda:0 $((2495 * mib + 1500 * mib)) 5 0 ) >/dev/null 2>&1 \
     && die "self-test ignored unused pool backing"
+  # An observed figure that includes the idle backing contradicts the engine's
+  # rule (and would hide a pool that is charged twice).
+  local pooled_in_observed
+  pooled_in_observed="$(fixture pooled_in_observed $((1065 * mib)) $((1065 * mib)) $((370 * mib)) $((4000 * mib)))"
+  ( assert_ledger_closes "$pooled_in_observed" cuda:0 $((2495 * mib + 1500 * mib)) 5 $((1500 * mib)) ) >/dev/null 2>&1 \
+    && die "self-test accepted an observed figure that counts idle pool backing"
+
+  # GPU run 2, card 0: one model, 512 MiB pool backing all free, no runtime row.
+  # Observed equals the leases, so the observed comparison passes; the driver
+  # still holds the CUDA context that no row accounts for, so the driver
+  # comparison fails and says why.
+  local run2
+  run2="$(fixture run2_card0 1041872768 0 0 1041872768)"
+  ( ledger_closure_report "$run2" cuda:0 1845493760 5 536870912 \
+      | jq -e '.vs_observed_ok and (.vs_process_ok | not) and .ledger == 1578743680 and .rows == 1041872768' ) >/dev/null 2>&1 \
+    || die "self-test mis-evaluated the run-2 card 0 figures"
+  ( assert_ledger_closes "$run2" cuda:0 1845493760 5 536870912 ) >/dev/null 2>&1 \
+    && die "self-test accepted a ledger short by the CUDA context"
+  local run2_message
+  run2_message="$( ( assert_ledger_closes "$run2" cuda:0 1845493760 5 536870912 ) 2>&1 || true )"
+  [[ "$run2_message" == *"runtime overhead row is absent"* ]] \
+    || die "self-test did not name the missing runtime row: $run2_message"
+  ( assert_ledger_closes "$run2" cuda:0 1578743680 5 536870912 ) >/dev/null 2>&1 \
+    || die "self-test rejected the run-2 ledger against a driver figure that includes the pool"
 
   # Over-attribution must not pass: observed follows the ledger (it is
   # max(sampled, attributed)), but the driver's process figure does not.

@@ -86,10 +86,22 @@ where
     }
 }
 
+/// Initialise NVML. nvml-wrapper loads `libnvidia-ml.so`, a development symlink
+/// that container images with the driver libraries injected (Docker's NVIDIA
+/// runtime, Vast.ai) do not carry: they only have `libnvidia-ml.so.1`. Try the
+/// versioned name when the default fails, and report the default's error.
+pub(crate) fn init_nvml() -> Result<nvml_wrapper::Nvml, nvml_wrapper::error::NvmlError> {
+    nvml_wrapper::Nvml::init().or_else(|first| {
+        nvml_wrapper::Nvml::builder()
+            .lib_path(std::ffi::OsStr::new("libnvidia-ml.so.1"))
+            .init()
+            .map_err(|_| first)
+    })
+}
+
 fn shared_nvml() -> Option<&'static nvml_wrapper::Nvml> {
     static NVML: OnceLock<Option<nvml_wrapper::Nvml>> = OnceLock::new();
-    NVML.get_or_init(|| nvml_wrapper::Nvml::init().ok())
-        .as_ref()
+    NVML.get_or_init(|| init_nvml().ok()).as_ref()
 }
 
 /// Format NVML's encoded CUDA driver version (`1000 * major + 10 * minor`,
@@ -132,10 +144,138 @@ pub(crate) fn nvml_device_rows() -> Option<Vec<Option<(f64, usize, usize)>>> {
             let device = nvml.device_by_index(index).ok()?;
             let util = device.utilization_rates().ok()?.gpu as f64;
             let mem = device.memory_info().ok()?;
-            Some((util, mem.used as usize, mem.total as usize))
+            let used = mem.used.saturating_sub(driver_reserved_bytes(&device));
+            Some((util, used as usize, mem.total as usize))
         })
         .collect();
     rows.iter().any(Option::is_some).then_some(rows)
+}
+
+/// Bytes the driver sets aside on a device for itself (NVML's `reserved`).
+///
+/// The classic `nvmlDeviceGetMemoryInfo` that nvml-wrapper exposes counts them
+/// as used (453 MiB per RTX 3090 on driver 610), while `nvidia-smi`'s
+/// `memory.used` and the per-process figures do not. Summed over the devices
+/// that inflated the engine's observed CUDA bytes by the reserve of every GPU
+/// whenever NVML loaded, and did not when the `nvidia-smi` fallback ran. Read
+/// them with the v2 call; 0 (the v1 behaviour) when the driver lacks it.
+fn driver_reserved_bytes(device: &nvml_wrapper::Device<'_>) -> u64 {
+    use nvml_wrapper_sys::bindings::{nvmlMemory_v2_t, NvmlLib};
+    static LIB: OnceLock<Option<NvmlLib>> = OnceLock::new();
+    // NVML_STRUCT_VERSION(Memory, 2): struct size | (version << 24).
+    const MEMORY_V2: u32 = std::mem::size_of::<nvmlMemory_v2_t>() as u32 | (2 << 24);
+    let lib = LIB.get_or_init(|| {
+        // SAFETY: loading the driver's NVML library, which `shared_nvml` has already
+        // loaded and initialised in this process; dlopen returns the same instance.
+        unsafe {
+            NvmlLib::new("libnvidia-ml.so.1")
+                .or_else(|_| NvmlLib::new("libnvidia-ml.so"))
+                .ok()
+        }
+    });
+    let Some(query) = lib
+        .as_ref()
+        .and_then(|lib| lib.nvmlDeviceGetMemoryInfo_v2.as_ref().ok())
+    else {
+        return 0;
+    };
+    let mut info = nvmlMemory_v2_t {
+        version: MEMORY_V2,
+        total: 0,
+        reserved: 0,
+        free: 0,
+        used: 0,
+    };
+    // SAFETY: `info` is a valid, initialised `nvmlMemory_v2_t` with its version
+    // set; the handle belongs to the initialised NVML instance.
+    let status = unsafe { query(device.handle(), &mut info) };
+    if status == 0 {
+        info.reserved
+    } else {
+        0
+    }
+}
+
+/// GPU memory per device, keyed by NVML index (the engine's CUDA device id).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DeviceMemorySample {
+    /// Device-wide used bytes, driver-reserved memory excluded.
+    pub(crate) used: std::collections::HashMap<usize, usize>,
+    /// This process's own bytes per device, when NVML lists the process (it
+    /// does not inside some PID namespaces); `None` otherwise.
+    pub(crate) process: Option<std::collections::HashMap<usize, usize>>,
+}
+
+fn nvml_device_memory() -> Option<DeviceMemorySample> {
+    use nvml_wrapper::enums::device::UsedGpuMemory;
+    let nvml = shared_nvml()?;
+    let count = nvml.device_count().ok()?;
+    let pid = std::process::id();
+    let mut sample = DeviceMemorySample::default();
+    let mut process = std::collections::HashMap::new();
+    let mut listed = false;
+    for index in 0..count {
+        let Ok(device) = nvml.device_by_index(index) else {
+            continue;
+        };
+        let Ok(memory) = device.memory_info() else {
+            continue;
+        };
+        let id = index as usize;
+        sample.used.insert(
+            id,
+            memory.used.saturating_sub(driver_reserved_bytes(&device)) as usize,
+        );
+        let mut ours = 0usize;
+        if let Ok(processes) = device.running_compute_processes() {
+            for entry in processes.iter().filter(|entry| entry.pid == pid) {
+                listed = true;
+                if let UsedGpuMemory::Used(bytes) = entry.used_gpu_memory {
+                    ours = ours.saturating_add(usize::try_from(bytes).unwrap_or(0));
+                }
+            }
+        }
+        process.insert(id, ours);
+    }
+    if sample.used.is_empty() {
+        return None;
+    }
+    sample.process = listed.then_some(process);
+    Some(sample)
+}
+
+/// Parse `nvidia-smi --query-gpu=index,memory.used` (MiB, no units) CSV.
+fn parse_smi_device_used(stdout: &str) -> std::collections::HashMap<usize, usize> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split(',').map(str::trim);
+            let index = parts.next()?.parse::<usize>().ok()?;
+            let mib = parts.next()?.parse::<f64>().ok()?;
+            Some((index, (mib * 1024.0 * 1024.0) as usize))
+        })
+        .collect()
+}
+
+/// Per-device GPU memory: NVML first (device-wide and per-process), then a
+/// bounded `nvidia-smi` call (device-wide only).
+pub(crate) fn sample_device_memory_blocking(smi_timeout: Duration) -> Option<DeviceMemorySample> {
+    if let Some(sample) = nvml_device_memory() {
+        return Some(sample);
+    }
+    let stdout = run_command_with_timeout(
+        "nvidia-smi",
+        &[
+            "--query-gpu=index,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        smi_timeout,
+    )?;
+    let used = parse_smi_device_used(&stdout);
+    (!used.is_empty()).then_some(DeviceMemorySample {
+        used,
+        process: None,
+    })
 }
 
 /// Samples GPU telemetry off the async runtime, with a timeout and a backoff
@@ -352,5 +492,18 @@ mod tests {
         let mut versions = [Some("12.1".to_string())];
         fill_cuda_versions(versions.iter_mut(), || panic!("NVML must not be queried"));
         assert_eq!(versions, [Some("12.1".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod device_memory_tests {
+    use super::*;
+
+    #[test]
+    fn nvidia_smi_device_rows_are_keyed_by_index() {
+        let used = parse_smi_device_used("0, 1769\n1, 12\nnot a row\n");
+        assert_eq!(used.get(&0), Some(&(1769 * 1024 * 1024)));
+        assert_eq!(used.get(&1), Some(&(12 * 1024 * 1024)));
+        assert_eq!(used.len(), 2);
     }
 }

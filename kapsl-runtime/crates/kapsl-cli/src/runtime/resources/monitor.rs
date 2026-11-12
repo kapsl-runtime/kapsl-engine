@@ -739,9 +739,22 @@ impl RuntimeMonitor {
                     (0.0, None, None)
                 };
 
+                // Per-device figures for the memory authority: the device-wide total
+                // cannot say which GPU holds the bytes.
+                let device_memory = if has_cuda && gpu_memory_bytes.is_some() {
+                    run_blocking_with_timeout(smi_timeout * 2, move || {
+                        sample_device_memory_blocking(smi_timeout)
+                    })
+                    .await
+                    .flatten()
+                } else {
+                    None
+                };
+                let mut foreign_by_device: HashMap<usize, usize> = HashMap::new();
                 let foreign_gpu_memory_bytes =
                     if cotenancy_guard && has_cuda && !gpu_sampler.backing_off(now) {
                         let foreign = sample_foreign_vram_async(smi_timeout).await;
+                        foreign_by_device = foreign.clone();
                         let ceilings = memory.reconcile_external_device_memory(&foreign);
                         if ceilings
                             .iter()
@@ -772,7 +785,24 @@ impl RuntimeMonitor {
                 *samples_for_task.write() = snapshot.clone();
 
                 memory.observe_process_memory(process_memory_bytes);
-                if let Some(gpu_bytes) = gpu_memory_bytes {
+                if let Some(sample) = &device_memory {
+                    // This process's own bytes on each device when NVML lists it,
+                    // otherwise the device's used bytes minus other processes.
+                    let per_device: HashMap<usize, usize> = sample
+                        .used
+                        .iter()
+                        .map(|(&device_id, &used)| {
+                            let bytes = match &sample.process {
+                                Some(process) => process.get(&device_id).copied().unwrap_or(0),
+                                None => used.saturating_sub(
+                                    foreign_by_device.get(&device_id).copied().unwrap_or(0),
+                                ),
+                            };
+                            (device_id, bytes)
+                        })
+                        .collect();
+                    memory.observe_cuda_memory_by_device(&per_device);
+                } else if let Some(gpu_bytes) = gpu_memory_bytes {
                     memory.observe_cuda_memory_total(
                         gpu_bytes.saturating_sub(foreign_gpu_memory_bytes.unwrap_or(0)),
                     );

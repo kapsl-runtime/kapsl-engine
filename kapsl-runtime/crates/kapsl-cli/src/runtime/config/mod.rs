@@ -593,6 +593,111 @@ pub(crate) struct MeshDeviceSelection {
     pub(crate) logical_provider: String,
 }
 
+/// Free bytes under the memory ledger for an engine CUDA device, installed once
+/// the memory authority exists. Placement of unpinned models reads it.
+type DeviceRoomFn = Box<dyn Fn(usize) -> usize + Send + Sync>;
+static DEVICE_ROOM: std::sync::OnceLock<DeviceRoomFn> = std::sync::OnceLock::new();
+/// Device chosen for each unpinned single-device model, so every plan of one
+/// model (primary load, replicas, preliminary admission) agrees on it even
+/// though the room under the ledger changes as soon as the model is admitted.
+static DEFAULT_PLACEMENTS: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn install_device_room(room: impl Fn(usize) -> usize + Send + Sync + 'static) {
+    let _ = DEVICE_ROOM.set(Box::new(room));
+}
+
+/// The device with the most room; ties go to the lowest id.
+pub(crate) fn choose_device_by_room(
+    candidates: &[usize],
+    room: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .max_by_key(|&id| (room(id), std::cmp::Reverse(id)))
+}
+
+/// Default placement of an unpinned model: ONE visible CUDA device, chosen by
+/// the room left under the ledger. Replicas across devices happen only when the
+/// manifest asks for a multi-device strategy (`pool`, `data-parallel`, ...), and
+/// an explicit `device_id` is never overridden. Pins the choice into
+/// `requirements.device_id` so every later selection sees the same device.
+/// Returns the chosen device when it pinned one.
+pub(crate) fn pin_default_cuda_device(
+    requirements: &mut kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+    base_model_id: u32,
+) -> Option<usize> {
+    if requirements.device_id.is_some() {
+        return None;
+    }
+    let strategy = requirements
+        .strategy
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        strategy.as_str(),
+        "pool"
+            | "round-robin"
+            | "data-parallel"
+            | "pipeline"
+            | "pipeline-parallel"
+            | "tensor-parallel"
+            | "auto"
+    ) {
+        return None;
+    }
+    let usable = usable_device_info(device_info, map);
+    let providers = candidate_providers(requirements, &usable);
+    let wants_cuda = providers.iter().any(|provider| {
+        matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "cuda" | "tensorrt"
+        )
+    }) || (providers.is_empty() && usable.has_cuda);
+    if !wants_cuda {
+        return None;
+    }
+    let candidates: Vec<usize> = usable
+        .devices
+        .iter()
+        .filter(|device| is_cuda_device(device))
+        .filter(|device| {
+            requirements
+                .min_vram_mb
+                .is_none_or(|min| device.memory_mb >= min)
+        })
+        .map(|device| device.id)
+        .collect();
+    if candidates.len() < 2 {
+        return None;
+    }
+    let mut chosen = DEFAULT_PLACEMENTS.lock().unwrap();
+    let device = match chosen.iter().find(|(id, _)| *id == base_model_id) {
+        Some((_, device)) if candidates.contains(device) => *device,
+        _ => {
+            // Without a ledger yet (startup planning) spread by how many default
+            // placements each device already has, then by id.
+            let tally = |id: usize| chosen.iter().filter(|(_, d)| *d == id).count();
+            let device = if DEVICE_ROOM.get().is_some() {
+                choose_device_by_room(&candidates, |id| DEVICE_ROOM.get().map_or(0, |f| f(id)))
+            } else {
+                choose_device_by_room(&candidates, |id| usize::MAX - tally(id))
+            }?;
+            chosen.retain(|(id, _)| *id != base_model_id);
+            chosen.push((base_model_id, device));
+            device
+        }
+    };
+    requirements.device_id = Some(device as i32);
+    log::info!(
+        "[placement] model {base_model_id}: no device pinned and no multi-device strategy; placing on CUDA device {device} (visible candidates {candidates:?}, most room under the ledger)"
+    );
+    Some(device)
+}
+
 /// An explicitly requested CUDA device that this process cannot use.
 ///
 /// Typed so the load path can reject the request at admission with a clear
@@ -886,3 +991,17 @@ pub(crate) fn select_mesh_devices_with(
 #[cfg(test)]
 #[path = "visibility_tests.rs"]
 mod visibility_tests;
+
+#[cfg(test)]
+mod default_placement_tests {
+    use super::choose_device_by_room;
+
+    #[test]
+    fn the_device_with_the_most_room_wins_and_ties_go_to_the_lowest_id() {
+        let room = |id: usize| [8usize, 20, 20][id];
+        assert_eq!(choose_device_by_room(&[0, 1, 2], room), Some(1));
+        assert_eq!(choose_device_by_room(&[0, 2], room), Some(2));
+        assert_eq!(choose_device_by_room(&[1, 0], |_| 5), Some(0));
+        assert_eq!(choose_device_by_room(&[], |_| 5), None);
+    }
+}

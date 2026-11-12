@@ -355,7 +355,7 @@ impl DeviceMemoryManager {
                     );
                     runtime_overhead.insert(device.id, bytes);
                 }
-                None => log::debug!(
+                None => log::warn!(
                     "[device-memory] CUDA device {}: per-process overhead unavailable; no runtime row",
                     device.id
                 ),

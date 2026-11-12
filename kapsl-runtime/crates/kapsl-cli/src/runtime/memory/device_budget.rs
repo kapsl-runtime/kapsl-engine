@@ -4,6 +4,12 @@ use std::collections::HashMap;
 pub(crate) const AUTO_POOL_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const AUTO_POOL_MIN_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const AUTO_POOL_GROWTH_FLOOR_BYTES: usize = 256 * 1024 * 1024;
+/// Growth room is also a share of the safe budget (1/16). CUDA backing is
+/// immutable and cannot grow once a workload is admitted, so a later dynamic
+/// load of a different model (a vision model next to a started GGUF) can only
+/// use room reserved here. The pool is charged to the ledger in full, so the
+/// room is accounted, not hidden.
+pub(crate) const AUTO_POOL_GROWTH_BUDGET_DIVISOR: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AutoPoolSizingInput {
@@ -61,7 +67,9 @@ pub(crate) fn choose_auto_pool_capacity(input: AutoPoolSizingInput) -> AutoPoolS
     let allocatable_capacity = available_after_external.saturating_sub(retained_reserve);
     // Automatic mode is demand-sized. Retain bounded growth room instead of
     // eagerly converting every otherwise-free byte into an immutable backing.
-    let growth_headroom = (required_pool_bytes / 4).max(AUTO_POOL_GROWTH_FLOOR_BYTES);
+    let growth_headroom = (required_pool_bytes / 4)
+        .max(AUTO_POOL_GROWTH_FLOOR_BYTES)
+        .max(input.safe_budget_bytes / AUTO_POOL_GROWTH_BUDGET_DIVISOR);
     let raw_capacity = required_pool_bytes
         .saturating_add(growth_headroom)
         .min(allocatable_capacity);
@@ -372,8 +380,31 @@ mod tests {
             minimum_pool_bytes: 0,
             unpooled_reserve_bytes: Some(2 * GIB),
         });
-        assert_eq!(decision.capacity_bytes, Some(512 * 1024 * 1024));
+        // 256 MiB minimum plus growth room of 1/16 of the safe budget (1.25 GiB).
+        assert_eq!(
+            decision.capacity_bytes,
+            Some(256 * 1024 * 1024 + 20 * GIB / 16)
+        );
         assert_eq!(decision.unpooled_reserve_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn auto_pool_leaves_room_for_a_later_vision_model_load() {
+        // The pool cannot grow once a workload is admitted, so the process-start
+        // pool must already hold the floor of a ~1.1 GB dynamic ONNX load (the
+        // YOLOX package next to a started GGUF) on a 24 GB card.
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 22_440_339_047,
+            planned_external_bytes: 759_835_488,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: None,
+        });
+        let capacity = decision.capacity_bytes.expect("automatic pool");
+        assert!(
+            capacity >= 1_088_552_216,
+            "pool {capacity} too small for the dynamic load"
+        );
+        assert_eq!(capacity % AUTO_POOL_ALIGNMENT_BYTES, 0);
     }
 
     #[test]
@@ -388,7 +419,8 @@ mod tests {
         });
         let capacity = decision.capacity_bytes.expect("automatic pool");
         let expected_reserve = (safe_budget / 5).max(GIB).min(safe_budget / 3);
-        let expected_capacity = 512 * 1024 * 1024;
+        let expected_capacity = (256 * 1024 * 1024 + safe_budget / 16) / AUTO_POOL_ALIGNMENT_BYTES
+            * AUTO_POOL_ALIGNMENT_BYTES;
         assert_eq!(capacity % AUTO_POOL_ALIGNMENT_BYTES, 0);
         assert_eq!(decision.unpooled_reserve_bytes, expected_reserve);
         assert_eq!(capacity, expected_capacity);

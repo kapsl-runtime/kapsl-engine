@@ -98,7 +98,7 @@ pub(super) fn sample_process_gpu_bytes(cuda: &cudarc::driver::CudaDevice) -> Opt
         )
     };
     if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-        log::debug!("[device-memory] runtime overhead: cuDeviceGetPCIBusId failed: {status:?}");
+        log::warn!("[device-memory] runtime overhead: cuDeviceGetPCIBusId failed: {status:?}");
         return None;
     }
     // SAFETY: the driver NUL-terminates the id within the buffer.
@@ -106,28 +106,50 @@ pub(super) fn sample_process_gpu_bytes(cuda: &cudarc::driver::CudaDevice) -> Opt
         .to_string_lossy()
         .into_owned();
 
-    let nvml = match nvml_wrapper::Nvml::init() {
+    let nvml = match crate::runtime::resources::init_nvml() {
         Ok(nvml) => nvml,
         Err(error) => {
-            log::debug!("[device-memory] runtime overhead: NVML unavailable: {error}");
+            log::warn!("[device-memory] runtime overhead: NVML unavailable: {error}");
             return None;
         }
     };
-    let device = nvml
-        .device_by_pci_bus_id(nvml_pci_bus_id(&cuda_bus_id))
-        .ok()?;
+    // Warnings, not debug lines: without this sample the runtime row is absent
+    // and the ledger is short by the CUDA context, so the reason must be visible.
+    let device = match nvml.device_by_pci_bus_id(nvml_pci_bus_id(&cuda_bus_id)) {
+        Ok(device) => device,
+        Err(error) => {
+            log::warn!("[device-memory] runtime overhead: NVML cannot open {cuda_bus_id}: {error}");
+            return None;
+        }
+    };
     let pid = std::process::id();
-    let used = device
-        .running_compute_processes()
-        .ok()?
+    let processes = match device.running_compute_processes() {
+        Ok(processes) => processes,
+        Err(error) => {
+            log::warn!(
+                "[device-memory] runtime overhead: NVML cannot list compute processes on {cuda_bus_id}: {error}"
+            );
+            return None;
+        }
+    };
+    let listed: Vec<u32> = processes.iter().map(|process| process.pid).collect();
+    let used = processes
         .into_iter()
         .find(|process| process.pid == pid)
         .map(|process| process.used_gpu_memory);
     match used {
         Some(UsedGpuMemory::Used(bytes)) => usize::try_from(bytes).ok(),
-        _ => {
-            log::debug!(
-                "[device-memory] runtime overhead: NVML does not report this process on {cuda_bus_id}"
+        Some(_) => {
+            log::warn!(
+                "[device-memory] runtime overhead: NVML lists pid {pid} on {cuda_bus_id} without a memory figure"
+            );
+            None
+        }
+        None => {
+            log::warn!(
+                "[device-memory] runtime overhead: NVML does not list pid {pid} on {cuda_bus_id} \
+                 (it lists {:?}; a PID namespace can hide this process)",
+                listed
             );
             None
         }

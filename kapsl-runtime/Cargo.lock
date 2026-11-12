@@ -2384,6 +2384,7 @@ dependencies = [
  "log",
  "mime_guess",
  "nvml-wrapper",
+ "nvml-wrapper-sys",
  "ort",
  "parking_lot",
  "prometheus",
@@ -2428,7 +2429,7 @@ dependencies = [
 [[package]]
 name = "kapsl-backends"
 version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2459,7 +2460,7 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.3.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "flate2",
  "fs2",
@@ -2479,7 +2480,7 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2515,7 +2516,7 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.3.3"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "cudarc",
  "half",
@@ -2547,7 +2548,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kernels"
 version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "cudarc",
  "half",
@@ -2559,7 +2560,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kv-abi"
 version = "0.6.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2568,7 +2569,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llama-cpp-2"
 version = "0.1.146-kapsl.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2581,7 +2582,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llama-cpp-sys-2"
 version = "0.1.146-kapsl.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "bindgen",
  "cc",
@@ -2594,7 +2595,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.3.7"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2624,7 +2625,7 @@ dependencies = [
 [[package]]
 name = "kapsl-loader"
 version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "half",
  "log",
@@ -2677,7 +2678,7 @@ dependencies = [
 [[package]]
 name = "kapsl-quantization"
 version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ceab4c1dead792b1cbac92fb7923536382eec465#ceab4c1dead792b1cbac92fb7923536382eec465"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=b6c748abe93d08544d14f02590584f8867cdda44#b6c748abe93d08544d14f02590584f8867cdda44"
 dependencies = [
  "anyhow",
  "half",
