@@ -373,6 +373,73 @@ mod tests {
     }
 
     #[test]
+    fn two_onnx_models_that_outgrow_the_budget_together_at_peak_are_denied() {
+        use crate::runtime::model::onnx_arena_peak_bytes;
+        // GPU run 5 and 6 ledger rows at 4 busy sessions: ResNet-50 1,761,607,680 B
+        // and ZFNet-512 2,437,110,191 B, 4,198,717,871 B together.
+        const RESNET: usize = 102_576_593;
+        const ZFNET: usize = 349_005_501;
+        const BUDGET: usize = 4_000_000_000;
+        let owner_a = MemoryOwner::new(1, 0);
+        let owner_b = MemoryOwner::new(2, 0);
+
+        let admit = |ledger: &mut DeviceBudgetLedger,
+                     name: &str,
+                     owner: MemoryOwner,
+                     weights: usize,
+                     workspace: usize| {
+            reserve_for(ledger, name, weights, owner)?;
+            ledger
+                .reserve_external(
+                    DEVICE,
+                    &format!("{name}:workspace"),
+                    workspace,
+                    owner,
+                    MemoryAllocationClass::TransientWorkspace,
+                )
+                .map(|_| ())
+        };
+        let new_ledger = || {
+            let mut ledger = DeviceBudgetLedger::default();
+            ledger.insert_device(DEVICE, BUDGET, 0).unwrap();
+            ledger
+        };
+
+        // The peak plan: weights and workspace, claims summing to the peak.
+        let mut ledger = new_ledger();
+        let resnet_peak = onnx_arena_peak_bytes(RESNET, 4);
+        admit(
+            &mut ledger,
+            "resnet",
+            owner_a,
+            RESNET * 4,
+            resnet_peak - RESNET * 4,
+        )
+        .expect("ResNet-50 alone fits");
+        let zfnet_peak = onnx_arena_peak_bytes(ZFNET, 4);
+        let denied = admit(
+            &mut ledger,
+            "zfnet",
+            owner_b,
+            ZFNET * 4,
+            zfnet_peak - ZFNET * 4,
+        )
+        .expect_err("ZFNet-512 next to it outgrows the budget at peak");
+        assert!(denied.contains("memory admission rejected"), "{denied}");
+
+        // The earlier plan (weights per session plus one max(model / 4, 64 MiB)
+        // workspace) admits both although together they reach 4.2 GB.
+        let old_plan = |model: usize| (model * 4, (model / 4).max(64 * 1024 * 1024));
+        let mut ledger = new_ledger();
+        let (weights, workspace) = old_plan(RESNET);
+        admit(&mut ledger, "resnet", owner_a, weights, workspace).unwrap();
+        let (weights, workspace) = old_plan(ZFNET);
+        admit(&mut ledger, "zfnet", owner_b, weights, workspace)
+            .expect("the load-time plan lets both in");
+        assert!(1_761_607_680usize + 2_437_110_191 > BUDGET);
+    }
+
+    #[test]
     fn auto_pool_subtracts_weights_and_retains_unpooled_headroom() {
         let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
             safe_budget_bytes: 20 * GIB,

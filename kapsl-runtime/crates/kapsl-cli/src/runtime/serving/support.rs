@@ -1130,4 +1130,75 @@ mod command_tests {
             "  ✗  small.aimod  denied · needs 0.30 GB, over the cuda:0 budget"
         );
     }
+
+    #[test]
+    fn an_onnx_peak_plan_denial_reads_needs_the_peak_and_the_free_bytes() {
+        // ONNX on ORT's own arena is admitted at its peak plan: YOLOX-nano at 4 sessions is
+        // 1,625,423,128 B, and the 409 body carries that figure as the cuda:0 request.
+        let peak = crate::runtime::model::onnx_arena_peak_bytes(3_702_598, 4);
+        assert_eq!(peak, 1_625_423_128);
+        let body = format!(
+            r#"{{"status":"denied","reason":"memory_admission","requested":[{{"domain":"cuda:0","bytes":{peak}}}]}}"#
+        );
+        let view = parse_memory_view(STATS).expect("parse stats");
+        let line = strip_ansi(&add_model_result_line(
+            "yolox-nano-cuda-0.aimod",
+            &add_model_result(409, &body, Some(&view)),
+            &Ansi::new(),
+        ));
+        assert_eq!(
+            line,
+            "  ✗  yolox-nano-cuda-0.aimod  denied · needs 1.63 GB, 1.09 GB free"
+        );
+        // A class budget narrower than the free bytes: no free figure, the budget is named.
+        let line = strip_ansi(&add_model_result_line(
+            "yolox-nano-cuda-0.aimod",
+            &add_model_result(409, &body, None),
+            &Ansi::new(),
+        ));
+        assert_eq!(
+            line,
+            "  ✗  yolox-nano-cuda-0.aimod  denied · needs 1.63 GB, over the cuda:0 budget"
+        );
+    }
+
+    // `pool_floor_refusal` exists only in a build with the CUDA device pool.
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn a_pool_floor_refusal_and_a_hidden_device_reach_the_cli_as_a_failure_reason() {
+        // Opt-in path: the pool refusal is a plain error, not a memory denial.
+        let reason = crate::runtime::memory::pool_floor_refusal(
+            0,
+            268_435_456,
+            1_088_552_216,
+            "the pool has admitted workloads",
+        );
+        let body =
+            serde_json::json!({"error": reason, "model_id": 1, "status": "failed"}).to_string();
+        let line = strip_ansi(&add_model_result_line(
+            "yolox-nano-cuda-0.aimod",
+            &add_model_result(500, &body, None),
+            &Ansi::new(),
+        ));
+        assert_eq!(
+            line,
+            "  ✗  yolox-nano-cuda-0.aimod  (automatic CUDA pool on device 0 is 268435456 bytes but the dynamic load requires at least 1088552216 bytes; the pool has admitted workloads and cannot be rematerialized)"
+        );
+        // A device this process cannot use: HTTP 409 with reason device_unavailable (not memory_admission).
+        let error = crate::runtime::config::DeviceUnavailable {
+            device_id: 1,
+            detail: "engine CUDA device 1 is not visible to this process; CUDA devices this process can use: [0] (set CUDA_VISIBLE_DEVICES to include it, or request one of those devices)".to_string(),
+        }
+        .to_string();
+        let body = serde_json::json!({"error": error, "model_id": 2, "status": "denied", "reason": "device_unavailable", "device_id": 1}).to_string();
+        let line = strip_ansi(&add_model_result_line(
+            "yolox-nano-cuda-1.aimod",
+            &add_model_result(409, &body, None),
+            &Ansi::new(),
+        ));
+        assert_eq!(
+            line,
+            "  ✗  yolox-nano-cuda-1.aimod  (the model requests CUDA device 1, which this process cannot use: engine CUDA device 1 is not visible to this process; CUDA devices this process can use: [0] (set CUDA_VISIBLE_DEVICES to include it, or request one of those devices))"
+        );
+    }
 }
