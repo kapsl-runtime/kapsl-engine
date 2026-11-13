@@ -94,6 +94,19 @@ impl DeviceBootstrapDemand {
     }
 }
 
+/// Why a dynamic load that needs a bigger pool than the one already admitted is refused. The harness
+/// (`claude/gpu-verify/lib/gv.py`, check e on the pool opt-in path) parses exactly this text.
+pub(crate) fn pool_floor_refusal(
+    device_id: usize,
+    current_capacity: usize,
+    required_capacity: usize,
+    cause: &str,
+) -> String {
+    format!(
+        "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; {cause} and cannot be rematerialized"
+    )
+}
+
 fn auto_pool_requires_rematerialization(
     current_capacity_bytes: usize,
     required_capacity_bytes: usize,
@@ -328,12 +341,21 @@ impl DeviceMemoryManager {
                 _ => device.id,
             };
             let physical_bytes = (device.memory_mb as usize).saturating_mul(1024 * 1024);
-            let cuda = CudaDevice::new(ordinal).map_err(|error| {
-                format!(
-                    "failed to open CUDA device {} (ordinal {ordinal}): {error}",
-                    device.id
-                )
-            })?;
+            // Read the device before and after the context exists so a host
+            // that hides this PID from NVML still gets a runtime row.
+            let (cuda, overhead) = super::runtime_overhead::probe_runtime_overhead(
+                device.id,
+                device.pci_bus_id.as_deref(),
+                || {
+                    CudaDevice::new(ordinal).map_err(|error| {
+                        format!(
+                            "failed to open CUDA device {} (ordinal {ordinal}): {error}",
+                            device.id
+                        )
+                    })
+                },
+                |cuda| super::runtime_overhead::sample_process_gpu_bytes(cuda),
+            )?;
             if let Err(error) = super::runtime_overhead::verify_cuda_identity(
                 device.id,
                 device.pci_bus_id.as_deref(),
@@ -346,17 +368,13 @@ impl DeviceMemoryManager {
             // The context now exists but no pool or model does: whatever the
             // driver attributes to this process here is the runtime's own
             // overhead, independent of every lease taken later.
-            match super::runtime_overhead::sample_process_gpu_bytes(&cuda) {
-                Some(bytes) => {
-                    log::info!(
-                        "[device-memory] CUDA device {}: runtime process overhead after init = {} bytes",
-                        device.id,
-                        bytes
-                    );
-                    runtime_overhead.insert(device.id, bytes);
+            match overhead {
+                Ok(overhead) => {
+                    log::info!("[device-memory] {}", overhead.log_line(device.id));
+                    runtime_overhead.insert(device.id, overhead.bytes);
                 }
-                None => log::warn!(
-                    "[device-memory] CUDA device {}: per-process overhead unavailable; no runtime row",
+                Err(reason) => log::warn!(
+                    "[device-memory] CUDA device {}: per-process overhead unavailable ({reason}); no runtime row",
                     device.id
                 ),
             }
@@ -654,13 +672,19 @@ impl DeviceMemoryManager {
             .keys()
             .any(|(candidate, _)| *candidate == device_id)
         {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool has admitted workloads and cannot be rematerialized"
+            return Err(pool_floor_refusal(
+                device_id,
+                current_capacity,
+                required_capacity,
+                "the pool has admitted workloads",
             ));
         }
         if pool.free_bytes() != current_capacity {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool still has live allocations and cannot be rematerialized"
+            return Err(pool_floor_refusal(
+                device_id,
+                current_capacity,
+                required_capacity,
+                "the pool still has live allocations",
             ));
         }
         if !pool.clients.retire().map_err(|error| {
@@ -2590,5 +2614,20 @@ mod tests {
         assert_eq!(metrics.owners[0].max_bytes, 800);
         assert!(metrics.owners[0].admitted);
         assert_eq!(metrics.owners[0].allocatable_bytes, 400);
+    }
+
+    #[test]
+    fn the_pool_floor_refusal_text_is_the_one_the_harness_parses() {
+        // GPU run 4 and run 5 logged exactly this text for YOLOX under a tight budget.
+        assert_eq!(
+            pool_floor_refusal(0, 268_435_456, 1_088_552_216, "the pool has admitted workloads"),
+            "automatic CUDA pool on device 0 is 268435456 bytes but the dynamic load requires at least 1088552216 bytes; \
+             the pool has admitted workloads and cannot be rematerialized"
+        );
+        assert_eq!(
+            pool_floor_refusal(1, 1, 2, "the pool still has live allocations"),
+            "automatic CUDA pool on device 1 is 1 bytes but the dynamic load requires at least 2 bytes; \
+             the pool still has live allocations and cannot be rematerialized"
+        );
     }
 }

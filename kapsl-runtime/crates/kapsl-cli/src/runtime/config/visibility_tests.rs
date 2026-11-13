@@ -213,3 +213,20 @@ fn an_unmatched_device_is_never_a_placement_target() {
         .expect_err("unmatched device 1");
     assert!(error.contains("could not be matched"), "{error}");
 }
+
+#[test]
+fn the_device_unavailable_text_is_the_one_the_harness_parses() {
+    let info = host_with_two_gpus();
+    let map = map_for(&info, &[PCI_0]);
+    let typed = check_requested_device_usable(&requirements(Some(1), None), &info, Some(&map))
+        .expect_err("device 1 is hidden");
+    let problem = map.ordinal_or_error(1).expect_err("hidden").to_string();
+    assert_eq!(
+        typed.to_string(),
+        format!(
+            "the model requests CUDA device 1, which this process cannot use: {problem}; \
+             CUDA devices this process can use: [0] \
+             (set CUDA_VISIBLE_DEVICES to include it, or request one of those devices)"
+        )
+    );
+}
