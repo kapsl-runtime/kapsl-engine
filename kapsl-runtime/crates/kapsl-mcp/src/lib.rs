@@ -15,7 +15,7 @@ use axum::{
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{Implementation, ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router, Json, ServerHandler,
 };
 use schemars::JsonSchema;
@@ -182,8 +182,8 @@ impl KapslMcpHandler {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KapslMcpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "kapsl-engine",
                 env!("CARGO_PKG_VERSION"),
