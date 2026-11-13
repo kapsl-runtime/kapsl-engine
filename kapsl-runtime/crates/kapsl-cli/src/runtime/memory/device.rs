@@ -94,6 +94,19 @@ impl DeviceBootstrapDemand {
     }
 }
 
+/// Why a dynamic load that needs a bigger pool than the one already admitted is refused. The harness
+/// (`claude/gpu-verify/lib/gv.py`, check e on the pool opt-in path) parses exactly this text.
+pub(crate) fn pool_floor_refusal(
+    device_id: usize,
+    current_capacity: usize,
+    required_capacity: usize,
+    cause: &str,
+) -> String {
+    format!(
+        "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; {cause} and cannot be rematerialized"
+    )
+}
+
 fn auto_pool_requires_rematerialization(
     current_capacity_bytes: usize,
     required_capacity_bytes: usize,
@@ -654,13 +667,19 @@ impl DeviceMemoryManager {
             .keys()
             .any(|(candidate, _)| *candidate == device_id)
         {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool has admitted workloads and cannot be rematerialized"
+            return Err(pool_floor_refusal(
+                device_id,
+                current_capacity,
+                required_capacity,
+                "the pool has admitted workloads",
             ));
         }
         if pool.free_bytes() != current_capacity {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool still has live allocations and cannot be rematerialized"
+            return Err(pool_floor_refusal(
+                device_id,
+                current_capacity,
+                required_capacity,
+                "the pool still has live allocations",
             ));
         }
         if !pool.clients.retire().map_err(|error| {
@@ -2590,5 +2609,20 @@ mod tests {
         assert_eq!(metrics.owners[0].max_bytes, 800);
         assert!(metrics.owners[0].admitted);
         assert_eq!(metrics.owners[0].allocatable_bytes, 400);
+    }
+
+    #[test]
+    fn the_pool_floor_refusal_text_is_the_one_the_harness_parses() {
+        // GPU run 4 and run 5 logged exactly this text for YOLOX under a tight budget.
+        assert_eq!(
+            pool_floor_refusal(0, 268_435_456, 1_088_552_216, "the pool has admitted workloads"),
+            "automatic CUDA pool on device 0 is 268435456 bytes but the dynamic load requires at least 1088552216 bytes; \
+             the pool has admitted workloads and cannot be rematerialized"
+        );
+        assert_eq!(
+            pool_floor_refusal(1, 1, 2, "the pool still has live allocations"),
+            "automatic CUDA pool on device 1 is 1 bytes but the dynamic load requires at least 2 bytes; \
+             the pool still has live allocations and cannot be rematerialized"
+        );
     }
 }

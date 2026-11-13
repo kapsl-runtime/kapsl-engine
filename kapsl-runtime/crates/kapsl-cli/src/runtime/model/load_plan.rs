@@ -354,22 +354,46 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
         }
 
         let kind = EngineKind::resolve(&plan.loader.manifest);
-        let wants_pool = kind.uses_onnx_session()
-            || (kind.is_gguf()
-                && (cfg!(any(
-                    feature = "gguf-native",
-                    feature = "gguf-cuda-shared-kv"
-                )) || crate::backend::lazy_llama_cpp_packs_enabled()))
-            || (kind == EngineKind::Native && cfg!(feature = "native"));
+        let onnx_pool_opt_in = onnx_cuda_pool_opt_in();
+        let wants_pool = kind_uses_shared_pool(kind, onnx_pool_opt_in);
         if wants_pool {
             for &device_id in &cuda_device_ids {
                 bootstrap.mark_pool_consumer(device_id);
             }
         }
 
-        // ORT CUDA/TensorRT sessions use the registered environment allocator,
-        // so their weights and workspaces are pool demand rather than external
-        // bytes.
+        // ONNX on ORT's own arena (the default) is external demand sized to
+        // its peak under load. With the pool opt-in, ORT CUDA/TensorRT sessions
+        // use the registered environment allocator, so their weights and
+        // workspaces are pool demand.
+        if kind.uses_onnx_session() && !wants_pool {
+            let model_bytes = std::fs::metadata(&plan.model_file_path)
+                .map_err(|error| {
+                    format!(
+                        "stat ONNX model {}: {error}",
+                        plan.model_file_path.display()
+                    )
+                })?
+                .len() as usize;
+            let per_device_model_bytes = if plan.use_pipeline_backend {
+                model_bytes.saturating_add(cuda_device_ids.len().saturating_sub(1))
+                    / cuda_device_ids.len().max(1)
+            } else {
+                model_bytes
+            };
+            let peak = onnx_arena_peak_bytes(per_device_model_bytes, plan.onnx_peak_concurrency);
+            for &device_id in &cuda_device_ids {
+                bootstrap.add_external_allocation(
+                    device_id,
+                    format!(
+                        "bootstrap-onnx-arena:{}:{}:{}",
+                        plan.base_model_id, plan.replica_id, device_id
+                    ),
+                    peak,
+                );
+            }
+            continue;
+        }
         if kind.uses_onnx_session() && wants_pool {
             let model_bytes = std::fs::metadata(&plan.model_file_path)
                 .map_err(|error| {
@@ -459,6 +483,104 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
         }
     }
     Ok(bootstrap)
+}
+
+/// Opt-in that puts ONNX CUDA sessions back on the shared Kapsl GPU pool.
+///
+/// By default ONNX models use ORT's own per-session arenas: run 5 and run 6
+/// showed CUDA 700 (illegal memory access) and hangs when concurrent ONNX
+/// sessions drew from the pool, and none with the pool off. GGUF and native
+/// models keep the pool either way.
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) const ONNX_CUDA_POOL_ENV: &str = "KAPSL_ONNX_CUDA_POOL";
+
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn onnx_cuda_pool_opt_in() -> bool {
+    std::env::var(ONNX_CUDA_POOL_ENV)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Whether `kind` draws its device memory from the shared pool.
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn kind_uses_shared_pool(kind: EngineKind, onnx_pool_opt_in: bool) -> bool {
+    if kind.uses_onnx_session() {
+        return onnx_pool_opt_in;
+    }
+    (kind.is_gguf()
+        && (cfg!(any(
+            feature = "gguf-native",
+            feature = "gguf-cuda-shared-kv"
+        )) || crate::backend::lazy_llama_cpp_packs_enabled()))
+        || (kind == EngineKind::Native && cfg!(feature = "native"))
+}
+
+/// Whether the embedded ORT environment allocator is registered with the pool
+/// for a provider: only for ONNX on CUDA/TensorRT, and only with the opt-in.
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn ort_pool_registration_wanted(provider: &str, onnx_pool_opt_in: bool) -> bool {
+    onnx_pool_opt_in
+        && (provider.eq_ignore_ascii_case("cuda") || provider.eq_ignore_ascii_case("tensorrt"))
+}
+
+/// Per-session workspace an ONNX CUDA session reaches under concurrent load
+/// with ORT's own arena: `max(0.9 x model, 384 MiB)`. The ledger rows measured
+/// in runs 5 and 6 (4 sessions all busy) were: YOLOX-nano 130,023,424 B,
+/// ResNet-50 1,761,607,680 B, ZFNet-512 2,437,110,191 B, BERT-base
+/// 2,810,119,568 B. Beyond the weights that is 29, 337, 255 and 267 MB per
+/// session, which is driven by activations and cuDNN workspaces, not file
+/// size, so a floor (set by ResNet-50) and a share of the model cover them.
+pub(crate) const ONNX_ARENA_WORKSPACE_FLOOR_BYTES: usize = 384 * 1024 * 1024;
+
+pub(crate) fn onnx_arena_workspace_per_session_bytes(model_bytes: usize) -> usize {
+    (model_bytes.saturating_mul(9) / 10).max(ONNX_ARENA_WORKSPACE_FLOOR_BYTES)
+}
+
+/// Device bytes an ONNX CUDA model on ORT's own arena can reach with every
+/// session busy: weights and workspace per session. Admission reserves this,
+/// not the load-time figure (ResNet-50 loads at 950 MB and reaches 1758 MB).
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn onnx_arena_peak_bytes(model_bytes: usize, sessions: usize) -> usize {
+    model_bytes
+        .saturating_add(onnx_arena_workspace_per_session_bytes(model_bytes))
+        .saturating_mul(sessions.max(1))
+}
+
+/// Raise an ONNX backend's CUDA workspace claim to the arena peak.
+///
+/// The backend plans weights for every session but one workspace of
+/// `max(model / 4, 64 MiB)`. Applies only to the backend-managed CUDA claims of
+/// a session pool (weights at least one model copy), where sessions are the
+/// weights divided by the model size; anything else is left as planned.
+pub(crate) fn raise_onnx_arena_claims_to_peak(
+    report: &mut kapsl_engine_api::MemoryReport,
+    model_bytes: usize,
+) {
+    use kapsl_engine_api::{MemoryAllocationClass, MemoryAllocationSource, MemoryDomain};
+    if model_bytes == 0 {
+        return;
+    }
+    let weights = report.allocations.iter().find(|allocation| {
+        matches!(allocation.domain, MemoryDomain::Cuda { .. })
+            && allocation.class == MemoryAllocationClass::PersistentWeights
+            && allocation.source == MemoryAllocationSource::BackendManaged
+    });
+    let Some(weights) = weights else { return };
+    if weights.bytes < model_bytes {
+        return;
+    }
+    let sessions = weights.bytes / model_bytes;
+    let domain = weights.domain.clone();
+    let peak_workspace =
+        onnx_arena_workspace_per_session_bytes(model_bytes).saturating_mul(sessions.max(1));
+    for allocation in report.allocations.iter_mut() {
+        if allocation.domain == domain
+            && allocation.class == MemoryAllocationClass::TransientWorkspace
+            && allocation.source == MemoryAllocationSource::BackendManaged
+        {
+            allocation.bytes = allocation.bytes.max(peak_workspace);
+        }
+    }
 }
 
 #[cfg(feature = "gpu-device-pool")]
@@ -626,6 +748,114 @@ mod device_memory_plan_tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn onnx_is_off_the_shared_pool_by_default_and_other_kinds_are_unaffected() {
+        for kind in [
+            EngineKind::OnnxForward,
+            EngineKind::OnnxDetect,
+            EngineKind::OnnxClassify,
+            EngineKind::OnnxEmbed,
+            EngineKind::OnnxGenerate,
+        ] {
+            assert!(!kind_uses_shared_pool(kind, false), "{kind:?} default");
+            assert!(kind_uses_shared_pool(kind, true), "{kind:?} opted in");
+        }
+        // The opt-in is about ONNX only: GGUF and native decide as before.
+        for kind in [EngineKind::GgufGenerate, EngineKind::Native] {
+            assert_eq!(
+                kind_uses_shared_pool(kind, false),
+                kind_uses_shared_pool(kind, true),
+                "{kind:?} must not depend on the ONNX opt-in"
+            );
+        }
+        assert_eq!(
+            kind_uses_shared_pool(EngineKind::Native, false),
+            cfg!(feature = "native")
+        );
+    }
+
+    #[test]
+    fn the_ort_allocator_is_registered_with_the_pool_only_when_opted_in() {
+        assert!(!ort_pool_registration_wanted("cuda", false));
+        assert!(!ort_pool_registration_wanted("tensorrt", false));
+        assert!(ort_pool_registration_wanted("cuda", true));
+        assert!(ort_pool_registration_wanted("TensorRT", true));
+        assert!(!ort_pool_registration_wanted("cpu", true));
+    }
+
+    /// Ledger rows (4 sessions all busy, ORT's own arena) from GPU runs 5 and 6.
+    const MEASURED_ARENA_PEAKS: [(&str, usize, usize); 4] = [
+        ("yolox-nano", 3_702_598, 130_023_424),
+        ("resnet50", 102_576_593, 1_761_607_680),
+        ("zfnet512", 349_005_501, 2_437_110_191),
+        ("bert-base", 435_852_736, 2_810_119_568),
+    ];
+
+    #[test]
+    fn the_onnx_arena_peak_plan_covers_every_measured_run_5_and_6_peak() {
+        for (name, model_bytes, measured) in MEASURED_ARENA_PEAKS {
+            let plan = onnx_arena_peak_bytes(model_bytes, 4);
+            assert!(
+                plan >= measured / 100 * 110,
+                "{name}: plan {plan} must cover the measured peak {measured} with 10% margin"
+            );
+        }
+        // ResNet-50 loads at about 950 MB; the load-time figure is not the plan.
+        assert!(onnx_arena_peak_bytes(102_576_593, 4) > 950_009_856 * 2);
+        // Larger models scale with 0.9 x model per session beyond the floor.
+        let big = 3_000_000_000usize;
+        assert_eq!(onnx_arena_workspace_per_session_bytes(big), big / 10 * 9);
+        assert_eq!(onnx_arena_peak_bytes(big, 0), big + big / 10 * 9);
+    }
+
+    #[test]
+    fn admission_claim_for_onnx_on_its_own_arena_is_raised_to_the_peak() {
+        use kapsl_engine_api::{
+            MemoryAllocation, MemoryAllocationClass, MemoryAllocationSource, MemoryDomain,
+            MemoryReport,
+        };
+        let model = 102_576_593usize;
+        let cuda = MemoryDomain::Cuda { device_id: 0 };
+        // What the SDK's ONNX backend plans on ORT's own arena: weights for
+        // every session, one workspace of max(model / 4, 64 MiB).
+        let planned = |source| MemoryReport {
+            allocations: vec![
+                MemoryAllocation {
+                    allocation_id: "m".into(),
+                    domain: cuda.clone(),
+                    class: MemoryAllocationClass::PersistentWeights,
+                    source,
+                    bytes: model * 4,
+                },
+                MemoryAllocation {
+                    allocation_id: "m:workspace".into(),
+                    domain: cuda.clone(),
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    source,
+                    bytes: (model / 4).max(64 * 1024 * 1024),
+                },
+            ],
+        };
+
+        let mut report = planned(MemoryAllocationSource::BackendManaged);
+        raise_onnx_arena_claims_to_peak(&mut report, model);
+        let total: usize = report.allocations.iter().map(|a| a.bytes).sum();
+        assert_eq!(total, onnx_arena_peak_bytes(model, 4));
+        assert!(total >= 1_761_607_680, "covers ResNet-50's measured peak");
+
+        // Pool-managed claims (the opt-in path) are left as the backend planned them.
+        let mut pooled = planned(MemoryAllocationSource::RuntimeManaged);
+        raise_onnx_arena_claims_to_peak(&mut pooled, model);
+        assert_eq!(pooled, planned(MemoryAllocationSource::RuntimeManaged));
+
+        // A split of one model across devices has less than one model copy per device.
+        let mut split = planned(MemoryAllocationSource::BackendManaged);
+        split.allocations[0].bytes = model / 2;
+        let before = split.clone();
+        raise_onnx_arena_claims_to_peak(&mut split, model);
+        assert_eq!(split, before);
     }
 
     #[test]
