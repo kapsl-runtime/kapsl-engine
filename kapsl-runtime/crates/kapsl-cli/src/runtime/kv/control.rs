@@ -1489,6 +1489,8 @@ pub(crate) struct ExternalKvCoordinator {
 }
 
 impl ExternalKvCoordinator {
+    // With the device pool the shared-pool constructor below is the one used.
+    #[cfg_attr(feature = "gpu-device-pool", allow(dead_code))]
     pub(crate) fn new(
         memory: Arc<MemoryAuthority>,
         maximum_lease_ttl: Duration,

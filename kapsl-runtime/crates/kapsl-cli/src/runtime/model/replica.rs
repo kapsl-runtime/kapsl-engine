@@ -148,7 +148,31 @@ pub(super) async fn load_replica(
         (None, None)
     };
 
-    let worker = start_isolated_worker(&plan).await?;
+    // An isolated worker is another process with its own ledger. Reserve its
+    // memory in this process before spawning it, and keep the reservation for
+    // as long as the worker lives (MEM-08).
+    let worker_memory = if plan.isolate_process {
+        let domains = isolated_worker_domains(&plan, device_mesh.as_ref(), device_info);
+        if domains.is_empty() {
+            None
+        } else {
+            Some(
+                reserve_isolated_worker_memory(
+                    &plan.model_file_path,
+                    &domains,
+                    &resources,
+                    plan.base_model_id,
+                    plan.replica_id,
+                    EngineKind::resolve(&plan.loader.manifest),
+                    plan.priority_weight,
+                )
+                .await?,
+            )
+        }
+    } else {
+        None
+    };
+    let worker = start_isolated_worker(&plan, worker_memory).await?;
     let mut engines = if let Some(worker) = worker {
         let engine_count = if role.is_primary() && !plan.use_pipeline_backend {
             device_mesh
@@ -552,6 +576,31 @@ fn model_info_for_plan(
         manifest.task.clone(),
         manifest.preprocess_kind(),
     )
+}
+
+/// Memory domains an isolated worker will occupy: the selected mesh devices of
+/// a primary load, or the first selected device of a single replica.
+fn isolated_worker_domains(
+    plan: &ModelLoadPlan,
+    mesh: Option<&kapsl_hal::device_mesh::DeviceMesh>,
+    device_info: &DeviceInfo,
+) -> Vec<MemoryDomain> {
+    let devices: Vec<kapsl_hal::device::Device> = match mesh {
+        Some(mesh) => (0..mesh.world_size)
+            .filter_map(|rank| mesh.get_device(rank).map(|device| (*device).clone()))
+            .collect(),
+        None => select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
+            .map(|selection| selection.devices.into_iter().take(1).collect())
+            .unwrap_or_default(),
+    };
+    let mut domains: Vec<MemoryDomain> = Vec::new();
+    for device in &devices {
+        let domain = MemoryDomain::for_provider(&device.backend.to_string(), device.id);
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains
 }
 
 fn log_package_plan(plan: &ModelLoadPlan) {

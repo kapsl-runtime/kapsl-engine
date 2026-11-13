@@ -227,7 +227,7 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
                         .filter(|r| r.replica_id > 0 && r.status == ModelStatus::Active)
                         .map(|r| (r.replica_id, r.id))
                         .collect();
-                    replica_ids.sort_by(|a, b| b.0.cmp(&a.0)); // Sort descending
+                    replica_ids.sort_by_key(|a| std::cmp::Reverse(a.0)); // Sort descending
 
                     for (replica_id, unique_id) in
                         replica_ids.iter().take(replicas_to_remove as usize)

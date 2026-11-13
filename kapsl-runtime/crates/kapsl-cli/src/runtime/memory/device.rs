@@ -101,6 +101,34 @@ fn auto_pool_requires_rematerialization(
     required_capacity_bytes > current_capacity_bytes
 }
 
+/// What the pool and the ledger could offer a dynamic load that the pool
+/// cannot hold, for the refusal message. Message only: it does not change when
+/// a load is refused.
+#[derive(Debug, Clone, Copy)]
+struct PoolRefusal {
+    device_id: usize,
+    required_bytes: usize,
+    capacity_bytes: usize,
+    free_bytes: usize,
+    budget_bytes: Option<usize>,
+    available_bytes: Option<usize>,
+}
+
+impl PoolRefusal {
+    fn message(&self, why: &str) -> String {
+        let ledger = match (self.budget_bytes, self.available_bytes) {
+            (Some(budget), Some(available)) => format!(
+                "; the device ledger budget is {budget} bytes with {available} bytes available"
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "automatic CUDA pool on device {} has {} of {} bytes free but this model plans {} pooled bytes (weights plus workspace); {why}{ledger}",
+            self.device_id, self.free_bytes, self.capacity_bytes, self.required_bytes
+        )
+    }
+}
+
 /// Host-only demand summary built before a physical CUDA backing allocation is
 /// chosen. Allocation IDs let duplicate immutable GGUF weights be counted once.
 #[derive(Debug, Clone, Default)]
@@ -647,6 +675,17 @@ impl DeviceMemoryManager {
         if !auto_pool_requires_rematerialization(current_capacity, required_capacity) {
             return Ok(());
         }
+        let refusal = {
+            let snapshot = self.budget.lock().unwrap().snapshot(device_id);
+            PoolRefusal {
+                device_id,
+                required_bytes: required_capacity,
+                capacity_bytes: current_capacity,
+                free_bytes: pool.free_bytes(),
+                budget_bytes: snapshot.map(|snapshot| snapshot.budget_bytes),
+                available_bytes: snapshot.map(|snapshot| snapshot.available_bytes()),
+            }
+        };
         if self
             .admission_refs
             .lock()
@@ -654,14 +693,13 @@ impl DeviceMemoryManager {
             .keys()
             .any(|(candidate, _)| *candidate == device_id)
         {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool has admitted workloads and cannot be rematerialized"
+            return Err(refusal.message(
+                "the pool backing is immutable once a workload is admitted, so it cannot be rebuilt larger",
             ));
         }
         if pool.free_bytes() != current_capacity {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool still has live allocations and cannot be rematerialized"
-            ));
+            return Err(refusal
+                .message("the pool still has live allocations, so it cannot be rebuilt larger"));
         }
         if !pool.clients.retire().map_err(|error| {
             format!("cannot rematerialize automatic CUDA pool on device {device_id}: {error}")
@@ -905,6 +943,17 @@ impl DeviceMemoryManager {
 
     pub(crate) fn has_pool(&self, device_id: usize) -> bool {
         self.pools.lock().unwrap().contains_key(&device_id)
+    }
+
+    /// Bytes the device ledger would still grant a new allocation on one
+    /// device: its budget minus the whole pool backing (idle part included) and
+    /// every external charge. `None` for a device the ledger does not manage.
+    pub(crate) fn ledger_available_bytes(&self, device_id: usize) -> Option<usize> {
+        self.budget
+            .lock()
+            .unwrap()
+            .snapshot(device_id)
+            .map(|snapshot| snapshot.available_bytes())
     }
 
     /// Physical CUDA backing reserved up front by the central pool. Raw
@@ -2590,5 +2639,40 @@ mod tests {
         assert_eq!(metrics.owners[0].max_bytes, 800);
         assert!(metrics.owners[0].admitted);
         assert_eq!(metrics.owners[0].allocatable_bytes, 400);
+    }
+
+    #[test]
+    fn a_pool_refusal_names_the_need_the_pool_and_the_ledger() {
+        // The check-i numbers: a 600 MB ONNX model at 4 sessions against a
+        // 256 MiB pool on a budget cut to 1463812096 bytes.
+        let message = PoolRefusal {
+            device_id: 0,
+            required_bytes: 2_400_000_000,
+            capacity_bytes: 268_435_456,
+            free_bytes: 268_435_456,
+            budget_bytes: Some(1_463_812_096),
+            available_bytes: Some(155_189_248),
+        }
+        .message("the pool backing is immutable once a workload is admitted, so it cannot be rebuilt larger");
+        for part in [
+            "device 0",
+            "268435456 of 268435456 bytes free",
+            "plans 2400000000 pooled bytes",
+            "immutable",
+            "budget is 1463812096 bytes with 155189248 bytes available",
+        ] {
+            assert!(message.contains(part), "message lacks `{part}`: {message}");
+        }
+        // Without a ledger snapshot the ledger clause is left out.
+        let no_ledger = PoolRefusal {
+            device_id: 1,
+            required_bytes: 1,
+            capacity_bytes: 2,
+            free_bytes: 0,
+            budget_bytes: None,
+            available_bytes: None,
+        }
+        .message("why");
+        assert!(!no_ledger.contains("ledger"), "{no_ledger}");
     }
 }

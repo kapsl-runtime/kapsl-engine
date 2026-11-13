@@ -626,6 +626,112 @@ pub(super) fn create_runtime_backend_for_device(
     Ok(backend)
 }
 
+/// The parent's memory reservation for an isolated worker. Dropping it
+/// releases the lease and the priority registration.
+pub(super) struct IsolatedWorkerMemory {
+    _lease: MemoryLease,
+    _priority: ModelPriorityLease,
+}
+
+/// Planned memory of an isolated worker in the parent's authority (MEM-08).
+///
+/// The worker is a separate process with its own ledger, so nothing in the
+/// parent charged its weights: N workers could each be admitted against the
+/// whole card. This reports the load-time estimate (the same one an in-process
+/// load starts from) as one backend-managed allocation per selected domain,
+/// charged against the budget outside the pool, before the child is spawned.
+pub(super) fn isolated_worker_memory_report(
+    model_file_path: &Path,
+    domains: &[MemoryDomain],
+    model_id: u32,
+    replica_id: u32,
+) -> Result<MemoryReport, String> {
+    use kapsl_engine_api::{
+        MemoryAllocation, MemoryAllocationClass as EngineClass,
+        MemoryAllocationSource as EngineSource, MemoryDomain as EngineDomain,
+    };
+    let estimate = estimated_model_memory(model_file_path)?;
+    let mut allocations = Vec::new();
+    for domain in domains {
+        let (engine_domain, weights_class) = match domain {
+            MemoryDomain::Cuda { device_id } => (
+                EngineDomain::Cuda {
+                    device_id: *device_id,
+                },
+                EngineClass::PersistentWeights,
+            ),
+            MemoryDomain::Host => (EngineDomain::Host, EngineClass::ModelSession),
+            // Other providers are planned from the plain estimate below.
+            _ => continue,
+        };
+        for (suffix, class, bytes) in [
+            ("weights", weights_class, estimate.session_bytes),
+            (
+                "workspace",
+                EngineClass::TransientWorkspace,
+                estimate.workspace_bytes,
+            ),
+        ] {
+            allocations.push(MemoryAllocation {
+                allocation_id: format!("isolated-worker:{model_id}:{replica_id}:{domain}:{suffix}"),
+                domain: engine_domain.clone(),
+                class,
+                source: EngineSource::BackendManaged,
+                bytes,
+            });
+        }
+    }
+    Ok(MemoryReport { allocations })
+}
+
+/// Admit and commit the parent-side reservation for an isolated worker. Runs
+/// before the child process is spawned; a denial is the same typed
+/// [`MemoryAdmissionFailure`] an in-process load would produce.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn reserve_isolated_worker_memory(
+    model_file_path: &Path,
+    domains: &[MemoryDomain],
+    resources: &Arc<RuntimeResources>,
+    model_id: u32,
+    replica_id: u32,
+    engine_kind: EngineKind,
+    priority_weight: u32,
+) -> Result<IsolatedWorkerMemory, DynError> {
+    let owner = MemoryOwner::new(model_id, replica_id);
+    let estimate = estimated_model_memory(model_file_path)?;
+    let report = isolated_worker_memory_report(model_file_path, domains, model_id, replica_id)?;
+    let plan = resources.memory().model_load_plan_with_report(
+        domains,
+        owner,
+        estimate.session_bytes,
+        estimate.workspace_bytes,
+        &report,
+    )?;
+    resources
+        .memory()
+        .check_cuda_load_sampling(&plan)
+        .map_err(|error| {
+            MemoryAdmissionFailure::new(owner, priority_weight, &plan, error).unreclaimable()
+        })?;
+    let priority = resources.priority().register(
+        owner,
+        priority_weight,
+        plan.claims().iter().map(|claim| claim.domain.clone()),
+    );
+    let mut admission = resources
+        .memory()
+        .begin_load(&plan, engine_kind)
+        .await
+        .map_err(|error| MemoryAdmissionFailure::new(owner, priority_weight, &plan, error))?;
+    admission
+        .reconcile(&report)
+        .map_err(|error| MemoryAdmissionFailure::new(owner, priority_weight, &plan, error))?;
+    Ok(IsolatedWorkerMemory {
+        _lease: admission.commit(),
+        _priority: priority,
+    })
+}
+
 /// Execute the runtime-owned backend load transaction.
 ///
 /// One backend-neutral plan is admitted before the backend can allocate,
@@ -656,6 +762,12 @@ pub(super) async fn load_runtime_backend(
         estimate.workspace_bytes,
         &planned_report,
     )?;
+    resources
+        .memory()
+        .check_cuda_load_sampling(&plan)
+        .map_err(|error| {
+            MemoryAdmissionFailure::new(owner, priority_weight, &plan, error).unreclaimable()
+        })?;
     let priority_lease = resources.priority().register(
         owner,
         priority_weight,
@@ -1415,5 +1527,107 @@ mod tests {
         assert_eq!(row.reserved_bytes, MIB);
         assert_eq!(row.committed_bytes, MIB);
         assert_eq!(row.observed_bytes, MIB);
+    }
+
+    fn roomy_host_info() -> DeviceInfo {
+        let mut info = device_info();
+        // `total_memory` is in KiB: 64 GiB.
+        info.total_memory = 64 * 1024 * 1024;
+        info
+    }
+
+    #[test]
+    fn isolated_worker_report_charges_weights_and_workspace_per_cuda_device() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(400 * MIB as u64).unwrap();
+        let domains = [
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+        ];
+        let report = isolated_worker_memory_report(file.path(), &domains, 9, 0).unwrap();
+        assert_eq!(report.allocations.len(), 4);
+        let estimate = estimated_model_memory(file.path()).unwrap();
+        let weights: Vec<_> = report
+            .allocations
+            .iter()
+            .filter(|a| a.class == EngineMemoryClass::PersistentWeights)
+            .collect();
+        assert_eq!(weights.len(), 2);
+        assert!(weights.iter().all(|a| a.bytes == estimate.session_bytes));
+        assert!(weights
+            .iter()
+            .all(|a| a.source == MemoryAllocationSource::BackendManaged));
+        let ids: std::collections::HashSet<_> = report
+            .allocations
+            .iter()
+            .map(|a| &a.allocation_id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "allocation ids are unique per device and kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_isolated_worker_holds_a_parent_lease_until_it_exits() {
+        let resources = RuntimeResources::new(&roomy_host_info()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(64 * MIB as u64).unwrap();
+        let owner = MemoryOwner::new(71, 0);
+        let host_used = |resources: &Arc<RuntimeResources>| {
+            resources
+                .memory()
+                .snapshot()
+                .rows
+                .iter()
+                .filter(|row| row.owner == owner)
+                .map(|row| row.reserved_bytes.max(row.committed_bytes))
+                .sum::<usize>()
+        };
+        assert_eq!(host_used(&resources), 0);
+        let memory = reserve_isolated_worker_memory(
+            file.path(),
+            &[MemoryDomain::Host],
+            &resources,
+            71,
+            0,
+            EngineKind::Native,
+            1,
+        )
+        .await
+        .expect("a 64 MiB model fits a 64 GiB host");
+        let estimate = estimated_model_memory(file.path()).unwrap();
+        assert!(
+            host_used(&resources) >= estimate.session_bytes,
+            "the parent now charges the worker's weights: {}",
+            host_used(&resources)
+        );
+        drop(memory);
+        assert_eq!(host_used(&resources), 0, "released when the worker is gone");
+    }
+
+    #[tokio::test]
+    async fn an_isolated_worker_that_does_not_fit_is_denied_before_spawning() {
+        // A 9 GiB (sparse) model plans 11+ GiB on a 10 GiB host.
+        let resources = RuntimeResources::new(&device_info()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(9 * 1024 * MIB as u64).unwrap();
+        let error = reserve_isolated_worker_memory(
+            file.path(),
+            &[MemoryDomain::Host],
+            &resources,
+            72,
+            0,
+            EngineKind::Native,
+            1,
+        )
+        .await
+        .err()
+        .expect("denied");
+        assert!(
+            error.downcast_ref::<MemoryAdmissionFailure>().is_some(),
+            "typed, so the API answers 409 and the arbiter may reclaim: {error}"
+        );
     }
 }

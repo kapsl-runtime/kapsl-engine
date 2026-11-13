@@ -277,13 +277,14 @@ pub(super) fn build_model_load_plan(
         worker_tp_degree,
         use_pipeline_backend,
     } = topology_choice;
-    BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
-        .map_err(|error| {
+    validate_hardware_requirements(&loader.manifest.hardware_requirements, device_info).map_err(
+        |error| {
             format!(
                 "Requirements validation failed for model {} replica {}: {}",
                 base_model_id, replica_id, error
             )
-        })?;
+        },
+    )?;
     export_gguf_auto_sizing_hint(
         &loader.manifest,
         defaults.batch_size,
@@ -511,8 +512,12 @@ fn planned_external_weight_bytes(kind: EngineKind, model_path: &Path) -> Result<
     }
 }
 
+/// Spawn the isolated worker, if the plan asks for one. `memory` is the
+/// parent's reservation for it (see [`reserve_isolated_worker_memory`]): it is
+/// tied to the worker's life, and dropped here when no worker is kept.
 pub(super) async fn start_isolated_worker(
     plan: &ModelLoadPlan,
+    memory: Option<IsolatedWorkerMemory>,
 ) -> Result<Option<Arc<WorkerProcess>>, Box<dyn std::error::Error + Send + Sync>> {
     if !plan.isolate_process {
         return Ok(None);
@@ -537,6 +542,9 @@ pub(super) async fn start_isolated_worker(
     ) {
         Ok(worker) => {
             let worker = Arc::new(worker);
+            if let Some(memory) = memory {
+                worker.attach_memory_guard(Box::new(memory));
+            }
             match wait_for_worker_ready_async(worker.as_ref(), Duration::from_secs(30)).await {
                 Ok(()) => Ok(Some(start_worker_with_supervisor(worker))),
                 Err(error) => {

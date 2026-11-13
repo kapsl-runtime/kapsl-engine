@@ -115,6 +115,14 @@ pub(crate) fn nvml_cuda_version() -> Option<String> {
     format_cuda_driver_version(shared_nvml()?.sys_cuda_driver_version().ok()?)
 }
 
+/// NVIDIA kernel driver version string (`550.54.15`), via NVML.
+pub(crate) fn nvml_driver_version() -> Option<String> {
+    shared_nvml()?
+        .sys_driver_version()
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
 /// Fill CUDA versions that device detection left empty. `lookup` (NVML in
 /// production) is only invoked when at least one entry is missing, and a
 /// failed lookup leaves every entry untouched.

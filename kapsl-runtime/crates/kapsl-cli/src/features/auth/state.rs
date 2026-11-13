@@ -299,7 +299,7 @@ impl ApiAuthState {
                 Some(self.key_view(key, user, now))
             })
             .collect::<Vec<_>>();
-        keys.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        keys.sort_by_key(|key| std::cmp::Reverse(key.created_at));
         keys
     }
 

@@ -24,7 +24,13 @@ struct MemoryDomainUsageResponse {
     committed_bytes: usize,
     observed_bytes: usize,
     used_bytes: usize,
+    /// What a new allocation on this domain would actually be granted: the
+    /// stricter of the authority's room and the CUDA device ledger's (which
+    /// also charges idle pool backing).
     available_bytes: usize,
+    /// The authority's own room, before the ledger gate. Equal to
+    /// `available_bytes` except on CUDA devices with an idle pool backing.
+    authority_available_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +78,7 @@ fn owner_kind_label(owner: MemoryOwner) -> &'static str {
 fn summarize_memory_authority(
     models: &ModelManager,
     snapshot: MemorySnapshot,
+    grantable: impl Fn(&MemoryDomain, usize) -> usize,
 ) -> MemoryAuthorityResponse {
     let mut by_model = BTreeMap::<(&'static str, u32), ModelMemoryAggregate>::new();
     for row in &snapshot.rows {
@@ -190,8 +197,8 @@ fn summarize_memory_authority(
             } else {
                 domain_used_bytes = domain_used_bytes.saturating_add(used_bytes);
                 domain_budget_bytes = domain_budget_bytes.saturating_add(domain.budget_bytes);
-                domain_available_bytes =
-                    domain_available_bytes.saturating_add(domain.available_bytes);
+                domain_available_bytes = domain_available_bytes
+                    .saturating_add(grantable(&domain.domain, domain.available_bytes));
             }
             MemoryDomainUsageResponse {
                 domain: domain.domain.to_string(),
@@ -201,7 +208,12 @@ fn summarize_memory_authority(
                 committed_bytes: domain.committed_bytes,
                 observed_bytes: domain.observed_bytes,
                 used_bytes,
-                available_bytes: domain.available_bytes,
+                available_bytes: if is_host_domain(&domain.domain) {
+                    domain.available_bytes
+                } else {
+                    grantable(&domain.domain, domain.available_bytes)
+                },
+                authority_available_bytes: domain.available_bytes,
             }
         })
         .collect();
@@ -230,6 +242,13 @@ struct SystemStatsResponse {
     foreign_gpu_memory_bytes: Option<usize>,
     pressure_state: String,
     collected_at_ms: u64,
+    /// CUDA driver / runtime versions (fields are `null` when unknown).
+    cuda: CudaVersions,
+    /// Freshness of the GPU samples behind CUDA admission: `fresh`, `stale`
+    /// (a safety margin is applied) or `failed` (no new CUDA growth admitted).
+    gpu_sampling: &'static str,
+    /// Seconds since the last GPU sample when `gpu_sampling` is not `fresh`.
+    gpu_sampling_age_secs: Option<u64>,
     memory_authority: MemoryAuthorityResponse,
 }
 
@@ -290,9 +309,12 @@ pub(crate) fn build_system_routes(
             let pressure_state = RuntimePressureState::from_u8(
                 runtime_pressure_state_for_system_stats.load(Ordering::Relaxed),
             );
+            let memory = resources_for_system_stats.memory();
+            let sampling = memory.cuda_sampling_state();
             let memory_authority = summarize_memory_authority(
                 &models_for_system_stats,
-                resources_for_system_stats.memory().snapshot(),
+                memory.snapshot(),
+                |domain, available| memory.grantable_bytes(domain, available),
             );
             warp::reply::json(&SystemStatsResponse {
                 pid: std::process::id(),
@@ -304,6 +326,9 @@ pub(crate) fn build_system_routes(
                 foreign_gpu_memory_bytes: samples.foreign_gpu_memory_bytes,
                 pressure_state: pressure_state.as_str().to_string(),
                 collected_at_ms: samples.collected_at_ms,
+                cuda: cuda_versions().clone(),
+                gpu_sampling: sampling.as_str(),
+                gpu_sampling_age_secs: sampling.age().map(|age| age.as_secs()),
                 memory_authority,
             })
         });
@@ -327,5 +352,43 @@ mod tests {
             owner_kind_label(MemoryOwner::external_kv(2).unwrap()),
             "external_kv_participant"
         );
+    }
+
+    #[test]
+    fn available_bytes_is_what_the_ledger_would_grant_not_the_authority_figure() {
+        // The 2026-10-24 L4 numbers (MEM-12): authority room 18_267_513_642,
+        // ledger room 17_410_267_546 (it also charges the idle pool backing).
+        const AUTHORITY: usize = 18_267_513_642;
+        const LEDGER: usize = 17_410_267_546;
+        let cuda = MemoryDomain::Cuda { device_id: 0 };
+        let snapshot = MemorySnapshot {
+            rows: Vec::new(),
+            domains: vec![MemoryDomainSnapshot {
+                domain: cuda.clone(),
+                budget_bytes: 22_000_000_000,
+                planned_bytes: 0,
+                reserved_bytes: 0,
+                committed_bytes: 0,
+                observed_bytes: 0,
+                available_bytes: AUTHORITY,
+            }],
+            foreign_pressure_active: false,
+        };
+        let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+        let response = summarize_memory_authority(&models, snapshot, |domain, available| {
+            assert_eq!(domain, &cuda);
+            crate::runtime::memory::stricter_available(available, Some(LEDGER))
+        });
+        assert_eq!(response.domains[0].available_bytes, LEDGER);
+        assert_eq!(response.domains[0].authority_available_bytes, AUTHORITY);
+        assert_eq!(response.domain_available_bytes, LEDGER);
+    }
+
+    #[test]
+    fn stricter_available_takes_the_smaller_gate() {
+        use crate::runtime::memory::stricter_available;
+        assert_eq!(stricter_available(10, Some(7)), 7);
+        assert_eq!(stricter_available(5, Some(7)), 5);
+        assert_eq!(stricter_available(10, None), 10);
     }
 }
