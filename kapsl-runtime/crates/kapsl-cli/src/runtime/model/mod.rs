@@ -7,6 +7,7 @@ mod backend;
 mod lifecycle;
 pub(crate) mod load_plan;
 mod manager;
+mod package_preflight;
 mod replica;
 mod scaling;
 
@@ -147,6 +148,7 @@ impl ModelRuntime {
         model_path: &Path,
         placement: &ModelLoadPlacement,
     ) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), DynError> {
+        self.preflight_package_admission(model_id, model_path, placement)?;
         let plan = self
             .load_planner
             .prepare(model_id, model_id, 0, model_path, Some(placement))?;
@@ -250,6 +252,7 @@ impl ModelRuntime {
             .resources
             .memory()
             .model_load_plan_with_report(&domains, owner, 0, 0, &report)?;
+        self.resources.memory().check_cuda_load_sampling(&plan)?;
         let admission = self
             .resources
             .memory()

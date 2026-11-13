@@ -55,8 +55,10 @@ fn test_parse_media_image_payload_to_float32_nchw() {
     let values: Vec<f32> = request
         .input
         .data
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("4 bytes per f32")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect();
     assert_eq!(values, vec![1.0, 0.0, 0.0]);
 }

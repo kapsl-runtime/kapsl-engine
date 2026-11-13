@@ -57,6 +57,10 @@ pub(crate) struct WorkerProcess {
     shutdown: AtomicBool,
     /// Number of automatic restarts performed (bounds the restart budget).
     restarts: AtomicU32,
+    /// The parent's memory reservation for this worker (MEM-08), released when
+    /// the worker is killed or the supervisor gives up on it. Type-erased so
+    /// the worker transport stays independent of the memory authority.
+    memory_guard: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 impl WorkerProcess {
@@ -67,10 +71,29 @@ impl WorkerProcess {
     pub(crate) fn kill(&self) {
         // Mark shutdown first so the supervisor won't try to restart it.
         self.shutdown.store(true, Ordering::Relaxed);
-        let mut child = self.child.lock();
-        if let Ok(None) = child.try_wait() {
-            let _ = child.kill();
+        {
+            let mut child = self.child.lock();
+            if let Ok(None) = child.try_wait() {
+                let _ = child.kill();
+            }
         }
+        self.release_memory_guard();
+    }
+
+    /// Tie the parent's memory reservation to this worker's life.
+    pub(crate) fn attach_memory_guard(&self, guard: Box<dyn std::any::Any + Send>) {
+        *self.memory_guard.lock() = Some(guard);
+    }
+
+    /// Give the reservation back (the worker is gone for good).
+    pub(crate) fn release_memory_guard(&self) {
+        let guard = self.memory_guard.lock().take();
+        drop(guard);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds_memory_guard(&self) -> bool {
+        self.memory_guard.lock().is_some()
     }
 
     /// Respawn the child process bound to the same socket path. The previous
@@ -99,18 +122,23 @@ impl Drop for WorkerProcess {
 
 /// Supervise an isolated worker: restart it (bounded retries with backoff) if it
 /// dies unexpectedly, so an isolated model recovers from a crash instead of
-/// staying down. Exits when the worker is intentionally shut down. Returns the
-/// same `Arc` for convenience.
+/// staying down. Exits when the worker is intentionally shut down, or when the
+/// last strong reference is gone (the supervisor holds only a `Weak`, so it
+/// cannot keep a stopped model's worker process and memory reservation alive).
+/// Returns the same `Arc` for convenience.
 pub(crate) fn start_worker_with_supervisor(worker: Arc<WorkerProcess>) -> Arc<WorkerProcess> {
     const CHECK_INTERVAL: Duration = Duration::from_secs(2);
     const RESTART_BACKOFF: Duration = Duration::from_secs(2);
     const MAX_RESTARTS: u32 = 5;
     const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-    let w = worker.clone();
+    let weak = Arc::downgrade(&worker);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(CHECK_INTERVAL).await;
+            let Some(w) = weak.upgrade() else {
+                break;
+            };
             if w.shutdown.load(Ordering::Relaxed) {
                 break;
             }
@@ -125,6 +153,7 @@ pub(crate) fn start_worker_with_supervisor(worker: Arc<WorkerProcess>) -> Arc<Wo
                     status,
                     MAX_RESTARTS
                 );
+                w.release_memory_guard();
                 break;
             }
             let attempt = w.restarts.fetch_add(1, Ordering::Relaxed) + 1;
@@ -292,6 +321,7 @@ pub(crate) fn spawn_worker_process(
             spec,
             shutdown: AtomicBool::new(false),
             restarts: AtomicU32::new(0),
+            memory_guard: Mutex::new(None),
         })
     }
 }
@@ -681,5 +711,94 @@ mod remote_engine_tests {
         assert_eq!(second.data, test_packet(3.0).data);
         assert!(rx.blocking_recv().is_none());
         server_thread.join().expect("server thread");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod memory_guard_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn sleeping_worker() -> WorkerProcess {
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        WorkerProcess {
+            socket_path: "/tmp/kapsl-test-worker-never-used.sock".to_string(),
+            child: Mutex::new(child),
+            spec: WorkerSpec {
+                model_id: 1,
+                model_path: PathBuf::from("/nonexistent"),
+                batch_size: 1,
+                scheduler_queue_size: 1,
+                scheduler_max_micro_batch: 1,
+                scheduler_queue_delay_ms: 0,
+                topology: "data-parallel".to_string(),
+                tp_degree: 1,
+                onnx_tuning: None,
+                offline: true,
+            },
+            shutdown: AtomicBool::new(false),
+            restarts: AtomicU32::new(0),
+            memory_guard: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn killing_the_worker_releases_the_reservation() {
+        let worker = sleeping_worker();
+        let released = Arc::new(AtomicBool::new(false));
+        worker.attach_memory_guard(Box::new(DropFlag(released.clone())));
+        assert!(worker.holds_memory_guard());
+        worker.kill();
+        assert!(released.load(Ordering::SeqCst));
+        assert!(!worker.holds_memory_guard());
+        assert!(
+            worker.try_wait().is_some() || {
+                std::thread::sleep(Duration::from_millis(200));
+                worker.try_wait().is_some()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_engine_handle_stops_the_worker_and_releases_it() {
+        // The supervisor used to keep its own strong reference forever, so a
+        // stopped model's worker (and now its reservation) never went away.
+        let worker = Arc::new(sleeping_worker());
+        let released = Arc::new(AtomicBool::new(false));
+        worker.attach_memory_guard(Box::new(DropFlag(released.clone())));
+        let worker = start_worker_with_supervisor(worker);
+        assert!(!released.load(Ordering::SeqCst), "alive while referenced");
+        drop(worker);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the last handle dropping must kill the worker and release its lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_the_supervisor_gives_up_on_releases_its_reservation() {
+        let worker = Arc::new(sleeping_worker());
+        let released = Arc::new(AtomicBool::new(false));
+        worker.attach_memory_guard(Box::new(DropFlag(released.clone())));
+        // Out of restart budget and already dead: the next check gives up.
+        worker.restarts.store(5, Ordering::Relaxed);
+        {
+            let mut child = worker.child.lock();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _worker = start_worker_with_supervisor(worker);
+        tokio::time::sleep(Duration::from_millis(2600)).await;
+        assert!(released.load(Ordering::SeqCst));
     }
 }

@@ -213,3 +213,45 @@ fn an_unmatched_device_is_never_a_placement_target() {
         .expect_err("unmatched device 1");
     assert!(error.contains("could not be matched"), "{error}");
 }
+
+#[test]
+fn min_cuda_version_is_compared_numerically_in_device_selection() {
+    let mut info = host_with_two_gpus();
+    info.devices[0].cuda_version = Some("13.0".to_string());
+    info.devices[1].cuda_version = Some("12.6".to_string());
+    let with_min = |min: &str| kapsl_core::HardwareRequirements {
+        min_cuda_version: Some(min.to_string()),
+        ..requirements(None, Some("pool"))
+    };
+    // "13.0" < "9.0" as strings; numerically 13.0 satisfies 9.0.
+    let selection = select_mesh_devices_with(&with_min("9.0"), &info, None).expect("both fit");
+    assert_eq!(selected_ids(&selection), vec![0, 1]);
+    // Only the 13.0 device satisfies 13.0.
+    let selection = select_mesh_devices_with(&with_min("13.0"), &info, None).expect("one fits");
+    assert_eq!(selected_ids(&selection), vec![0]);
+}
+
+#[test]
+fn requirements_validation_compares_min_cuda_version_numerically() {
+    let mut info = host_with_two_gpus();
+    info.devices[0].cuda_version = Some("13.0".to_string());
+    info.devices[1].cuda_version = Some("12.6".to_string());
+    let with_min = |min: &str, device_id: Option<i32>| kapsl_core::HardwareRequirements {
+        min_cuda_version: Some(min.to_string()),
+        ..requirements(device_id, None)
+    };
+    // The pinned SDK's own validation rejects this ("13.0" < "9.0" as strings);
+    // through the engine's wrapper a 13.0 device satisfies 9.0.
+    assert!(
+        BackendFactory::validate_requirements(&with_min("9.0", Some(0)), &info).is_err(),
+        "if this passes the SDK pin has the numeric compare and the wrapper can go"
+    );
+    validate_hardware_requirements(&with_min("9.0", Some(0)), &info).expect("13.0 >= 9.0");
+    validate_hardware_requirements(&with_min("12.10", Some(0)), &info).expect("13.0 >= 12.10");
+    // 12.6 does not satisfy 13.0, and the message keeps the readable versions.
+    let error =
+        validate_hardware_requirements(&with_min("13.0", Some(1)), &info).expect_err("12.6 < 13.0");
+    assert!(error.contains("12.6 < required 13.0"), "{error}");
+    // Unparseable on either side fails closed.
+    assert!(validate_hardware_requirements(&with_min("twelve", Some(0)), &info).is_err());
+}

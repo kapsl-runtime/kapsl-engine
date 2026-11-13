@@ -693,6 +693,7 @@ impl BackendManager {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn plan_onnx(
         &self,
         profile: OnnxBackendPackProfile,

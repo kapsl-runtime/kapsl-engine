@@ -602,6 +602,7 @@ static DEVICE_ROOM: std::sync::OnceLock<DeviceRoomFn> = std::sync::OnceLock::new
 /// though the room under the ledger changes as soon as the model is admitted.
 static DEFAULT_PLACEMENTS: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
 pub(crate) fn install_device_room(room: impl Fn(usize) -> usize + Send + Sync + 'static) {
     let _ = DEVICE_ROOM.set(Box::new(room));
 }
@@ -754,6 +755,88 @@ fn usable_device_info(
         usable.has_cuda = false;
     }
     usable
+}
+
+/// Parse a dotted CUDA version ("12.4", "13", "12.4.1") into numeric parts.
+fn parse_cuda_version(version: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = version
+        .trim()
+        .split('.')
+        .map(|part| part.trim().parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// Numeric comparison of dotted versions: `13.0 >= 9.0` (a string compare says
+/// otherwise). Missing trailing parts count as zero, so `12 == 12.0`. Either
+/// side failing to parse is a failed requirement (fail closed).
+pub(crate) fn cuda_version_at_least(device_version: &str, min_version: &str) -> bool {
+    let (Some(device), Some(min)) = (
+        parse_cuda_version(device_version),
+        parse_cuda_version(min_version),
+    ) else {
+        return false;
+    };
+    let len = device.len().max(min.len());
+    for i in 0..len {
+        let d = device.get(i).copied().unwrap_or(0);
+        let m = min.get(i).copied().unwrap_or(0);
+        if d != m {
+            return d > m;
+        }
+    }
+    true
+}
+
+/// Fixed-width form of a dotted version whose plain string order is its
+/// numeric order ("13.0" -> `0000000013.0000000000.0000000000.0000000000`).
+/// An unparseable `device` version sorts below every real one and an
+/// unparseable requirement above every real one, so both fail closed.
+fn sortable_cuda_version(version: &str, is_requirement: bool) -> String {
+    match parse_cuda_version(version) {
+        Some(parts) if parts.len() <= 4 => (0..4)
+            .map(|i| format!("{:010}", parts.get(i).copied().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join("."),
+        _ if is_requirement => "~".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// `BackendFactory::validate_requirements` with `min_cuda_version` compared
+/// numerically. The SDK revision this engine pins still compares the two
+/// versions as strings ("13.0" < "9.0"), so both sides are handed to it in a
+/// fixed-width form whose string order is the numeric order, and the readable
+/// versions are put back into its error text. Once the pin moves to an SDK with
+/// the numeric compare this wrapper can call it directly.
+pub(crate) fn validate_hardware_requirements(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+) -> Result<(), String> {
+    let Some(min_version) = &requirements.min_cuda_version else {
+        return BackendFactory::validate_requirements(requirements, device_info);
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut requirements = requirements.clone();
+    let sortable_min = sortable_cuda_version(min_version, true);
+    pairs.push((sortable_min.clone(), min_version.clone()));
+    requirements.min_cuda_version = Some(sortable_min);
+    let mut device_info = device_info.clone();
+    for device in device_info.devices.iter_mut() {
+        if let Some(version) = device.cuda_version.as_mut() {
+            let sortable = sortable_cuda_version(version, false);
+            if !sortable.is_empty() {
+                pairs.push((sortable.clone(), version.clone()));
+            }
+            *version = sortable;
+        }
+    }
+    BackendFactory::validate_requirements(&requirements, &device_info).map_err(|mut message| {
+        for (sortable, original) in &pairs {
+            message = message.replace(sortable.as_str(), original);
+        }
+        message
+    })
 }
 
 fn candidate_providers(
@@ -915,8 +998,8 @@ pub(crate) fn select_mesh_devices_with(
                     if let Some(min_ver) = &requirements.min_cuda_version {
                         matches.retain(|d| {
                             d.cuda_version
-                                .as_ref()
-                                .map(|ver| ver >= min_ver)
+                                .as_deref()
+                                .map(|ver| cuda_version_at_least(ver, min_ver))
                                 .unwrap_or(false)
                         });
                     }
@@ -991,6 +1074,30 @@ pub(crate) fn select_mesh_devices_with(
 #[cfg(test)]
 #[path = "visibility_tests.rs"]
 mod visibility_tests;
+
+#[cfg(test)]
+mod cuda_version_tests {
+    use super::cuda_version_at_least;
+
+    #[test]
+    fn versions_compare_numerically_not_as_strings() {
+        assert!(cuda_version_at_least("13.0", "9.0"));
+        assert!(!cuda_version_at_least("9.0", "13.0"));
+        assert!(cuda_version_at_least("12.10", "12.9"));
+        assert!(!cuda_version_at_least("11.8", "12.0"));
+        assert!(cuda_version_at_least("12.0", "12.0"));
+        assert!(cuda_version_at_least("12", "12.0"));
+        assert!(cuda_version_at_least("12.4.1", "12.4"));
+        assert!(!cuda_version_at_least("12.4", "12.4.1"));
+    }
+
+    #[test]
+    fn an_unparseable_version_fails_the_requirement() {
+        assert!(!cuda_version_at_least("", "12.0"));
+        assert!(!cuda_version_at_least("12.x", "12.0"));
+        assert!(!cuda_version_at_least("12.0", "twelve"));
+    }
+}
 
 #[cfg(test)]
 mod default_placement_tests {

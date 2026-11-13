@@ -278,6 +278,26 @@ async fn test_system_routes_report_health_and_pressure_state() {
     assert_eq!(stats_json["gpu_memory_total_bytes"], 20);
     assert_eq!(stats_json["foreign_gpu_memory_bytes"], 4);
     assert_eq!(stats_json["pressure_state"], "conserve");
+    // CUDA driver/runtime versions and the GPU sample freshness are served
+    // here; the values are null/"fresh" on a host without a GPU.
+    for key in ["driver_version", "driver_cuda_version", "runtime_version"] {
+        assert!(
+            stats_json["cuda"].get(key).is_some(),
+            "stats `cuda` lacks `{key}`: {}",
+            stats_json["cuda"]
+        );
+    }
+    assert_eq!(stats_json["gpu_sampling"], "fresh");
+    assert!(stats_json["gpu_sampling_age_secs"].is_null());
+    for domain in stats_json["memory_authority"]["domains"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(
+            domain["available_bytes"],
+            domain["authority_available_bytes"]
+        );
+    }
     assert_eq!(stats_json["memory_authority"]["model_bytes"], 1000);
     assert_eq!(stats_json["memory_authority"]["domain_used_bytes"], 1000);
     assert_eq!(
@@ -648,9 +668,10 @@ impl Engine for OpenAiEmbeddingTestEngine {
         let first_token = request
             .input
             .data
-            .chunks_exact(8)
-            .next()
-            .map(|bytes| i64::from_ne_bytes(bytes.try_into().expect("int64 token")))
+            .as_chunks::<8>()
+            .0
+            .first()
+            .map(|bytes| i64::from_ne_bytes(*bytes))
             .unwrap_or_default() as f32;
         let values = [first_token, 2.0, 3.0, 4.0];
         let data = values
