@@ -46,6 +46,14 @@ pub(crate) struct RuntimeResources {
     priority: Arc<PriorityArbiter>,
     pressure: Arc<ResourcePressure>,
     managed_vllm: RwLock<Option<Arc<ManagedVllmDeployment>>>,
+    /// Runs `force_cpu` requests for every replica, so their combined CPU
+    /// work is bounded by one thread count instead of one pool per replica.
+    cpu_pool: CpuPool,
+}
+
+/// Sized by Rayon's default: the logical CPU count, or `RAYON_NUM_THREADS`.
+fn shared_cpu_pool() -> Result<CpuPool, String> {
+    CpuPool::new(0).map_err(|error| format!("failed to create CPU thread pool: {error}"))
 }
 
 impl RuntimeResources {
@@ -64,6 +72,7 @@ impl RuntimeResources {
                 priority: PriorityArbiter::new(),
                 pressure: ResourcePressure::from_env(),
                 managed_vllm: RwLock::new(None),
+                cpu_pool: shared_cpu_pool()?,
             }))
         }
     }
@@ -88,6 +97,7 @@ impl RuntimeResources {
             priority: PriorityArbiter::new(),
             pressure: ResourcePressure::from_env(),
             managed_vllm: RwLock::new(None),
+            cpu_pool: shared_cpu_pool()?,
         }))
     }
 
@@ -105,6 +115,10 @@ impl RuntimeResources {
 
     pub(crate) fn priority(&self) -> &Arc<PriorityArbiter> {
         &self.priority
+    }
+
+    pub(crate) fn cpu_pool(&self) -> &CpuPool {
+        &self.cpu_pool
     }
 
     pub(crate) fn install_managed_vllm(

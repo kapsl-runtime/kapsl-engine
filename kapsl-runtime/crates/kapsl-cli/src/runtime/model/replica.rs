@@ -321,12 +321,11 @@ pub(super) async fn load_replica(
         None
     };
     let scheduler = Arc::new(
-        Scheduler::new(
+        Scheduler::new_with_cpu_pool(
             std::mem::take(&mut engines),
-            plan.batch_size,
+            resources.cpu_pool().clone(),
             1,
             plan.scheduler_queue_size,
-            true,
             plan.scheduler_max_micro_batch,
             plan.scheduler_queue_delay_ms,
             scheduler_mesh,
@@ -415,12 +414,11 @@ async fn load_managed_vllm_replica(
         replica: plan.replica_id.to_string(),
     });
     let scheduler = Arc::new(
-        Scheduler::new(
+        Scheduler::new_with_cpu_pool(
             vec![engine],
-            plan.batch_size,
+            resources.cpu_pool().clone(),
             1,
             plan.scheduler_queue_size,
-            true,
             plan.scheduler_max_micro_batch,
             plan.scheduler_queue_delay_ms,
             None,

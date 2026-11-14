@@ -665,6 +665,7 @@ impl NativePackInstance {
         let host = NativeBackendHost::new(
             resources,
             &pack.manifest.backend,
+            provider,
             device_id,
             model_id,
             replica_id,
