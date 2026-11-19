@@ -6,6 +6,12 @@
 //! model/replica is unloaded. Provider domains are accounting adapters: they
 //! participate in ownership and lifetime now, without pretending that the
 //! runtime physically allocates their memory.
+//!
+//! GPU physical backing is managed here in two forms: `device` manages the HAL
+//! `GpuDevicePool` arena shared by in-process backends, and `gpu_shared_pool`
+//! provisions isolated `GpuIpcPoolAllocation` / `GpuVmmPoolAllocation` backings
+//! for external KV workers. Each device's region registry observes both forms;
+//! their existing owners and authority charges retain the physical lifetimes.
 
 use super::*;
 
@@ -14,6 +20,10 @@ mod device;
 #[cfg(any(feature = "gpu-device-pool", test))]
 mod device_budget;
 mod device_limits;
+mod gpu_region_metrics;
+mod gpu_regions;
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+mod gpu_shared_pool;
 pub(crate) mod host;
 #[cfg(any(feature = "gpu-device-pool", test))]
 mod pool_clients;
@@ -22,6 +32,10 @@ mod priority;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use device::*;
 pub(crate) use device_limits::*;
+pub(crate) use gpu_region_metrics::GpuRegionMetrics;
+pub(crate) use gpu_regions::GpuRegionSnapshot;
+#[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+pub(crate) use gpu_shared_pool::GpuSharedPoolProvisioner;
 #[cfg(feature = "gpu-device-pool")]
 pub(crate) use pool_clients::PoolClientCleanup;
 #[cfg(any(feature = "gpu-device-pool", test))]
@@ -1421,6 +1435,20 @@ impl MemoryAuthority {
             .cuda_device(device_id)
     }
 
+    #[cfg(all(feature = "gpu-device-pool", any(target_os = "linux", test)))]
+    fn register_gpu_region(
+        &self,
+        device_id: usize,
+        kind: gpu_regions::GpuRegionKind,
+        isolation: gpu_regions::GpuRegionIsolation,
+        backing: &Arc<dyn gpu_regions::GpuRegionSource>,
+    ) -> Result<gpu_regions::GpuRegionId, String> {
+        self.cuda
+            .as_ref()
+            .ok_or_else(|| "runtime has no CUDA memory authority".to_string())?
+            .register_region(device_id, kind, isolation, backing)
+    }
+
     /// KV policy capacity for one HAL device. The authority owns the physical
     /// budget; callers only translate these bytes into logical blocks.
     pub(crate) fn kv_budget_bytes(&self, device_id: usize) -> usize {
@@ -1656,6 +1684,20 @@ impl MemoryAuthority {
     pub(crate) fn snapshot(&self) -> MemorySnapshot {
         let _operation = self.operations.lock();
         self.snapshot_unlocked()
+    }
+
+    /// Sample physical backing separately from atomic admission accounting.
+    /// These bytes describe existing charges, not additional budget claims.
+    /// In particular, do not hold `operations` while sampling backing locks.
+    pub(crate) fn gpu_region_snapshots(&self) -> Vec<GpuRegionSnapshot> {
+        #[cfg(feature = "gpu-device-pool")]
+        return self
+            .cuda
+            .as_ref()
+            .map(|manager| manager.region_snapshots())
+            .unwrap_or_default();
+        #[cfg(not(feature = "gpu-device-pool"))]
+        Vec::new()
     }
 
     fn snapshot_unlocked(&self) -> MemorySnapshot {

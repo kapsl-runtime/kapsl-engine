@@ -75,10 +75,7 @@ mod tests;
 #[tokio::main]
 async fn main() -> Result<(), DynError> {
     let raw_argv: Vec<String> = std::env::args().collect();
-    let Cli {
-        command,
-        run: _legacy_run_args,
-    } = Cli::parse_from(&raw_argv);
+    let Cli { command, .. } = Cli::parse_from(&raw_argv);
     if !matches!(command, Some(KapslCommand::Run(_)) | None) {
         observability::init()?;
     }

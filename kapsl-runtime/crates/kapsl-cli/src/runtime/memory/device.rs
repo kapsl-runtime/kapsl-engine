@@ -1,6 +1,10 @@
 use super::device_budget::{
     choose_auto_pool_capacity, AutoPoolSizingDecision, AutoPoolSizingInput, DeviceBudgetLedger,
 };
+use super::gpu_regions::{
+    GpuRegionId, GpuRegionIsolation, GpuRegionKind, GpuRegionOwnerUsage, GpuRegionRegistry,
+    GpuRegionSource, GpuRegionUsage,
+};
 use super::*;
 use cudarc::driver::{result as cuda_result, CudaDevice};
 use kapsl_hal::gpu_arena::{GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner};
@@ -15,12 +19,48 @@ const RELEASE_RETRY_ATTEMPTS: usize = 400;
 
 struct DeviceAuthority {
     cuda: Arc<CudaDevice>,
+    regions: GpuRegionRegistry,
     load_lock: Arc<AsyncMutex<()>>,
     pool_init_lock: Mutex<()>,
     pool_mode: DevicePoolMode,
     unpooled_reserve_bytes: Option<usize>,
     auto_driver_reserve_bytes: usize,
     implicit_auto_attempted: AtomicBool,
+}
+
+impl GpuRegionSource for GpuDevicePool {
+    fn region_usage(&self) -> Option<GpuRegionUsage> {
+        Some(arena_region_usage(self.snapshot()))
+    }
+}
+
+fn arena_region_usage(snapshot: kapsl_hal::gpu_arena::GpuDevicePoolSnapshot) -> GpuRegionUsage {
+    GpuRegionUsage {
+        committed_bytes: snapshot.capacity_bytes,
+        mapped_bytes: snapshot.capacity_bytes,
+        virtual_reserved_bytes: 0,
+        logical_allocated_bytes: Some(snapshot.allocated_bytes),
+        reusable_bytes: Some(snapshot.free_bytes),
+        largest_free_range_bytes: Some(snapshot.largest_free_range_bytes),
+        owners: snapshot
+            .owners
+            .into_iter()
+            .map(|entry| GpuRegionOwnerUsage {
+                owner: entry
+                    .owner
+                    .model_id()
+                    .zip(entry.owner.replica_id())
+                    .map(|(model, replica)| MemoryOwner::new(model, replica)),
+                backend: match entry.owner.backend() {
+                    PoolBackend::Onnx => "onnx",
+                    PoolBackend::Gguf => "gguf",
+                    PoolBackend::Native => "native",
+                },
+                class: memory_class(entry.owner.class()),
+                logical_bytes: entry.usage_bytes,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +242,7 @@ impl DeviceMemoryManager {
                 device.id,
                 DeviceAuthority {
                     cuda,
+                    regions: GpuRegionRegistry::new(device.id),
                     load_lock: Arc::new(AsyncMutex::new(())),
                     pool_init_lock: Mutex::new(()),
                     pool_mode,
@@ -605,6 +646,11 @@ impl DeviceMemoryManager {
                 ));
             }
         };
+        authority.regions.register(
+            GpuRegionKind::Arena,
+            GpuRegionIsolation::Local,
+            &(pool.clone() as Arc<dyn GpuRegionSource>),
+        );
         self.pools.lock().unwrap().insert(
             device_id,
             Arc::new(ManagedDevicePool {
@@ -731,6 +777,31 @@ impl DeviceMemoryManager {
                     .map(|snapshot| (device_id, snapshot.budget_bytes))
             })
             .collect()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn register_region(
+        &self,
+        device_id: usize,
+        kind: GpuRegionKind,
+        isolation: GpuRegionIsolation,
+        backing: &Arc<dyn GpuRegionSource>,
+    ) -> Result<GpuRegionId, String> {
+        let authority = self
+            .devices
+            .get(&device_id)
+            .ok_or_else(|| format!("CUDA device {device_id} is not managed by this runtime"))?;
+        Ok(authority.regions.register(kind, isolation, backing))
+    }
+
+    pub(crate) fn region_snapshots(&self) -> Vec<GpuRegionSnapshot> {
+        let mut snapshots: Vec<_> = self
+            .devices
+            .values()
+            .flat_map(|authority| authority.regions.snapshots())
+            .collect();
+        snapshots.sort_by_key(|region| (region.device_id, region.id));
+        snapshots
     }
 
     pub(crate) fn observed_pool_claims(&self) -> Vec<MemoryClaim> {
@@ -2120,6 +2191,47 @@ mod tests {
             )),
             "native:unattributed:externally-owned"
         );
+    }
+
+    #[test]
+    fn arena_region_preserves_mixed_and_unattributed_logical_owners() {
+        let owners = [
+            PoolOwner::onnx(1, 2, PoolAllocationClass::TransientWorkspace),
+            PoolOwner::gguf(3, 4, PoolAllocationClass::KvCache),
+            PoolOwner::unattributed(PoolBackend::Native, PoolAllocationClass::BlockTable),
+        ];
+        let usage = arena_region_usage(kapsl_hal::gpu_arena::GpuDevicePoolSnapshot {
+            capacity_bytes: 4096,
+            allocated_bytes: 768,
+            live_allocation_count: 3,
+            free_bytes: 3328,
+            free_range_count: 2,
+            largest_free_range_bytes: 2048,
+            fragmentation_ratio: 1.0 - 2048.0 / 3328.0,
+            owners: owners
+                .into_iter()
+                .map(|owner| kapsl_hal::gpu_arena::PoolOwnerSnapshot {
+                    owner,
+                    usage_bytes: 256,
+                    guaranteed_bytes: 0,
+                    max_bytes: 4096,
+                    admitted: true,
+                    allocatable_bytes: 2048,
+                })
+                .collect(),
+        });
+        assert_eq!(usage.committed_bytes, 4096);
+        assert_eq!(usage.logical_allocated_bytes, Some(768));
+        assert_eq!(usage.reusable_bytes, Some(3328));
+        assert_eq!(usage.largest_free_range_bytes, Some(2048));
+        assert_eq!(usage.virtual_reserved_bytes, 0);
+        assert_eq!(usage.owners[0].owner, Some(MemoryOwner::new(1, 2)));
+        assert_eq!(usage.owners[0].backend, "onnx");
+        assert_eq!(usage.owners[1].owner, Some(MemoryOwner::new(3, 4)));
+        assert_eq!(usage.owners[1].class, MemoryAllocationClass::KvCache);
+        assert_eq!(usage.owners[2].owner, None);
+        assert_eq!(usage.owners[2].backend, "native");
+        assert_eq!(usage.owners[2].class, MemoryAllocationClass::BlockTable);
     }
 
     #[test]

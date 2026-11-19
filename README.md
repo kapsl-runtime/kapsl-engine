@@ -67,6 +67,10 @@ The runtime binary depends on those crates through normal Cargo dependencies.
 Reusable Rust libraries, client bindings, transports, schedulers, backend abstractions,
 RAG primitives, and Python packaging belong in `kapsl-sdk`.
 
+The [GPU memory pool design](docs/gpu-memory-pool-design.md) describes a common
+per-device allocation interface over local, IPC, and VMM backing regions and tracks
+the initial region registry and snapshot implementation.
+
 The optional MCP adapter is a northbound runtime protocol and remains in this
 repository. It calls the same governed inference service as HTTP and native
 transports and has no dependency on a concrete inference backend. See
