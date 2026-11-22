@@ -396,6 +396,76 @@ fn decode_bounded_manifest<R: Read>(
     serde_json::from_slice(&bytes).map_err(|error| format!("Invalid metadata.json: {error}"))
 }
 
+/// Manifest and model size of a `.aimod` archive, read from the tar headers
+/// without writing anything to disk.
+#[derive(Debug, Clone)]
+pub(crate) struct PackageHeader {
+    pub(crate) manifest: Manifest,
+    /// Size of the model file entry in bytes, from its tar header.
+    pub(crate) model_bytes: u64,
+}
+
+/// Read the manifest and the model entry's size from a `.aimod` archive.
+///
+/// Packages are written with `metadata.json` first, immediately followed by the
+/// model file, so both are reached after reading one small entry and one tar
+/// header: no model bytes are decompressed. A package written in another order
+/// is still handled; the scan then decompresses (without writing) past the
+/// entries that come first. `Ok(None)` for anything that is not a package
+/// archive (directories, raw model files), or an archive that lacks either
+/// entry.
+pub(crate) fn inspect_package_header(path: &Path) -> Result<Option<PackageHeader>, String> {
+    if path.is_dir() || looks_like_model_file_path(path) {
+        return Ok(None);
+    }
+    let file = File::open(path)
+        .map_err(|error| format!("Failed to open package {}: {error}", path.display()))?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("Failed to read package {}: {error}", path.display()))?;
+    let mut manifest: Option<Manifest> = None;
+    let mut sizes: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in entries {
+        let mut entry = entry.map_err(|error| {
+            format!(
+                "Failed to read package entry in {}: {error}",
+                path.display()
+            )
+        })?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| {
+                format!(
+                    "Failed to read package entry path in {}: {error}",
+                    path.display()
+                )
+            })?
+            .components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .collect::<PathBuf>();
+        if entry_path == Path::new("metadata.json") {
+            let size = entry.size();
+            manifest = Some(decode_bounded_manifest(&mut entry, Some(size))?);
+        } else {
+            sizes.push((entry_path, entry.size()));
+        }
+        if let Some(manifest) = &manifest {
+            let model_path: PathBuf = Path::new(&manifest.model_file)
+                .components()
+                .filter(|component| !matches!(component, std::path::Component::CurDir))
+                .collect();
+            if let Some((_, bytes)) = sizes.iter().find(|(entry, _)| *entry == model_path) {
+                return Ok(Some(PackageHeader {
+                    manifest: manifest.clone(),
+                    model_bytes: *bytes,
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Read only the manifest needed for a policy decision.
 ///
 /// In particular, this does not invoke `PackageLoader::load`, populate the

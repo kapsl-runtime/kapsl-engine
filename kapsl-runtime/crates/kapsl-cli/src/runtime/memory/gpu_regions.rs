@@ -4,6 +4,13 @@
 //! identities and observations without another budget ledger. Retirement waits
 //! for weak observer pins before releasing physical storage and its charge.
 
+// Region registration is wired up by the CUDA device pool, and exported regions
+// by its Linux shared pool; without them these identities are unused.
+#![cfg_attr(
+    not(all(feature = "gpu-device-pool", target_os = "linux")),
+    allow(dead_code)
+)]
+
 use super::{MemoryAllocationClass, MemoryOwner};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;

@@ -277,13 +277,14 @@ pub(super) fn build_model_load_plan(
         worker_tp_degree,
         use_pipeline_backend,
     } = topology_choice;
-    BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
-        .map_err(|error| {
+    validate_hardware_requirements(&loader.manifest.hardware_requirements, device_info).map_err(
+        |error| {
             format!(
                 "Requirements validation failed for model {} replica {}: {}",
                 base_model_id, replica_id, error
             )
-        })?;
+        },
+    )?;
     export_gguf_auto_sizing_hint(
         &loader.manifest,
         defaults.batch_size,
@@ -312,17 +313,25 @@ pub(super) fn build_model_load_plan(
         use_pipeline_backend,
         backend_tuning: backend_tuning.clone(),
         #[cfg(feature = "gpu-device-pool")]
-        onnx_peak_concurrency: match &backend_tuning {
-            BackendLoadTuning::Onnx(_) if engine_kind.is_onnx_generate() => 1,
-            BackendLoadTuning::Onnx(tuning) => {
-                tuning.peak_concurrency_hint.unwrap_or(1).max(1) as usize
-            }
-            BackendLoadTuning::None => 1,
-        },
+        onnx_peak_concurrency: onnx_peak_sessions(engine_kind, &backend_tuning),
         isolate_process: resolve_isolate_process(&loader.manifest),
         isolate_strict: resolve_isolate_process_strict(&loader.manifest),
         loader,
     })
+}
+
+/// Sessions an ONNX model has busy at peak: the load tuning's concurrency hint,
+/// one for a generative model or no tuning. Sizes the arena peak plan, both for
+/// an in-process load and for the parent's lease on an isolated worker (the
+/// worker gets the same tuning, so it opens the same number of sessions).
+pub(crate) fn onnx_peak_sessions(engine_kind: EngineKind, tuning: &BackendLoadTuning) -> usize {
+    match tuning {
+        BackendLoadTuning::Onnx(_) if engine_kind.is_onnx_generate() => 1,
+        BackendLoadTuning::Onnx(tuning) => {
+            tuning.peak_concurrency_hint.unwrap_or(1).max(1) as usize
+        }
+        BackendLoadTuning::None => 1,
+    }
 }
 
 #[cfg(feature = "gpu-device-pool")]
@@ -647,8 +656,12 @@ fn planned_external_weight_bytes(kind: EngineKind, model_path: &Path) -> Result<
     }
 }
 
+/// Spawn the isolated worker, if the plan asks for one. `memory` is the
+/// parent's reservation for it (see [`reserve_isolated_worker_memory`]): it is
+/// tied to the worker's life, and dropped here when no worker is kept.
 pub(super) async fn start_isolated_worker(
     plan: &ModelLoadPlan,
+    memory: Option<IsolatedWorkerMemory>,
 ) -> Result<Option<Arc<WorkerProcess>>, Box<dyn std::error::Error + Send + Sync>> {
     if !plan.isolate_process {
         return Ok(None);
@@ -673,6 +686,9 @@ pub(super) async fn start_isolated_worker(
     ) {
         Ok(worker) => {
             let worker = Arc::new(worker);
+            if let Some(memory) = memory {
+                worker.attach_memory_guard(Box::new(memory));
+            }
             match wait_for_worker_ready_async(worker.as_ref(), Duration::from_secs(30)).await {
                 Ok(()) => Ok(Some(start_worker_with_supervisor(worker))),
                 Err(error) => {

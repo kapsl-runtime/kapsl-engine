@@ -288,6 +288,9 @@ fn log_hardware(device_info: &DeviceInfo) {
             "✗ Not available".to_string()
         }
     );
+    if device_info.has_cuda {
+        log::info!("CUDA versions: {}", cuda_versions().describe());
+    }
     log::info!(
         "Metal: {}",
         if device_info.has_metal {

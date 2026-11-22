@@ -436,7 +436,7 @@ mod tests {
         let (weights, workspace) = old_plan(ZFNET);
         admit(&mut ledger, "zfnet", owner_b, weights, workspace)
             .expect("the load-time plan lets both in");
-        assert!(1_761_607_680usize + 2_437_110_191 > BUDGET);
+        const { assert!(1_761_607_680usize + 2_437_110_191 > BUDGET) };
     }
 
     #[test]
