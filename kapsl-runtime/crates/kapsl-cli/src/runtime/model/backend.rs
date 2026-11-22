@@ -64,7 +64,9 @@ pub(super) fn acquire_embedded_ort_pool_clients(
     provider: &str,
     device_ids: &[usize],
 ) -> Result<Vec<PoolClientLease>, String> {
-    if !provider.eq_ignore_ascii_case("cuda") && !provider.eq_ignore_ascii_case("tensorrt") {
+    // ONNX models use ORT's own arena unless the pool is opted into
+    // (KAPSL_ONNX_CUDA_POOL=1); see `onnx_cuda_pool_opt_in`.
+    if !ort_pool_registration_wanted(provider, onnx_cuda_pool_opt_in()) {
         return Ok(Vec::new());
     }
     let mut clients = Vec::new();
@@ -437,6 +439,7 @@ impl kapsl_engine_api::Engine for MemoryTrackedEngine {
 
 #[derive(Debug, Clone, Copy)]
 struct EstimatedModelMemory {
+    serialized_bytes: usize,
     session_bytes: usize,
     workspace_bytes: usize,
 }
@@ -447,6 +450,7 @@ fn estimated_model_memory(model_path: &Path) -> Result<EstimatedModelMemory, Str
         .len() as usize;
     // Account for decoded/aligned weights and a bounded execution workspace.
     Ok(EstimatedModelMemory {
+        serialized_bytes: serialized,
         session_bytes: serialized.saturating_mul(5).saturating_div(4),
         workspace_bytes: (serialized / 4).max(256 * 1024 * 1024),
     })
@@ -590,7 +594,9 @@ pub(super) fn create_runtime_backend_for_device(
         let backend = LLMBackend::with_device(provider.to_owned(), device_id as i32)
             .with_memory_owner(model_id, replica_id);
         #[cfg(feature = "gpu-device-pool")]
-        let backend = backend.with_env_allocators(resources.uses_env_allocators(device_id));
+        let backend = backend.with_env_allocators(
+            onnx_cuda_pool_opt_in() && resources.uses_env_allocators(device_id),
+        );
         let backend = PreparedBackend::from(Box::new(backend));
         #[cfg(feature = "gpu-device-pool")]
         let backend = backend.with_pool_clients(pool_clients);
@@ -640,17 +646,46 @@ pub(super) struct IsolatedWorkerMemory {
 /// whole card. This reports the load-time estimate (the same one an in-process
 /// load starts from) as one backend-managed allocation per selected domain,
 /// charged against the budget outside the pool, before the child is spawned.
+///
+/// An ONNX model on ORT's own arena (the default) is the exception on CUDA: its
+/// worker grows to the same peak an in-process load is admitted at (weights and
+/// workspace for every busy session), so the lease is that peak plan, split
+/// the way `raise_onnx_arena_claims_to_peak` splits it (for a pipeline mesh the
+/// model is shared out over the CUDA devices, as the bootstrap plan does). The estimate would
+/// charge a ResNet-50 worker 0.38 GB where its arena reaches 1.8 GB, and
+/// the lease is never reconciled upward (the parent gets no report from the
+/// child), so the hold has nothing to raise it later.
 pub(super) fn isolated_worker_memory_report(
     model_file_path: &Path,
     domains: &[MemoryDomain],
     model_id: u32,
     replica_id: u32,
+    engine_kind: EngineKind,
+    onnx_sessions: usize,
+    pipeline: bool,
 ) -> Result<MemoryReport, String> {
     use kapsl_engine_api::{
         MemoryAllocation, MemoryAllocationClass as EngineClass,
         MemoryAllocationSource as EngineSource, MemoryDomain as EngineDomain,
     };
     let estimate = estimated_model_memory(model_file_path)?;
+    let cuda_devices = domains
+        .iter()
+        .filter(|domain| matches!(domain, MemoryDomain::Cuda { .. }))
+        .count()
+        .max(1);
+    let arena_peak = onnx_arena_claims_held(engine_kind).then(|| {
+        let model_bytes = if pipeline {
+            estimate.serialized_bytes.saturating_add(cuda_devices - 1) / cuda_devices
+        } else {
+            estimate.serialized_bytes
+        };
+        let sessions = onnx_sessions.max(1);
+        (
+            model_bytes.saturating_mul(sessions),
+            onnx_arena_workspace_per_session_bytes(model_bytes).saturating_mul(sessions),
+        )
+    });
     let mut allocations = Vec::new();
     for domain in domains {
         let (engine_domain, weights_class) = match domain {
@@ -664,12 +699,16 @@ pub(super) fn isolated_worker_memory_report(
             // Other providers are planned from the plain estimate below.
             _ => continue,
         };
+        let (weights_bytes, workspace_bytes) = match (&domain, arena_peak) {
+            (MemoryDomain::Cuda { .. }, Some(peak)) => peak,
+            _ => (estimate.session_bytes, estimate.workspace_bytes),
+        };
         for (suffix, class, bytes) in [
-            ("weights", weights_class, estimate.session_bytes),
+            ("weights", weights_class, weights_bytes),
             (
                 "workspace",
                 EngineClass::TransientWorkspace,
-                estimate.workspace_bytes,
+                workspace_bytes,
             ),
         ] {
             allocations.push(MemoryAllocation {
@@ -695,11 +734,21 @@ pub(super) async fn reserve_isolated_worker_memory(
     model_id: u32,
     replica_id: u32,
     engine_kind: EngineKind,
+    onnx_sessions: usize,
+    pipeline: bool,
     priority_weight: u32,
 ) -> Result<IsolatedWorkerMemory, DynError> {
     let owner = MemoryOwner::new(model_id, replica_id);
     let estimate = estimated_model_memory(model_file_path)?;
-    let report = isolated_worker_memory_report(model_file_path, domains, model_id, replica_id)?;
+    let report = isolated_worker_memory_report(
+        model_file_path,
+        domains,
+        model_id,
+        replica_id,
+        engine_kind,
+        onnx_sessions,
+        pipeline,
+    )?;
     let plan = resources.memory().model_load_plan_with_report(
         domains,
         owner,
@@ -752,9 +801,17 @@ pub(super) async fn load_runtime_backend(
 ) -> Result<Box<dyn kapsl_engine_api::Engine>, DynError> {
     let owner = MemoryOwner::new(model_id, replica_id);
     let estimate = estimated_model_memory(model_file_path)?;
-    let planned_report = backend
+    let mut planned_report = backend
         .planned_memory(model_file_path)
         .map_err(|error| format!("backend memory plan failed: {error}"))?;
+    if engine_kind.uses_onnx_session() {
+        // ORT's own arena grows with busy sessions (ResNet-50 loads at 950 MB
+        // and reaches 1758 MB), so reserve the peak, not the load-time figure.
+        let model_bytes = std::fs::metadata(model_file_path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
+        raise_onnx_arena_claims_to_peak(&mut planned_report, model_bytes);
+    }
     let plan = resources.memory().model_load_plan_with_report(
         admission_domains,
         owner,
@@ -1544,7 +1601,16 @@ mod tests {
             MemoryDomain::Cuda { device_id: 0 },
             MemoryDomain::Cuda { device_id: 1 },
         ];
-        let report = isolated_worker_memory_report(file.path(), &domains, 9, 0).unwrap();
+        let report = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            9,
+            0,
+            EngineKind::Native,
+            1,
+            false,
+        )
+        .unwrap();
         assert_eq!(report.allocations.len(), 4);
         let estimate = estimated_model_memory(file.path()).unwrap();
         let weights: Vec<_> = report
@@ -1566,6 +1632,90 @@ mod tests {
             ids.len(),
             4,
             "allocation ids are unique per device and kind"
+        );
+    }
+
+    #[test]
+    fn an_isolated_onnx_worker_on_orts_arena_is_leased_at_the_same_peak_plan_as_in_process() {
+        // ResNet-50, 4 sessions: the in-process claim is raised to this peak, and the
+        // worker's arena reaches it too, so the parent's lease must not be the
+        // 1.25 x file estimate.
+        let model = 102_576_593usize;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(model as u64).unwrap();
+        let domains = [MemoryDomain::Cuda { device_id: 0 }, MemoryDomain::Host];
+        let total = |report: &MemoryReport, host: bool| {
+            report
+                .allocations
+                .iter()
+                .filter(|a| matches!(a.domain, kapsl_engine_api::MemoryDomain::Host) == host)
+                .map(|a| a.bytes)
+                .sum::<usize>()
+        };
+        let onnx = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            9,
+            0,
+            EngineKind::OnnxClassify,
+            4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            total(&onnx, false),
+            onnx_arena_peak_bytes(model, 4),
+            "CUDA lease equals the in-process peak plan"
+        );
+        // Same split as `raise_onnx_arena_claims_to_peak`: weights for every session.
+        let weights = onnx
+            .allocations
+            .iter()
+            .find(|a| {
+                a.class == EngineMemoryClass::PersistentWeights
+                    && !matches!(a.domain, kapsl_engine_api::MemoryDomain::Host)
+            })
+            .unwrap();
+        assert_eq!(weights.bytes, model * 4);
+        // The host row of the same worker keeps the plain estimate.
+        let estimate = estimated_model_memory(file.path()).unwrap();
+        assert_eq!(
+            total(&onnx, true),
+            estimate.session_bytes + estimate.workspace_bytes
+        );
+        // A pipeline mesh shares one model copy out over its CUDA devices.
+        let two = [
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+        ];
+        let sharded = isolated_worker_memory_report(
+            file.path(),
+            &two,
+            9,
+            0,
+            EngineKind::OnnxClassify,
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            total(&sharded, false),
+            2 * onnx_arena_peak_bytes(model.div_ceil(2), 4)
+        );
+        // Kinds that are not held (GGUF, native) keep the estimate on CUDA.
+        let gguf = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            9,
+            0,
+            EngineKind::GgufGenerate,
+            4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            total(&gguf, false),
+            estimate.session_bytes + estimate.workspace_bytes
         );
     }
 
@@ -1594,6 +1744,8 @@ mod tests {
             0,
             EngineKind::Native,
             1,
+            false,
+            1,
         )
         .await
         .expect("a 64 MiB model fits a 64 GiB host");
@@ -1620,6 +1772,8 @@ mod tests {
             72,
             0,
             EngineKind::Native,
+            1,
+            false,
             1,
         )
         .await
