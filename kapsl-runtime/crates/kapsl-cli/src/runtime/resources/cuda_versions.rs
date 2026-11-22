@@ -135,11 +135,10 @@ mod tests {
 
     #[test]
     fn runtime_version_prefers_env_then_toolkit_dirs() {
-        let roots = [PathBuf::from("/a"), PathBuf::from("/b")];
-        let read = |path: &Path| match path.to_str().unwrap() {
-            "/b/version.txt" => Some("CUDA Version 11.8.89".to_string()),
-            _ => None,
-        };
+        // Compare paths, not strings: `join` uses the platform separator.
+        let roots = [PathBuf::from("a"), PathBuf::from("b")];
+        let only_in_b = roots[1].join("version.txt");
+        let read = |path: &Path| (path == only_in_b).then(|| "CUDA Version 11.8.89".to_string());
         assert_eq!(
             detect_runtime_version(Some("12.6.3"), &roots, read).as_deref(),
             Some("12.6.3")
