@@ -788,57 +788,6 @@ pub(crate) fn cuda_version_at_least(device_version: &str, min_version: &str) -> 
     true
 }
 
-/// Fixed-width form of a dotted version whose plain string order is its
-/// numeric order ("13.0" -> `0000000013.0000000000.0000000000.0000000000`).
-/// An unparseable `device` version sorts below every real one and an
-/// unparseable requirement above every real one, so both fail closed.
-fn sortable_cuda_version(version: &str, is_requirement: bool) -> String {
-    match parse_cuda_version(version) {
-        Some(parts) if parts.len() <= 4 => (0..4)
-            .map(|i| format!("{:010}", parts.get(i).copied().unwrap_or(0)))
-            .collect::<Vec<_>>()
-            .join("."),
-        _ if is_requirement => "~".to_string(),
-        _ => String::new(),
-    }
-}
-
-/// `BackendFactory::validate_requirements` with `min_cuda_version` compared
-/// numerically. The SDK revision this engine pins still compares the two
-/// versions as strings ("13.0" < "9.0"), so both sides are handed to it in a
-/// fixed-width form whose string order is the numeric order, and the readable
-/// versions are put back into its error text. Once the pin moves to an SDK with
-/// the numeric compare this wrapper can call it directly.
-pub(crate) fn validate_hardware_requirements(
-    requirements: &kapsl_core::HardwareRequirements,
-    device_info: &DeviceInfo,
-) -> Result<(), String> {
-    let Some(min_version) = &requirements.min_cuda_version else {
-        return BackendFactory::validate_requirements(requirements, device_info);
-    };
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    let mut requirements = requirements.clone();
-    let sortable_min = sortable_cuda_version(min_version, true);
-    pairs.push((sortable_min.clone(), min_version.clone()));
-    requirements.min_cuda_version = Some(sortable_min);
-    let mut device_info = device_info.clone();
-    for device in device_info.devices.iter_mut() {
-        if let Some(version) = device.cuda_version.as_mut() {
-            let sortable = sortable_cuda_version(version, false);
-            if !sortable.is_empty() {
-                pairs.push((sortable.clone(), version.clone()));
-            }
-            *version = sortable;
-        }
-    }
-    BackendFactory::validate_requirements(&requirements, &device_info).map_err(|mut message| {
-        for (sortable, original) in &pairs {
-            message = message.replace(sortable.as_str(), original);
-        }
-        message
-    })
-}
-
 fn candidate_providers(
     requirements: &kapsl_core::HardwareRequirements,
     device_info: &DeviceInfo,

@@ -240,20 +240,16 @@ fn requirements_validation_compares_min_cuda_version_numerically() {
         min_cuda_version: Some(min.to_string()),
         ..requirements(device_id, None)
     };
-    // The pinned SDK's own validation rejects this ("13.0" < "9.0" as strings);
-    // through the engine's wrapper a 13.0 device satisfies 9.0.
-    assert!(
-        BackendFactory::validate_requirements(&with_min("9.0", Some(0)), &info).is_err(),
-        "if this passes the SDK pin has the numeric compare and the wrapper can go"
-    );
-    validate_hardware_requirements(&with_min("9.0", Some(0)), &info).expect("13.0 >= 9.0");
-    validate_hardware_requirements(&with_min("12.10", Some(0)), &info).expect("13.0 >= 12.10");
+    // "13.0" < "9.0" as strings; the SDK compares numerically.
+    BackendFactory::validate_requirements(&with_min("9.0", Some(0)), &info).expect("13.0 >= 9.0");
+    BackendFactory::validate_requirements(&with_min("12.10", Some(0)), &info)
+        .expect("13.0 >= 12.10");
     // 12.6 does not satisfy 13.0, and the message keeps the readable versions.
-    let error =
-        validate_hardware_requirements(&with_min("13.0", Some(1)), &info).expect_err("12.6 < 13.0");
+    let error = BackendFactory::validate_requirements(&with_min("13.0", Some(1)), &info)
+        .expect_err("12.6 < 13.0");
     assert!(error.contains("12.6 < required 13.0"), "{error}");
     // Unparseable on either side fails closed.
-    assert!(validate_hardware_requirements(&with_min("twelve", Some(0)), &info).is_err());
+    assert!(BackendFactory::validate_requirements(&with_min("twelve", Some(0)), &info).is_err());
 }
 
 #[test]
