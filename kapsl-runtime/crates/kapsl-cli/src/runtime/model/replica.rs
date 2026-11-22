@@ -461,10 +461,15 @@ fn create_pipeline_backend(
     .with_memory_owner(plan.base_model_id, plan.replica_id);
     #[cfg(feature = "gpu-device-pool")]
     {
+        // An ONNX pipeline uses the pool's environment allocator only with the
+        // opt-in; the other kinds follow the pool on their devices.
+        let pool_allowed = !EngineKind::resolve(&plan.loader.manifest).uses_onnx_session()
+            || onnx_cuda_pool_opt_in();
         backend = backend.with_env_allocators(
-            device_ids
-                .iter()
-                .any(|&device_id| resources.uses_env_allocators(device_id)),
+            pool_allowed
+                && device_ids
+                    .iter()
+                    .any(|&device_id| resources.uses_env_allocators(device_id)),
         );
     }
 

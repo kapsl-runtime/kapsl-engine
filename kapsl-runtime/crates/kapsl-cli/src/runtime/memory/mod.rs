@@ -14,6 +14,7 @@
 
 use super::*;
 
+mod arena_hold;
 #[cfg(feature = "gpu-device-pool")]
 mod device;
 #[cfg(any(feature = "gpu-device-pool", test))]
@@ -43,6 +44,8 @@ pub(crate) use pool_clients::PoolClientCleanup;
 #[cfg(any(feature = "gpu-device-pool", test))]
 pub(crate) use pool_clients::{PoolClientLease, PoolClients};
 pub(crate) use priority::*;
+
+pub(crate) use arena_hold::ArenaHold;
 
 use self::host::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
 use crate::app::config::constants::PROVIDER_MEMORY_LIMITS_ENV;
@@ -944,7 +947,7 @@ pub(crate) fn classify_external_allocation(allocation_id: &str) -> MemoryAllocat
     }
 }
 
-#[cfg(feature = "gpu-device-pool")]
+#[cfg(any(feature = "gpu-device-pool", test))]
 fn external_cuda_report_from_backend(report: &BackendMemoryReport) -> ExternalDeviceMemoryReport {
     ExternalDeviceMemoryReport {
         allocations: report
@@ -2508,6 +2511,9 @@ impl MemoryAuthority {
             },
             #[cfg(feature = "gpu-device-pool")]
             cuda: Vec::new(),
+            arena_hold: crate::runtime::model::load_plan::onnx_arena_claims_held(kind)
+                .then(|| ArenaHold::from_plan(plan.claims()))
+                .flatten(),
             reconciled: false,
         };
 
@@ -2676,6 +2682,8 @@ pub(crate) struct MemoryAdmission {
     cuda_plan: MemoryPlan,
     #[cfg(feature = "gpu-device-pool")]
     cuda: Vec<DeviceMemoryAdmission>,
+    /// ONNX arena claims held at their peak; moved to the lease on commit.
+    arena_hold: Option<ArenaHold>,
     reconciled: bool,
 }
 
@@ -2686,9 +2694,12 @@ impl MemoryAdmission {
             host_load.reconcile(&mut lease.host)?;
         }
 
+        // The device budget follows the held report (never below the peak plan
+        // or the observed high-water mark); `observed` keeps the real bytes.
+        let held_report = held_report(&mut self.arena_hold, actual_report);
         #[cfg(feature = "gpu-device-pool")]
         {
-            let external_cuda = external_cuda_report_from_backend(actual_report);
+            let external_cuda = external_cuda_report_from_backend(&held_report);
             for admission in &mut self.cuda {
                 admission.reconcile(&external_cuda)?;
             }
@@ -2696,7 +2707,7 @@ impl MemoryAdmission {
         if let Some(lease) = self.lease.as_mut() {
             lease.record_loaded_report(actual_report)?;
         }
-        reconcile_backend_claim_bytes(&mut self.cuda_plan.claims, actual_report);
+        reconcile_backend_claim_bytes(&mut self.cuda_plan.claims, &held_report);
         self.reconciled = true;
         Ok(())
     }
@@ -2717,8 +2728,19 @@ impl MemoryAdmission {
                 .any(|claim| claim.owner == item.owner()));
             lease.cuda.push(item);
         }
+        lease.arena_hold = self.arena_hold.take();
         lease.mark_committed();
         lease
+    }
+}
+
+/// The report to reserve device memory against: the backend's report with the
+/// held ONNX arena claims raised to their floor, or the report itself when
+/// nothing is held.
+fn held_report(hold: &mut Option<ArenaHold>, report: &BackendMemoryReport) -> BackendMemoryReport {
+    match hold {
+        Some(hold) => hold.hold(report),
+        None => report.clone(),
     }
 }
 
@@ -2736,6 +2758,7 @@ pub(crate) struct MemoryLease {
     cuda: Vec<DeviceMemoryLease>,
     #[cfg(feature = "gpu-device-pool")]
     cuda_transient: Vec<DeviceMemoryTransientLease>,
+    arena_hold: Option<ArenaHold>,
     released: bool,
 }
 
@@ -2770,6 +2793,7 @@ impl MemoryLease {
             cuda: Vec::new(),
             #[cfg(feature = "gpu-device-pool")]
             cuda_transient: Vec::new(),
+            arena_hold: None,
             released: false,
         }
     }
@@ -3002,12 +3026,17 @@ impl MemoryLease {
             return Ok(());
         }
         let owner = self.single_owner()?;
-        let actual_plan = MemoryPlan::from_backend_report(owner, report);
-        let actual = aggregate_claim_rows(actual_plan.claims());
+        // `actual` is what the backend really holds (observed and committed);
+        // `held` is what stays reserved: a held ONNX arena claim never drops
+        // below its peak plan or its observed high-water mark.
+        let held = held_report(&mut self.arena_hold, report);
+        let actual = aggregate_claim_rows(MemoryPlan::from_backend_report(owner, report).claims());
+        let held_plan = MemoryPlan::from_backend_report(owner, &held);
+        let held_rows = aggregate_claim_rows(held_plan.claims());
 
         #[cfg(feature = "gpu-device-pool")]
         {
-            let external_cuda = external_cuda_report_from_backend(report);
+            let external_cuda = external_cuda_report_from_backend(&held);
             let result = self
                 .cuda
                 .iter_mut()
@@ -3026,10 +3055,10 @@ impl MemoryLease {
         let current = aggregate_claim_rows(&self.claims);
 
         let mut growth = MemoryPlan::new();
-        for (key, actual_bytes) in &actual {
+        for (key, actual_bytes) in &held_rows {
             let current_bytes = current.get(key).copied().unwrap_or(0);
             if *actual_bytes > current_bytes {
-                let mut claim = actual_plan
+                let mut claim = held_plan
                     .claims()
                     .iter()
                     .find(|claim| MemoryRowKey::from_claim(claim) == *key)
@@ -3061,9 +3090,9 @@ impl MemoryLease {
             // Only rows the backend reported (or moved to another domain) may
             // shrink. Anything else (e.g. the transient workspace admitted for
             // the load) keeps its admitted bytes until unload.
-            let target = match actual.get(&key) {
+            let target = match held_rows.get(&key) {
                 Some(&target) => target,
-                None if row_migrated_by_report(&key, &actual) => 0,
+                None if row_migrated_by_report(&key, &held_rows) => 0,
                 None => continue,
             };
             if current_bytes > target {
@@ -3298,16 +3327,21 @@ impl MemoryLease {
         report: &BackendMemoryReport,
         target_planned: HashMap<MemoryRowKey, usize>,
     ) -> Result<(), String> {
+        // Reserve against the held report (see `reconcile_locked`); observed
+        // and committed below take the real one.
+        let held = held_report(&mut self.arena_hold, report);
         #[cfg(feature = "gpu-device-pool")]
         {
-            let external_cuda = external_cuda_report_from_backend(report);
+            let external_cuda = external_cuda_report_from_backend(&held);
             for lease in &mut self.cuda {
                 lease.reconcile_report(&external_cuda)?;
             }
         }
 
         let owner = self.single_owner()?;
-        let actual_plan = MemoryPlan::from_backend_report(owner, report);
+        let measured =
+            aggregate_claim_rows(MemoryPlan::from_backend_report(owner, report).claims());
+        let actual_plan = MemoryPlan::from_backend_report(owner, &held);
         let actual = aggregate_claim_rows(actual_plan.claims());
         let current = aggregate_claim_rows(&self.claims);
 
@@ -3364,8 +3398,8 @@ impl MemoryLease {
             self.set_claim_row_bytes(key, *bytes);
         }
         self.planned = target_planned;
-        self.observed = actual.clone();
-        self.committed = actual;
+        self.observed = measured.clone();
+        self.committed = measured;
         self.refresh_accounting(false);
         Ok(())
     }
@@ -5314,6 +5348,219 @@ mod tests {
             authority.host.reserved_bytes(),
             "host ledger is not closed"
         );
+    }
+
+    /// The device budget as the load path drives it: reserve both rows at the
+    /// peak plan, then reconcile with the report `held_report` hands the ledger.
+    /// ResNet-50, 4 sessions (run 8): the plan puts 410,306,372 B in the
+    /// weights row and 1,610,612,736 B in the workspace row.
+    struct ArenaLedger {
+        ledger: device_budget::DeviceBudgetLedger,
+        hold: Option<ArenaHold>,
+    }
+
+    const ARENA_WEIGHTS_ID: &str = "onnx-session:60:0";
+    const ARENA_WORKSPACE_ID: &str = "onnx-session:60:0:workspace";
+    const ARENA_PLAN_WEIGHTS: usize = 410_306_372;
+    const ARENA_PLAN_WORKSPACE: usize = 1_610_612_736;
+    const ARENA_PLAN_TOTAL: usize = 2_020_919_108;
+
+    impl ArenaLedger {
+        fn new(budget: usize, held: bool) -> Self {
+            Self::with_plan(budget, ARENA_PLAN_WEIGHTS, ARENA_PLAN_WORKSPACE, held)
+        }
+
+        fn with_plan(budget: usize, weights: usize, workspace: usize, held: bool) -> Self {
+            let owner = MemoryOwner::new(60, 0);
+            let mut ledger = device_budget::DeviceBudgetLedger::default();
+            ledger.insert_device(0, budget, 0).unwrap();
+            let rows = [
+                (
+                    ARENA_WEIGHTS_ID,
+                    weights,
+                    MemoryAllocationClass::PersistentWeights,
+                ),
+                (
+                    ARENA_WORKSPACE_ID,
+                    workspace,
+                    MemoryAllocationClass::TransientWorkspace,
+                ),
+            ];
+            for (id, bytes, class) in rows {
+                ledger.reserve_external(0, id, bytes, owner, class).unwrap();
+            }
+            let hold = held.then(|| {
+                let claims: Vec<_> = rows
+                    .iter()
+                    .map(|(id, bytes, class)| MemoryClaim {
+                        domain: MemoryDomain::Cuda { device_id: 0 },
+                        owner,
+                        class: *class,
+                        bytes: *bytes,
+                        source: MemoryClaimSource::External {
+                            allocation_id: id.to_string(),
+                        },
+                    })
+                    .collect();
+                ArenaHold::from_plan(&claims).unwrap()
+            });
+            Self { ledger, hold }
+        }
+
+        /// One sample: the backend's measured weights and workspace rows.
+        fn report(&mut self, weights: usize, workspace: usize) {
+            let row = |id: &str, class, bytes| kapsl_engine_api::MemoryAllocation {
+                allocation_id: id.to_string(),
+                domain: BackendMemoryDomain::Cuda { device_id: 0 },
+                class,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes,
+            };
+            let report = BackendMemoryReport {
+                allocations: vec![
+                    row(
+                        ARENA_WEIGHTS_ID,
+                        BackendMemoryAllocationClass::PersistentWeights,
+                        weights,
+                    ),
+                    row(
+                        ARENA_WORKSPACE_ID,
+                        BackendMemoryAllocationClass::TransientWorkspace,
+                        workspace,
+                    ),
+                ],
+            };
+            let held = held_report(&mut self.hold, &report);
+            for external in external_cuda_report_from_backend(&held).allocations {
+                self.ledger
+                    .reconcile_external(0, &external.allocation_id, external.bytes)
+                    .unwrap();
+            }
+        }
+
+        /// Bytes the first model holds against the device budget.
+        fn reserved(&self) -> usize {
+            self.ledger.external_bytes(0, ARENA_WEIGHTS_ID)
+                + self.ledger.external_bytes(0, ARENA_WORKSPACE_ID)
+        }
+
+        fn release(&mut self) {
+            for id in [ARENA_WEIGHTS_ID, ARENA_WORKSPACE_ID] {
+                self.ledger.release_external(0, id, MemoryOwner::new(60, 0));
+            }
+        }
+
+        fn second_model_admitted(&mut self, bytes: usize) -> bool {
+            self.ledger
+                .reserve_external(
+                    0,
+                    "model-b",
+                    bytes,
+                    MemoryOwner::new(61, 0),
+                    MemoryAllocationClass::TransientWorkspace,
+                )
+                .is_ok()
+        }
+    }
+
+    // Run 8 measurements for the same model.
+    const IDLE: (usize, usize) = (559_939_584, 67_108_864);
+    const BUSY: (usize, usize) = (1_094_713_344, 671_088_640);
+    const _: () = assert!(BUSY.0 + BUSY.1 < ARENA_PLAN_TOTAL);
+
+    #[test]
+    fn the_first_models_claim_is_the_plan_total_at_idle_and_busy_not_the_per_row_sum() {
+        let mut held = ArenaLedger::new(4_000_000_000, true);
+        for (weights, workspace) in [IDLE, BUSY, IDLE, BUSY] {
+            held.report(weights, workspace);
+            assert_eq!(
+                held.reserved(),
+                ARENA_PLAN_TOTAL,
+                "the plan total, not 2,705,326,080"
+            );
+        }
+        // The measured bytes are below the plan: only the reservation is held.
+        // Rows follow the report; the shortfall sits on the workspace row.
+        assert_eq!(held.ledger.external_bytes(0, ARENA_WEIGHTS_ID), BUSY.0);
+        assert_eq!(
+            held.ledger.external_bytes(0, ARENA_WORKSPACE_ID),
+            ARENA_PLAN_TOTAL - BUSY.0
+        );
+    }
+
+    #[test]
+    fn a_second_model_is_not_admitted_against_memory_the_first_reclaims_under_load() {
+        // 3,400 MB budget; B needs 1,500 MB. Beside A at its measured size it
+        // fits (3,400 - 627 = 2,773 MB free at idle); beside A at its plan it
+        // does not (3,400 - 2,021 = 1,379 MB).
+        let (budget, b) = (3_400_000_000, 1_500_000_000);
+
+        // Held (the policy): B stays out through idle, busy and idle again.
+        let mut held = ArenaLedger::new(budget, true);
+        held.report(IDLE.0, IDLE.1);
+        assert!(
+            !held.second_model_admitted(b),
+            "idle A still claims its plan"
+        );
+        held.report(BUSY.0, BUSY.1);
+        assert!(!held.second_model_admitted(b), "busy A");
+        held.report(IDLE.0, IDLE.1);
+        assert!(
+            !held.second_model_admitted(b),
+            "idle again: the claim did not shrink back"
+        );
+        // Unload A and B fits.
+        held.release();
+        assert!(held.second_model_admitted(b), "A's claim ends with A");
+
+        // Without the hold (what run 7 did) B is admitted at idle: the defect.
+        let mut unheld = ArenaLedger::new(budget, false);
+        unheld.report(IDLE.0, IDLE.1);
+        assert!(unheld.second_model_admitted(b), "reconciling down admits B");
+    }
+
+    #[test]
+    fn the_hold_does_not_refuse_a_model_that_fits_beside_the_plan_total() {
+        // 1,300 MB fits in the 1,379 MB left beside A's plan total. Per-row
+        // flooring (run 8) held A at 2,705 MB busy and left only 695 MB.
+        let mut held = ArenaLedger::new(3_400_000_000, true);
+        held.report(BUSY.0, BUSY.1);
+        assert!(held.second_model_admitted(1_300_000_000));
+    }
+
+    #[test]
+    fn a_high_water_total_above_the_plan_is_what_the_second_model_must_clear() {
+        // The arena outgrows its 1,000 MB plan (1,400 MB) and later falls back
+        // to 300 MB: the claim stays at 1,400 MB.
+        let mut held = ArenaLedger::with_plan(2000 * MIB, 200 * MIB, 800 * MIB, true);
+        held.report(100 * MIB, 200 * MIB);
+        assert_eq!(held.reserved(), 1000 * MIB);
+        held.report(900 * MIB, 500 * MIB);
+        assert_eq!(held.reserved(), 1400 * MIB);
+        held.report(100 * MIB, 200 * MIB);
+        assert_eq!(held.reserved(), 1400 * MIB);
+        assert!(
+            !held.second_model_admitted(700 * MIB),
+            "2000 - 1400 = 600 MB free"
+        );
+        assert!(held.second_model_admitted(600 * MIB));
+    }
+
+    #[test]
+    fn claims_that_are_not_held_still_follow_the_backend_down() {
+        // GGUF, native and pool opt-in plans carry no hold: `None` is a
+        // pass-through, so their reconcile shrinks exactly as before.
+        let mut none: Option<ArenaHold> = None;
+        let report = BackendMemoryReport {
+            allocations: vec![kapsl_engine_api::MemoryAllocation {
+                allocation_id: "gguf:weights".to_string(),
+                domain: BackendMemoryDomain::Cuda { device_id: 0 },
+                class: BackendMemoryAllocationClass::PersistentWeights,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes: 100 * MIB,
+            }],
+        };
+        assert_eq!(held_report(&mut none, &report), report);
     }
 
     #[test]

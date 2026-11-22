@@ -64,7 +64,9 @@ pub(super) fn acquire_embedded_ort_pool_clients(
     provider: &str,
     device_ids: &[usize],
 ) -> Result<Vec<PoolClientLease>, String> {
-    if !provider.eq_ignore_ascii_case("cuda") && !provider.eq_ignore_ascii_case("tensorrt") {
+    // ONNX models use ORT's own arena unless the pool is opted into
+    // (KAPSL_ONNX_CUDA_POOL=1); see `onnx_cuda_pool_opt_in`.
+    if !ort_pool_registration_wanted(provider, onnx_cuda_pool_opt_in()) {
         return Ok(Vec::new());
     }
     let mut clients = Vec::new();
@@ -590,7 +592,9 @@ pub(super) fn create_runtime_backend_for_device(
         let backend = LLMBackend::with_device(provider.to_owned(), device_id as i32)
             .with_memory_owner(model_id, replica_id);
         #[cfg(feature = "gpu-device-pool")]
-        let backend = backend.with_env_allocators(resources.uses_env_allocators(device_id));
+        let backend = backend.with_env_allocators(
+            onnx_cuda_pool_opt_in() && resources.uses_env_allocators(device_id),
+        );
         let backend = PreparedBackend::from(Box::new(backend));
         #[cfg(feature = "gpu-device-pool")]
         let backend = backend.with_pool_clients(pool_clients);
@@ -646,9 +650,17 @@ pub(super) async fn load_runtime_backend(
 ) -> Result<Box<dyn kapsl_engine_api::Engine>, DynError> {
     let owner = MemoryOwner::new(model_id, replica_id);
     let estimate = estimated_model_memory(model_file_path)?;
-    let planned_report = backend
+    let mut planned_report = backend
         .planned_memory(model_file_path)
         .map_err(|error| format!("backend memory plan failed: {error}"))?;
+    if engine_kind.uses_onnx_session() {
+        // ORT's own arena grows with busy sessions (ResNet-50 loads at 950 MB
+        // and reaches 1758 MB), so reserve the peak, not the load-time figure.
+        let model_bytes = std::fs::metadata(model_file_path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
+        raise_onnx_arena_claims_to_peak(&mut planned_report, model_bytes);
+    }
     let plan = resources.memory().model_load_plan_with_report(
         admission_domains,
         owner,
