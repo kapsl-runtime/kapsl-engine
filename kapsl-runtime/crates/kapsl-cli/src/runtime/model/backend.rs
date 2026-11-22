@@ -64,7 +64,9 @@ pub(super) fn acquire_embedded_ort_pool_clients(
     provider: &str,
     device_ids: &[usize],
 ) -> Result<Vec<PoolClientLease>, String> {
-    if !provider.eq_ignore_ascii_case("cuda") && !provider.eq_ignore_ascii_case("tensorrt") {
+    // ONNX models use ORT's own arena unless the pool is opted into
+    // (KAPSL_ONNX_CUDA_POOL=1); see `onnx_cuda_pool_opt_in`.
+    if !ort_pool_registration_wanted(provider, onnx_cuda_pool_opt_in()) {
         return Ok(Vec::new());
     }
     let mut clients = Vec::new();
@@ -437,6 +439,7 @@ impl kapsl_engine_api::Engine for MemoryTrackedEngine {
 
 #[derive(Debug, Clone, Copy)]
 struct EstimatedModelMemory {
+    serialized_bytes: usize,
     session_bytes: usize,
     workspace_bytes: usize,
 }
@@ -447,6 +450,7 @@ fn estimated_model_memory(model_path: &Path) -> Result<EstimatedModelMemory, Str
         .len() as usize;
     // Account for decoded/aligned weights and a bounded execution workspace.
     Ok(EstimatedModelMemory {
+        serialized_bytes: serialized,
         session_bytes: serialized.saturating_mul(5).saturating_div(4),
         workspace_bytes: (serialized / 4).max(256 * 1024 * 1024),
     })
@@ -590,7 +594,9 @@ pub(super) fn create_runtime_backend_for_device(
         let backend = LLMBackend::with_device(provider.to_owned(), device_id as i32)
             .with_memory_owner(model_id, replica_id);
         #[cfg(feature = "gpu-device-pool")]
-        let backend = backend.with_env_allocators(resources.uses_env_allocators(device_id));
+        let backend = backend.with_env_allocators(
+            onnx_cuda_pool_opt_in() && resources.uses_env_allocators(device_id),
+        );
         let backend = PreparedBackend::from(Box::new(backend));
         #[cfg(feature = "gpu-device-pool")]
         let backend = backend.with_pool_clients(pool_clients);
@@ -626,6 +632,155 @@ pub(super) fn create_runtime_backend_for_device(
     Ok(backend)
 }
 
+/// The parent's memory reservation for an isolated worker. Dropping it
+/// releases the lease and the priority registration.
+pub(super) struct IsolatedWorkerMemory {
+    _lease: MemoryLease,
+    _priority: ModelPriorityLease,
+}
+
+/// Planned memory of an isolated worker in the parent's authority (MEM-08).
+///
+/// The worker is a separate process with its own ledger, so nothing in the
+/// parent charged its weights: N workers could each be admitted against the
+/// whole card. This reports the load-time estimate (the same one an in-process
+/// load starts from) as one backend-managed allocation per selected domain,
+/// charged against the budget outside the pool, before the child is spawned.
+///
+/// An ONNX model on ORT's own arena (the default) is the exception on CUDA: its
+/// worker grows to the same peak an in-process load is admitted at (weights and
+/// workspace for every busy session), so the lease is that peak plan, split
+/// the way `raise_onnx_arena_claims_to_peak` splits it (for a pipeline mesh the
+/// model is shared out over the CUDA devices, as the bootstrap plan does). The estimate would
+/// charge a ResNet-50 worker 0.38 GB where its arena reaches 1.8 GB, and
+/// the lease is never reconciled upward (the parent gets no report from the
+/// child), so the hold has nothing to raise it later.
+pub(super) fn isolated_worker_memory_report(
+    model_file_path: &Path,
+    domains: &[MemoryDomain],
+    model_id: u32,
+    replica_id: u32,
+    engine_kind: EngineKind,
+    onnx_sessions: usize,
+    pipeline: bool,
+) -> Result<MemoryReport, String> {
+    use kapsl_engine_api::{
+        MemoryAllocation, MemoryAllocationClass as EngineClass,
+        MemoryAllocationSource as EngineSource, MemoryDomain as EngineDomain,
+    };
+    let estimate = estimated_model_memory(model_file_path)?;
+    let cuda_devices = domains
+        .iter()
+        .filter(|domain| matches!(domain, MemoryDomain::Cuda { .. }))
+        .count()
+        .max(1);
+    let arena_peak = onnx_arena_claims_held(engine_kind).then(|| {
+        let model_bytes = if pipeline {
+            estimate.serialized_bytes.saturating_add(cuda_devices - 1) / cuda_devices
+        } else {
+            estimate.serialized_bytes
+        };
+        let sessions = onnx_sessions.max(1);
+        (
+            model_bytes.saturating_mul(sessions),
+            onnx_arena_workspace_per_session_bytes(model_bytes).saturating_mul(sessions),
+        )
+    });
+    let mut allocations = Vec::new();
+    for domain in domains {
+        let (engine_domain, weights_class) = match domain {
+            MemoryDomain::Cuda { device_id } => (
+                EngineDomain::Cuda {
+                    device_id: *device_id,
+                },
+                EngineClass::PersistentWeights,
+            ),
+            MemoryDomain::Host => (EngineDomain::Host, EngineClass::ModelSession),
+            // Other providers are planned from the plain estimate below.
+            _ => continue,
+        };
+        let (weights_bytes, workspace_bytes) = match (&domain, arena_peak) {
+            (MemoryDomain::Cuda { .. }, Some(peak)) => peak,
+            _ => (estimate.session_bytes, estimate.workspace_bytes),
+        };
+        for (suffix, class, bytes) in [
+            ("weights", weights_class, weights_bytes),
+            (
+                "workspace",
+                EngineClass::TransientWorkspace,
+                workspace_bytes,
+            ),
+        ] {
+            allocations.push(MemoryAllocation {
+                allocation_id: format!("isolated-worker:{model_id}:{replica_id}:{domain}:{suffix}"),
+                domain: engine_domain.clone(),
+                class,
+                source: EngineSource::BackendManaged,
+                bytes,
+            });
+        }
+    }
+    Ok(MemoryReport { allocations })
+}
+
+/// Admit and commit the parent-side reservation for an isolated worker. Runs
+/// before the child process is spawned; a denial is the same typed
+/// [`MemoryAdmissionFailure`] an in-process load would produce.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn reserve_isolated_worker_memory(
+    model_file_path: &Path,
+    domains: &[MemoryDomain],
+    resources: &Arc<RuntimeResources>,
+    model_id: u32,
+    replica_id: u32,
+    engine_kind: EngineKind,
+    onnx_sessions: usize,
+    pipeline: bool,
+    priority_weight: u32,
+) -> Result<IsolatedWorkerMemory, DynError> {
+    let owner = MemoryOwner::new(model_id, replica_id);
+    let estimate = estimated_model_memory(model_file_path)?;
+    let report = isolated_worker_memory_report(
+        model_file_path,
+        domains,
+        model_id,
+        replica_id,
+        engine_kind,
+        onnx_sessions,
+        pipeline,
+    )?;
+    let plan = resources.memory().model_load_plan_with_report(
+        domains,
+        owner,
+        estimate.session_bytes,
+        estimate.workspace_bytes,
+        &report,
+    )?;
+    resources
+        .memory()
+        .check_cuda_load_sampling(&plan)
+        .map_err(|error| {
+            MemoryAdmissionFailure::new(owner, priority_weight, &plan, error).unreclaimable()
+        })?;
+    let priority = resources.priority().register(
+        owner,
+        priority_weight,
+        plan.claims().iter().map(|claim| claim.domain.clone()),
+    );
+    let mut admission = resources
+        .memory()
+        .begin_load(&plan, engine_kind)
+        .await
+        .map_err(|error| MemoryAdmissionFailure::new(owner, priority_weight, &plan, error))?;
+    admission
+        .reconcile(&report)
+        .map_err(|error| MemoryAdmissionFailure::new(owner, priority_weight, &plan, error))?;
+    Ok(IsolatedWorkerMemory {
+        _lease: admission.commit(),
+        _priority: priority,
+    })
+}
+
 /// Execute the runtime-owned backend load transaction.
 ///
 /// One backend-neutral plan is admitted before the backend can allocate,
@@ -646,9 +801,17 @@ pub(super) async fn load_runtime_backend(
 ) -> Result<Box<dyn kapsl_engine_api::Engine>, DynError> {
     let owner = MemoryOwner::new(model_id, replica_id);
     let estimate = estimated_model_memory(model_file_path)?;
-    let planned_report = backend
+    let mut planned_report = backend
         .planned_memory(model_file_path)
         .map_err(|error| format!("backend memory plan failed: {error}"))?;
+    if engine_kind.uses_onnx_session() {
+        // ORT's own arena grows with busy sessions (ResNet-50 loads at 950 MB
+        // and reaches 1758 MB), so reserve the peak, not the load-time figure.
+        let model_bytes = std::fs::metadata(model_file_path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
+        raise_onnx_arena_claims_to_peak(&mut planned_report, model_bytes);
+    }
     let plan = resources.memory().model_load_plan_with_report(
         admission_domains,
         owner,
@@ -656,6 +819,12 @@ pub(super) async fn load_runtime_backend(
         estimate.workspace_bytes,
         &planned_report,
     )?;
+    resources
+        .memory()
+        .check_cuda_load_sampling(&plan)
+        .map_err(|error| {
+            MemoryAdmissionFailure::new(owner, priority_weight, &plan, error).unreclaimable()
+        })?;
     let priority_lease = resources.priority().register(
         owner,
         priority_weight,
@@ -1415,5 +1584,204 @@ mod tests {
         assert_eq!(row.reserved_bytes, MIB);
         assert_eq!(row.committed_bytes, MIB);
         assert_eq!(row.observed_bytes, MIB);
+    }
+
+    fn roomy_host_info() -> DeviceInfo {
+        let mut info = device_info();
+        // `total_memory` is in KiB: 64 GiB.
+        info.total_memory = 64 * 1024 * 1024;
+        info
+    }
+
+    #[test]
+    fn isolated_worker_report_charges_weights_and_workspace_per_cuda_device() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(400 * MIB as u64).unwrap();
+        let domains = [
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+        ];
+        let report = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            9,
+            0,
+            EngineKind::Native,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.allocations.len(), 4);
+        let estimate = estimated_model_memory(file.path()).unwrap();
+        let weights: Vec<_> = report
+            .allocations
+            .iter()
+            .filter(|a| a.class == EngineMemoryClass::PersistentWeights)
+            .collect();
+        assert_eq!(weights.len(), 2);
+        assert!(weights.iter().all(|a| a.bytes == estimate.session_bytes));
+        assert!(weights
+            .iter()
+            .all(|a| a.source == MemoryAllocationSource::BackendManaged));
+        let ids: std::collections::HashSet<_> = report
+            .allocations
+            .iter()
+            .map(|a| &a.allocation_id)
+            .collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "allocation ids are unique per device and kind"
+        );
+    }
+
+    #[test]
+    fn an_isolated_onnx_worker_on_orts_arena_is_leased_at_the_same_peak_plan_as_in_process() {
+        // ResNet-50, 4 sessions: the in-process claim is raised to this peak, and the
+        // worker's arena reaches it too, so the parent's lease must not be the
+        // 1.25 x file estimate.
+        let model = 102_576_593usize;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(model as u64).unwrap();
+        let domains = [MemoryDomain::Cuda { device_id: 0 }, MemoryDomain::Host];
+        let total = |report: &MemoryReport, host: bool| {
+            report
+                .allocations
+                .iter()
+                .filter(|a| matches!(a.domain, kapsl_engine_api::MemoryDomain::Host) == host)
+                .map(|a| a.bytes)
+                .sum::<usize>()
+        };
+        let onnx = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            9,
+            0,
+            EngineKind::OnnxClassify,
+            4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            total(&onnx, false),
+            onnx_arena_peak_bytes(model, 4),
+            "CUDA lease equals the in-process peak plan"
+        );
+        // Same split as `raise_onnx_arena_claims_to_peak`: weights for every session.
+        let weights = onnx
+            .allocations
+            .iter()
+            .find(|a| {
+                a.class == EngineMemoryClass::PersistentWeights
+                    && !matches!(a.domain, kapsl_engine_api::MemoryDomain::Host)
+            })
+            .unwrap();
+        assert_eq!(weights.bytes, model * 4);
+        // The host row of the same worker keeps the plain estimate.
+        let estimate = estimated_model_memory(file.path()).unwrap();
+        assert_eq!(
+            total(&onnx, true),
+            estimate.session_bytes + estimate.workspace_bytes
+        );
+        // A pipeline mesh shares one model copy out over its CUDA devices.
+        let two = [
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+        ];
+        let sharded = isolated_worker_memory_report(
+            file.path(),
+            &two,
+            9,
+            0,
+            EngineKind::OnnxClassify,
+            4,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            total(&sharded, false),
+            2 * onnx_arena_peak_bytes(model.div_ceil(2), 4)
+        );
+        // Kinds that are not held (GGUF, native) keep the estimate on CUDA.
+        let gguf = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            9,
+            0,
+            EngineKind::GgufGenerate,
+            4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            total(&gguf, false),
+            estimate.session_bytes + estimate.workspace_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn an_isolated_worker_holds_a_parent_lease_until_it_exits() {
+        let resources = RuntimeResources::new(&roomy_host_info()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(64 * MIB as u64).unwrap();
+        let owner = MemoryOwner::new(71, 0);
+        let host_used = |resources: &Arc<RuntimeResources>| {
+            resources
+                .memory()
+                .snapshot()
+                .rows
+                .iter()
+                .filter(|row| row.owner == owner)
+                .map(|row| row.reserved_bytes.max(row.committed_bytes))
+                .sum::<usize>()
+        };
+        assert_eq!(host_used(&resources), 0);
+        let memory = reserve_isolated_worker_memory(
+            file.path(),
+            &[MemoryDomain::Host],
+            &resources,
+            71,
+            0,
+            EngineKind::Native,
+            1,
+            false,
+            1,
+        )
+        .await
+        .expect("a 64 MiB model fits a 64 GiB host");
+        let estimate = estimated_model_memory(file.path()).unwrap();
+        assert!(
+            host_used(&resources) >= estimate.session_bytes,
+            "the parent now charges the worker's weights: {}",
+            host_used(&resources)
+        );
+        drop(memory);
+        assert_eq!(host_used(&resources), 0, "released when the worker is gone");
+    }
+
+    #[tokio::test]
+    async fn an_isolated_worker_that_does_not_fit_is_denied_before_spawning() {
+        // A 9 GiB (sparse) model plans 11+ GiB on a 10 GiB host.
+        let resources = RuntimeResources::new(&device_info()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(9 * 1024 * MIB as u64).unwrap();
+        let error = reserve_isolated_worker_memory(
+            file.path(),
+            &[MemoryDomain::Host],
+            &resources,
+            72,
+            0,
+            EngineKind::Native,
+            1,
+            false,
+            1,
+        )
+        .await
+        .err()
+        .expect("denied");
+        assert!(
+            error.downcast_ref::<MemoryAdmissionFailure>().is_some(),
+            "typed, so the API answers 409 and the arbiter may reclaim: {error}"
+        );
     }
 }

@@ -702,6 +702,10 @@ impl RuntimeMonitor {
         let mut cotenancy_exporter =
             cotenancy_guard.then(|| CotenancyCeilingExporter::new(&registry));
         let memory_exporter = MemorySnapshotExporter::new(&registry);
+        if has_cuda {
+            // From here on, observed GPU memory that stops refreshing is stale.
+            memory.expect_cuda_sampling();
+        }
         let gpu_region_metrics = GpuRegionMetrics::new(&registry);
 
         let task = tokio::spawn(async move {

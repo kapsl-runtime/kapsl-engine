@@ -14,6 +14,7 @@
 
 use super::*;
 
+mod arena_hold;
 #[cfg(feature = "gpu-device-pool")]
 mod device;
 #[cfg(any(feature = "gpu-device-pool", test))]
@@ -43,6 +44,8 @@ pub(crate) use pool_clients::PoolClientCleanup;
 #[cfg(any(feature = "gpu-device-pool", test))]
 pub(crate) use pool_clients::{PoolClientLease, PoolClients};
 pub(crate) use priority::*;
+
+pub(crate) use arena_hold::ArenaHold;
 
 use self::host::{HostMemoryLease, HostMemoryLoadAdmission, HostMemoryManager};
 use crate::app::config::constants::PROVIDER_MEMORY_LIMITS_ENV;
@@ -581,8 +584,8 @@ impl MemorySnapshot {
             saw_memory = true;
             let per_replica = model_bytes.saturating_add(current_replicas as usize - 1)
                 / current_replicas as usize;
-            if per_replica > 0 {
-                additions = additions.min((domain.available_bytes / per_replica) as u32);
+            if let Some(fit) = domain.available_bytes.checked_div(per_replica) {
+                additions = additions.min(fit as u32);
             }
         }
         if saw_memory {
@@ -610,6 +613,81 @@ struct AuthorityAccounting {
     /// before any pool or model exists. Attribution only: it appears as an
     /// observed row but never changes a domain's budget or availability.
     runtime_overhead: HashMap<usize, usize>,
+    /// When the monitor started expecting GPU samples (None: no sampler runs,
+    /// so observed memory is never considered stale; unit tests, CPU hosts).
+    cuda_sampling_armed_at: Option<Instant>,
+    /// Last time a GPU sample was applied to the observed figures.
+    cuda_last_observed_at: Option<Instant>,
+}
+
+/// How long GPU observations may go without a refresh before admission stops
+/// trusting them (the sampler runs every 2 s and backs off 30 s after a
+/// failure, so this tolerates one failed probe and a slow one).
+pub(crate) const CUDA_OBSERVATION_STALE_AFTER: Duration = Duration::from_secs(45);
+/// After this long without any sample the observed figures are treated as
+/// unknown and CUDA admission fails closed.
+pub(crate) const CUDA_OBSERVATION_FAILED_AFTER: Duration = Duration::from_secs(300);
+
+/// Freshness of the GPU observations behind CUDA admission (MEM-03/04).
+///
+/// The device gates use leases and the last observed bytes. A stalled or
+/// failing sampler used to leave the last value in place forever, so growth by
+/// anything not holding a lease (a co-tenant, a backend allocating past its
+/// plan) was invisible and admission silently reduced to leases alone.
+///
+/// The policy applies to NEW model loads only ([`MemoryAuthority::check_cuda_load_sampling`]).
+/// Snapshots, the pressure state, KV policy and request-time growth of models
+/// that are already admitted keep using the unclamped numbers: a dead sampler
+/// must stop new admissions, not shed traffic from running models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CudaSamplingState {
+    /// Samples are current, or no sampler runs.
+    Fresh,
+    /// No sample for [`CUDA_OBSERVATION_STALE_AFTER`]: admission keeps a safety
+    /// margin (10% of the budget, at least 1 GiB) on every CUDA domain.
+    Stale { age: Duration },
+    /// No sample for [`CUDA_OBSERVATION_FAILED_AFTER`] (or never since the
+    /// sampler was armed): observed memory is unknown, so no new CUDA growth
+    /// is admitted until sampling recovers.
+    Failed { age: Duration },
+}
+
+impl CudaSamplingState {
+    pub(crate) fn from_ages(age: Option<Duration>) -> Self {
+        match age {
+            None => Self::Fresh,
+            Some(age) if age >= CUDA_OBSERVATION_FAILED_AFTER => Self::Failed { age },
+            Some(age) if age >= CUDA_OBSERVATION_STALE_AFTER => Self::Stale { age },
+            Some(_) => Self::Fresh,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Stale { .. } => "stale",
+            Self::Failed { .. } => "failed",
+        }
+    }
+
+    pub(crate) fn age(self) -> Option<Duration> {
+        match self {
+            Self::Fresh => None,
+            Self::Stale { age } | Self::Failed { age } => Some(age),
+        }
+    }
+
+    /// The room a CUDA domain may offer given this sampling state.
+    pub(crate) fn clamp_available(self, available: usize, budget: usize) -> usize {
+        match self {
+            Self::Fresh => available,
+            Self::Stale { .. } => {
+                let margin = (budget / 10).max(1024 * 1024 * 1024).min(budget);
+                available.saturating_sub(margin)
+            }
+            Self::Failed { .. } => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -856,6 +934,10 @@ pub(crate) struct MemoryAdmissionFailure {
     /// explain a denial ("needs X, Y free") without parsing `message`.
     requested: Vec<(MemoryDomain, usize)>,
     message: String,
+    /// False when no amount of reclaiming lower-priority models can make the
+    /// request fit (it exceeds the whole domain budget), so the arbiter must
+    /// not evict anything for it.
+    reclaimable: bool,
 }
 
 impl MemoryAdmissionFailure {
@@ -890,7 +972,18 @@ impl MemoryAdmissionFailure {
             domains,
             requested,
             message: message.into(),
+            reclaimable: true,
         }
+    }
+
+    /// A denial that eviction cannot fix; see [`Self::is_reclaimable`].
+    pub(crate) fn unreclaimable(mut self) -> Self {
+        self.reclaimable = false;
+        self
+    }
+
+    pub(crate) fn is_reclaimable(&self) -> bool {
+        self.reclaimable
     }
 
     pub(crate) fn requested_bytes(&self) -> &[(MemoryDomain, usize)] {
@@ -944,7 +1037,7 @@ pub(crate) fn classify_external_allocation(allocation_id: &str) -> MemoryAllocat
     }
 }
 
-#[cfg(feature = "gpu-device-pool")]
+#[cfg(any(feature = "gpu-device-pool", test))]
 fn external_cuda_report_from_backend(report: &BackendMemoryReport) -> ExternalDeviceMemoryReport {
     ExternalDeviceMemoryReport {
         allocations: report
@@ -1404,6 +1497,18 @@ fn drop_unmanaged_cuda_domains(
     });
 }
 
+/// The smaller of the authority's available bytes and the ledger's, when the
+/// ledger manages the device.
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn stricter_available(
+    authority_available: usize,
+    ledger_available: Option<usize>,
+) -> usize {
+    ledger_available.map_or(authority_available, |ledger| {
+        ledger.min(authority_available)
+    })
+}
+
 impl MemoryAuthority {
     /// Build the policy/accounting half of a CUDA authority without opening a
     /// physical device. Synthetic-device unit tests use this constructor so
@@ -1580,6 +1685,29 @@ impl MemoryAuthority {
         self.budget_for_domain(domain)
     }
 
+    /// Bytes a new allocation on `domain` can actually be granted. Admission
+    /// passes two gates and the stricter one wins: the authority's own
+    /// `available_bytes` (`authority_available`, which counts only the pool
+    /// bytes in use) and, for a CUDA device, the device ledger, which also
+    /// charges the idle part of the pool backing. Reporting the authority's
+    /// number alone advertised room the ledger then refused (MEM-12: 18.27 GB
+    /// shown, 17.41 GB grantable).
+    pub(crate) fn grantable_bytes(
+        &self,
+        domain: &MemoryDomain,
+        authority_available: usize,
+    ) -> usize {
+        #[cfg(feature = "gpu-device-pool")]
+        if let (MemoryDomain::Cuda { device_id }, Some(manager)) = (domain, self.cuda.as_ref()) {
+            return stricter_available(
+                authority_available,
+                manager.ledger_available_bytes(*device_id),
+            );
+        }
+        let _ = domain;
+        authority_available
+    }
+
     pub(crate) fn supports_external_leases(&self, domain: &MemoryDomain) -> bool {
         if self.domain_budget_bytes(domain) == 0 {
             return false;
@@ -1600,6 +1728,72 @@ impl MemoryAuthority {
             | MemoryDomain::HostMapped { .. }
             | MemoryDomain::Provider { .. } => true,
         }
+    }
+
+    /// The monitor is about to sample the GPU every cycle. From now on, observed
+    /// CUDA memory that stops refreshing is treated as stale (see
+    /// [`CudaSamplingState`]); a sampler that never succeeds counts from here.
+    pub(crate) fn expect_cuda_sampling(&self) {
+        self.accounting
+            .lock()
+            .cuda_sampling_armed_at
+            .get_or_insert_with(Instant::now);
+    }
+
+    /// Gate for a NEW model load's CUDA claims against the sampling state:
+    /// refused outright when sampling has failed, and held to the room left
+    /// after the safety margin while samples are stale. Not a request-time
+    /// check: running models are never affected. Callers mark the refusal
+    /// unreclaimable, since evicting a model cannot make samples fresh.
+    pub(crate) fn check_cuda_load_sampling(&self, plan: &MemoryPlan) -> Result<(), String> {
+        let state = self.cuda_sampling_state();
+        if state == CudaSamplingState::Fresh {
+            return Ok(());
+        }
+        let mut requested = HashMap::<usize, usize>::new();
+        for claim in plan.claims().iter().filter(|claim| claim.bytes > 0) {
+            if let MemoryDomain::Cuda { device_id } = claim.domain {
+                let bytes = requested.entry(device_id).or_default();
+                *bytes = bytes.saturating_add(claim.bytes);
+            }
+        }
+        if requested.is_empty() {
+            return Ok(());
+        }
+        let age = state.age().map_or(0, |age| age.as_secs());
+        if matches!(state, CudaSamplingState::Failed { .. }) {
+            return Err(format!(
+                "GPU memory sampling has failed for {age}s, so observed device memory is unknown; no new CUDA load is admitted until sampling recovers"
+            ));
+        }
+        let snapshot = self.snapshot();
+        for (device_id, bytes) in requested {
+            let domain = MemoryDomain::Cuda { device_id };
+            let Some(row) = snapshot.domain(&domain) else {
+                continue;
+            };
+            let room = state.clamp_available(row.available_bytes, row.budget_bytes);
+            if bytes > room {
+                return Err(format!(
+                    "GPU memory samples are {age}s old, so a safety margin is held back on {domain}: requested={bytes} available={} after the margin (without it {}) budget={} bytes",
+                    room, row.available_bytes, row.budget_bytes
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cuda_sampling_state(&self) -> CudaSamplingState {
+        Self::sampling_state_of(&self.accounting.lock(), Instant::now())
+    }
+
+    fn sampling_state_of(accounting: &AuthorityAccounting, now: Instant) -> CudaSamplingState {
+        let reference = accounting
+            .cuda_last_observed_at
+            .or(accounting.cuda_sampling_armed_at);
+        CudaSamplingState::from_ages(
+            reference.map(|at| now.checked_duration_since(at).unwrap_or_default()),
+        )
     }
 
     pub(crate) fn observe_process_memory(&self, bytes: usize) {
@@ -1626,6 +1820,7 @@ impl MemoryAuthority {
             return;
         }
         let mut accounting = self.accounting.lock();
+        accounting.cuda_last_observed_at = Some(Instant::now());
         let mut assigned = 0usize;
         for (index, (device_id, budget)) in devices.iter().enumerate() {
             let observed = if index + 1 == devices.len() {
@@ -1657,6 +1852,9 @@ impl MemoryAuthority {
     /// ignored; managed devices missing from `per_device` keep their last value.
     pub(crate) fn observe_cuda_memory_by_device(&self, per_device: &HashMap<usize, usize>) {
         let mut accounting = self.accounting.lock();
+        if !per_device.is_empty() {
+            accounting.cuda_last_observed_at = Some(Instant::now());
+        }
         for (&device_id, policy) in &self.device_domains {
             if !matches!(policy.domain, MemoryDomain::Cuda { .. }) {
                 continue;
@@ -2508,6 +2706,9 @@ impl MemoryAuthority {
             },
             #[cfg(feature = "gpu-device-pool")]
             cuda: Vec::new(),
+            arena_hold: crate::runtime::model::load_plan::onnx_arena_claims_held(kind)
+                .then(|| ArenaHold::from_plan(plan.claims()))
+                .flatten(),
             reconciled: false,
         };
 
@@ -2676,6 +2877,8 @@ pub(crate) struct MemoryAdmission {
     cuda_plan: MemoryPlan,
     #[cfg(feature = "gpu-device-pool")]
     cuda: Vec<DeviceMemoryAdmission>,
+    /// ONNX arena claims held at their peak; moved to the lease on commit.
+    arena_hold: Option<ArenaHold>,
     reconciled: bool,
 }
 
@@ -2686,9 +2889,12 @@ impl MemoryAdmission {
             host_load.reconcile(&mut lease.host)?;
         }
 
+        // The device budget follows the held report (never below the peak plan
+        // or the observed high-water mark); `observed` keeps the real bytes.
+        let held_report = held_report(&mut self.arena_hold, actual_report);
         #[cfg(feature = "gpu-device-pool")]
         {
-            let external_cuda = external_cuda_report_from_backend(actual_report);
+            let external_cuda = external_cuda_report_from_backend(&held_report);
             for admission in &mut self.cuda {
                 admission.reconcile(&external_cuda)?;
             }
@@ -2696,7 +2902,7 @@ impl MemoryAdmission {
         if let Some(lease) = self.lease.as_mut() {
             lease.record_loaded_report(actual_report)?;
         }
-        reconcile_backend_claim_bytes(&mut self.cuda_plan.claims, actual_report);
+        reconcile_backend_claim_bytes(&mut self.cuda_plan.claims, &held_report);
         self.reconciled = true;
         Ok(())
     }
@@ -2717,8 +2923,19 @@ impl MemoryAdmission {
                 .any(|claim| claim.owner == item.owner()));
             lease.cuda.push(item);
         }
+        lease.arena_hold = self.arena_hold.take();
         lease.mark_committed();
         lease
+    }
+}
+
+/// The report to reserve device memory against: the backend's report with the
+/// held ONNX arena claims raised to their floor, or the report itself when
+/// nothing is held.
+fn held_report(hold: &mut Option<ArenaHold>, report: &BackendMemoryReport) -> BackendMemoryReport {
+    match hold {
+        Some(hold) => hold.hold(report),
+        None => report.clone(),
     }
 }
 
@@ -2736,6 +2953,7 @@ pub(crate) struct MemoryLease {
     cuda: Vec<DeviceMemoryLease>,
     #[cfg(feature = "gpu-device-pool")]
     cuda_transient: Vec<DeviceMemoryTransientLease>,
+    arena_hold: Option<ArenaHold>,
     released: bool,
 }
 
@@ -2770,6 +2988,7 @@ impl MemoryLease {
             cuda: Vec::new(),
             #[cfg(feature = "gpu-device-pool")]
             cuda_transient: Vec::new(),
+            arena_hold: None,
             released: false,
         }
     }
@@ -3002,12 +3221,17 @@ impl MemoryLease {
             return Ok(());
         }
         let owner = self.single_owner()?;
-        let actual_plan = MemoryPlan::from_backend_report(owner, report);
-        let actual = aggregate_claim_rows(actual_plan.claims());
+        // `actual` is what the backend really holds (observed and committed);
+        // `held` is what stays reserved: a held ONNX arena claim never drops
+        // below its peak plan or its observed high-water mark.
+        let held = held_report(&mut self.arena_hold, report);
+        let actual = aggregate_claim_rows(MemoryPlan::from_backend_report(owner, report).claims());
+        let held_plan = MemoryPlan::from_backend_report(owner, &held);
+        let held_rows = aggregate_claim_rows(held_plan.claims());
 
         #[cfg(feature = "gpu-device-pool")]
         {
-            let external_cuda = external_cuda_report_from_backend(report);
+            let external_cuda = external_cuda_report_from_backend(&held);
             let result = self
                 .cuda
                 .iter_mut()
@@ -3026,10 +3250,10 @@ impl MemoryLease {
         let current = aggregate_claim_rows(&self.claims);
 
         let mut growth = MemoryPlan::new();
-        for (key, actual_bytes) in &actual {
+        for (key, actual_bytes) in &held_rows {
             let current_bytes = current.get(key).copied().unwrap_or(0);
             if *actual_bytes > current_bytes {
-                let mut claim = actual_plan
+                let mut claim = held_plan
                     .claims()
                     .iter()
                     .find(|claim| MemoryRowKey::from_claim(claim) == *key)
@@ -3061,9 +3285,9 @@ impl MemoryLease {
             // Only rows the backend reported (or moved to another domain) may
             // shrink. Anything else (e.g. the transient workspace admitted for
             // the load) keeps its admitted bytes until unload.
-            let target = match actual.get(&key) {
+            let target = match held_rows.get(&key) {
                 Some(&target) => target,
-                None if row_migrated_by_report(&key, &actual) => 0,
+                None if row_migrated_by_report(&key, &held_rows) => 0,
                 None => continue,
             };
             if current_bytes > target {
@@ -3298,16 +3522,21 @@ impl MemoryLease {
         report: &BackendMemoryReport,
         target_planned: HashMap<MemoryRowKey, usize>,
     ) -> Result<(), String> {
+        // Reserve against the held report (see `reconcile_locked`); observed
+        // and committed below take the real one.
+        let held = held_report(&mut self.arena_hold, report);
         #[cfg(feature = "gpu-device-pool")]
         {
-            let external_cuda = external_cuda_report_from_backend(report);
+            let external_cuda = external_cuda_report_from_backend(&held);
             for lease in &mut self.cuda {
                 lease.reconcile_report(&external_cuda)?;
             }
         }
 
         let owner = self.single_owner()?;
-        let actual_plan = MemoryPlan::from_backend_report(owner, report);
+        let measured =
+            aggregate_claim_rows(MemoryPlan::from_backend_report(owner, report).claims());
+        let actual_plan = MemoryPlan::from_backend_report(owner, &held);
         let actual = aggregate_claim_rows(actual_plan.claims());
         let current = aggregate_claim_rows(&self.claims);
 
@@ -3364,8 +3593,8 @@ impl MemoryLease {
             self.set_claim_row_bytes(key, *bytes);
         }
         self.planned = target_planned;
-        self.observed = actual.clone();
-        self.committed = actual;
+        self.observed = measured.clone();
+        self.committed = measured;
         self.refresh_accounting(false);
         Ok(())
     }
@@ -5316,6 +5545,240 @@ mod tests {
         );
     }
 
+    /// The device budget as the load path drives it: reserve both rows at the
+    /// peak plan, then reconcile with the report `held_report` hands the ledger.
+    /// ResNet-50, 4 sessions (run 8): the plan puts 410,306,372 B in the
+    /// weights row and 1,610,612,736 B in the workspace row.
+    struct ArenaLedger {
+        ledger: device_budget::DeviceBudgetLedger,
+        hold: Option<ArenaHold>,
+    }
+
+    const ARENA_WEIGHTS_ID: &str = "onnx-session:60:0";
+    const ARENA_WORKSPACE_ID: &str = "onnx-session:60:0:workspace";
+    const ARENA_PLAN_WEIGHTS: usize = 410_306_372;
+    const ARENA_PLAN_WORKSPACE: usize = 1_610_612_736;
+    const ARENA_PLAN_TOTAL: usize = 2_020_919_108;
+
+    impl ArenaLedger {
+        fn new(budget: usize, held: bool) -> Self {
+            Self::with_plan(budget, ARENA_PLAN_WEIGHTS, ARENA_PLAN_WORKSPACE, held)
+        }
+
+        fn with_plan(budget: usize, weights: usize, workspace: usize, held: bool) -> Self {
+            let owner = MemoryOwner::new(60, 0);
+            let mut ledger = device_budget::DeviceBudgetLedger::default();
+            ledger.insert_device(0, budget, 0).unwrap();
+            let rows = [
+                (
+                    ARENA_WEIGHTS_ID,
+                    weights,
+                    MemoryAllocationClass::PersistentWeights,
+                ),
+                (
+                    ARENA_WORKSPACE_ID,
+                    workspace,
+                    MemoryAllocationClass::TransientWorkspace,
+                ),
+            ];
+            for (id, bytes, class) in rows {
+                ledger.reserve_external(0, id, bytes, owner, class).unwrap();
+            }
+            let hold = held.then(|| {
+                let claims: Vec<_> = rows
+                    .iter()
+                    .map(|(id, bytes, class)| MemoryClaim {
+                        domain: MemoryDomain::Cuda { device_id: 0 },
+                        owner,
+                        class: *class,
+                        bytes: *bytes,
+                        source: MemoryClaimSource::External {
+                            allocation_id: id.to_string(),
+                        },
+                    })
+                    .collect();
+                ArenaHold::from_plan(&claims).unwrap()
+            });
+            Self { ledger, hold }
+        }
+
+        /// One sample: the backend's measured weights and workspace rows.
+        fn report(&mut self, weights: usize, workspace: usize) {
+            let row = |id: &str, class, bytes| kapsl_engine_api::MemoryAllocation {
+                allocation_id: id.to_string(),
+                domain: BackendMemoryDomain::Cuda { device_id: 0 },
+                class,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes,
+            };
+            let report = BackendMemoryReport {
+                allocations: vec![
+                    row(
+                        ARENA_WEIGHTS_ID,
+                        BackendMemoryAllocationClass::PersistentWeights,
+                        weights,
+                    ),
+                    row(
+                        ARENA_WORKSPACE_ID,
+                        BackendMemoryAllocationClass::TransientWorkspace,
+                        workspace,
+                    ),
+                ],
+            };
+            let held = held_report(&mut self.hold, &report);
+            for external in external_cuda_report_from_backend(&held).allocations {
+                self.ledger
+                    .reconcile_external(0, &external.allocation_id, external.bytes)
+                    .unwrap();
+            }
+        }
+
+        /// Bytes the first model holds against the device budget.
+        fn reserved(&self) -> usize {
+            self.ledger.external_bytes(0, ARENA_WEIGHTS_ID)
+                + self.ledger.external_bytes(0, ARENA_WORKSPACE_ID)
+        }
+
+        fn release(&mut self) {
+            for id in [ARENA_WEIGHTS_ID, ARENA_WORKSPACE_ID] {
+                self.ledger.release_external(0, id, MemoryOwner::new(60, 0));
+            }
+        }
+
+        fn second_model_admitted(&mut self, bytes: usize) -> bool {
+            self.ledger
+                .reserve_external(
+                    0,
+                    "model-b",
+                    bytes,
+                    MemoryOwner::new(61, 0),
+                    MemoryAllocationClass::TransientWorkspace,
+                )
+                .is_ok()
+        }
+    }
+
+    // Run 8 measurements for the same model.
+    const IDLE: (usize, usize) = (559_939_584, 67_108_864);
+    const BUSY: (usize, usize) = (1_094_713_344, 671_088_640);
+    const _: () = assert!(BUSY.0 + BUSY.1 < ARENA_PLAN_TOTAL);
+
+    #[test]
+    fn the_first_models_claim_is_the_plan_total_at_idle_and_busy_not_the_per_row_sum() {
+        let mut held = ArenaLedger::new(4_000_000_000, true);
+        for (weights, workspace) in [IDLE, BUSY, IDLE, BUSY] {
+            held.report(weights, workspace);
+            assert_eq!(
+                held.reserved(),
+                ARENA_PLAN_TOTAL,
+                "the plan total, not 2,705,326,080"
+            );
+        }
+        // The measured bytes are below the plan: only the reservation is held.
+        // Rows follow the report; the shortfall sits on the workspace row.
+        assert_eq!(held.ledger.external_bytes(0, ARENA_WEIGHTS_ID), BUSY.0);
+        assert_eq!(
+            held.ledger.external_bytes(0, ARENA_WORKSPACE_ID),
+            ARENA_PLAN_TOTAL - BUSY.0
+        );
+    }
+
+    #[test]
+    fn a_second_model_is_not_admitted_against_memory_the_first_reclaims_under_load() {
+        // 3,400 MB budget; B needs 1,500 MB. Beside A at its measured size it
+        // fits (3,400 - 627 = 2,773 MB free at idle); beside A at its plan it
+        // does not (3,400 - 2,021 = 1,379 MB).
+        let (budget, b) = (3_400_000_000, 1_500_000_000);
+
+        // Held (the policy): B stays out through idle, busy and idle again.
+        let mut held = ArenaLedger::new(budget, true);
+        held.report(IDLE.0, IDLE.1);
+        assert!(
+            !held.second_model_admitted(b),
+            "idle A still claims its plan"
+        );
+        held.report(BUSY.0, BUSY.1);
+        assert!(!held.second_model_admitted(b), "busy A");
+        held.report(IDLE.0, IDLE.1);
+        assert!(
+            !held.second_model_admitted(b),
+            "idle again: the claim did not shrink back"
+        );
+        // Unload A and B fits.
+        held.release();
+        assert!(held.second_model_admitted(b), "A's claim ends with A");
+
+        // Without the hold (what run 7 did) B is admitted at idle: the defect.
+        let mut unheld = ArenaLedger::new(budget, false);
+        unheld.report(IDLE.0, IDLE.1);
+        assert!(unheld.second_model_admitted(b), "reconciling down admits B");
+    }
+
+    #[test]
+    fn available_bytes_never_advertises_room_the_hold_keeps_back() {
+        // `grantable_bytes` takes the stricter of the authority's figure and the
+        // ledger's. The ledger charges the held claim (the plan total), so even if the
+        // authority's figure followed the arena down to its idle size, what is
+        // reported is the room beside the held claim, which is what admission
+        // would grant a second model.
+        let budget = 3_400_000_000;
+        let mut held = ArenaLedger::new(budget, true);
+        for (weights, workspace) in [IDLE, BUSY, IDLE] {
+            held.report(weights, workspace);
+            let ledger_available = held.ledger.snapshot(0).map(|s| s.available_bytes());
+            assert_eq!(ledger_available, Some(budget - ARENA_PLAN_TOTAL));
+            let authority_at_idle_size = budget - (IDLE.0 + IDLE.1);
+            assert_eq!(
+                stricter_available(authority_at_idle_size, ledger_available),
+                budget - ARENA_PLAN_TOTAL
+            );
+        }
+    }
+
+    #[test]
+    fn the_hold_does_not_refuse_a_model_that_fits_beside_the_plan_total() {
+        // 1,300 MB fits in the 1,379 MB left beside A's plan total. Per-row
+        // flooring (run 8) held A at 2,705 MB busy and left only 695 MB.
+        let mut held = ArenaLedger::new(3_400_000_000, true);
+        held.report(BUSY.0, BUSY.1);
+        assert!(held.second_model_admitted(1_300_000_000));
+    }
+
+    #[test]
+    fn a_high_water_total_above_the_plan_is_what_the_second_model_must_clear() {
+        // The arena outgrows its 1,000 MB plan (1,400 MB) and later falls back
+        // to 300 MB: the claim stays at 1,400 MB.
+        let mut held = ArenaLedger::with_plan(2000 * MIB, 200 * MIB, 800 * MIB, true);
+        held.report(100 * MIB, 200 * MIB);
+        assert_eq!(held.reserved(), 1000 * MIB);
+        held.report(900 * MIB, 500 * MIB);
+        assert_eq!(held.reserved(), 1400 * MIB);
+        held.report(100 * MIB, 200 * MIB);
+        assert_eq!(held.reserved(), 1400 * MIB);
+        assert!(
+            !held.second_model_admitted(700 * MIB),
+            "2000 - 1400 = 600 MB free"
+        );
+        assert!(held.second_model_admitted(600 * MIB));
+    }
+
+    #[test]
+    fn claims_that_are_not_held_still_follow_the_backend_down() {
+        // GGUF, native and pool opt-in plans carry no hold: `None` is a
+        // pass-through, so their reconcile shrinks exactly as before.
+        let mut none: Option<ArenaHold> = None;
+        let report = BackendMemoryReport {
+            allocations: vec![kapsl_engine_api::MemoryAllocation {
+                allocation_id: "gguf:weights".to_string(),
+                domain: BackendMemoryDomain::Cuda { device_id: 0 },
+                class: BackendMemoryAllocationClass::PersistentWeights,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes: 100 * MIB,
+            }],
+        };
+        assert_eq!(held_report(&mut none, &report), report);
+    }
+
     #[test]
     fn onnx_measured_report_replaces_the_lease_echo_and_closes_the_ledger() {
         let authority = MemoryAuthority::new(&cpu_device_info()).unwrap();
@@ -5426,7 +5889,7 @@ mod tests {
         // weights/workspace row there, adds its own estimates in it.
         let plan = authority
             .model_load_plan_with_report(
-                &[metal.clone()],
+                std::slice::from_ref(&metal),
                 owner,
                 14 * MIB * 5 / 4,
                 256 * MIB,
@@ -5582,5 +6045,202 @@ mod tests {
             "a denial reserves nothing"
         );
         assert_host_ledger_closed(&authority);
+    }
+
+    // --- GPU sample staleness (MEM-03/04) --------------------------------
+
+    fn cuda0() -> MemoryDomain {
+        MemoryDomain::Cuda { device_id: 0 }
+    }
+
+    fn cuda_available(authority: &MemoryAuthority) -> usize {
+        authority
+            .snapshot()
+            .domain(&cuda0())
+            .expect("cuda domain")
+            .available_bytes
+    }
+
+    fn set_sampling_ages(
+        authority: &MemoryAuthority,
+        armed_secs_ago: Option<u64>,
+        observed_secs_ago: Option<u64>,
+    ) {
+        let ago = |secs: u64| Instant::now() - Duration::from_secs(secs);
+        let mut accounting = authority.accounting.lock();
+        accounting.cuda_sampling_armed_at = armed_secs_ago.map(ago);
+        accounting.cuda_last_observed_at = observed_secs_ago.map(ago);
+        accounting.observed_domains.insert(cuda0(), 2 * GIB);
+    }
+
+    #[test]
+    fn sampling_state_thresholds() {
+        let secs = |s| Some(Duration::from_secs(s));
+        assert_eq!(CudaSamplingState::from_ages(None), CudaSamplingState::Fresh);
+        assert_eq!(
+            CudaSamplingState::from_ages(secs(44)),
+            CudaSamplingState::Fresh
+        );
+        assert!(matches!(
+            CudaSamplingState::from_ages(secs(45)),
+            CudaSamplingState::Stale { .. }
+        ));
+        assert!(matches!(
+            CudaSamplingState::from_ages(secs(300)),
+            CudaSamplingState::Failed { .. }
+        ));
+    }
+
+    fn cuda_plan_of(bytes: usize) -> MemoryPlan {
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            cuda0(),
+            MemoryOwner::new(91, 0),
+            MemoryAllocationClass::PersistentWeights,
+            bytes,
+        ));
+        plan
+    }
+
+    #[test]
+    fn fresh_samples_and_hosts_without_a_sampler_gate_nothing() {
+        let authority = authority_with_budgets(&[(cuda0(), 20 * GIB)]);
+        set_sampling_ages(&authority, Some(600), Some(1));
+        assert_eq!(cuda_available(&authority), 18 * GIB);
+        assert_eq!(authority.cuda_sampling_state(), CudaSamplingState::Fresh);
+        authority
+            .check_cuda_load_sampling(&cuda_plan_of(18 * GIB))
+            .expect("fresh samples leave the full room");
+        // No sampler armed (CPU host, unit tests): never stale.
+        set_sampling_ages(&authority, None, None);
+        authority
+            .check_cuda_load_sampling(&cuda_plan_of(18 * GIB))
+            .expect("no sampler, no staleness");
+    }
+
+    #[test]
+    fn stale_samples_hold_back_a_margin_for_new_loads_instead_of_trusting_leases_alone() {
+        let authority = authority_with_budgets(&[(cuda0(), 20 * GIB)]);
+        set_sampling_ages(&authority, Some(600), Some(100));
+        // 10% of the 20 GiB budget is held back from a new load: 18 -> 16 GiB.
+        authority
+            .check_cuda_load_sampling(&cuda_plan_of(16 * GIB))
+            .expect("fits after the margin");
+        let error = authority
+            .check_cuda_load_sampling(&cuda_plan_of(17 * GIB))
+            .expect_err("17 GiB > 16 GiB");
+        assert!(error.contains("samples are 100s old"), "{error}");
+        // The margin has a floor of 1 GiB on small budgets.
+        let small = authority_with_budgets(&[(cuda0(), 4 * GIB)]);
+        set_sampling_ages(&small, Some(600), Some(100));
+        assert_eq!(
+            CudaSamplingState::Stale {
+                age: Duration::from_secs(60)
+            }
+            .clamp_available(2 * GIB, 4 * GIB),
+            GIB
+        );
+        small
+            .check_cuda_load_sampling(&cuda_plan_of(GIB))
+            .expect("1 GiB fits the 1 GiB left");
+        assert!(small
+            .check_cuda_load_sampling(&cuda_plan_of(2 * GIB))
+            .is_err());
+    }
+
+    #[test]
+    fn failed_sampling_refuses_new_cuda_loads_only_and_recovers() {
+        let authority = authority_with_budgets(&[(cuda0(), 20 * GIB)]);
+        // Armed 400 s ago, never a successful sample.
+        set_sampling_ages(&authority, Some(400), None);
+        assert_eq!(authority.cuda_sampling_state().as_str(), "failed");
+        let error = authority
+            .check_cuda_load_sampling(&cuda_plan_of(MIB))
+            .expect_err("fail closed");
+        assert!(error.contains("sampling has failed"), "{error}");
+        // A plan with no CUDA bytes (a host model) is not gated.
+        authority
+            .check_cuda_load_sampling(&MemoryPlan::new())
+            .expect("no CUDA claim");
+        // A sample arrives: new loads are admitted again.
+        authority.accounting.lock().cuda_last_observed_at = Some(Instant::now());
+        assert_eq!(authority.cuda_sampling_state(), CudaSamplingState::Fresh);
+        authority
+            .check_cuda_load_sampling(&cuda_plan_of(MIB))
+            .expect("recovered");
+    }
+
+    #[test]
+    fn stale_sampling_leaves_snapshots_pressure_and_running_models_alone() {
+        // The snapshot feeds the pressure state, KV policy, autoscaling and the
+        // request-time growth of models that are already admitted. A dead
+        // sampler must not shrink any of them (that would shed traffic from
+        // healthy models); only the new-load gate reacts.
+        let authority = authority_with_budgets(&[(cuda0(), 20 * GIB)]);
+        set_sampling_ages(&authority, Some(600), Some(1));
+        let fresh = authority.snapshot();
+        let fresh_pressure =
+            evaluate_authority_pressure_state(&fresh, 0.0, &RuntimePressureConfig::from_env());
+        set_sampling_ages(&authority, Some(600), None);
+        assert_eq!(authority.cuda_sampling_state().as_str(), "failed");
+        let failed = authority.snapshot();
+        assert_eq!(failed.domain(&cuda0()), fresh.domain(&cuda0()));
+        assert_eq!(cuda_available(&authority), 18 * GIB);
+        assert_eq!(
+            evaluate_authority_pressure_state(&failed, 0.0, &RuntimePressureConfig::from_env()),
+            fresh_pressure
+        );
+        // Request-time growth on the host of an admitted owner still works.
+        let mut plan = MemoryPlan::new();
+        plan.push(MemoryClaim::runtime(
+            MemoryDomain::Host,
+            MemoryOwner::new(92, 0),
+            MemoryAllocationClass::ModelSession,
+            MIB,
+        ));
+        let mut lease = authority.admit(&plan).expect("host model admitted");
+        lease
+            .grow(&plan)
+            .expect("request-time growth is not gated by GPU sampling");
+    }
+
+    #[test]
+    fn observing_gpu_memory_refreshes_the_sample_clock() {
+        let host = HostMemoryManager::new(&cpu_device_info());
+        let domain_budgets = HashMap::from([
+            (MemoryDomain::Host, host.budget().safe_bytes),
+            (cuda0(), 20 * GIB),
+        ]);
+        let authority = Arc::new(MemoryAuthority {
+            host,
+            #[cfg(feature = "gpu-device-pool")]
+            cuda: None,
+            providers: Arc::new(ProviderMemoryLedger::with_budgets(HashMap::new())),
+            operations: Mutex::new(()),
+            accounting: Mutex::new(AuthorityAccounting::default()),
+            next_lease_id: AtomicU64::new(1),
+            device_domains: HashMap::from([(
+                0usize,
+                MemoryDomainPolicy {
+                    domain: cuda0(),
+                    budget_bytes: 20 * GIB,
+                },
+            )]),
+            domain_budgets,
+            live_ceiling: Mutex::new(HashMap::new()),
+        });
+        authority.expect_cuda_sampling();
+        {
+            let mut accounting = authority.accounting.lock();
+            accounting.cuda_sampling_armed_at = Some(Instant::now() - Duration::from_secs(400));
+        }
+        assert_eq!(authority.cuda_sampling_state().as_str(), "failed");
+        authority.observe_cuda_memory_by_device(&HashMap::from([(0usize, GIB)]));
+        assert_eq!(authority.cuda_sampling_state(), CudaSamplingState::Fresh);
+        authority.accounting.lock().cuda_last_observed_at =
+            Some(Instant::now() - Duration::from_secs(60));
+        assert_eq!(authority.cuda_sampling_state().as_str(), "stale");
+        authority.observe_cuda_memory_total(GIB);
+        assert_eq!(authority.cuda_sampling_state(), CudaSamplingState::Fresh);
     }
 }
