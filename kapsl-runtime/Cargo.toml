@@ -27,3 +27,5 @@ kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11
 kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
 kapsl-llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
 kapsl-llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
