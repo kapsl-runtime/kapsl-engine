@@ -277,14 +277,13 @@ pub(super) fn build_model_load_plan(
         worker_tp_degree,
         use_pipeline_backend,
     } = topology_choice;
-    validate_hardware_requirements(&loader.manifest.hardware_requirements, device_info).map_err(
-        |error| {
+    BackendFactory::validate_requirements(&loader.manifest.hardware_requirements, device_info)
+        .map_err(|error| {
             format!(
                 "Requirements validation failed for model {} replica {}: {}",
                 base_model_id, replica_id, error
             )
-        },
-    )?;
+        })?;
     export_gguf_auto_sizing_hint(
         &loader.manifest,
         defaults.batch_size,
