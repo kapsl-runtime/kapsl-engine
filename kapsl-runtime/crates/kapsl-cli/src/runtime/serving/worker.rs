@@ -27,7 +27,7 @@ fn is_explicit_worker_gpu_boundary(name: &str, value: &str) -> bool {
         .is_some_and(|device_id| !device_id.is_empty() && is_cuda_cap())
 }
 
-fn isolated_worker_gpu_pool_allowed() -> bool {
+pub(crate) fn isolated_worker_gpu_pool_allowed() -> bool {
     std::env::vars().any(|(name, value)| is_explicit_worker_gpu_boundary(&name, &value))
 }
 

@@ -156,6 +156,22 @@ pub(super) async fn load_replica(
         if domains.is_empty() {
             None
         } else {
+            // A GGUF's lease is what its backend plans for an in-process load.
+            #[cfg(feature = "gpu-device-pool")]
+            let planned = planned_gguf_report_for_worker(
+                &plan.loader.manifest,
+                onnx_route.as_ref(),
+                &domains,
+                device_info,
+                plan.backend_tuning.onnx(),
+                &resources,
+                plan.base_model_id,
+                plan.replica_id,
+                &plan.model_file_path,
+            );
+            #[cfg(not(feature = "gpu-device-pool"))]
+            let planned: Result<kapsl_engine_api::MemoryReport, String> =
+                Err("built without gpu-device-pool: the file-size estimate".to_string());
             Some(
                 reserve_isolated_worker_memory(
                     &plan.model_file_path,
@@ -170,6 +186,7 @@ pub(super) async fn load_replica(
                     ),
                     plan.use_pipeline_backend,
                     plan.priority_weight,
+                    planned.as_ref().map_err(String::as_str),
                 )
                 .await?,
             )

@@ -3250,6 +3250,14 @@ impl MemoryLease {
         let current = aggregate_claim_rows(&self.claims);
 
         let mut growth = MemoryPlan::new();
+        // CUDA rows whose device-ledger charge `reconcile_report` has just set to
+        // the held bytes (absolute). The authority's row grows to match, but the
+        // ledger must not be charged for the growth a second time: run 9 charged
+        // YOLOX's plan (1,625,423,128 B) plus the hold's shortfall (1,528,954,136 B)
+        // again as a request-lifetime lease, 3,154,377,264 B for one model, and a
+        // tight budget refused the second charge.
+        #[cfg(feature = "gpu-device-pool")]
+        let mut ledger_charged = Vec::new();
         for (key, actual_bytes) in &held_rows {
             let current_bytes = current.get(key).copied().unwrap_or(0);
             if *actual_bytes > current_bytes {
@@ -3260,6 +3268,11 @@ impl MemoryLease {
                     .cloned()
                     .expect("aggregated backend row has a claim template");
                 claim.bytes = actual_bytes - current_bytes;
+                #[cfg(feature = "gpu-device-pool")]
+                if self.device_ledger_charges_row(&held_plan, key) {
+                    ledger_charged.push(claim);
+                    continue;
+                }
                 growth.push(claim);
             }
         }
@@ -3274,6 +3287,19 @@ impl MemoryLease {
             self.observed = overlay_reported_rows(&self.observed, &actual);
             self.refresh_accounting(false);
             return Err(error);
+        }
+
+        #[cfg(feature = "gpu-device-pool")]
+        if !ledger_charged.is_empty() {
+            for claim in &ledger_charged {
+                self.add_claim_bytes(claim, claim.bytes);
+                let planned = self
+                    .planned
+                    .entry(MemoryRowKey::from_claim(claim))
+                    .or_default();
+                *planned = planned.saturating_add(claim.bytes);
+            }
+            self.refresh_accounting(false);
         }
 
         // Publish the new observed floors before shrinking so a concurrent or
@@ -3377,6 +3403,36 @@ impl MemoryLease {
                 target,
             ));
         }
+    }
+
+    /// Whether every claim of the row `key` in `plan` is a backend-managed CUDA
+    /// allocation whose device-ledger charge one of this lease's device leases
+    /// already owns. Growing such a row in the authority must not reserve it in
+    /// the ledger again.
+    #[cfg(feature = "gpu-device-pool")]
+    fn device_ledger_charges_row(&self, plan: &MemoryPlan, key: &MemoryRowKey) -> bool {
+        if !matches!(key.domain, MemoryDomain::Cuda { .. }) {
+            return false;
+        }
+        let mut seen = false;
+        for claim in plan
+            .claims()
+            .iter()
+            .filter(|claim| MemoryRowKey::from_claim(claim) == *key)
+        {
+            let MemoryClaimSource::External { allocation_id } = &claim.source else {
+                return false;
+            };
+            if !self
+                .cuda
+                .iter()
+                .any(|lease| lease.charges_allocation(allocation_id))
+            {
+                return false;
+            }
+            seen = true;
+        }
+        seen
     }
 
     fn resize_adapter_row(&mut self, key: &MemoryRowKey, target: usize) -> Result<(), String> {
@@ -5712,6 +5768,392 @@ mod tests {
         let mut unheld = ArenaLedger::new(budget, false);
         unheld.report(IDLE.0, IDLE.1);
         assert!(unheld.second_model_admitted(b), "reconciling down admits B");
+    }
+
+    // ---- run 9, check e: YOLOX on ORT's own arena beside a Qwen GGUF, through the lease ----
+    //
+    // Run 9 logged, at admission, `global_used=4,334,943,512` (the pool 1,669,332,992 B, Qwen
+    // 1,040,187,392 B and YOLOX's plan 1,625,423,128 B), and after the first continuous reconcile
+    // `global_used=5,863,897,648`: YOLOX charged 3,154,377,264 B, its plan plus 1,528,954,136 B, which is
+    // exactly the hold's shortfall. Under the tight 3,498,049,536 B budget the same reconcile was
+    // refused ("continuous reconciliation rejected ... external_planned=1528954136").
+    #[cfg(feature = "gpu-device-pool")]
+    mod yolox_beside_qwen {
+        use super::*;
+
+        const WEIGHTS_ID: &str = "onnx-session:0:1";
+        const WORKSPACE_ID: &str = "onnx-session:0:1:workspace";
+        // 4 sessions of the 3,702,598 B model: 4 x model and 4 x max(0.9 x model, 384 MiB).
+        const PLAN_WEIGHTS: usize = 14_810_392;
+        const PLAN_WORKSPACE: usize = 1_610_612_736;
+        const PLAN_TOTAL: usize = PLAN_WEIGHTS + PLAN_WORKSPACE; // 1,625,423,128
+                                                                 // What ORT really held (run 9 `after` snapshot): committed 96,468,992 B.
+        const REAL_WEIGHTS: usize = 29_360_128;
+        const REAL_WORKSPACE: usize = 67_108_864;
+        // Qwen's ledger rows (run 9): 1,038,077,440 B lease plus the 2,109,952 B residual.
+        const QWEN: usize = 1_040_187_392;
+
+        struct Case {
+            manager: Arc<DeviceMemoryManager>,
+            lease: MemoryLease,
+            report: BackendMemoryReport,
+            budget: usize,
+            pool: usize,
+        }
+
+        fn cuda0() -> MemoryDomain {
+            MemoryDomain::Cuda { device_id: 0 }
+        }
+
+        fn backend_row(
+            id: &str,
+            class: BackendMemoryAllocationClass,
+            bytes: usize,
+        ) -> kapsl_engine_api::MemoryAllocation {
+            kapsl_engine_api::MemoryAllocation {
+                allocation_id: id.to_string(),
+                domain: BackendMemoryDomain::Cuda { device_id: 0 },
+                class,
+                source: BackendMemoryAllocationSource::BackendManaged,
+                bytes,
+            }
+        }
+
+        /// The state after a load: the ledger carries Qwen and YOLOX at the held report
+        /// (what `MemoryAdmission::reconcile` does at load), the lease's own claims sit at the
+        /// rows the backend reported, and the hold knows the peak plan.
+        fn loaded(budget: usize, pool: usize) -> Case {
+            let owner = MemoryOwner::new(1, 0);
+            let manager = DeviceMemoryManager::for_ledger_tests(0, budget, pool);
+            manager
+                .reserve_for_tests(
+                    0,
+                    "qwen",
+                    QWEN,
+                    MemoryOwner::new(0, 0),
+                    MemoryAllocationClass::PersistentWeights,
+                )
+                .unwrap();
+            manager.reconcile_for_tests(0, "qwen", QWEN).unwrap();
+            let plan_claims: Vec<MemoryClaim> = [
+                (
+                    WEIGHTS_ID,
+                    PLAN_WEIGHTS,
+                    MemoryAllocationClass::PersistentWeights,
+                ),
+                (
+                    WORKSPACE_ID,
+                    PLAN_WORKSPACE,
+                    MemoryAllocationClass::TransientWorkspace,
+                ),
+            ]
+            .into_iter()
+            .map(|(id, bytes, class)| MemoryClaim {
+                domain: cuda0(),
+                owner,
+                class,
+                bytes,
+                source: MemoryClaimSource::External {
+                    allocation_id: id.to_string(),
+                },
+            })
+            .collect();
+            for claim in &plan_claims {
+                let MemoryClaimSource::External { allocation_id } = &claim.source else {
+                    unreachable!()
+                };
+                manager
+                    .reserve_for_tests(0, allocation_id, claim.bytes, owner, claim.class)
+                    .unwrap();
+            }
+            let mut hold = Some(ArenaHold::from_plan(&plan_claims).unwrap());
+            let report = BackendMemoryReport {
+                allocations: vec![
+                    backend_row(
+                        WEIGHTS_ID,
+                        BackendMemoryAllocationClass::PersistentWeights,
+                        REAL_WEIGHTS,
+                    ),
+                    backend_row(
+                        WORKSPACE_ID,
+                        BackendMemoryAllocationClass::TransientWorkspace,
+                        REAL_WORKSPACE,
+                    ),
+                ],
+            };
+            // Admission-time reconcile: the ledger follows the held report.
+            let held = held_report(&mut hold, &report);
+            for allocation in external_cuda_report_from_backend(&held).allocations {
+                manager
+                    .reconcile_for_tests(0, &allocation.allocation_id, allocation.bytes)
+                    .unwrap();
+            }
+            let authority = Arc::new(MemoryAuthority {
+                host: HostMemoryManager::new(&cpu_device_info()),
+                cuda: Some(Arc::clone(&manager)),
+                providers: Arc::new(ProviderMemoryLedger::with_budgets(HashMap::new())),
+                operations: Mutex::new(()),
+                accounting: Mutex::new(AuthorityAccounting::default()),
+                next_lease_id: AtomicU64::new(1),
+                device_domains: HashMap::new(),
+                domain_budgets: HashMap::from([(cuda0(), budget)]),
+                live_ceiling: Mutex::new(HashMap::new()),
+            });
+            // The lease's claims are the rows the backend reported at commit.
+            let actual_claims = MemoryPlan::from_backend_report(owner, &report)
+                .claims()
+                .to_vec();
+            let mut lease = MemoryLease::new(authority, actual_claims);
+            lease.cuda = vec![DeviceMemoryLease::for_ledger_tests(
+                &manager,
+                0,
+                owner,
+                &[WEIGHTS_ID, WORKSPACE_ID],
+            )];
+            lease.arena_hold = hold;
+            lease.mark_committed();
+            Case {
+                manager,
+                lease,
+                report,
+                budget,
+                pool,
+            }
+        }
+
+        fn lease_cuda_rows(lease: &MemoryLease) -> usize {
+            lease
+                .claims()
+                .iter()
+                .filter(|claim| claim.domain == cuda0())
+                .map(|claim| claim.bytes)
+                .sum()
+        }
+
+        #[test]
+        fn the_device_ledger_carries_the_held_claim_once_after_a_continuous_reconcile() {
+            // Unconstrained run 9: a 22.4 GB budget, the auto pool at 1,592 MiB.
+            let mut case = loaded(22_440_339_047, 1_669_332_992);
+            let at_admission = case.manager.ledger_used_for_tests(0);
+            assert_eq!(at_admission, case.pool + QWEN + PLAN_TOTAL);
+            assert_eq!(at_admission, 4_334_943_512, "the run 9 log at admission");
+
+            case.lease
+                .reconcile(&case.report)
+                .expect("the reconcile fits");
+
+            assert_eq!(
+                case.manager.ledger_used_for_tests(0),
+                case.pool + QWEN + PLAN_TOTAL,
+                "the ledger charges YOLOX's held claim once (run 9: 5,863,897,648 B, +1,528,954,136)"
+            );
+            assert_eq!(
+                case.manager.ledger_available_bytes(0),
+                Some(case.budget - case.pool - QWEN - PLAN_TOTAL)
+            );
+            assert_eq!(
+                lease_cuda_rows(&case.lease),
+                PLAN_TOTAL,
+                "the authority's row follows the held report"
+            );
+        }
+
+        #[test]
+        fn a_continuous_reconcile_does_not_fail_when_the_held_claim_fits() {
+            // Tight run 9: a 3,498,049,536 B budget, the pool at 512 MiB. The held claim was
+            // already in the ledger, so reconciling it again must not ask for more room.
+            let mut case = loaded(3_498_049_536, 536_870_912);
+            assert_eq!(
+                case.manager.ledger_available_bytes(0),
+                Some(295_568_104),
+                "the run 9 log after YOLOX's admission"
+            );
+            case.lease.reconcile(&case.report).unwrap_or_else(|error| {
+                panic!("run 9 logged: continuous reconciliation rejected: {error}")
+            });
+            assert_eq!(case.manager.ledger_available_bytes(0), Some(295_568_104));
+            assert_eq!(lease_cuda_rows(&case.lease), PLAN_TOTAL);
+        }
+
+        #[test]
+        fn what_available_bytes_reports_is_what_the_ledger_admits() {
+            // The reported figure and admission read the same ledger: a claim of exactly the
+            // reported room is admitted, one byte more is refused, after the reconcile.
+            for (budget, pool) in [
+                (22_440_339_047, 1_669_332_992),
+                (3_498_049_536, 536_870_912),
+            ] {
+                let mut case = loaded(budget, pool);
+                case.lease.reconcile(&case.report).unwrap();
+                let reported = case.manager.ledger_available_bytes(0).unwrap();
+                let claim = |bytes| MemoryClaim {
+                    domain: cuda0(),
+                    owner: MemoryOwner::new(2, 0),
+                    class: MemoryAllocationClass::TransientWorkspace,
+                    bytes,
+                    source: MemoryClaimSource::External {
+                        allocation_id: "second-model".to_string(),
+                    },
+                };
+                assert!(
+                    case.manager.admit_transient(&claim(reported + 1)).is_err(),
+                    "one byte over the reported room is refused (budget {budget})"
+                );
+                let lease = case.manager.admit_transient(&claim(reported));
+                assert!(
+                    lease.is_ok(),
+                    "exactly the reported room is admitted (budget {budget})"
+                );
+            }
+        }
+
+        #[test]
+        fn a_growing_report_is_charged_for_the_growth_only() {
+            // The arena outgrowing the plan (the high-water mark above it) raises the held
+            // claim by the growth, and the ledger by the same bytes, once.
+            let mut case = loaded(22_440_339_047, 1_669_332_992);
+            case.lease.reconcile(&case.report).unwrap();
+            let before = case.manager.ledger_used_for_tests(0);
+            let busy = BackendMemoryReport {
+                allocations: vec![
+                    backend_row(
+                        WEIGHTS_ID,
+                        BackendMemoryAllocationClass::PersistentWeights,
+                        PLAN_WEIGHTS,
+                    ),
+                    backend_row(
+                        WORKSPACE_ID,
+                        BackendMemoryAllocationClass::TransientWorkspace,
+                        PLAN_WORKSPACE + 100 * 1024 * 1024,
+                    ),
+                ],
+            };
+            case.lease.reconcile(&busy).unwrap();
+            assert_eq!(
+                case.manager.ledger_used_for_tests(0),
+                before + 100 * 1024 * 1024
+            );
+            assert_eq!(lease_cuda_rows(&case.lease), PLAN_TOTAL + 100 * 1024 * 1024);
+        }
+    }
+
+    // ---- run 9b, check o: a running model's request on a device with no physical pool ----
+    //
+    // With `KAPSL_GPU_DEVICE_POOL_DISABLED=1` (what check o set for its engine, and what every isolated
+    // worker runs with) the device manager keeps its ledger but materialises no pool. A request grows the
+    // lease by a runtime-managed KV claim; the pool-quota check used to treat "no pool" as an error, so the
+    // running Qwen answered HTTP 429 "runtime-managed CUDA claim for model 0 replica 0 targets device 0
+    // without a physical pool". Nothing in that path reads the sampling state.
+    #[cfg(feature = "gpu-device-pool")]
+    mod request_without_a_pool {
+        use super::*;
+
+        const WEIGHTS: usize = 491_400_032;
+        const KV: usize = 16 * 1024 * 1024;
+
+        fn running_qwen(budget: usize) -> (Arc<DeviceMemoryManager>, MemoryLease) {
+            let owner = MemoryOwner::new(0, 0);
+            let manager = DeviceMemoryManager::for_ledger_tests(0, budget, 0);
+            manager
+                .reserve_for_tests(
+                    0,
+                    "gguf:0:weights",
+                    WEIGHTS,
+                    owner,
+                    MemoryAllocationClass::PersistentWeights,
+                )
+                .unwrap();
+            let authority = Arc::new(MemoryAuthority {
+                host: HostMemoryManager::new(&cpu_device_info()),
+                cuda: Some(Arc::clone(&manager)),
+                providers: Arc::new(ProviderMemoryLedger::with_budgets(HashMap::new())),
+                operations: Mutex::new(()),
+                accounting: Mutex::new(AuthorityAccounting::default()),
+                next_lease_id: AtomicU64::new(1),
+                device_domains: HashMap::new(),
+                domain_budgets: HashMap::from([(cuda0(), budget)]),
+                live_ceiling: Mutex::new(HashMap::new()),
+            });
+            let mut lease = MemoryLease::new(
+                authority,
+                vec![MemoryClaim {
+                    domain: cuda0(),
+                    owner,
+                    class: MemoryAllocationClass::PersistentWeights,
+                    bytes: WEIGHTS,
+                    source: MemoryClaimSource::External {
+                        allocation_id: "gguf:0:weights".to_string(),
+                    },
+                }],
+            );
+            lease.cuda = vec![DeviceMemoryLease::for_ledger_tests(
+                &manager,
+                0,
+                owner,
+                &["gguf:0:weights"],
+            )];
+            lease.mark_committed();
+            (manager, lease)
+        }
+
+        fn request_plan() -> MemoryPlan {
+            let mut plan = MemoryPlan::new();
+            plan.push(MemoryClaim::runtime(
+                cuda0(),
+                MemoryOwner::new(0, 0),
+                MemoryAllocationClass::KvCache,
+                KV,
+            ));
+            plan
+        }
+
+        #[test]
+        fn a_running_model_serves_a_request_when_the_device_has_no_pool() {
+            let (_manager, mut lease) = running_qwen(4 * GIB);
+            lease
+                .grow(&request_plan())
+                .unwrap_or_else(|error| panic!("run 9b logged HTTP 429: {error}"));
+        }
+
+        #[test]
+        fn a_running_model_keeps_serving_while_cuda_sampling_has_failed() {
+            let (_manager, mut lease) = running_qwen(4 * GIB);
+            // Armed 400 s ago, never a successful sample: failed, as in check o after +300 s.
+            set_sampling_ages(&lease.authority, Some(400), None);
+            assert_eq!(lease.authority.cuda_sampling_state().as_str(), "failed");
+            lease
+                .grow(&request_plan())
+                .unwrap_or_else(|error| panic!("run 9b logged HTTP 429: {error}"));
+            // New loads are still refused in that state: only running models are exempt.
+            assert!(lease
+                .authority
+                .check_cuda_load_sampling(&request_plan())
+                .is_err());
+        }
+
+        #[test]
+        fn a_request_beyond_the_domain_budget_is_still_refused_without_a_pool() {
+            // The pool quota is gone, the authority's own budget is not: the 429 is replaced by the
+            // limit that applies, not by unbounded growth.
+            let (_manager, mut lease) = running_qwen(WEIGHTS + KV / 2);
+            let error = lease
+                .grow(&request_plan())
+                .expect_err("16 MiB does not fit in 8 MiB of room");
+            assert!(!error.contains("without a physical pool"), "{error}");
+        }
+
+        #[test]
+        fn a_device_the_manager_does_not_account_is_still_an_error() {
+            let (_manager, mut lease) = running_qwen(4 * GIB);
+            let mut plan = MemoryPlan::new();
+            plan.push(MemoryClaim::runtime(
+                MemoryDomain::Cuda { device_id: 7 },
+                MemoryOwner::new(0, 0),
+                MemoryAllocationClass::KvCache,
+                KV,
+            ));
+            assert!(lease.grow(&plan).is_err());
+        }
     }
 
     #[test]

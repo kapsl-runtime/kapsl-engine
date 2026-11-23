@@ -468,6 +468,43 @@ pub(super) fn create_runtime_backend_for_device(
     model_id: u32,
     replica_id: u32,
 ) -> Result<PreparedBackend, String> {
+    create_runtime_backend_for_device_with_pool(
+        manifest,
+        onnx_route,
+        provider,
+        device_id,
+        device_info,
+        tuning,
+        resources,
+        model_id,
+        replica_id,
+        true,
+    )
+}
+
+/// As [`create_runtime_backend_for_device`]; `allow_pool: false` builds the
+/// backend as a process without a runtime device pool would (an isolated worker
+/// has none unless the operator gave it an explicit GPU boundary), so a GGUF
+/// then plans llama.cpp's native KV instead of a pool-owned one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn create_runtime_backend_for_device_with_pool(
+    manifest: &Manifest,
+    onnx_route: Option<&OnnxBackendRoute>,
+    provider: &str,
+    device_id: usize,
+    device_info: &DeviceInfo,
+    tuning: Option<&OnnxRuntimeTuning>,
+    resources: &RuntimeResources,
+    model_id: u32,
+    replica_id: u32,
+    allow_pool: bool,
+) -> Result<PreparedBackend, String> {
+    #[cfg(not(any(
+        feature = "native",
+        feature = "gguf-native",
+        feature = "gguf-cuda-shared-kv"
+    )))]
+    let _ = allow_pool;
     let engine_kind = EngineKind::resolve(manifest);
     #[cfg(not(any(
         feature = "native",
@@ -495,7 +532,10 @@ pub(super) fn create_runtime_backend_for_device(
 
     #[cfg(feature = "gguf-native")]
     if engine_kind.is_gguf() {
-        let backend = if let Some(pool) = resources.device_pool(device_id) {
+        let backend = if let Some(pool) = allow_pool
+            .then(|| resources.device_pool(device_id))
+            .flatten()
+        {
             BackendFactory::create_gguf_native_device_pool_for_replica(
                 device_id as i32,
                 pool,
@@ -510,7 +550,10 @@ pub(super) fn create_runtime_backend_for_device(
 
     #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
     if engine_kind.is_gguf() {
-        let backend = if let Some(pool) = resources.device_pool(device_id) {
+        let backend = if let Some(pool) = allow_pool
+            .then(|| resources.device_pool(device_id))
+            .flatten()
+        {
             BackendFactory::create_gguf_cuda_device_pool_for_replica(
                 device_id as i32,
                 pool,
@@ -525,7 +568,10 @@ pub(super) fn create_runtime_backend_for_device(
 
     #[cfg(feature = "native")]
     if engine_kind == EngineKind::Native {
-        if let Some(pool) = resources.device_pool(device_id) {
+        if let Some(pool) = allow_pool
+            .then(|| resources.device_pool(device_id))
+            .flatten()
+        {
             return BackendFactory::create_native_device_pool_for_replica(
                 device_id as i32,
                 pool,
@@ -723,6 +769,237 @@ pub(super) fn isolated_worker_memory_report(
     Ok(MemoryReport { allocations })
 }
 
+/// What an in-process load of a GGUF model would plan for the devices an
+/// isolated worker uses: the backend's own `planned_memory` (weights, compute
+/// buffers and, with llama.cpp-owned KV, the KV), from a backend built the way the
+/// in-process load builds it and never loaded. One backend per CUDA device; a
+/// worker with no CUDA domain (a CPU host) is planned once on the host. Run 9
+/// (check m): the file-size estimate held 882,685,496 B for a model whose
+/// in-process plan asked for 2,030,401,376 B.
+/// `Err(reason)` for other kinds, or when a backend cannot be built or planned
+/// (the caller then keeps the estimate and says why: planning must never block
+/// isolation).
+#[cfg(feature = "gpu-device-pool")]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn planned_gguf_report_for_worker(
+    manifest: &Manifest,
+    onnx_route: Option<&OnnxBackendRoute>,
+    domains: &[MemoryDomain],
+    device_info: &DeviceInfo,
+    tuning: Option<&OnnxRuntimeTuning>,
+    resources: &RuntimeResources,
+    model_id: u32,
+    replica_id: u32,
+    model_file_path: &Path,
+) -> Result<MemoryReport, String> {
+    if !EngineKind::resolve(manifest).is_gguf() {
+        return Err("not a GGUF model: the worker keeps the file-size estimate".to_string());
+    }
+    let mut targets: Vec<(&'static str, usize)> = domains
+        .iter()
+        .filter_map(|domain| match domain {
+            MemoryDomain::Cuda { device_id } => Some(("cuda", *device_id)),
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        targets.push(("cpu", 0));
+    }
+    let mut merged = MemoryReport {
+        allocations: Vec::new(),
+    };
+    for (provider, device_id) in targets {
+        let planned = create_runtime_backend_for_device_with_pool(
+            manifest,
+            onnx_route,
+            provider,
+            device_id,
+            device_info,
+            tuning,
+            resources,
+            model_id,
+            replica_id,
+            crate::runtime::serving::isolated_worker_gpu_pool_allowed(),
+        )
+        .and_then(|backend| {
+            backend
+                .planned_memory(model_file_path)
+                .map_err(|error| error.to_string())
+        });
+        match planned {
+            Ok(report) => merged.allocations.extend(report.allocations),
+            Err(error) => {
+                let reason = format!("planning on {provider}:{device_id} failed ({error})");
+                log::warn!(
+                    "[memory-authority] could not plan the isolated worker of model {model_id} replica {replica_id} from its backend: {reason}; using the file-size estimate"
+                );
+                return Err(reason);
+            }
+        }
+    }
+    if merged.allocations.is_empty() {
+        let reason = "the backend planned nothing".to_string();
+        log::warn!(
+            "[memory-authority] the isolated worker of model {model_id} replica {replica_id} got an empty plan from its backend; using the file-size estimate"
+        );
+        return Err(reason);
+    }
+    Ok(merged)
+}
+
+/// The parent's reservation for an isolated worker from a backend's in-process
+/// plan: every backend-managed allocation on the worker's domains, summed per
+/// (domain, class) under the isolated-worker ids. Runtime-managed rows (a pool
+/// KV the child owns itself) are not the parent's to charge.
+///
+/// A worker domain the plan leaves without a model row or a workspace row (the
+/// backend placed nothing there: another ordinal, `KAPSL_GGUF_N_GPU_LAYERS=0`)
+/// takes that row from `estimate`, the file-size report. Left empty, the
+/// authority would fill it with a runtime-managed claim, and a runtime-managed
+/// CUDA claim is refused without an admitted pool workload. Returns the report and
+/// a note per row that fell back.
+pub(super) fn isolated_worker_report_from_plan(
+    planned: &MemoryReport,
+    estimate: &MemoryReport,
+    domains: &[MemoryDomain],
+    model_id: u32,
+    replica_id: u32,
+) -> (MemoryReport, Vec<String>) {
+    use kapsl_engine_api::{
+        MemoryAllocation, MemoryAllocationClass as EngineClass,
+        MemoryAllocationSource as EngineSource, MemoryDomain as EngineDomain,
+    };
+    let wanted = |domain: &EngineDomain| {
+        domains.iter().any(|candidate| match (candidate, domain) {
+            (MemoryDomain::Cuda { device_id }, EngineDomain::Cuda { device_id: other }) => {
+                device_id == other
+            }
+            (MemoryDomain::Host, EngineDomain::Host) => true,
+            _ => false,
+        })
+    };
+    let label_of = |domain: &EngineDomain| match domain {
+        EngineDomain::Cuda { device_id } => format!("cuda:{device_id}"),
+        EngineDomain::Host => "host".to_string(),
+        other => format!("{other:?}").to_ascii_lowercase(),
+    };
+    let mut rows: Vec<MemoryAllocation> = Vec::new();
+    for allocation in &planned.allocations {
+        if allocation.source != EngineSource::BackendManaged
+            || allocation.bytes == 0
+            || !wanted(&allocation.domain)
+        {
+            continue;
+        }
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.domain == allocation.domain && row.class == allocation.class)
+        {
+            row.bytes = row.bytes.saturating_add(allocation.bytes);
+            continue;
+        }
+        rows.push(MemoryAllocation {
+            allocation_id: format!(
+                "isolated-worker:{model_id}:{replica_id}:{}:{}",
+                label_of(&allocation.domain),
+                format!("{:?}", allocation.class).to_ascii_lowercase()
+            ),
+            domain: allocation.domain.clone(),
+            class: allocation.class,
+            source: EngineSource::BackendManaged,
+            bytes: allocation.bytes,
+        });
+    }
+    let mut notes = Vec::new();
+    let is_model = |class: EngineClass| {
+        matches!(
+            class,
+            EngineClass::PersistentWeights | EngineClass::ModelSession
+        )
+    };
+    for domain in estimate
+        .allocations
+        .iter()
+        .map(|row| row.domain.clone())
+        .fold(Vec::<EngineDomain>::new(), |mut seen, domain| {
+            if !seen.contains(&domain) {
+                seen.push(domain);
+            }
+            seen
+        })
+    {
+        if !wanted(&domain) {
+            continue;
+        }
+        for (what, covered) in [
+            (
+                "model",
+                rows.iter()
+                    .any(|row| row.domain == domain && is_model(row.class)),
+            ),
+            (
+                "workspace",
+                rows.iter().any(|row| {
+                    row.domain == domain && row.class == EngineClass::TransientWorkspace
+                }),
+            ),
+        ] {
+            if covered {
+                continue;
+            }
+            for row in estimate.allocations.iter().filter(|row| {
+                row.domain == domain
+                    && if what == "model" {
+                        is_model(row.class)
+                    } else {
+                        row.class == EngineClass::TransientWorkspace
+                    }
+            }) {
+                notes.push(format!(
+                    "{} {what} from the file-size estimate",
+                    label_of(&domain)
+                ));
+                rows.push(row.clone());
+            }
+        }
+    }
+    (MemoryReport { allocations: rows }, notes)
+}
+
+/// The one line that says what an isolated worker's parent reservation is made of
+/// (the harness reads it: `claude/gpu-verify/lib/gv9.py`, `RE_ISOLATED_RESERVATION`).
+pub(super) fn isolated_reservation_line(
+    model_id: u32,
+    replica_id: u32,
+    source: &str,
+    report: &MemoryReport,
+    notes: &[String],
+) -> String {
+    use kapsl_engine_api::MemoryDomain as EngineDomain;
+    let rows: Vec<String> = report
+        .allocations
+        .iter()
+        .map(|row| {
+            let domain = match &row.domain {
+                EngineDomain::Cuda { device_id } => format!("cuda:{device_id}"),
+                EngineDomain::Host => "host".to_string(),
+                other => format!("{other:?}").to_ascii_lowercase(),
+            };
+            format!(
+                "{domain}:{}={}",
+                format!("{:?}", row.class).to_ascii_lowercase(),
+                row.bytes
+            )
+        })
+        .collect();
+    let total: usize = report.allocations.iter().map(|row| row.bytes).sum();
+    format!(
+        "[memory-authority] isolated worker {model_id}/{replica_id} reservation: source={source} total={total} rows=[{}] notes=[{}]",
+        rows.join(", "),
+        notes.join("; ")
+    )
+}
+
 /// Admit and commit the parent-side reservation for an isolated worker. Runs
 /// before the child process is spawned; a denial is the same typed
 /// [`MemoryAdmissionFailure`] an in-process load would produce.
@@ -737,10 +1014,11 @@ pub(super) async fn reserve_isolated_worker_memory(
     onnx_sessions: usize,
     pipeline: bool,
     priority_weight: u32,
+    planned: Result<&MemoryReport, &str>,
 ) -> Result<IsolatedWorkerMemory, DynError> {
     let owner = MemoryOwner::new(model_id, replica_id);
     let estimate = estimated_model_memory(model_file_path)?;
-    let report = isolated_worker_memory_report(
+    let estimate_report = isolated_worker_memory_report(
         model_file_path,
         domains,
         model_id,
@@ -749,6 +1027,34 @@ pub(super) async fn reserve_isolated_worker_memory(
         onnx_sessions,
         pipeline,
     )?;
+    let (report, source, notes) = match planned {
+        Ok(planned) => {
+            let (report, notes) = isolated_worker_report_from_plan(
+                planned,
+                &estimate_report,
+                domains,
+                model_id,
+                replica_id,
+            );
+            let source = if notes.is_empty() {
+                "planned"
+            } else {
+                "planned+estimate"
+            };
+            (report, source, notes)
+        }
+        Err(reason) => (estimate_report, "estimate", vec![reason.to_string()]),
+    };
+    if !matches!(source, "planned") && planned.is_ok() {
+        log::warn!(
+            "[memory-authority] the plan of the isolated worker of model {model_id} replica {replica_id} left rows empty; the file-size estimate fills them: {}",
+            notes.join("; ")
+        );
+    }
+    log::info!(
+        "{}",
+        isolated_reservation_line(model_id, replica_id, source, &report, &notes)
+    );
     let plan = resources.memory().model_load_plan_with_report(
         domains,
         owner,
@@ -1719,6 +2025,345 @@ mod tests {
         );
     }
 
+    // Run 9, check m: a 491,400,032 B Qwen GGUF. The file-size estimate held
+    // 882,685,496 B for its worker while an in-process load of the same model
+    // planned 2,030,401,376 B (weights, compute buffers and llama.cpp's native KV,
+    // which the backend plans when no runtime pool owns the KV).
+    const QWEN_FILE: usize = 491_400_032;
+    const QWEN_SCRATCH: usize = 703_727_104;
+    const QWEN_NATIVE_KV: usize = 835_274_240;
+
+    fn gguf_plan(device_ids: &[usize], with_host: bool) -> MemoryReport {
+        use kapsl_engine_api::{
+            MemoryAllocation, MemoryAllocationClass as C, MemoryAllocationSource as Source,
+            MemoryDomain as D,
+        };
+        let row = |domain: D, class: C, source: Source, bytes: usize, id: &str| MemoryAllocation {
+            allocation_id: id.to_string(),
+            domain,
+            class,
+            source,
+            bytes,
+        };
+        let mut allocations = Vec::new();
+        for &device_id in device_ids {
+            let cuda = || D::Cuda { device_id };
+            allocations.push(row(
+                cuda(),
+                C::PersistentWeights,
+                Source::BackendManaged,
+                QWEN_FILE,
+                "w",
+            ));
+            allocations.push(row(
+                cuda(),
+                C::TransientWorkspace,
+                Source::BackendManaged,
+                QWEN_SCRATCH,
+                "s",
+            ));
+            allocations.push(row(
+                cuda(),
+                C::KvCache,
+                Source::BackendManaged,
+                QWEN_NATIVE_KV,
+                "kv",
+            ));
+        }
+        if with_host {
+            allocations.push(row(
+                D::Host,
+                C::ModelSession,
+                Source::BackendManaged,
+                93_592_576,
+                "h",
+            ));
+        }
+        // A pool-owned KV row is the runtime's, never the parent's to charge for a child.
+        allocations.push(row(
+            D::Cuda {
+                device_id: device_ids[0],
+            },
+            C::KvCache,
+            Source::RuntimeManaged,
+            0,
+            "pool-kv",
+        ));
+        MemoryReport { allocations }
+    }
+
+    fn cuda_total(report: &MemoryReport, device_id: usize) -> usize {
+        report
+            .allocations
+            .iter()
+            .filter(|a| a.domain == kapsl_engine_api::MemoryDomain::Cuda { device_id })
+            .map(|a| a.bytes)
+            .sum()
+    }
+
+    #[test]
+    fn an_isolated_gguf_worker_is_leased_at_the_in_process_plan() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(QWEN_FILE as u64).unwrap();
+        let domains = [MemoryDomain::Cuda { device_id: 0 }];
+        // What the file-size estimate held in run 9.
+        let estimate = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            1,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cuda_total(&estimate, 0), 882_685_496);
+
+        let planned = gguf_plan(&[0], true);
+        let (report, notes) = isolated_worker_report_from_plan(&planned, &estimate, &domains, 1, 0);
+        assert!(notes.is_empty(), "nothing fell back: {notes:?}");
+        assert_eq!(cuda_total(&report, 0), 2_030_401_376, "the in-process plan");
+        assert!(
+            cuda_total(&report, 0) > cuda_total(&estimate, 0),
+            "KV and compute buffers are no longer left out"
+        );
+        // Only the worker's own domain, only what a backend manages itself.
+        assert!(report.allocations.iter().all(|a| a.domain
+            == kapsl_engine_api::MemoryDomain::Cuda { device_id: 0 }
+            && a.source == kapsl_engine_api::MemoryAllocationSource::BackendManaged
+            && a.allocation_id.starts_with("isolated-worker:1:0:cuda:0:")));
+        // One row per class, with distinct ids (the ledger keys on them).
+        let ids: std::collections::HashSet<_> = report
+            .allocations
+            .iter()
+            .map(|a| a.allocation_id.clone())
+            .collect();
+        assert_eq!(ids.len(), report.allocations.len());
+    }
+
+    #[test]
+    fn an_isolated_gguf_report_follows_the_devices_the_worker_uses() {
+        let planned = gguf_plan(&[0, 1], true);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(QWEN_FILE as u64).unwrap();
+        let both = [
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+            MemoryDomain::Host,
+        ];
+        let estimate_for = |domains: &[MemoryDomain]| {
+            isolated_worker_memory_report(
+                file.path(),
+                domains,
+                2,
+                1,
+                EngineKind::GgufGenerate,
+                1,
+                false,
+            )
+            .unwrap()
+        };
+        let (report, notes) =
+            isolated_worker_report_from_plan(&planned, &estimate_for(&both), &both, 2, 1);
+        // The plan's single host row is a model row; its workspace comes from the estimate.
+        assert_eq!(
+            notes,
+            vec!["host workspace from the file-size estimate".to_string()]
+        );
+        assert_eq!(cuda_total(&report, 0), 2_030_401_376);
+        assert_eq!(cuda_total(&report, 1), 2_030_401_376);
+        assert!(report
+            .allocations
+            .iter()
+            .any(|a| a.domain == kapsl_engine_api::MemoryDomain::Host));
+        let one = [MemoryDomain::Cuda { device_id: 1 }];
+        let (only_one, _) =
+            isolated_worker_report_from_plan(&planned, &estimate_for(&one), &one, 2, 1);
+        assert_eq!(cuda_total(&only_one, 0), 0, "device 0 is not the worker's");
+        assert_eq!(cuda_total(&only_one, 1), 2_030_401_376);
+    }
+
+    #[test]
+    fn a_worker_domain_the_plan_leaves_empty_takes_the_estimate_rows() {
+        // The plan places everything on cuda:0; the worker also uses cuda:1 (another ordinal,
+        // or `KAPSL_GGUF_N_GPU_LAYERS=0`). An empty domain would get runtime-managed CUDA
+        // claims from the authority, which are refused without an admitted pool workload.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(QWEN_FILE as u64).unwrap();
+        let domains = [
+            MemoryDomain::Cuda { device_id: 0 },
+            MemoryDomain::Cuda { device_id: 1 },
+        ];
+        let estimate = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            3,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        let planned = gguf_plan(&[0], false);
+        let (report, notes) = isolated_worker_report_from_plan(&planned, &estimate, &domains, 3, 0);
+        assert_eq!(
+            cuda_total(&report, 0),
+            2_030_401_376,
+            "the planned device keeps its plan"
+        );
+        assert_eq!(
+            cuda_total(&report, 1),
+            cuda_total(&estimate, 1),
+            "the empty device takes the estimate"
+        );
+        assert_eq!(notes.len(), 2, "a note per missing row: {notes:?}");
+        assert!(notes.iter().all(|note| note.starts_with("cuda:1 ")));
+        // Every worker domain now has a model row and a workspace row.
+        for device_id in [0usize, 1] {
+            let domain = kapsl_engine_api::MemoryDomain::Cuda { device_id };
+            assert!(report.allocations.iter().any(|a| a.domain == domain
+                && a.class == kapsl_engine_api::MemoryAllocationClass::PersistentWeights));
+            assert!(report.allocations.iter().any(|a| a.domain == domain
+                && a.class == kapsl_engine_api::MemoryAllocationClass::TransientWorkspace));
+        }
+    }
+
+    #[test]
+    fn a_plan_that_only_holds_host_rows_leaves_a_cuda_worker_on_the_estimate() {
+        // Every layer on the CPU: the backend plans host rows only, whatever the worker's domain.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(QWEN_FILE as u64).unwrap();
+        let domains = [MemoryDomain::Cuda { device_id: 0 }];
+        let estimate = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            4,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        let host_only = MemoryReport {
+            allocations: vec![kapsl_engine_api::MemoryAllocation {
+                allocation_id: "h".into(),
+                domain: kapsl_engine_api::MemoryDomain::Host,
+                class: kapsl_engine_api::MemoryAllocationClass::ModelSession,
+                source: kapsl_engine_api::MemoryAllocationSource::BackendManaged,
+                bytes: QWEN_FILE,
+            }],
+        };
+        let (report, notes) =
+            isolated_worker_report_from_plan(&host_only, &estimate, &domains, 4, 0);
+        assert_eq!(cuda_total(&report, 0), cuda_total(&estimate, 0));
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(report
+            .allocations
+            .iter()
+            .all(|a| a.domain == kapsl_engine_api::MemoryDomain::Cuda { device_id: 0 }));
+    }
+
+    #[test]
+    fn the_reservation_line_says_where_the_bytes_came_from() {
+        let planned = gguf_plan(&[0], false);
+        let domains = [MemoryDomain::Cuda { device_id: 0 }];
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(QWEN_FILE as u64).unwrap();
+        let estimate = isolated_worker_memory_report(
+            file.path(),
+            &domains,
+            5,
+            2,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        let (report, notes) = isolated_worker_report_from_plan(&planned, &estimate, &domains, 5, 2);
+        let line = isolated_reservation_line(5, 2, "planned", &report, &notes);
+        assert!(line.starts_with("[memory-authority] isolated worker 5/2 reservation: source=planned total=2030401376 rows=["), "{line}");
+        assert!(
+            line.contains("cuda:0:persistentweights=491400032"),
+            "{line}"
+        );
+        assert!(
+            line.contains("cuda:0:transientworkspace=703727104"),
+            "{line}"
+        );
+        assert!(line.contains("cuda:0:kvcache=835274240"), "{line}");
+        assert!(line.ends_with("notes=[]"), "{line}");
+        let fallback = isolated_reservation_line(
+            5,
+            2,
+            "estimate",
+            &estimate,
+            &["planning on cuda:0 failed (stat GGUF model)".to_string()],
+        );
+        assert!(fallback.contains("source=estimate"), "{fallback}");
+        assert!(
+            fallback.contains("notes=[planning on cuda:0 failed (stat GGUF model)]"),
+            "{fallback}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_planned_isolated_worker_is_leased_at_the_plan_and_released_with_it() {
+        let resources = RuntimeResources::new(&roomy_host_info()).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(64 * MIB as u64).unwrap();
+        let owner = MemoryOwner::new(73, 0);
+        let used = |resources: &Arc<RuntimeResources>| {
+            resources
+                .memory()
+                .snapshot()
+                .rows
+                .iter()
+                .filter(|row| row.owner == owner)
+                .map(|row| row.reserved_bytes.max(row.committed_bytes))
+                .sum::<usize>()
+        };
+        // A host-domain plan: a 300 MiB session row and a 700 MiB workspace row.
+        let planned = MemoryReport {
+            allocations: vec![
+                kapsl_engine_api::MemoryAllocation {
+                    allocation_id: "w".into(),
+                    domain: kapsl_engine_api::MemoryDomain::Host,
+                    class: kapsl_engine_api::MemoryAllocationClass::ModelSession,
+                    source: kapsl_engine_api::MemoryAllocationSource::BackendManaged,
+                    bytes: 300 * MIB,
+                },
+                kapsl_engine_api::MemoryAllocation {
+                    allocation_id: "s".into(),
+                    domain: kapsl_engine_api::MemoryDomain::Host,
+                    class: kapsl_engine_api::MemoryAllocationClass::TransientWorkspace,
+                    source: kapsl_engine_api::MemoryAllocationSource::BackendManaged,
+                    bytes: 700 * MIB,
+                },
+            ],
+        };
+        let memory = reserve_isolated_worker_memory(
+            file.path(),
+            &[MemoryDomain::Host],
+            &resources,
+            73,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+            1,
+            Ok(&planned),
+        )
+        .await
+        .expect("fits");
+        assert_eq!(
+            used(&resources),
+            1000 * MIB,
+            "the lease is the plan, not the file estimate"
+        );
+        drop(memory);
+        assert_eq!(used(&resources), 0);
+    }
+
     #[tokio::test]
     async fn an_isolated_worker_holds_a_parent_lease_until_it_exits() {
         let resources = RuntimeResources::new(&roomy_host_info()).unwrap();
@@ -1746,6 +2391,7 @@ mod tests {
             1,
             false,
             1,
+            Err("test: no plan"),
         )
         .await
         .expect("a 64 MiB model fits a 64 GiB host");
@@ -1775,6 +2421,7 @@ mod tests {
             1,
             false,
             1,
+            Err("test: no plan"),
         )
         .await
         .err()
@@ -1782,6 +2429,266 @@ mod tests {
         assert!(
             error.downcast_ref::<MemoryAdmissionFailure>().is_some(),
             "typed, so the API answers 409 and the arbiter may reclaim: {error}"
+        );
+    }
+
+    // ---- real-GGUF checks of the planning backend the parent builds for an isolated worker (opt-in)
+    //
+    //   KAPSL_GGUF_N_GPU_LAYERS=0 KAPSL_TEST_GGUF=/path/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+    //     cargo test -p kapsl --features gpu-device-pool real_gguf_planning -- --ignored --test-threads=1 --nocapture
+    #[cfg(feature = "gpu-device-pool")]
+    fn real_gguf() -> PathBuf {
+        PathBuf::from(
+            std::env::var("KAPSL_TEST_GGUF").expect("set KAPSL_TEST_GGUF to a .gguf path"),
+        )
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    fn gguf_manifest() -> Manifest {
+        serde_json::from_value(serde_json::json!({
+            "project_name": "qwen-test",
+            "framework": "gguf",
+            "version": "1.0.0",
+            "created_at": "2026-11-22",
+            "model_file": "model.gguf",
+            "hardware_requirements": { "preferred_provider": "cpu" },
+        }))
+        .expect("a GGUF manifest")
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    fn backend_managed_total(
+        report: &MemoryReport,
+        domain: &kapsl_engine_api::MemoryDomain,
+    ) -> usize {
+        report
+            .allocations
+            .iter()
+            .filter(|a| {
+                &a.domain == domain
+                    && a.source == kapsl_engine_api::MemoryAllocationSource::BackendManaged
+            })
+            .map(|a| a.bytes)
+            .sum()
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    #[tokio::test]
+    #[ignore = "needs KAPSL_TEST_GGUF (real GGUF, CPU)"]
+    async fn real_gguf_planning_a_cpu_isolated_worker_is_leased_at_its_backends_planned_memory() {
+        let path = real_gguf();
+        let info = roomy_host_info();
+        let resources = RuntimeResources::new(&info).unwrap();
+        let manifest = gguf_manifest();
+        // What the backend itself plans for an in-process load (built without a pool, as the worker is).
+        let direct = create_runtime_backend_for_device_with_pool(
+            &manifest, None, "cpu", 0, &info, None, &resources, 7, 0, false,
+        )
+        .expect("a GGUF backend is built on the CPU")
+        .planned_memory(&path)
+        .expect("planned_memory on a real GGUF");
+        let host = kapsl_engine_api::MemoryDomain::Host;
+        let direct_host = backend_managed_total(&direct, &host);
+        eprintln!(
+            "planned_memory rows: {:?}",
+            direct
+                .allocations
+                .iter()
+                .map(|a| (
+                    format!("{:?}", a.domain),
+                    format!("{:?}", a.class),
+                    a.source,
+                    a.bytes
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            direct_host > 0,
+            "the backend plans host memory for a CPU GGUF"
+        );
+
+        // The helper (no CUDA domain: the host is planned once) returns the same plan.
+        let domains = [MemoryDomain::Host];
+        let planned = planned_gguf_report_for_worker(
+            &manifest, None, &domains, &info, None, &resources, 7, 0, &path,
+        )
+        .expect("planned_gguf_report_for_worker on a real GGUF");
+        assert_eq!(backend_managed_total(&planned, &host), direct_host);
+
+        // The reservation it becomes equals that plan to the byte (nothing fell back) ...
+        let estimate = isolated_worker_memory_report(
+            &path,
+            &domains,
+            7,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        let (report, notes) = isolated_worker_report_from_plan(&planned, &estimate, &domains, 7, 0);
+        eprintln!(
+            "{}",
+            isolated_reservation_line(7, 0, "planned", &report, &notes)
+        );
+        let reserved: usize = report.allocations.iter().map(|a| a.bytes).sum();
+        let from_plan = estimate_notes_free(&notes, reserved, direct_host, &estimate);
+        assert!(
+            from_plan,
+            "reserved {reserved} B, backend planned {direct_host} B, notes {notes:?}"
+        );
+
+        // ... and so does the lease the authority holds, released with the worker.
+        let owner = MemoryOwner::new(7, 0);
+        let used = |resources: &Arc<RuntimeResources>| {
+            resources
+                .memory()
+                .snapshot()
+                .rows
+                .iter()
+                .filter(|row| row.owner == owner)
+                .map(|row| row.reserved_bytes.max(row.committed_bytes))
+                .sum::<usize>()
+        };
+        let lease = reserve_isolated_worker_memory(
+            &path,
+            &domains,
+            &resources,
+            7,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+            1,
+            Ok(&planned),
+        )
+        .await
+        .expect("a 0.5B model fits a 64 GiB host");
+        assert_eq!(used(&resources), reserved, "the lease is the reservation");
+        drop(lease);
+        assert_eq!(used(&resources), 0);
+    }
+
+    /// The reservation equals the backend's plan when no row fell back; when the plan lacked a workspace
+    /// row the estimate filled exactly that row.
+    #[cfg(feature = "gpu-device-pool")]
+    fn estimate_notes_free(
+        notes: &[String],
+        reserved: usize,
+        planned_host: usize,
+        estimate: &MemoryReport,
+    ) -> bool {
+        if notes.is_empty() {
+            return reserved == planned_host;
+        }
+        let ws: usize = estimate
+            .allocations
+            .iter()
+            .filter(|a| a.class == kapsl_engine_api::MemoryAllocationClass::TransientWorkspace)
+            .map(|a| a.bytes)
+            .sum();
+        notes.len() == 1 && reserved == planned_host + ws
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    #[ignore = "needs KAPSL_TEST_GGUF (real GGUF, CPU)"]
+    fn real_gguf_planning_a_cuda_worker_on_a_cpu_build_falls_back_to_the_estimate_per_domain() {
+        let path = real_gguf();
+        let info = roomy_host_info();
+        let resources = RuntimeResources::new(&info).unwrap();
+        let manifest = gguf_manifest();
+        let domains = [MemoryDomain::Cuda { device_id: 0 }];
+        let estimate = isolated_worker_memory_report(
+            &path,
+            &domains,
+            8,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        let cuda = kapsl_engine_api::MemoryDomain::Cuda { device_id: 0 };
+        match planned_gguf_report_for_worker(
+            &manifest, None, &domains, &info, None, &resources, 8, 0, &path,
+        ) {
+            Err(reason) => {
+                eprintln!("planning refused (warning logged): {reason}");
+                assert!(!reason.is_empty());
+            }
+            Ok(planned) => {
+                // A CPU build places nothing on a CUDA ordinal: the domain must not be left empty.
+                let (report, notes) =
+                    isolated_worker_report_from_plan(&planned, &estimate, &domains, 8, 0);
+                eprintln!(
+                    "{}",
+                    isolated_reservation_line(8, 0, "planned+estimate", &report, &notes)
+                );
+                assert_eq!(
+                    backend_managed_total(&report, &cuda),
+                    backend_managed_total(&estimate, &cuda),
+                    "a CUDA worker domain with no planned rows reserves the estimate (notes {notes:?})"
+                );
+                assert!(!notes.is_empty());
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    #[ignore = "needs KAPSL_TEST_GGUF (real GGUF, CPU)"]
+    fn real_gguf_planning_a_model_that_cannot_be_planned_keeps_the_estimate() {
+        let real = real_gguf();
+        let info = roomy_host_info();
+        let resources = RuntimeResources::new(&info).unwrap();
+        let manifest = gguf_manifest();
+        // `planned_memory` stats the file: a path that is gone cannot be planned.
+        let gone = real.with_file_name("no-such-model.gguf");
+        let err = planned_gguf_report_for_worker(
+            &manifest,
+            None,
+            &[MemoryDomain::Host],
+            &info,
+            None,
+            &resources,
+            9,
+            0,
+            &gone,
+        )
+        .expect_err("a missing model cannot be planned");
+        assert!(err.contains("planning on cpu:0 failed"), "{err}");
+        // A model that is not GGUF is not planned from a backend at all.
+        let mut onnx = gguf_manifest();
+        onnx.framework = "onnx".to_string();
+        let err = planned_gguf_report_for_worker(
+            &onnx,
+            None,
+            &[MemoryDomain::Host],
+            &info,
+            None,
+            &resources,
+            9,
+            0,
+            &real,
+        )
+        .expect_err("not GGUF");
+        assert!(err.contains("not a GGUF model"), "{err}");
+        // The reservation then reports the estimate, and says why.
+        let estimate = isolated_worker_memory_report(
+            &real,
+            &[MemoryDomain::Host],
+            9,
+            0,
+            EngineKind::GgufGenerate,
+            1,
+            false,
+        )
+        .unwrap();
+        let line = isolated_reservation_line(9, 0, "estimate", &estimate, &[err]);
+        assert!(
+            line.contains("source=estimate") && line.contains("notes=[not a GGUF model"),
+            "{line}"
         );
     }
 }

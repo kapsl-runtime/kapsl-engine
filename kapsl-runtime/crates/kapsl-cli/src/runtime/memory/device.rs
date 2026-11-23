@@ -1077,8 +1077,15 @@ impl DeviceMemoryManager {
                 claim.domain
             ));
         };
-        let pools = self.pools.lock().unwrap();
-        let Some(pool) = pools.get(&device_id) else {
+        let pool = self.pools.lock().unwrap().get(&device_id).cloned();
+        let Some(pool) = pool else {
+            // Pooling disabled (`KAPSL_GPU_DEVICE_POOL_DISABLED`, as every isolated worker
+            // runs): the device keeps its ledger but has no workload quota to bound a request
+            // by, so a running model's request is bounded by the authority's own rows alone.
+            // Only a device this manager does not account at all is an error.
+            if self.budget.lock().unwrap().snapshot(device_id).is_some() {
+                return Ok(None);
+            }
             return Err(format!(
                 "runtime-managed CUDA claim for {} targets device {} without a physical pool",
                 claim.owner, device_id
@@ -1121,6 +1128,10 @@ impl DeviceMemoryManager {
             return Ok(None);
         }
         if matches!(claim.source, MemoryClaimSource::Runtime { .. }) {
+            if !self.has_pool(device_id) && self.runtime_allocatable(claim)?.is_none() {
+                // An accounted device with no pool: nothing here to bound or charge.
+                return Ok(None);
+            }
             let allocatable = self.runtime_allocatable(claim)?.ok_or_else(|| {
                 format!(
                     "runtime-managed CUDA claim for {} targets device {} without an admitted pool workload",
@@ -1992,6 +2003,16 @@ impl DeviceMemoryLease {
         self.memory_owner
     }
 
+    /// Whether the device ledger already carries this backend allocation as a
+    /// charge owned by this lease. `reconcile_report` sets such a charge to the
+    /// reported bytes (absolute), so a row made of these allocations must not
+    /// be charged again when the authority's own row grows to match.
+    pub(crate) fn charges_allocation(&self, allocation_id: &str) -> bool {
+        self.reservations.iter().any(|reservation| {
+            reservation.owns_charge && reservation.allocation_id == allocation_id
+        })
+    }
+
     pub(crate) fn reconcile_report(
         &mut self,
         report: &ExternalDeviceMemoryReport,
@@ -2321,6 +2342,89 @@ fn auto_safe_budget_from_inputs(
     let live_ceiling = declared_bytes.min(free_bytes);
     let driver_reserve = (declared_bytes / 10).max(DRIVER_RESERVE_FLOOR_BYTES);
     (live_ceiling.saturating_sub(driver_reserve), driver_reserve)
+}
+
+/// Ledger-only stand-ins for a CUDA device, so the lease's reconcile paths can be
+/// exercised without a GPU: `admit_transient`, `reconcile_external` and the
+/// lease's release only ever touch the device budget ledger.
+#[cfg(test)]
+impl DeviceMemoryManager {
+    pub(crate) fn for_ledger_tests(device_id: usize, budget: usize, pooled: usize) -> Arc<Self> {
+        let mut ledger = DeviceBudgetLedger::default();
+        ledger.insert_device(device_id, budget, pooled).unwrap();
+        Arc::new(Self {
+            devices: HashMap::new(),
+            pools: Mutex::new(HashMap::new()),
+            budget: Mutex::new(ledger),
+            admission_refs: Mutex::new(HashMap::new()),
+            next_fallback_allocation: AtomicU64::new(0),
+            metrics: Mutex::new(None),
+            runtime_overhead: HashMap::new(),
+        })
+    }
+
+    pub(crate) fn reserve_for_tests(
+        &self,
+        device_id: usize,
+        allocation_id: &str,
+        bytes: usize,
+        owner: MemoryOwner,
+        class: MemoryAllocationClass,
+    ) -> Result<(), String> {
+        self.budget
+            .lock()
+            .unwrap()
+            .reserve_external(device_id, allocation_id, bytes, owner, class)
+            .map(|_| ())
+    }
+
+    pub(crate) fn reconcile_for_tests(
+        &self,
+        device_id: usize,
+        allocation_id: &str,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.reconcile_external(device_id, allocation_id, bytes)
+    }
+
+    pub(crate) fn ledger_used_for_tests(&self, device_id: usize) -> usize {
+        self.budget
+            .lock()
+            .unwrap()
+            .snapshot(device_id)
+            .map_or(0, |snapshot| snapshot.used_bytes())
+    }
+}
+
+#[cfg(test)]
+impl DeviceMemoryLease {
+    /// A lease that owns the ledger charges of `allocation_ids` (already
+    /// reserved in the manager's ledger).
+    pub(crate) fn for_ledger_tests(
+        manager: &Arc<DeviceMemoryManager>,
+        device_id: usize,
+        owner: MemoryOwner,
+        allocation_ids: &[&str],
+    ) -> Self {
+        Self {
+            manager: Arc::clone(manager),
+            device_id,
+            memory_owner: owner,
+            pool_owner: PoolOwner::onnx(
+                owner.model_id,
+                owner.replica_id,
+                PoolAllocationClass::PersistentWeights,
+            ),
+            reservations: allocation_ids
+                .iter()
+                .map(|id| ExternalReservation {
+                    allocation_id: (*id).to_string(),
+                    memory_owner: owner,
+                    owns_charge: true,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]

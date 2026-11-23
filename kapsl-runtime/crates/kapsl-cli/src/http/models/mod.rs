@@ -9,7 +9,7 @@ mod reader;
 mod scaling;
 mod swap;
 
-use infer::{build_model_infer_route, ModelInferRouteConfig};
+pub(crate) use infer::{build_model_infer_route, ModelInferRouteConfig};
 pub(crate) use infer_stream::{build_model_infer_stream_route, ModelInferStreamRouteConfig};
 use lifecycle::{build_model_lifecycle_routes, ModelLifecycleRoutesConfig};
 use reader::{build_model_reader_routes, ModelReaderRoutesConfig};
