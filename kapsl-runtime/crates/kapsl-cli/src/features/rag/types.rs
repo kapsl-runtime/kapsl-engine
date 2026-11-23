@@ -49,8 +49,35 @@ impl RagAugmentError {
 pub(crate) struct InferPayloadEnvelope<T> {
     #[serde(default)]
     pub(crate) rag: Option<InferRagOptions>,
+    /// Top-level generation parameters (`{"input": ..., "max_tokens": 64, "min_tokens": 20}`). They
+    /// are not `InferenceRequest` fields, so the flattened request below would drop them silently.
+    #[serde(default)]
+    pub(crate) max_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) min_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) min_new_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) temperature: Option<f64>,
     #[serde(flatten)]
     pub(crate) request: T,
+}
+
+impl InferPayloadEnvelope<kapsl_engine_api::InferenceRequest> {
+    /// The RAG options and the request, with the top-level generation parameters applied to the
+    /// request's metadata (see `apply_top_level_generation_params`).
+    pub(crate) fn into_parts(
+        self,
+    ) -> (Option<InferRagOptions>, kapsl_engine_api::InferenceRequest) {
+        let mut request = self.request;
+        crate::features::infer_adapter::apply_top_level_generation_params(
+            &mut request,
+            self.max_tokens,
+            self.min_tokens.or(self.min_new_tokens),
+            self.temperature,
+        );
+        (self.rag, request)
+    }
 }
 
 /// Storage-independent query passed to [`super::RagService::query_chunks`].
