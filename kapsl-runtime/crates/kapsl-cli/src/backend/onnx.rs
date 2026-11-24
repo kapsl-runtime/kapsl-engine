@@ -509,6 +509,7 @@ mod tests {
             signature: "fixture".to_string(),
             memory: crate::backend::BackendMemoryManifest::default(),
             installer: crate::backend::BackendInstaller::Extract,
+            files_blake3: None,
             files: std::collections::BTreeMap::new(),
             licenses: Vec::new(),
             priority: 0,

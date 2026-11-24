@@ -275,6 +275,10 @@ pub(crate) struct BackendPackManifest {
     /// Optional hashes for security-sensitive installed files.
     #[serde(default)]
     pub(crate) files: BTreeMap<String, String>,
+    /// Optional complete BLAKE3 digests authenticated by the signed index.
+    /// SHA-256 remains required for installation and older engine versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) files_blake3: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub(crate) licenses: Vec<BackendLicenseNotice>,
     #[serde(default)]
@@ -445,6 +449,82 @@ impl BackendTarget {
             driver_version: cuda.and_then(|device| device.driver_version.clone()),
         }
     }
+
+    /// Parse `<os>-<architecture>-<cpu|cuda|tensorrt>` into a synthetic target
+    /// that names a runtime family rather than a particular host.
+    pub(crate) fn from_triple(requested: &str) -> Result<Self, String> {
+        let (platform, accelerator) = [
+            ("-tensorrt", BackendAccelerator::TensorRt),
+            ("-cuda", BackendAccelerator::Cuda),
+            ("-cpu", BackendAccelerator::Cpu),
+        ]
+        .into_iter()
+        .find_map(|(suffix, accelerator)| {
+            requested
+                .strip_suffix(suffix)
+                .map(|platform| (platform.to_string(), accelerator))
+        })
+        .ok_or_else(|| {
+            format!(
+                "Invalid target `{requested}`; expected <os>-<architecture>-cpu, -cuda, or -tensorrt"
+            )
+        })?;
+        let architecture = platform
+            .rsplit_once('-')
+            .map(|(_, architecture)| architecture.to_string())
+            .ok_or_else(|| format!("Invalid target platform `{platform}`"))?;
+        Ok(Self {
+            platform,
+            architecture,
+            accelerator,
+            // A cross-target names a runtime family, not a particular host.
+            // Actual minimum versions are enforced again on bundle activation.
+            cuda_version: (accelerator != BackendAccelerator::Cpu).then(|| "999.0".to_string()),
+            driver_version: (accelerator != BackendAccelerator::Cpu).then(|| "9999.0".to_string()),
+        })
+    }
+}
+
+/// Whether `backend ensure` should plan for CUDA. An explicit target replaces
+/// hardware probing entirely.
+fn ensure_has_cuda(device_info: &DeviceInfo, requested: Option<&BackendTarget>) -> bool {
+    requested.map_or(device_info.has_cuda, |target| {
+        target.accelerator != BackendAccelerator::Cpu
+    })
+}
+
+fn ensure_onnx_profile(
+    manifest: &kapsl_core::Manifest,
+    device_info: &DeviceInfo,
+    requested: Option<&BackendTarget>,
+) -> Result<Option<OnnxBackendPackProfile>, String> {
+    match requested {
+        Some(target) => crate::backend::onnx_pack_profile_for_target(manifest, target.accelerator),
+        None => crate::backend::onnx_pack_profile_for_manifest(manifest, device_info),
+    }
+}
+
+fn ensure_llama_profile(
+    manifest: &kapsl_core::Manifest,
+    device_info: &DeviceInfo,
+    requested: Option<&BackendTarget>,
+) -> Option<LlamaCppBackendPackProfile> {
+    match requested {
+        Some(target) => {
+            crate::backend::llama_cpp_pack_profile_for_target(manifest, target.accelerator)
+        }
+        None => crate::backend::llama_cpp_pack_profile_for_manifest(manifest, device_info),
+    }
+}
+
+/// Constraints a signed pack declares, for comparison against a host later.
+fn describe_pack_constraints(pack: &BackendPackManifest) -> String {
+    format!(
+        "accelerator={} minimum_cuda={} minimum_driver={}",
+        pack.accelerator_profile,
+        pack.minimum_cuda.as_deref().unwrap_or("none"),
+        pack.minimum_driver.as_deref().unwrap_or("none"),
+    )
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -613,6 +693,7 @@ impl BackendManager {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn plan_onnx(
         &self,
         profile: OnnxBackendPackProfile,
@@ -1653,6 +1734,18 @@ impl BackendManager {
             validate_relative_pack_path("file checksum path", path)?;
             validate_sha256(digest)?;
         }
+        if let Some(files) = &pack.files_blake3 {
+            if !files.keys().eq(pack.files.keys()) {
+                return Err(BackendManagerError::new(
+                    "BLAKE3 file set must exactly match the signed SHA-256 file set",
+                ));
+            }
+            for digest in files.values() {
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(BackendManagerError::new("invalid BLAKE3 digest"));
+                }
+            }
+        }
         if !pack.files.contains_key(&pack.entrypoint) {
             return Err(BackendManagerError::new(format!(
                 "backend entrypoint `{}` requires a signed installed-file checksum",
@@ -1741,14 +1834,19 @@ impl BackendManager {
             return Ok(false);
         }
         let started = Instant::now();
-        let valid = checksums::verify_installed_files(&root, &expected.files)?;
+        let (files, algorithm) = match &expected.files_blake3 {
+            Some(files) => (files, checksums::Algorithm::Blake3),
+            None => (&expected.files, checksums::Algorithm::Sha256),
+        };
+        let valid = checksums::verify_installed_files(&root, files, algorithm)?;
         log::debug!(
-            "Installed backend pack checksums {}/{} files={} valid={} elapsed_ms={:.3}",
+            "Installed backend pack checksums {}/{} files={} valid={} elapsed_ms={:.3} algorithm={:?}",
             expected.backend,
             expected.profile,
-            expected.files.len(),
+            files.len(),
             valid,
-            started.elapsed().as_secs_f64() * 1000.0
+            started.elapsed().as_secs_f64() * 1000.0,
+            algorithm
         );
         if !valid {
             return Ok(false);
@@ -1944,6 +2042,19 @@ impl BackendManager {
                 )));
             }
         }
+        // Check both signed digest maps before publishing an installation.
+        // A malformed extension must fail here, not only on the next load.
+        if let Some(files) = &pack.files_blake3 {
+            if !checksums::verify_installed_files(
+                &install_root,
+                files,
+                checksums::Algorithm::Blake3,
+            )? {
+                return Err(BackendManagerError::new(
+                    "installed backend failed BLAKE3 verification",
+                ));
+            }
+        }
         for notice in &pack.licenses {
             if let Some(relative) = notice.path.as_deref() {
                 let path = install_root.join(relative);
@@ -2033,7 +2144,15 @@ pub(crate) fn execute_backend_command(
     match args.command {
         crate::app::BackendSubcommand::Ensure(args) => {
             let device_info = DeviceInfo::probe();
-            let target = BackendTarget::current(&device_info);
+            let requested = args
+                .target
+                .as_deref()
+                .map(BackendTarget::from_triple)
+                .transpose()?;
+            let target = requested
+                .clone()
+                .unwrap_or_else(|| BackendTarget::current(&device_info));
+            let has_cuda = ensure_has_cuda(&device_info, requested.as_ref());
             let model_paths = crate::backend::expand_run_bundles(&args.model, &device_info)?;
             let manager = BackendManager::from_env(args.offline)?;
             let mut ensured = HashSet::<(String, String)>::new();
@@ -2046,8 +2165,7 @@ pub(crate) fn execute_backend_command(
                 })?;
                 let manifest = crate::backend::inspect_serving_manifest(&absolute)?;
                 crate::backend::validate_model_contract(&manifest)?;
-                let decision =
-                    crate::backend::resolve_serving_backend(&manifest, device_info.has_cuda)?;
+                let decision = crate::backend::resolve_serving_backend(&manifest, has_cuda)?;
                 crate::backend::validate_runtime_serving_backend(&manifest, decision)?;
                 let memory = crate::backend::preliminary_memory_admission(
                     &absolute,
@@ -2055,7 +2173,11 @@ pub(crate) fn execute_backend_command(
                     decision,
                     &device_info,
                 )?;
-                if memory.status == crate::backend::MemoryAdmissionStatus::Rejected {
+                // An explicit target is prepared on a host that need not own the
+                // accelerator, so admission is deferred to the serving host.
+                if requested.is_none()
+                    && memory.status == crate::backend::MemoryAdmissionStatus::Rejected
+                {
                     return Err(format!(
                         "preliminary memory admission rejected `{}` before backend download: {}",
                         manifest.project_name, memory.reason
@@ -2064,8 +2186,14 @@ pub(crate) fn execute_backend_command(
                 }
                 let uses_onnx = kapsl_core::EngineKind::resolve(&manifest).uses_onnx_session();
                 let signed_onnx_route = crate::backend::generic_native_backend_packs_enabled()?;
+                let lazy_onnx = match requested.as_ref() {
+                    Some(target) => {
+                        crate::backend::onnx_lazy_packs_supported_for_platform(&target.platform)
+                    }
+                    None => crate::backend::lazy_onnx_packs_enabled(),
+                };
                 let onnx_profile = if uses_onnx && signed_onnx_route {
-                    if !crate::backend::lazy_onnx_packs_enabled() {
+                    if !lazy_onnx {
                         return Err(format!(
                             "model `{}` requires a signed native backend pack, but ONNX pack installation is disabled or unsupported on {}; set {}=0 only for an explicit embedded ORT rollback",
                             manifest.project_name,
@@ -2074,12 +2202,18 @@ pub(crate) fn execute_backend_command(
                         )
                         .into());
                     }
-                    crate::backend::onnx_pack_profile_for_manifest(&manifest, &device_info)?
+                    ensure_onnx_profile(&manifest, &device_info, requested.as_ref())?
                 } else {
                     None
                 };
-                let llama_profile = if crate::backend::lazy_llama_cpp_packs_enabled() {
-                    crate::backend::llama_cpp_pack_profile_for_manifest(&manifest, &device_info)
+                let lazy_llama = match requested.as_ref() {
+                    Some(target) => crate::backend::llama_cpp_lazy_packs_supported_for_platform(
+                        &target.platform,
+                    ),
+                    None => crate::backend::lazy_llama_cpp_packs_enabled(),
+                };
+                let llama_profile = if lazy_llama {
+                    ensure_llama_profile(&manifest, &device_info, requested.as_ref())
                 } else {
                     None
                 };
@@ -2112,6 +2246,12 @@ pub(crate) fn execute_backend_command(
                             installed.display(),
                             plan.selection_reason
                         );
+                        if requested.is_some() {
+                            println!(
+                                "  constraints: {}",
+                                describe_pack_constraints(&plan.manifest)
+                            );
+                        }
                     }
                 } else if let Some(profile) = llama_profile {
                     let identity = ("llama-cpp".to_string(), profile.profile().to_string());
@@ -2123,20 +2263,22 @@ pub(crate) fn execute_backend_command(
                             llama_target.driver_version = None;
                         }
                         let plan = manager.plan_llama_cpp(profile, &llama_target)?;
-                        let admission = crate::backend::preliminary_llama_cpp_memory_admission(
-                            profile,
-                            &absolute,
-                            &manifest,
-                            &device_info,
-                            &plan.manifest,
-                            None,
-                        )?;
-                        if admission.status == crate::backend::MemoryAdmissionStatus::Rejected {
-                            return Err(format!(
-                                "preliminary memory admission rejected `{}` before backend download: {}",
-                                manifest.project_name, admission.reason
-                            )
-                            .into());
+                        if requested.is_none() {
+                            let admission = crate::backend::preliminary_llama_cpp_memory_admission(
+                                profile,
+                                &absolute,
+                                &manifest,
+                                &device_info,
+                                &plan.manifest,
+                                None,
+                            )?;
+                            if admission.status == crate::backend::MemoryAdmissionStatus::Rejected {
+                                return Err(format!(
+                                    "preliminary memory admission rejected `{}` before backend download: {}",
+                                    manifest.project_name, admission.reason
+                                )
+                                .into());
+                            }
                         }
                         let installed = manager.ensure_pack(&plan.manifest)?;
                         println!(
@@ -2144,6 +2286,12 @@ pub(crate) fn execute_backend_command(
                             profile.profile(),
                             installed.display()
                         );
+                        if requested.is_some() {
+                            println!(
+                                "  constraints: {}",
+                                describe_pack_constraints(&plan.manifest)
+                            );
+                        }
                     }
                 } else if uses_onnx && !signed_onnx_route {
                     let reason = crate::backend::embedded_onnx_rollback_reason(&manifest)?;
@@ -2943,6 +3091,7 @@ mod tests {
             signature: sign_artifact(&signing, &digest),
             memory: BackendMemoryManifest::default(),
             installer: BackendInstaller::Extract,
+            files_blake3: None,
             files: BTreeMap::from([("bin/python".to_string(), executable_digest)]),
             licenses: Vec::new(),
             priority: 1,
@@ -3043,6 +3192,135 @@ mod tests {
             synchronize_before_free: uses_device,
         };
         pack
+    }
+
+    fn add_signed_blake3(root: &Path, pack: &mut BackendPackManifest, signing: &SigningKey) {
+        pack.files_blake3 = Some(BTreeMap::from([(
+            pack.entrypoint.clone(),
+            blake3::hash(b"#!/bin/sh\nexit 0\n").to_hex().to_string(),
+        )]));
+        let index = BackendIndex {
+            schema_version: BACKEND_INDEX_SCHEMA_VERSION,
+            runtime_version: "0.2.3".into(),
+            generated_at: "2026-09-19T00:00:00Z".into(),
+            packs: vec![pack.clone()],
+        };
+        let bytes = serde_json::to_vec(&index).unwrap();
+        fs::write(root.join("backend-index.json"), &bytes).unwrap();
+        fs::write(
+            root.join("backend-index.json.sig"),
+            sign_index(signing, &bytes),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_manifest_omits_blake3_and_round_trips_unchanged() {
+        let (_root, manager, pack, _) = fixture();
+        let bytes = serde_json::to_vec(&pack).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("files_blake3"));
+        let restored: BackendPackManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored, pack);
+        let path = manager.ensure_pack(&restored).unwrap();
+        fs::write(path.join(&restored.entrypoint), b"tampered").unwrap();
+        assert!(!manager.installed_pack_is_valid(&restored).unwrap());
+    }
+
+    #[test]
+    fn blake3_requires_the_complete_legacy_file_set_and_valid_digests() {
+        let (root, manager, mut pack, signing) = fixture();
+        add_signed_blake3(root.path(), &mut pack, &signing);
+        manager.validate_pack_manifest(&pack, None).unwrap();
+        for invalid in [
+            BTreeMap::new(),
+            BTreeMap::from([("extra".into(), "00".repeat(32))]),
+            BTreeMap::from([(pack.entrypoint.clone(), "z".repeat(64))]),
+            BTreeMap::from([(pack.entrypoint.clone(), "00".repeat(31))]),
+            BTreeMap::from([(pack.entrypoint.clone(), "00".repeat(33))]),
+        ] {
+            let mut invalid_pack = pack.clone();
+            invalid_pack.files_blake3 = Some(invalid);
+            assert!(manager.validate_pack_manifest(&invalid_pack, None).is_err());
+        }
+        let mut invalid_pack = pack.clone();
+        invalid_pack
+            .files_blake3
+            .as_mut()
+            .unwrap()
+            .insert("../escape".into(), "00".repeat(32));
+        invalid_pack
+            .files
+            .insert("../escape".into(), "00".repeat(32));
+        assert!(manager.validate_pack_manifest(&invalid_pack, None).is_err());
+    }
+
+    #[test]
+    fn installed_blake3_is_bound_to_the_signed_index_not_the_receipt() {
+        let (root, manager, mut pack, signing) = fixture();
+        add_signed_blake3(root.path(), &mut pack, &signing);
+        let plan = manager.plan_vllm(&cuda_target()).unwrap();
+        assert_eq!(plan.manifest, pack);
+        let installed = manager.ensure_pack(&plan.manifest).unwrap();
+        assert!(manager.list().unwrap()[0].valid);
+        assert!(manager.installed_pack_is_valid(&pack).unwrap());
+        fs::write(installed.join(&pack.entrypoint), b"#!/bin/sh\nexit 1\n").unwrap();
+        assert!(!manager.installed_pack_is_valid(&pack).unwrap());
+        let receipt = installed.join(INSTALL_RECORD_NAME);
+        let mut record: InstalledPackRecord =
+            read_json_bounded(&receipt, MAX_MANIFEST_BYTES).unwrap();
+        record.manifest.files_blake3.as_mut().unwrap().insert(
+            pack.entrypoint.clone(),
+            blake3::hash(b"#!/bin/sh\nexit 1\n").to_hex().to_string(),
+        );
+        fs::write(receipt, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(!manager.list().unwrap()[0].valid);
+        assert!(!manager.installed_pack_is_valid(&pack).unwrap());
+    }
+
+    #[test]
+    fn changing_blake3_index_bytes_invalidates_the_signature() {
+        let (root, manager, mut pack, signing) = fixture();
+        add_signed_blake3(root.path(), &mut pack, &signing);
+        let path = root.path().join("backend-index.json");
+        let mut index: BackendIndex = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        index.packs[0].files_blake3 = None;
+        let bytes = serde_json::to_vec(&index).unwrap();
+        let signature = fs::read_to_string(root.path().join("backend-index.json.sig")).unwrap();
+        assert!(manager
+            .verify_index_bytes(&bytes, &signature)
+            .unwrap_err()
+            .to_string()
+            .contains("signature"));
+    }
+
+    #[test]
+    fn installation_checks_both_signed_digest_maps() {
+        for corrupt_blake3 in [true, false] {
+            let (root, manager, mut pack, signing) = fixture();
+            add_signed_blake3(root.path(), &mut pack, &signing);
+            let files = if corrupt_blake3 {
+                pack.files_blake3.as_mut().unwrap()
+            } else {
+                &mut pack.files
+            };
+            files.insert(pack.entrypoint.clone(), "00".repeat(32));
+            assert!(manager.ensure_pack(&pack).is_err());
+            assert!(!manager.installed_path(&pack).unwrap().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blake3_does_not_allow_an_escaping_symlink_with_matching_bytes() {
+        use std::os::unix::fs::symlink;
+        let (root, manager, mut pack, signing) = fixture();
+        add_signed_blake3(root.path(), &mut pack, &signing);
+        let installed = manager.ensure_pack(&pack).unwrap();
+        let external = root.path().join("external-python");
+        fs::copy(installed.join(&pack.entrypoint), &external).unwrap();
+        fs::remove_file(installed.join(&pack.entrypoint)).unwrap();
+        symlink(external, installed.join(&pack.entrypoint)).unwrap();
+        assert!(!manager.installed_pack_is_valid(&pack).unwrap());
     }
 
     #[test]
@@ -3572,5 +3850,122 @@ mod tests {
         assert!(version_at_least("13.0", "12.6"));
         assert!(version_at_least("580.10.2", "580.9"));
         assert!(!version_at_least("12.1", "12.10"));
+    }
+    fn no_gpu_device_info() -> DeviceInfo {
+        DeviceInfo {
+            cpu_cores: 1,
+            total_memory: 0,
+            os_type: "test".to_string(),
+            os_release: "test".to_string(),
+            has_cuda: false,
+            has_metal: false,
+            has_rocm: false,
+            has_directml: false,
+            devices: Vec::new(),
+        }
+    }
+
+    fn cuda_preferring_onnx_manifest() -> kapsl_core::Manifest {
+        kapsl_core::Manifest {
+            project_name: "ensure-target-test".to_string(),
+            framework: "onnx".to_string(),
+            version: "1.0.0".to_string(),
+            created_at: "2026-08-25T00:00:00Z".to_string(),
+            format: Some("onnx".to_string()),
+            model_type: Some("embedding".to_string()),
+            task: Some("embed".to_string()),
+            model_file: "model.onnx".to_string(),
+            metadata: None,
+            hardware_requirements: kapsl_core::HardwareRequirements {
+                preferred_provider: Some("cuda".to_string()),
+                fallback_providers: vec!["cpu".to_string()],
+                ..kapsl_core::HardwareRequirements::default()
+            },
+            cron_jobs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parses_explicit_target_triples() {
+        let cuda = BackendTarget::from_triple("linux-x86_64-cuda").unwrap();
+        assert_eq!(cuda.platform, "linux-x86_64");
+        assert_eq!(cuda.architecture, "x86_64");
+        assert_eq!(cuda.accelerator, BackendAccelerator::Cuda);
+        // Synthetic targets satisfy any minimum; packs declare the real floor.
+        assert_eq!(cuda.cuda_version.as_deref(), Some("999.0"));
+        assert_eq!(cuda.driver_version.as_deref(), Some("9999.0"));
+
+        let cpu = BackendTarget::from_triple("linux-aarch64-cpu").unwrap();
+        assert_eq!(cpu.platform, "linux-aarch64");
+        assert_eq!(cpu.accelerator, BackendAccelerator::Cpu);
+        assert_eq!(cpu.cuda_version, None);
+        assert_eq!(cpu.driver_version, None);
+
+        let trt = BackendTarget::from_triple("linux-x86_64-tensorrt").unwrap();
+        assert_eq!(trt.accelerator, BackendAccelerator::TensorRt);
+    }
+
+    #[test]
+    fn rejects_malformed_target_triples() {
+        for bad in ["", "cuda", "-cuda", "linux-x86_64", "linux-x86_64-rocm"] {
+            assert!(BackendTarget::from_triple(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_cuda_target_selects_cuda_pack_without_a_gpu() {
+        let info = no_gpu_device_info();
+        let manifest = cuda_preferring_onnx_manifest();
+        let target = BackendTarget::from_triple("linux-x86_64-cuda").unwrap();
+
+        assert!(ensure_has_cuda(&info, Some(&target)));
+        assert_eq!(
+            ensure_onnx_profile(&manifest, &info, Some(&target)).unwrap(),
+            Some(OnnxBackendPackProfile::Cuda12)
+        );
+    }
+
+    #[test]
+    fn no_target_keeps_probed_device_selection() {
+        let info = no_gpu_device_info();
+        let manifest = cuda_preferring_onnx_manifest();
+
+        assert!(!ensure_has_cuda(&info, None));
+        assert_eq!(
+            ensure_onnx_profile(&manifest, &info, None),
+            crate::backend::onnx_pack_profile_for_manifest(&manifest, &info)
+        );
+    }
+
+    #[test]
+    fn explicit_cpu_target_selects_cpu_pack_even_for_cuda_preferring_model() {
+        let info = no_gpu_device_info();
+        let manifest = cuda_preferring_onnx_manifest();
+        let target = BackendTarget::from_triple("linux-x86_64-cpu").unwrap();
+
+        assert!(!ensure_has_cuda(&info, Some(&target)));
+        assert_eq!(
+            ensure_onnx_profile(&manifest, &info, Some(&target)).unwrap(),
+            Some(OnnxBackendPackProfile::Cpu)
+        );
+    }
+
+    #[test]
+    fn describes_declared_pack_constraints() {
+        let (_root, _manager, mut pack, _signing) = fixture();
+        pack.accelerator_profile = "cuda".to_string();
+        pack.minimum_cuda = Some("12.0".to_string());
+        pack.minimum_driver = Some("525.60".to_string());
+        assert_eq!(
+            describe_pack_constraints(&pack),
+            "accelerator=cuda minimum_cuda=12.0 minimum_driver=525.60"
+        );
+        pack.accelerator_profile = "cpu".to_string();
+        pack.minimum_cuda = None;
+        pack.minimum_driver = None;
+        assert_eq!(
+            describe_pack_constraints(&pack),
+            "accelerator=cpu minimum_cuda=none minimum_driver=none"
+        );
     }
 }

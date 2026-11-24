@@ -66,3 +66,35 @@ fn bundle_accepts_multiple_models_and_cross_target() {
     );
     assert_eq!(args.output, PathBuf::from("production.kapsl-bundle"));
 }
+
+#[test]
+fn backend_ensure_accepts_explicit_target() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "backend",
+        "ensure",
+        "model.aimod",
+        "--target",
+        "linux-x86_64-cuda",
+    ])
+    .unwrap();
+    let Some(KapslCommand::Backend(args)) = cli.command else {
+        panic!("expected backend command");
+    };
+    let crate::app::BackendSubcommand::Ensure(args) = args.command else {
+        panic!("expected backend ensure");
+    };
+    assert_eq!(args.target.as_deref(), Some("linux-x86_64-cuda"));
+}
+
+#[test]
+fn backend_ensure_target_is_optional() {
+    let cli = Cli::try_parse_from(["kapsl", "backend", "ensure", "model.aimod"]).unwrap();
+    let Some(KapslCommand::Backend(args)) = cli.command else {
+        panic!("expected backend command");
+    };
+    let crate::app::BackendSubcommand::Ensure(args) = args.command else {
+        panic!("expected backend ensure");
+    };
+    assert_eq!(args.target, None);
+}

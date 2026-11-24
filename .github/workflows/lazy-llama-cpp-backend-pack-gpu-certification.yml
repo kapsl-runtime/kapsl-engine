@@ -19,6 +19,13 @@ on:
         description: Absolute path to a uniform-KV causal GGUF/AIMOD artifact on the GPU runner
         required: true
         type: string
+      gguf_second_model_path:
+        description: >-
+          Optional absolute path to a second, different uniform-KV GGUF/AIMOD
+          artifact. When set, the memory ledger is also checked against physical
+          GPU usage with both GGUF models resident.
+        required: false
+        type: string
       ort_model_path:
         description: Absolute path to a CUDA-compatible ONNX/AIMOD artifact on the GPU runner
         required: true
@@ -136,6 +143,17 @@ jobs:
           KAPSL_BACKEND_CACHE_DIR: ${{ runner.temp }}/lazy-llama-integration-cache-${{ github.run_id }}-${{ github.run_attempt }}
         run: .github/scripts/test-gpu-device-pool-integration.sh
 
+      - name: Check memory ledger closure with two GGUF models
+        if: inputs.gguf_second_model_path != ''
+        env:
+          KAPSL_GPU_INTEGRATION: "1"
+          KAPSL_GPU_TEST_BINARY: ${{ github.workspace }}/kapsl-runtime/target-cert-eager/release/kapsl
+          KAPSL_GPU_TEST_GGUF_MODEL: ${{ inputs.gguf_model_path }}
+          KAPSL_GPU_TEST_GGUF_MODEL_B: ${{ inputs.gguf_second_model_path }}
+          KAPSL_GPU_TEST_CUDA_VISIBLE_DEVICES: ${{ inputs.cuda_visible_devices }}
+          KAPSL_GPU_TEST_OUTPUT_DIR: ${{ runner.temp }}/gguf-ledger-closure-${{ github.run_id }}-${{ github.run_attempt }}
+        run: .github/scripts/test-gguf-ledger-closure.sh
+
       - name: Enforce native-pack performance budgets
         env:
           KAPSL_GPU_CERTIFICATION: "1"
@@ -157,6 +175,7 @@ jobs:
           path: |
             ${{ runner.temp }}/lazy-llama-integration-${{ github.run_id }}-${{ github.run_attempt }}
             ${{ runner.temp }}/lazy-llama-performance-${{ github.run_id }}-${{ github.run_attempt }}
+            ${{ runner.temp }}/gguf-ledger-closure-${{ github.run_id }}-${{ github.run_attempt }}
             ${{ runner.temp }}/backend-index.json
             ${{ runner.temp }}/backend-index.json.sig
           if-no-files-found: warn

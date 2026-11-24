@@ -53,7 +53,8 @@ pub(crate) fn build_model_infer_route(
                                 body.as_ref(),
                             )
                         {
-                            let rag_options = match validate_infer_rag_options(envelope.rag)
+                            let (envelope_rag, envelope_request) = envelope.into_parts();
+                            let rag_options = match validate_infer_rag_options(envelope_rag)
                             {
                                 Ok(options) => options,
                                 Err(RagAugmentError::BadRequest(error)) => {
@@ -77,7 +78,7 @@ pub(crate) fn build_model_infer_route(
                                     );
                                 }
                             };
-                            (false, rag_options, envelope.request)
+                            (false, rag_options, envelope_request)
                         } else {
                             let payload: serde_json::Value =
                                 match serde_json::from_slice(body.as_ref()) {

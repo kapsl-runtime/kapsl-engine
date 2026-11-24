@@ -206,15 +206,16 @@ impl ReservationBook {
 #[cfg(feature = "gpu-device-pool")]
 mod cuda {
     use super::*;
+    use crate::runtime::memory::gpu_pool::{GpuAllocationLease, GpuRegionLease};
     use cudarc::driver::{result, sys};
-    use kapsl_hal::gpu_arena::{
-        GpuAllocation, GpuDevicePool, GpuKvPoolView, PoolAllocationClass, PoolOwner,
-    };
+    use kapsl_hal::gpu_arena::{GpuKvPoolView, PoolAllocationClass, PoolOwner};
+    use kapsl_hal::gpu_arena_region::GpuArenaRegion;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     pub(crate) struct LlamaCppSharedPoolHost {
-        device_pool: Arc<GpuDevicePool>,
+        region: GpuRegionLease,
+        device_pool: Arc<GpuArenaRegion>,
         device_id: usize,
         model_id: u32,
         replica_id: u32,
@@ -223,18 +224,20 @@ mod cuda {
 
     impl LlamaCppSharedPoolHost {
         pub(crate) fn new(
-            device_pool: Arc<GpuDevicePool>,
+            region: GpuRegionLease,
             device_id: usize,
             model_id: u32,
             replica_id: u32,
-        ) -> Self {
-            Self {
+        ) -> Result<Self, String> {
+            let device_pool = region.arena()?.clone();
+            Ok(Self {
+                region,
                 device_pool,
                 device_id,
                 model_id,
                 replica_id,
                 live_pools: Mutex::new(HashSet::new()),
-            }
+            })
         }
 
         pub(crate) fn callbacks(&mut self) -> KapslLlamaHostCallbacksV1 {
@@ -290,8 +293,8 @@ mod cuda {
 
     struct RuntimeSharedPool {
         view: GpuKvPoolView,
-        device_pool: Arc<GpuDevicePool>,
-        block_table: Option<GpuAllocation>,
+        device_pool: Arc<GpuArenaRegion>,
+        block_table: Option<GpuAllocationLease>,
         block_table_bytes: usize,
         block_size_tokens: usize,
         book: Mutex<ReservationBook>,
@@ -338,8 +341,8 @@ mod cuda {
                 .ok_or_else(|| "shared KV block-table byte size overflow".to_string())?;
             let table_owner = owner.with_class(PoolAllocationClass::BlockTable);
             let block_table = host
-                .device_pool
-                .alloc(table_owner, block_table_bytes, std::mem::align_of::<u32>())
+                .region
+                .allocate(table_owner, block_table_bytes, std::mem::align_of::<u32>())
                 .map_err(|error| format!("allocate runtime shared KV block table: {error}"))?;
             let pool = Self {
                 view,
@@ -360,7 +363,7 @@ mod cuda {
         fn table_ptr(&self) -> *mut u32 {
             self.block_table
                 .as_ref()
-                .map(|allocation| self.device_pool.allocation_ptr(allocation).cast())
+                .map(|allocation| allocation.pointer().unwrap_or(0) as *mut u32)
                 .unwrap_or(std::ptr::null_mut())
         }
 
@@ -485,7 +488,9 @@ mod cuda {
     impl Drop for RuntimeSharedPool {
         fn drop(&mut self) {
             if let Some(allocation) = self.block_table.take() {
-                if let Err(error) = self.device_pool.free(allocation) {
+                // SAFETY: destroy_shared_pool follows the pack's completion
+                // contract; failed construction has not exposed this table.
+                if let Err(error) = unsafe { allocation.release_after_fence() } {
                     log::error!("failed to release llama.cpp shared KV block table: {error}");
                 }
             }

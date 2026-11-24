@@ -23,6 +23,11 @@ impl Ansi {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_color(enabled: bool) -> Self {
+        Self { enabled }
+    }
+
     pub(super) fn is_enabled(&self) -> bool {
         self.enabled
     }

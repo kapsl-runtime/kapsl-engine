@@ -164,6 +164,12 @@ def validate_extract_file_hashes(template: dict[str, Any], archive_path: pathlib
         return
 
     expected = {str(path): str(digest).lower() for path, digest in template["files"].items()}
+    expected_blake3 = template.get("files_blake3")
+    if expected_blake3 is not None:
+        try:
+            from blake3 import blake3
+        except ImportError as error:
+            raise SystemExit("BLAKE3 templates require .github/requirements-backend-index.txt") from error
     actual: dict[str, str] = {}
     verified_installed_bytes = 0
     with tarfile.open(archive_path, "r:gz") as archive:
@@ -186,10 +192,15 @@ def validate_extract_file_hashes(template: dict[str, Any], archive_path: pathlib
             if stream is None:
                 raise SystemExit(f"{archive_path}: cannot read signed installed file {relative}")
             digest = hashlib.sha256()
+            fast_digest = blake3() if expected_blake3 is not None else None
             while block := stream.read(1024 * 1024):
                 digest.update(block)
+                if fast_digest is not None:
+                    fast_digest.update(block)
                 verified_installed_bytes += len(block)
             actual[relative] = digest.hexdigest()
+            if fast_digest is not None and fast_digest.hexdigest() != expected_blake3[relative].lower():
+                raise SystemExit(f"{archive_path}: BLAKE3 installed file digest mismatch: {relative}")
 
     missing = sorted(set(expected) - set(actual))
     if missing:
@@ -385,6 +396,13 @@ def validate_template(template: dict[str, Any], source: pathlib.Path) -> None:
         validate_relative_path(path, "files key", source)
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
             raise SystemExit(f"{source}: invalid SHA-256 for installed file {path}")
+    files_blake3 = template.get("files_blake3")
+    if files_blake3 is not None:
+        if not isinstance(files_blake3, dict) or files_blake3.keys() != files.keys():
+            raise SystemExit(f"{source}: BLAKE3 file set must exactly match files")
+        for path, digest in files_blake3.items():
+            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+                raise SystemExit(f"{source}: invalid BLAKE3 for installed file {path}")
     if template["entrypoint"] not in files:
         raise SystemExit(
             f"{source}: entrypoint requires a signed installed-file checksum"

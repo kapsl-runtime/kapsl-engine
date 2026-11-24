@@ -1948,7 +1948,7 @@ fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> Resul
         serde_json::Value::Object(values) => {
             output.push('{');
             let mut entries = values.iter().collect::<Vec<_>>();
-            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_unstable_by_key(|(left, _)| *left);
             for (index, (key, value)) in entries.into_iter().enumerate() {
                 if index != 0 {
                     output.push(',');
@@ -4834,6 +4834,7 @@ fn model_fingerprint(manifest: &Manifest, model_root: &Path) -> Result<String, S
     Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_kv_transfer_config(
     control_endpoint: &str,
     participant_id: &str,
