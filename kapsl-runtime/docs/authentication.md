@@ -58,6 +58,8 @@ curl http://127.0.0.1:9095/api/models \
 When the runtime is built with `--features mcp-server` and started with
 `--mcp-port`, the Streamable HTTP endpoint uses the same bearer credentials.
 All currently exposed MCP tools require reader access and `api:read` scope.
+Inference session IDs are scoped to the authorizing credential, so a key sees
+the same sessions over MCP as over HTTP and gRPC.
 
 ### kapsl-sdk (Python)
 

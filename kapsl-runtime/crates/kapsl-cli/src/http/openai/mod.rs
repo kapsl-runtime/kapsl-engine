@@ -19,7 +19,6 @@ use types::openai_error;
 pub(crate) struct OpenAiRoutesConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
-    pub(crate) log_sensitive_ids: bool,
 }
 
 /// A model that is loaded, has a live pool, and can serve inference.
@@ -136,11 +135,7 @@ fn model_object(model: &ModelInfo) -> serde_json::Value {
 pub(crate) fn build_openai_routes(
     config: OpenAiRoutesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let OpenAiRoutesConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    } = config;
+    let OpenAiRoutesConfig { models, inference } = config;
 
     // GET /v1/models
     let models_for_list = models.clone();
@@ -185,18 +180,13 @@ pub(crate) fn build_openai_routes(
     let chat_completions = chat::build_chat_completions_route(chat::ChatCompletionsConfig {
         models: models.clone(),
         inference: inference.clone(),
-        log_sensitive_ids,
     });
     let embeddings = embeddings::build_embeddings_route(embeddings::EmbeddingsConfig {
         models: models.clone(),
         inference: inference.clone(),
-        log_sensitive_ids,
     });
-    let responses = responses::build_responses_route(responses::ResponsesConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    });
+    let responses =
+        responses::build_responses_route(responses::ResponsesConfig { models, inference });
 
     list_models
         .or(get_model)

@@ -12,17 +12,12 @@ use futures::StreamExt;
 pub(crate) struct ResponsesConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
-    pub(crate) log_sensitive_ids: bool,
 }
 
 pub(crate) fn build_responses_route(
     config: ResponsesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let ResponsesConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    } = config;
+    let ResponsesConfig { models, inference } = config;
 
     warp::path!("v1" / "responses")
         .and(warp::post())
@@ -37,15 +32,8 @@ pub(crate) fn build_responses_route(
                 let inference = inference.clone();
                 async move {
                     Ok::<_, warp::Rejection>(
-                        handle_response(
-                            body,
-                            session_header,
-                            authorization,
-                            &models,
-                            &inference,
-                            log_sensitive_ids,
-                        )
-                        .await,
+                        handle_response(body, session_header, authorization, &models, &inference)
+                            .await,
                     )
                 }
             },
@@ -253,14 +241,12 @@ struct ResponseContext {
     parallel_tool_calls: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_response(
     body: warp::hyper::body::Bytes,
     session_header: Option<String>,
     authorization: Option<String>,
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
-    log_sensitive_ids: bool,
 ) -> warp::reply::Response {
     use warp::http::StatusCode;
 
@@ -322,10 +308,6 @@ async fn handle_response(
         scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
 
     let scheduler_priority = inference.priority_for_request(&request);
-    let session_id_for_log = redact_identifier_for_logs(
-        client_session_id.as_deref().unwrap_or("-"),
-        log_sensitive_ids,
-    );
     let prompt_tokens = estimate_tokens(&prompt);
     let context = ResponseContext {
         response_id,
@@ -349,7 +331,6 @@ async fn handle_response(
             model_id: resolved.id,
             context,
             prompt_tokens,
-            session_id_for_log,
         })
         .await;
     }
@@ -374,17 +355,15 @@ async fn handle_response(
             let status = status_code_for_engine_error(&error);
             if status == StatusCode::INTERNAL_SERVER_ERROR {
                 log::error!(
-                    "Response failed: model_id={} session_id={} status={} error={}",
+                    "Response failed: model_id={} status={} error={}",
                     resolved.id,
-                    session_id_for_log,
                     status.as_u16(),
                     error
                 );
             } else {
                 log::warn!(
-                    "Response rejected: model_id={} session_id={} status={} error={}",
+                    "Response rejected: model_id={} status={} error={}",
                     resolved.id,
-                    session_id_for_log,
                     status.as_u16(),
                     error
                 );
@@ -597,7 +576,6 @@ struct StreamResponseArgs {
     model_id: u32,
     context: ResponseContext,
     prompt_tokens: u64,
-    session_id_for_log: String,
 }
 
 async fn stream_response(args: StreamResponseArgs) -> warp::reply::Response {
@@ -608,7 +586,6 @@ async fn stream_response(args: StreamResponseArgs) -> warp::reply::Response {
         model_id,
         context,
         prompt_tokens,
-        session_id_for_log,
     } = args;
 
     let stream = match inference
@@ -619,9 +596,8 @@ async fn stream_response(args: StreamResponseArgs) -> warp::reply::Response {
         Err(error) => {
             let status = status_code_for_engine_error(&error);
             log::warn!(
-                "Response stream start failed: model_id={} session_id={} status={} error={}",
+                "Response stream start failed: model_id={} status={} error={}",
                 model_id,
-                session_id_for_log,
                 status.as_u16(),
                 error
             );

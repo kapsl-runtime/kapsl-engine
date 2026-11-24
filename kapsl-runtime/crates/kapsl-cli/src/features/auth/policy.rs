@@ -5,7 +5,8 @@ use super::*;
 /// Apply the shared API authorization policy for any northbound protocol.
 ///
 /// Protocol adapters extract credentials and the peer address; this function
-/// owns the loopback fallback, role hierarchy, API-key scopes, and usage touch.
+/// owns the loopback fallback, role hierarchy, API-key scopes, and usage touch,
+/// and issues the [`ApiPrincipal`] for the credential it just evaluated.
 pub(crate) fn authorize_api_request(
     auth_state: &RwLock<ApiAuthState>,
     required_role: ApiRole,
@@ -54,6 +55,7 @@ fn evaluate_api_access(
                         scopes: None,
                     },
                     mode: "local-loopback",
+                    principal: ApiPrincipal::from_authorization(authorization),
                 })
             } else {
                 Err(ApiAuthorizationError::LocalOnly)
@@ -80,6 +82,7 @@ fn evaluate_api_access(
             "role-token"
         },
         grant: grant_match.grant,
+        principal: ApiPrincipal::from_authorization(authorization),
     })
 }
 
