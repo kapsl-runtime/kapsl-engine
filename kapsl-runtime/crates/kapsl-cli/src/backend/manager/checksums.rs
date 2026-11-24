@@ -333,4 +333,44 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("pack checksum worker panicked"));
     }
+
+    #[test]
+    fn known_vectors_match_for_both_algorithms_and_both_timing_modes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("vector");
+        for (bytes, sha256, blake3) in [
+            (
+                b"".as_slice(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+            ),
+            (
+                b"abc".as_slice(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+            ),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(sha256_file(&path).unwrap(), sha256);
+            for (algorithm, expected) in [(Algorithm::Sha256, sha256), (Algorithm::Blake3, blake3)]
+            {
+                assert_eq!(hash_file(&path, algorithm).unwrap(), expected);
+                // Profiling adds clocks around the same reads and digests.
+                assert_eq!(
+                    hash_file_measured::<true>(&path, algorithm).0.unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn directory_reads_are_errors_not_checksums() {
+        let root = tempfile::tempdir().unwrap();
+        // Opening or reading a directory fails on Linux, macOS and Windows.
+        for algorithm in [Algorithm::Sha256, Algorithm::Blake3] {
+            assert!(hash_file(root.path(), algorithm).is_err());
+        }
+        assert!(sha256_file(root.path()).is_err());
+    }
 }
