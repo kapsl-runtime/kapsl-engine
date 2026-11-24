@@ -221,9 +221,8 @@ pub(crate) fn build_model_infer_route(
                             }
                         }
                     }
-                    let client_session_id = request.session_id.clone();
                     request.session_id = scope_session_id_for_authorization(
-                        client_session_id.as_deref(),
+                        request.session_id.as_deref(),
                         authorization.as_deref(),
                     );
                     let request_id = request
@@ -231,11 +230,8 @@ pub(crate) fn build_model_infer_route(
                         .as_ref()
                         .and_then(|metadata| metadata.request_id.as_deref())
                         .unwrap_or("-");
-                    let session_id = client_session_id.as_deref().unwrap_or("-");
                     let request_id_for_log =
                         redact_identifier_for_logs(request_id, log_sensitive_ids);
-                    let session_id_for_log =
-                        redact_identifier_for_logs(session_id, log_sensitive_ids);
                     let scheduler_priority = inference.priority_for_request(&request);
                     let force_cpu = request
                         .metadata
@@ -255,21 +251,19 @@ pub(crate) fn build_model_infer_route(
                             let status = status_code_for_engine_error(&e);
                             if status == StatusCode::INTERNAL_SERVER_ERROR {
                                 log::error!(
-                                    "Infer execution failed: model_id={} framework={} request_id={} session_id={} status={} error={}",
+                                    "Infer execution failed: model_id={} framework={} request_id={} status={} error={}",
                                     model_id,
                                     model_framework,
                                     request_id_for_log,
-                                    session_id_for_log,
                                     status.as_u16(),
                                     e
                                 );
                             } else {
                                 log::warn!(
-                                    "Infer execution rejected: model_id={} framework={} request_id={} session_id={} status={} error={}",
+                                    "Infer execution rejected: model_id={} framework={} request_id={} status={} error={}",
                                     model_id,
                                     model_framework,
                                     request_id_for_log,
-                                    session_id_for_log,
                                     status.as_u16(),
                                     e
                                 );

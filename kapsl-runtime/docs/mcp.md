@@ -32,10 +32,11 @@ prevent DNS-rebinding attacks.
   media inference envelope. It submits the resulting request through the same
   `InferenceService` used by the native and HTTP ingress paths.
 
-MCP inference intentionally ignores client-provided session IDs in this first
-version. Kapsl normally derives the internal session namespace from the
-authenticated credential. The MCP facade will enable sessions after principal
-identity is part of its request context.
+A `session_id` in the `kapsl_infer` envelope is scoped to the credential that
+authorized the request, exactly as on the HTTP and gRPC paths: the same API key
+and session ID reach the same internal session from every protocol, and two
+keys can never share one. Without authentication, loopback clients share a
+single local namespace.
 
 ## Authorization
 
@@ -49,6 +50,9 @@ Authorization: Bearer <api-key>
 ```
 
 Login, HTTP routes, gRPC, and MCP all use the engine's shared policy evaluator.
+For MCP, that evaluator also issues the caller's principal (a hash of the
+credential, never the credential itself); the adapter carries it to the tool
+call without inspecting it, and the engine uses it to scope sessions.
 MCP request completion events use the process-wide logging subscriber;
 see [Logging](logging.md) for JSON output and audit filters.
 

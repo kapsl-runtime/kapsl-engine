@@ -105,7 +105,6 @@ pub(crate) fn start_http_server(
     let openai_routes = build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference,
-        log_sensitive_ids,
     });
     let system_routes = build_system_routes(
         models,
