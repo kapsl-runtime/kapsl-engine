@@ -77,6 +77,7 @@ Options:
 | `KAPSL_PROVIDER_POLICY` | `fastest` (auto-select fastest backend) or `manifest` (use manifest-specified backend) |
 | `KAPSL_LLM_ISOLATE_PROCESS` | Set to `1` to run LLM backends in a subprocess for isolation |
 | `KAPSL_DISABLE_INLINE_MEDIA_PREPROCESS` | Disable automatic image/video-to-tensor preprocessing |
+| `KAPSL_ALLOW_CLIENT_FORCE_CPU` | Set to `1` to honour a client's `metadata.force_cpu`. Off by default: such requests skip GPU queueing, so the runtime ignores the flag unless the operator opts in. |
 | `KAPSL_BACKEND_CACHE_DIR` | Override the runtime-versioned lazy backend cache root |
 | `KAPSL_BUNDLE_CACHE_DIR` | Override the verified offline-bundle extraction cache |
 | `KAPSL_OFFLINE` | Set to `1` to forbid backend-index and artifact network access |

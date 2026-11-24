@@ -12,6 +12,7 @@ pub(crate) const API_ADMIN_TOKEN_ENV: &str = "KAPSL_API_TOKEN_ADMIN";
 pub(crate) const AUTH_STORE_PATH_ENV: &str = "KAPSL_AUTH_STORE_PATH";
 pub(crate) const DEFAULT_AUTH_STORE_FILENAME: &str = "auth-store.json";
 pub(crate) const LOG_SENSITIVE_IDS_ENV: &str = "KAPSL_LOG_SENSITIVE_IDS";
+pub(crate) const ALLOW_CLIENT_FORCE_CPU_ENV: &str = "KAPSL_ALLOW_CLIENT_FORCE_CPU";
 pub(crate) const ALLOW_INSECURE_HTTP_ENV: &str = "KAPSL_ALLOW_INSECURE_HTTP";
 pub(crate) const TCP_AUTH_TOKEN_ENV: &str = "KAPSL_TCP_AUTH_TOKEN";
 

@@ -10,6 +10,7 @@ pub(crate) struct ResolvedRuntimeConfig {
     pub(crate) state_layout: RuntimeStateLayout,
     pub(crate) auth_state: Arc<RwLock<ApiAuthState>>,
     pub(crate) log_sensitive_ids: bool,
+    pub(crate) allow_client_force_cpu: bool,
     pub(crate) http_bind_addr: IpAddr,
     pub(crate) http_port: u16,
     #[cfg(feature = "mcp-server")]
@@ -160,6 +161,7 @@ pub(crate) fn resolve_runtime_config(
         state_layout.auth_store_path.clone(),
     )));
     let log_sensitive_ids = env_flag(LOG_SENSITIVE_IDS_ENV);
+    let allow_client_force_cpu = env_flag(ALLOW_CLIENT_FORCE_CPU_ENV);
     let http_bind_addr = parse_bind_ip(&args.http_bind, IpAddr::from([127, 0, 0, 1]), "http_bind");
     #[cfg(feature = "mcp-server")]
     let mcp_allowed_hosts = std::env::var("KAPSL_MCP_ALLOWED_HOSTS")
@@ -215,6 +217,7 @@ pub(crate) fn resolve_runtime_config(
         state_layout,
         auth_state,
         log_sensitive_ids,
+        allow_client_force_cpu,
         http_bind_addr,
         http_port: args.metrics_port,
         #[cfg(feature = "mcp-server")]

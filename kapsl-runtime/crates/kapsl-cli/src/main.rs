@@ -29,7 +29,7 @@ use kapsl_rag::{ConnectorClient, FsDocStore};
 use kapsl_rag_sdk::protocol::{ConnectorRequestKind, ConnectorResponseKind, ConnectorResult};
 use kapsl_rag_sdk::types::{DeltaOp, DocumentDelta};
 use kapsl_scheduler::{
-    determine_priority, PoolStrategy, ReplicaPool, ReplicaScheduler,
+    determine_priority, CpuPool, PoolStrategy, ReplicaPool, ReplicaScheduler,
     RequestMetadata as SchedulerRequestMetadata, Scheduler,
 };
 use kapsl_shm::memory::ShmManager;

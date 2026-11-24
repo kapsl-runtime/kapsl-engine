@@ -17,6 +17,10 @@ pub(crate) struct InferenceService {
     pressure: Arc<ResourcePressure>,
     telemetry: Arc<ModelTelemetry>,
     metrics: Option<kapsl_monitor::metrics::KapslMetrics>,
+    /// `force_cpu` always comes from a client (request metadata or a
+    /// transport frame) and skips GPU queueing, so it is honoured only when
+    /// the operator sets `KAPSL_ALLOW_CLIENT_FORCE_CPU`.
+    allow_client_force_cpu: bool,
 }
 
 impl InferenceService {
@@ -31,6 +35,7 @@ impl InferenceService {
             pressure,
             telemetry,
             metrics: None,
+            allow_client_force_cpu: false,
         })
     }
 
@@ -39,12 +44,14 @@ impl InferenceService {
         pressure: Arc<ResourcePressure>,
         telemetry: Arc<ModelTelemetry>,
         metrics: kapsl_monitor::metrics::KapslMetrics,
+        allow_client_force_cpu: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             models,
             pressure,
             telemetry,
             metrics: Some(metrics),
+            allow_client_force_cpu,
         })
     }
 
@@ -94,7 +101,7 @@ impl InferenceService {
     ) -> Result<BinaryTensorPacket, EngineError> {
         let pool = self.ready_pool(model_id)?;
         self.apply_pressure_policy(&mut request, priority)?;
-        let force_cpu = effective_force_cpu(&request, force_cpu);
+        let force_cpu = self.permit_force_cpu(effective_force_cpu(&request, force_cpu));
         let cancellation = request
             .cancellation
             .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
@@ -137,7 +144,7 @@ impl InferenceService {
     ) -> Result<InferenceStream, EngineError> {
         let pool = self.ready_pool(model_id)?;
         self.apply_pressure_policy(&mut request, priority)?;
-        let force_cpu = effective_force_cpu(&request, force_cpu);
+        let force_cpu = self.permit_force_cpu(effective_force_cpu(&request, force_cpu));
         let cancellation = request
             .cancellation
             .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
@@ -176,6 +183,7 @@ impl InferenceService {
         if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
             validate_openai_wire_generation_cap(&request, cap)?;
         }
+        let force_cpu = self.permit_force_cpu(force_cpu);
         let cancellation = request
             .cancellation
             .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
@@ -220,6 +228,7 @@ impl InferenceService {
         if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
             validate_openai_wire_generation_cap(&request, cap)?;
         }
+        let force_cpu = self.permit_force_cpu(force_cpu);
         let cancellation = request
             .cancellation
             .get_or_insert_with(kapsl_engine_api::CancellationToken::new)
@@ -391,6 +400,17 @@ fn validate_openai_wire_generation_cap(
         )));
     }
     Ok(())
+}
+
+impl InferenceService {
+    fn permit_force_cpu(&self, requested: bool) -> bool {
+        if requested && !self.allow_client_force_cpu {
+            log::debug!(
+                "ignoring client force_cpu; set {ALLOW_CLIENT_FORCE_CPU_ENV}=1 to honour it"
+            );
+        }
+        requested && self.allow_client_force_cpu
+    }
 }
 
 fn effective_force_cpu(request: &InferenceRequest, adapter_force_cpu: bool) -> bool {
@@ -724,6 +744,98 @@ mod tests {
         assert!(!cancellation.is_cancelled());
         drop(stream);
         assert!(cancellation.is_cancelled());
+    }
+
+    /// Records whether `infer` ran on a Rayon thread, which, unlike Tokio's
+    /// threads, is unnamed. Only the scheduler's CPU pool runs on Rayon.
+    struct ThreadRecordingEngine {
+        ran_on_cpu_pool: Arc<Mutex<Option<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Engine for ThreadRecordingEngine {
+        async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+            *self.ran_on_cpu_pool.lock() = Some(std::thread::current().name().is_none());
+            Ok(request.input.clone())
+        }
+
+        fn infer_stream(&self, request: &InferenceRequest) -> kapsl_engine_api::EngineStream {
+            let packet = request.input.clone();
+            Box::pin(futures::stream::once(async move { Ok(packet) }))
+        }
+
+        fn unload(&mut self) {}
+
+        fn metrics(&self) -> EngineMetrics {
+            EngineMetrics::default()
+        }
+
+        fn health_check(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    fn force_cpu_service(allow: bool) -> (Arc<InferenceService>, Arc<Mutex<Option<bool>>>) {
+        let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+        let ran_on_cpu_pool = Arc::new(Mutex::new(None));
+        let engine: EngineHandle = Arc::new(ThreadRecordingEngine {
+            ran_on_cpu_pool: ran_on_cpu_pool.clone(),
+        });
+        let scheduler = Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+        let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+        pool.add_replica(0, scheduler);
+        models.install_loaded(
+            MODEL_ID,
+            PathBuf::from("/test/model"),
+            Arc::new(pool),
+            vec![],
+        );
+        let pressure = ResourcePressure::new(
+            Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+            pressure_config(),
+        );
+        let service = Arc::new(InferenceService {
+            models,
+            pressure,
+            telemetry: Arc::new(ModelTelemetry::default()),
+            metrics: None,
+            allow_client_force_cpu: allow,
+        });
+        (service, ran_on_cpu_pool)
+    }
+
+    fn force_cpu_request() -> InferenceRequest {
+        let mut request = request(10);
+        request.metadata.as_mut().unwrap().force_cpu = Some(true);
+        request
+    }
+
+    #[tokio::test]
+    async fn client_force_cpu_is_ignored_unless_the_operator_allows_it() {
+        let (service, ran_on_cpu_pool) = force_cpu_service(false);
+        service
+            .infer(MODEL_ID, force_cpu_request(), Priority::Throughput, false)
+            .await
+            .unwrap();
+        assert_eq!(*ran_on_cpu_pool.lock(), Some(false), "metadata flag");
+
+        let transport = service.scheduler_for_transport(MODEL_ID).unwrap();
+        transport
+            .infer(&request(10), Priority::Throughput, true)
+            .await
+            .unwrap();
+        assert_eq!(*ran_on_cpu_pool.lock(), Some(false), "transport flag");
+
+        let (service, ran_on_cpu_pool) = force_cpu_service(true);
+        service
+            .infer(MODEL_ID, force_cpu_request(), Priority::Throughput, false)
+            .await
+            .unwrap();
+        assert_eq!(*ran_on_cpu_pool.lock(), Some(true), "operator allowed");
     }
 
     #[tokio::test]
