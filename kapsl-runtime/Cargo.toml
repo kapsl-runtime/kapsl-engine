@@ -16,16 +16,17 @@ rust-version = "1.92"
 
 [patch.crates-io]
 esaxx-rs = { path = "patches/esaxx-rs" }
-kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-kv-abi = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-loader = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
-kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "e11170430be2081d2464048a93c13dae84d7ac2d" }
+kapsl-llm = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-backends = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-engine-api = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-core = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-hal = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-kv-abi = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-loader = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-kernels = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-quantization = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-llama-cpp-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-llama-cpp-sys-2 = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-rag = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-rag-sdk = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
+kapsl-scheduler = { git = "https://github.com/kapsl-runtime/kapsl-sdk", rev = "aa127c1c24ca2a2b30fcb5d289b1b758189aa19c" }
