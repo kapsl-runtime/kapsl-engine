@@ -44,7 +44,6 @@ on:
       - "kapsl-runtime/crates/kapsl-cli/src/app/cli/commands/packages.rs"
       - "kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
       - "kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
-      - "kapsl-runtime/crates/kapsl-backend-llama-cpp/**"
       - ".github/scripts/bootstrap-vllm-backend.sh"
       - ".github/scripts/package-linux-vllm-backend.sh"
       - ".github/scripts/managed-vllm-cu130.lock"

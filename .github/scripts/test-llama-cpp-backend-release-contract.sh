@@ -20,10 +20,15 @@ cli_manifest="kapsl-runtime/crates/kapsl-cli/Cargo.toml"
 
 # The pack source and its exact published SDK pins live in kapsl-integrations
 # (integrations/llama-cpp), whose CI enforces them. The engine pins one exact
-# integrations commit.
+# integrations commit and must not carry a second copy of the crate.
 if ! grep -Eq '^[0-9a-f]{40}$' "$integration_lock" \
   || [ "$(wc -l < "$integration_lock" | tr -d ' ')" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
+  exit 1
+fi
+if [ -e kapsl-runtime/crates/kapsl-backend-llama-cpp ] \
+  || grep -Fq 'kapsl-backend-llama-cpp' kapsl-runtime/Cargo.toml; then
+  echo "The llama.cpp pack source belongs to kapsl-integrations, not the engine workspace." >&2
   exit 1
 fi
 require_literal "$integration_verifier" '--ignored=matching'
