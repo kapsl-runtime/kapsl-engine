@@ -70,7 +70,8 @@ pub(crate) fn build_model_infer_stream_route(
                         InferPayloadEnvelope<InferenceRequest>,
                     >(body.as_ref())
                     {
-                        let rag_options = match validate_infer_rag_options(envelope.rag) {
+                        let (envelope_rag, envelope_request) = envelope.into_parts();
+                        let rag_options = match validate_infer_rag_options(envelope_rag) {
                             Ok(options) => options,
                             Err(RagAugmentError::BadRequest(error)) => {
                                 return Ok(json_error(StatusCode::BAD_REQUEST, error));
@@ -79,7 +80,7 @@ pub(crate) fn build_model_infer_stream_route(
                                 return Ok(json_error(StatusCode::INTERNAL_SERVER_ERROR, error));
                             }
                         };
-                        (rag_options, envelope.request)
+                        (rag_options, envelope_request)
                     } else {
                         let payload: serde_json::Value = match serde_json::from_slice(body.as_ref())
                         {

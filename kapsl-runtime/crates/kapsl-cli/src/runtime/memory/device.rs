@@ -1,9 +1,13 @@
 use super::device_budget::{
     choose_auto_pool_capacity, AutoPoolSizingDecision, AutoPoolSizingInput, DeviceBudgetLedger,
 };
+use super::gpu_pool::{GpuDevicePool, GpuRegionLease};
+use super::gpu_regions::{GpuRegionOwnerUsage, GpuRegionSource, GpuRegionUsage};
 use super::*;
 use cudarc::driver::{result as cuda_result, CudaDevice};
-use kapsl_hal::gpu_arena::{GpuDevicePool, PoolAllocationClass, PoolBackend, PoolOwner};
+use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolBackend, PoolOwner};
+use kapsl_hal::gpu_arena_region::GpuArenaRegion;
+use kapsl_llm::cuda_ordinal::CudaMatch;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,12 +19,48 @@ const RELEASE_RETRY_ATTEMPTS: usize = 400;
 
 struct DeviceAuthority {
     cuda: Arc<CudaDevice>,
+    regions: Arc<GpuDevicePool>,
     load_lock: Arc<AsyncMutex<()>>,
     pool_init_lock: Mutex<()>,
     pool_mode: DevicePoolMode,
     unpooled_reserve_bytes: Option<usize>,
     auto_driver_reserve_bytes: usize,
     implicit_auto_attempted: AtomicBool,
+}
+
+impl GpuRegionSource for GpuArenaRegion {
+    fn region_usage(&self) -> Option<GpuRegionUsage> {
+        Some(arena_region_usage(self.snapshot()))
+    }
+}
+
+fn arena_region_usage(snapshot: kapsl_hal::gpu_arena::GpuDevicePoolSnapshot) -> GpuRegionUsage {
+    GpuRegionUsage {
+        committed_bytes: snapshot.capacity_bytes,
+        mapped_bytes: snapshot.capacity_bytes,
+        virtual_reserved_bytes: 0,
+        logical_allocated_bytes: Some(snapshot.allocated_bytes),
+        reusable_bytes: Some(snapshot.free_bytes),
+        largest_free_range_bytes: Some(snapshot.largest_free_range_bytes),
+        owners: snapshot
+            .owners
+            .into_iter()
+            .map(|entry| GpuRegionOwnerUsage {
+                owner: entry
+                    .owner
+                    .model_id()
+                    .zip(entry.owner.replica_id())
+                    .map(|(model, replica)| MemoryOwner::new(model, replica)),
+                backend: match entry.owner.backend() {
+                    PoolBackend::Onnx => "onnx",
+                    PoolBackend::Gguf => "gguf",
+                    PoolBackend::Native => "native",
+                },
+                class: memory_class(entry.owner.class()),
+                logical_bytes: entry.usage_bytes,
+            })
+            .collect(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +94,53 @@ impl DeviceBootstrapDemand {
     }
 }
 
+/// Why a dynamic load that needs a bigger pool than the one already admitted is refused. The harness
+/// (`claude/gpu-verify/lib/gv.py`, check e on the pool opt-in path) parses exactly this text.
+pub(crate) fn pool_floor_refusal(
+    device_id: usize,
+    current_capacity: usize,
+    required_capacity: usize,
+    cause: &str,
+) -> String {
+    format!(
+        "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; {cause} and cannot be rematerialized"
+    )
+}
+
 fn auto_pool_requires_rematerialization(
     current_capacity_bytes: usize,
     required_capacity_bytes: usize,
 ) -> bool {
     required_capacity_bytes > current_capacity_bytes
+}
+
+/// What the pool and the ledger could offer a dynamic load that the pool
+/// cannot hold. Message only: it does not change when a load is refused. It
+/// follows the harness-parsed `pool_floor_refusal` text, never replaces it.
+#[derive(Debug, Clone, Copy)]
+struct PoolRefusal {
+    capacity_bytes: usize,
+    free_bytes: usize,
+    budget_bytes: Option<usize>,
+    available_bytes: Option<usize>,
+}
+
+impl PoolRefusal {
+    fn refuse(&self, device_id: usize, required_bytes: usize, cause: &str) -> String {
+        let ledger = match (self.budget_bytes, self.available_bytes) {
+            (Some(budget), Some(available)) => format!(
+                "; the device ledger budget is {budget} bytes with {available} bytes available"
+            ),
+            _ => String::new(),
+        };
+        format!(
+            "{} (the pool has {} of {} bytes free; this model plans {} pooled bytes, weights plus workspace{ledger})",
+            pool_floor_refusal(device_id, self.capacity_bytes, required_bytes, cause),
+            self.free_bytes,
+            self.capacity_bytes,
+            required_bytes,
+        )
+    }
 }
 
 /// Host-only demand summary built before a physical CUDA backing allocation is
@@ -127,15 +209,17 @@ struct ExternalReservation {
 }
 
 struct ManagedDevicePool {
-    backing: Arc<GpuDevicePool>,
+    region: GpuRegionLease,
     clients: Arc<PoolClients>,
 }
 
 impl std::ops::Deref for ManagedDevicePool {
-    type Target = GpuDevicePool;
+    type Target = GpuArenaRegion;
 
     fn deref(&self) -> &Self::Target {
-        &self.backing
+        self.region
+            .arena()
+            .expect("managed arena remains registered")
     }
 }
 
@@ -151,6 +235,87 @@ pub(crate) struct DeviceMemoryManager {
     admission_refs: Mutex<HashMap<(usize, PoolOwner), usize>>,
     next_fallback_allocation: AtomicU64,
     metrics: Mutex<Option<kapsl_monitor::metrics::KapslMetrics>>,
+    /// Driver-reported per-process footprint per device, sampled right after
+    /// the CUDA context was created and before any pool or model.
+    runtime_overhead: HashMap<usize, usize>,
+}
+
+/// Read the PCI bus id the CUDA driver reports for each visible ordinal.
+fn enumerate_cuda_pci_ids() -> Result<Vec<Option<String>>, String> {
+    use cudarc::driver::{result, sys};
+    result::init().map_err(|error| format!("CUDA init failed: {error}"))?;
+    let count =
+        result::device::get_count().map_err(|error| format!("CUDA device count: {error}"))?;
+    (0..count)
+        .map(|ordinal| {
+            let handle = result::device::get(ordinal)
+                .map_err(|error| format!("CUDA device {ordinal}: {error}"))?;
+            let mut buffer = [0 as std::os::raw::c_char; 32];
+            // SAFETY: the buffer outlives the call and its length is passed.
+            let status = unsafe {
+                sys::lib().cuDeviceGetPCIBusId(
+                    buffer.as_mut_ptr(),
+                    buffer.len() as std::os::raw::c_int,
+                    handle,
+                )
+            };
+            if status != sys::CUresult::CUDA_SUCCESS {
+                return Ok(None);
+            }
+            // SAFETY: the driver NUL-terminates the id within the buffer.
+            Ok(Some(
+                unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+        })
+        .collect()
+}
+
+/// Join the inventory's CUDA devices to the CUDA runtime's visible ordinals by
+/// PCI bus id, install the result for every library call that converts between
+/// the two, and log the full mapping. `None` when there are no CUDA devices or
+/// the runtime cannot be enumerated (then the historical id == ordinal behavior
+/// applies and a failure to open a device is reported as before).
+pub(crate) fn install_cuda_ordinal_map(
+    device_info: &DeviceInfo,
+) -> Option<std::sync::Arc<kapsl_llm::cuda_ordinal::CudaOrdinalMap>> {
+    let engine: Vec<_> = device_info
+        .devices
+        .iter()
+        .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
+        .map(|device| kapsl_llm::cuda_ordinal::EngineCudaDevice {
+            id: device.id,
+            pci_bus_id: device.pci_bus_id.clone(),
+        })
+        .collect();
+    if engine.is_empty() {
+        return None;
+    }
+    // This module only builds with `gpu-device-pool`, so the CUDA runtime is
+    // always enumerable here. An empty enumeration is a real answer (for example
+    // `CUDA_VISIBLE_DEVICES=""`) and marks every engine device hidden; a failed
+    // one installs no map rather than a map that would hide every device.
+    let ordinal_pci = match enumerate_cuda_pci_ids() {
+        Ok(ids) => ids,
+        Err(error) => {
+            log::warn!("[device-memory] cannot enumerate CUDA devices ({error}); assuming inventory id == CUDA ordinal");
+            return None;
+        }
+    };
+    let map = kapsl_llm::cuda_ordinal::install(kapsl_llm::cuda_ordinal::CudaOrdinalMap::build(
+        &engine,
+        &ordinal_pci,
+    ));
+    log::info!(
+        "[device-memory] CUDA_VISIBLE_DEVICES={:?} CUDA_DEVICE_ORDER={:?}",
+        std::env::var("CUDA_VISIBLE_DEVICES").ok(),
+        std::env::var("CUDA_DEVICE_ORDER").ok()
+    );
+    for line in map.describe() {
+        log::info!("[device-memory] {line}");
+    }
+    Some(map)
 }
 
 impl DeviceMemoryManager {
@@ -164,6 +329,7 @@ impl DeviceMemoryManager {
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<Option<Arc<Self>>, String> {
         let mut devices = HashMap::new();
+        let mut runtime_overhead = HashMap::new();
         let mut budget = DeviceBudgetLedger::default();
         let pooling_disabled = env_flag(GPU_DEVICE_POOL_DISABLED_ENV);
         if pooling_disabled {
@@ -172,13 +338,75 @@ impl DeviceMemoryManager {
                 GPU_DEVICE_POOL_DISABLED_ENV
             );
         }
+        // Startup installs the map before models are planned (so a request for a
+        // hidden device is denied at admission); build it here only if it is absent.
+        let cuda_map =
+            kapsl_llm::cuda_ordinal::installed().or_else(|| install_cuda_ordinal_map(device_info));
         for device in &device_info.devices {
             if !device.backend.to_string().eq_ignore_ascii_case("cuda") {
                 continue;
             }
+            // The inventory id (NVML) is the key for budgets, pools and leases; the
+            // CUDA runtime numbers the same GPU differently, so open it by the
+            // ordinal the PCI-bus-id mapping gives. A device this process cannot see
+            // or cannot match is left unmanaged, never opened under another GPU's
+            // number.
+            let ordinal = match cuda_map.as_ref().map(|map| map.status(device.id)) {
+                Some(Some(CudaMatch::Visible { ordinal })) => *ordinal,
+                Some(Some(CudaMatch::Hidden)) => {
+                    log::info!(
+                        "[device-memory] CUDA device {} is not visible to this process; not managed",
+                        device.id
+                    );
+                    continue;
+                }
+                Some(Some(CudaMatch::Unmatched(reason))) => {
+                    log::warn!(
+                        "[device-memory] CUDA device {} could not be matched to a CUDA ordinal ({reason}); not managed",
+                        device.id
+                    );
+                    continue;
+                }
+                _ => device.id,
+            };
             let physical_bytes = (device.memory_mb as usize).saturating_mul(1024 * 1024);
-            let cuda = CudaDevice::new(device.id)
-                .map_err(|error| format!("failed to open CUDA device {}: {error}", device.id))?;
+            // Read the device before and after the context exists so a host
+            // that hides this PID from NVML still gets a runtime row.
+            let (cuda, overhead) = super::runtime_overhead::probe_runtime_overhead(
+                device.id,
+                device.pci_bus_id.as_deref(),
+                || {
+                    CudaDevice::new(ordinal).map_err(|error| {
+                        format!(
+                            "failed to open CUDA device {} (ordinal {ordinal}): {error}",
+                            device.id
+                        )
+                    })
+                },
+                |cuda| super::runtime_overhead::sample_process_gpu_bytes(cuda),
+            )?;
+            if let Err(error) = super::runtime_overhead::verify_cuda_identity(
+                device.id,
+                device.pci_bus_id.as_deref(),
+                super::runtime_overhead::cuda_pci_bus_id(&cuda).as_deref(),
+            ) {
+                // Defensive: the mapping should make this impossible.
+                log::error!("[device-memory] {error}; not managed");
+                continue;
+            }
+            // The context now exists but no pool or model does: whatever the
+            // driver attributes to this process here is the runtime's own
+            // overhead, independent of every lease taken later.
+            match overhead {
+                Ok(overhead) => {
+                    log::info!("[device-memory] {}", overhead.log_line(device.id));
+                    runtime_overhead.insert(device.id, overhead.bytes);
+                }
+                Err(reason) => log::warn!(
+                    "[device-memory] CUDA device {}: per-process overhead unavailable ({reason}); no runtime row",
+                    device.id
+                ),
+            }
             let pool_mode = resolve_device_pool_mode(device.id, pooling_disabled)?;
             let unpooled_reserve_bytes = if matches!(pool_mode, DevicePoolMode::Auto { .. }) {
                 configured_nonnegative_bytes(GPU_DEVICE_POOL_UNPOOLED_RESERVE_BYTES_ENV, device.id)?
@@ -201,6 +429,7 @@ impl DeviceMemoryManager {
             devices.insert(
                 device.id,
                 DeviceAuthority {
+                    regions: GpuDevicePool::new(cuda.clone(), device.id),
                     cuda,
                     load_lock: Arc::new(AsyncMutex::new(())),
                     pool_init_lock: Mutex::new(()),
@@ -222,6 +451,7 @@ impl DeviceMemoryManager {
             admission_refs: Mutex::new(HashMap::new()),
             next_fallback_allocation: AtomicU64::new(1),
             metrics: Mutex::new(None),
+            runtime_overhead,
         });
         manager.materialize_configured_pools(bootstrap)?;
         if manager.pools.lock().unwrap().is_empty() {
@@ -464,6 +694,15 @@ impl DeviceMemoryManager {
         if !auto_pool_requires_rematerialization(current_capacity, required_capacity) {
             return Ok(());
         }
+        let refusal = {
+            let snapshot = self.budget.lock().unwrap().snapshot(device_id);
+            PoolRefusal {
+                capacity_bytes: current_capacity,
+                free_bytes: pool.free_bytes(),
+                budget_bytes: snapshot.map(|snapshot| snapshot.budget_bytes),
+                available_bytes: snapshot.map(|snapshot| snapshot.available_bytes()),
+            }
+        };
         if self
             .admission_refs
             .lock()
@@ -471,13 +710,17 @@ impl DeviceMemoryManager {
             .keys()
             .any(|(candidate, _)| *candidate == device_id)
         {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool has admitted workloads and cannot be rematerialized"
+            return Err(refusal.refuse(
+                device_id,
+                required_capacity,
+                "the pool has admitted workloads",
             ));
         }
         if pool.free_bytes() != current_capacity {
-            return Err(format!(
-                "automatic CUDA pool on device {device_id} is {current_capacity} bytes but the dynamic load requires at least {required_capacity} bytes; the pool still has live allocations and cannot be rematerialized"
+            return Err(refusal.refuse(
+                device_id,
+                required_capacity,
+                "the pool still has live allocations",
             ));
         }
         if !pool.clients.retire().map_err(|error| {
@@ -487,7 +730,22 @@ impl DeviceMemoryManager {
                 "cannot rematerialize automatic CUDA pool on device {device_id}: backend clients are still live"
             ));
         }
-        self.pools.lock().unwrap().remove(&device_id);
+        {
+            let mut pools = self.pools.lock().unwrap();
+            if Arc::strong_count(&pool) != 2 {
+                return Err("arena still has a runtime observer; retry capacity change".into());
+            }
+            pools.remove(&device_id);
+        }
+        match authority.regions.retire_arena(&pool.region) {
+            Ok(true) => {}
+            result => {
+                self.pools.lock().unwrap().insert(device_id, pool);
+                return Err(result.err().unwrap_or_else(|| {
+                    "arena still has live region or compatibility leases".into()
+                }));
+            }
+        }
         if let Some(metrics) = self.metrics.lock().unwrap().clone() {
             metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
         }
@@ -583,7 +841,7 @@ impl DeviceMemoryManager {
             .lock()
             .unwrap()
             .set_pooled_bytes(device_id, capacity)?;
-        let pool = match GpuDevicePool::new(Arc::clone(&authority.cuda), capacity) {
+        let pool = match GpuArenaRegion::new(Arc::clone(&authority.cuda), capacity) {
             Ok(pool) => Arc::new(pool),
             Err(error) => {
                 let _ = self
@@ -605,10 +863,22 @@ impl DeviceMemoryManager {
                 ));
             }
         };
+        let region = match authority.regions.install_arena(pool) {
+            Ok(region) => region,
+            Err(error) => {
+                // install_arena consumes and drops rejected backing before its
+                // physical charge can be rolled back.
+                self.budget
+                    .lock()
+                    .unwrap()
+                    .set_pooled_bytes(device_id, previous.pooled_bytes)?;
+                return Err(error);
+            }
+        };
         self.pools.lock().unwrap().insert(
             device_id,
             Arc::new(ManagedDevicePool {
-                backing: pool,
+                region,
                 clients: Arc::new(PoolClients::default()),
             }),
         );
@@ -649,10 +919,9 @@ impl DeviceMemoryManager {
             .lock()
             .unwrap()
             .iter()
-            .map(|(&device_id, pool)| (device_id, Arc::clone(pool)))
+            .map(|(&device_id, pool)| (device_id, pool.snapshot()))
             .collect();
-        for (device_id, pool) in pools {
-            let snapshot = pool.snapshot();
+        for (device_id, snapshot) in pools {
             metrics.set_gpu_device_pool_metrics(
                 &device_id.to_string(),
                 &pool_snapshot_metrics(snapshot),
@@ -661,19 +930,19 @@ impl DeviceMemoryManager {
     }
 
     #[cfg(feature = "gpu-device-pool")]
-    pub(crate) fn pool(&self, device_id: usize) -> Option<Arc<GpuDevicePool>> {
+    pub(crate) fn pool(&self, device_id: usize) -> Option<Arc<GpuArenaRegion>> {
         self.pools
             .lock()
             .unwrap()
             .get(&device_id)
-            .map(|pool| pool.backing.clone())
+            .map(|pool| pool.region.arena().expect("managed arena is live").clone())
     }
 
     pub(crate) fn acquire_pool_client(
         self: &Arc<Self>,
         device_id: usize,
         client: &'static str,
-        register: impl FnOnce(&Arc<GpuDevicePool>) -> Result<PoolClientCleanup, String>,
+        register: impl FnOnce(&Arc<GpuArenaRegion>) -> Result<PoolClientCleanup, String>,
     ) -> Result<Option<PoolClientLease>, String> {
         let Some(authority) = self.devices.get(&device_id) else {
             return Ok(None);
@@ -684,7 +953,7 @@ impl DeviceMemoryManager {
         };
         let manager = Arc::downgrade(self);
         pool.clients
-            .acquire(client, || register(&pool.backing))
+            .acquire(client, || register(pool.region.arena()?))
             .map(|lease| {
                 Some(lease.on_release(move || {
                     if let Some(manager) = manager.upgrade() {
@@ -696,6 +965,17 @@ impl DeviceMemoryManager {
 
     pub(crate) fn has_pool(&self, device_id: usize) -> bool {
         self.pools.lock().unwrap().contains_key(&device_id)
+    }
+
+    /// Bytes the device ledger would still grant a new allocation on one
+    /// device: its budget minus the whole pool backing (idle part included) and
+    /// every external charge. `None` for a device the ledger does not manage.
+    pub(crate) fn ledger_available_bytes(&self, device_id: usize) -> Option<usize> {
+        self.budget
+            .lock()
+            .unwrap()
+            .snapshot(device_id)
+            .map(|snapshot| snapshot.available_bytes())
     }
 
     /// Physical CUDA backing reserved up front by the central pool. Raw
@@ -721,6 +1001,14 @@ impl DeviceMemoryManager {
             .ok_or_else(|| format!("CUDA device {device_id} is not managed by this runtime"))
     }
 
+    /// Per-process overhead measured once after CUDA init, by device id.
+    pub(crate) fn runtime_overhead(&self) -> Vec<(usize, usize)> {
+        self.runtime_overhead
+            .iter()
+            .map(|(&device_id, &bytes)| (device_id, bytes))
+            .collect()
+    }
+
     pub(crate) fn domain_budgets(&self) -> Vec<(usize, usize)> {
         let budget = self.budget.lock().unwrap();
         self.devices
@@ -733,17 +1021,33 @@ impl DeviceMemoryManager {
             .collect()
     }
 
+    pub(crate) fn device_pool(&self, device_id: usize) -> Option<Arc<GpuDevicePool>> {
+        self.devices
+            .get(&device_id)
+            .map(|authority| authority.regions.clone())
+    }
+
+    pub(crate) fn region_snapshots(&self) -> Vec<GpuRegionSnapshot> {
+        let mut snapshots: Vec<_> = self
+            .devices
+            .values()
+            .flat_map(|authority| authority.regions.snapshots())
+            .collect();
+        snapshots.sort_by_key(|region| (region.device_id, region.id));
+        snapshots
+    }
+
     pub(crate) fn observed_pool_claims(&self) -> Vec<MemoryClaim> {
         let pools: Vec<_> = self
             .pools
             .lock()
             .unwrap()
             .iter()
-            .map(|(&device_id, pool)| (device_id, Arc::clone(pool)))
+            .map(|(&device_id, pool)| (device_id, pool.snapshot()))
             .collect();
         let mut claims = Vec::new();
-        for (device_id, pool) in pools {
-            for owner in pool.snapshot().owners {
+        for (device_id, snapshot) in pools {
+            for owner in snapshot.owners {
                 let (Some(model_id), Some(replica_id)) =
                     (owner.owner.model_id(), owner.owner.replica_id())
                 else {
@@ -773,7 +1077,15 @@ impl DeviceMemoryManager {
                 claim.domain
             ));
         };
-        let Some(pool) = self.pools.lock().unwrap().get(&device_id).cloned() else {
+        let pool = self.pools.lock().unwrap().get(&device_id).cloned();
+        let Some(pool) = pool else {
+            // Pooling disabled (`KAPSL_GPU_DEVICE_POOL_DISABLED`, as every isolated worker
+            // runs): the device keeps its ledger but has no workload quota to bound a request
+            // by, so a running model's request is bounded by the authority's own rows alone.
+            // Only a device this manager does not account at all is an error.
+            if self.budget.lock().unwrap().snapshot(device_id).is_some() {
+                return Ok(None);
+            }
             return Err(format!(
                 "runtime-managed CUDA claim for {} targets device {} without a physical pool",
                 claim.owner, device_id
@@ -816,6 +1128,10 @@ impl DeviceMemoryManager {
             return Ok(None);
         }
         if matches!(claim.source, MemoryClaimSource::Runtime { .. }) {
+            if !self.has_pool(device_id) && self.runtime_allocatable(claim)?.is_none() {
+                // An accounted device with no pool: nothing here to bound or charge.
+                return Ok(None);
+            }
             let allocatable = self.runtime_allocatable(claim)?.ok_or_else(|| {
                 format!(
                     "runtime-managed CUDA claim for {} targets device {} without an admitted pool workload",
@@ -1291,6 +1607,7 @@ impl DeviceMemoryManager {
                     device_id
                 );
                 drop(refs);
+                drop(pool);
                 self.try_reclaim_pool(device_id);
                 true
             }
@@ -1341,7 +1658,19 @@ impl DeviceMemoryManager {
                 return;
             }
         }
-        self.pools.lock().unwrap().remove(&device_id);
+        {
+            let mut pools = self.pools.lock().unwrap();
+            if Arc::strong_count(&pool) != 2 {
+                return;
+            }
+            pools.remove(&device_id);
+        }
+        if !matches!(authority.regions.retire_arena(&pool.region), Ok(true)) {
+            self.pools.lock().unwrap().insert(device_id, pool);
+            return;
+        }
+        // Physical Drop and trimming complete before the authority charge is removed.
+        drop(pool);
         if let Some(metrics) = self.metrics.lock().unwrap().clone() {
             metrics.remove_gpu_device_pool_metrics(&device_id.to_string());
         }
@@ -1419,19 +1748,62 @@ impl DeviceMemoryAdmission {
         }
         let mut newly_charged_reported_bytes = 0usize;
 
+        // Decide per planned reservation how this report applies (see
+        // `reservation_outcome`). The classes of reported allocations that match
+        // no reservation tell us which unreported reservations were renamed or
+        // migrated rather than omitted.
+        let planned_ids: std::collections::HashSet<&str> = self
+            .reservations
+            .iter()
+            .map(|reservation| reservation.allocation_id.as_str())
+            .collect();
+        let unmatched_report_classes: Vec<MemoryAllocationClass> = actual_by_id
+            .keys()
+            .filter(|id| !planned_ids.contains(id.as_str()))
+            .map(|id| classify_external_allocation(id))
+            .collect();
+        let report_has_device_allocations = !actual_by_id.is_empty();
+        // Bytes of reservations kept despite not being reported. They stay
+        // charged until unload and come out of the residual below, since the
+        // load-time free-memory sample already contains them.
+        let mut retained_unreported_bytes = 0usize;
         for reservation in &self.reservations {
-            let actual_bytes = actual_by_id.remove(&reservation.allocation_id).unwrap_or(0);
-            if reservation.owns_charge {
-                newly_charged_reported_bytes =
-                    newly_charged_reported_bytes.saturating_add(actual_bytes);
-                self.manager.reconcile_external(
-                    self.device_id,
-                    &reservation.allocation_id,
-                    actual_bytes,
-                )?;
+            let reported = actual_by_id.remove(&reservation.allocation_id);
+            if !reservation.owns_charge {
+                continue;
+            }
+            let outcome = reservation_outcome(
+                reported,
+                report_has_device_allocations,
+                unmatched_report_classes
+                    .contains(&classify_external_allocation(&reservation.allocation_id)),
+            );
+            let reconcile_to = match outcome {
+                ReservationOutcome::Reconcile(bytes) => Some(bytes),
+                ReservationOutcome::Release => Some(0),
+                ReservationOutcome::Retain => None,
+            };
+            match reconcile_to {
+                Some(actual_bytes) => {
+                    newly_charged_reported_bytes =
+                        newly_charged_reported_bytes.saturating_add(actual_bytes);
+                    self.manager.reconcile_external(
+                        self.device_id,
+                        &reservation.allocation_id,
+                        actual_bytes,
+                    )?;
+                }
+                None => {
+                    let retained = self
+                        .manager
+                        .budget
+                        .lock()
+                        .unwrap()
+                        .external_bytes(self.device_id, &reservation.allocation_id);
+                    retained_unreported_bytes = retained_unreported_bytes.saturating_add(retained);
+                }
             }
         }
-
         for (allocation_id, actual_bytes) in actual_by_id {
             let (_, owns_charge) = self.manager.budget.lock().unwrap().reserve_external(
                 self.device_id,
@@ -1455,7 +1827,7 @@ impl DeviceMemoryAdmission {
 
         let residual_bytes = untracked_observed_bytes(
             observed_external_bytes,
-            newly_charged_reported_bytes,
+            newly_charged_reported_bytes.saturating_add(retained_unreported_bytes),
             newly_authorized_bytes,
         );
         if newly_authorized_bytes > 0 {
@@ -1507,6 +1879,36 @@ impl DeviceMemoryAdmission {
             pool_owner: self.pool_owner,
             reservations: std::mem::take(&mut self.reservations),
         }
+    }
+}
+
+/// How a load-time backend report applies to one planned reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationOutcome {
+    /// The backend reported this allocation: charge exactly the reported bytes.
+    Reconcile(usize),
+    /// Not reported, but the backend reported nothing on this device, or
+    /// reported the same class under a different id (renamed or migrated):
+    /// release it. The measured residual is then attributed separately.
+    Release,
+    /// Not reported while the rest of the report is partial: the backend simply
+    /// omitted it (for example a transient workspace it cannot attribute), so
+    /// the admitted bytes stay charged until unload.
+    Retain,
+}
+
+fn reservation_outcome(
+    reported: Option<usize>,
+    report_has_device_allocations: bool,
+    class_reported_under_another_id: bool,
+) -> ReservationOutcome {
+    match reported {
+        Some(bytes) => ReservationOutcome::Reconcile(bytes),
+        // An empty per-device report is the "no telemetry" signal (legacy and
+        // shared-allocator ONNX wrappers): behave exactly as before.
+        None if !report_has_device_allocations => ReservationOutcome::Release,
+        None if class_reported_under_another_id => ReservationOutcome::Release,
+        None => ReservationOutcome::Retain,
     }
 }
 
@@ -1601,6 +2003,16 @@ impl DeviceMemoryLease {
         self.memory_owner
     }
 
+    /// Whether the device ledger already carries this backend allocation as a
+    /// charge owned by this lease. `reconcile_report` sets such a charge to the
+    /// reported bytes (absolute), so a row made of these allocations must not
+    /// be charged again when the authority's own row grows to match.
+    pub(crate) fn charges_allocation(&self, allocation_id: &str) -> bool {
+        self.reservations.iter().any(|reservation| {
+            reservation.owns_charge && reservation.allocation_id == allocation_id
+        })
+    }
+
     pub(crate) fn reconcile_report(
         &mut self,
         report: &ExternalDeviceMemoryReport,
@@ -1665,7 +2077,11 @@ fn pool_class(class: MemoryAllocationClass) -> PoolAllocationClass {
         MemoryAllocationClass::TransientWorkspace => PoolAllocationClass::TransientWorkspace,
         MemoryAllocationClass::BlockTable => PoolAllocationClass::BlockTable,
         MemoryAllocationClass::RequestTransient => PoolAllocationClass::RequestTransient,
-        MemoryAllocationClass::ExternallyOwned => PoolAllocationClass::ExternallyOwned,
+        // Runtime overhead is attribution only and is never admitted through an
+        // adapter; the closest pool class keeps the match total.
+        MemoryAllocationClass::ExternallyOwned | MemoryAllocationClass::RuntimeOverhead => {
+            PoolAllocationClass::ExternallyOwned
+        }
     }
 }
 
@@ -1733,7 +2149,7 @@ fn pool_snapshot_metrics(
 }
 
 fn configured_quota(
-    pool: &GpuDevicePool,
+    pool: &GpuArenaRegion,
     owner: PoolOwner,
     device_id: usize,
 ) -> Result<(usize, usize), String> {
@@ -1928,6 +2344,89 @@ fn auto_safe_budget_from_inputs(
     (live_ceiling.saturating_sub(driver_reserve), driver_reserve)
 }
 
+/// Ledger-only stand-ins for a CUDA device, so the lease's reconcile paths can be
+/// exercised without a GPU: `admit_transient`, `reconcile_external` and the
+/// lease's release only ever touch the device budget ledger.
+#[cfg(test)]
+impl DeviceMemoryManager {
+    pub(crate) fn for_ledger_tests(device_id: usize, budget: usize, pooled: usize) -> Arc<Self> {
+        let mut ledger = DeviceBudgetLedger::default();
+        ledger.insert_device(device_id, budget, pooled).unwrap();
+        Arc::new(Self {
+            devices: HashMap::new(),
+            pools: Mutex::new(HashMap::new()),
+            budget: Mutex::new(ledger),
+            admission_refs: Mutex::new(HashMap::new()),
+            next_fallback_allocation: AtomicU64::new(0),
+            metrics: Mutex::new(None),
+            runtime_overhead: HashMap::new(),
+        })
+    }
+
+    pub(crate) fn reserve_for_tests(
+        &self,
+        device_id: usize,
+        allocation_id: &str,
+        bytes: usize,
+        owner: MemoryOwner,
+        class: MemoryAllocationClass,
+    ) -> Result<(), String> {
+        self.budget
+            .lock()
+            .unwrap()
+            .reserve_external(device_id, allocation_id, bytes, owner, class)
+            .map(|_| ())
+    }
+
+    pub(crate) fn reconcile_for_tests(
+        &self,
+        device_id: usize,
+        allocation_id: &str,
+        bytes: usize,
+    ) -> Result<(), String> {
+        self.reconcile_external(device_id, allocation_id, bytes)
+    }
+
+    pub(crate) fn ledger_used_for_tests(&self, device_id: usize) -> usize {
+        self.budget
+            .lock()
+            .unwrap()
+            .snapshot(device_id)
+            .map_or(0, |snapshot| snapshot.used_bytes())
+    }
+}
+
+#[cfg(test)]
+impl DeviceMemoryLease {
+    /// A lease that owns the ledger charges of `allocation_ids` (already
+    /// reserved in the manager's ledger).
+    pub(crate) fn for_ledger_tests(
+        manager: &Arc<DeviceMemoryManager>,
+        device_id: usize,
+        owner: MemoryOwner,
+        allocation_ids: &[&str],
+    ) -> Self {
+        Self {
+            manager: Arc::clone(manager),
+            device_id,
+            memory_owner: owner,
+            pool_owner: PoolOwner::onnx(
+                owner.model_id,
+                owner.replica_id,
+                PoolAllocationClass::PersistentWeights,
+            ),
+            reservations: allocation_ids
+                .iter()
+                .map(|id| ExternalReservation {
+                    allocation_id: (*id).to_string(),
+                    memory_owner: owner,
+                    owns_charge: true,
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2076,6 +2575,76 @@ mod tests {
     }
 
     #[test]
+    fn partial_report_retains_unreported_reservations() {
+        // Weights reported, scratch omitted, nothing else of that class: keep.
+        assert_eq!(
+            reservation_outcome(None, true, false),
+            ReservationOutcome::Retain
+        );
+    }
+
+    #[test]
+    fn reported_reservation_reconciles_to_the_reported_bytes() {
+        assert_eq!(
+            reservation_outcome(Some(7), true, false),
+            ReservationOutcome::Reconcile(7)
+        );
+        // A reported zero still reconciles (and so shrinks) the row.
+        assert_eq!(
+            reservation_outcome(Some(0), true, true),
+            ReservationOutcome::Reconcile(0)
+        );
+    }
+
+    #[test]
+    fn empty_report_releases_every_reservation_as_before() {
+        // The "no telemetry" signal: legacy behaviour is unchanged.
+        assert_eq!(
+            reservation_outcome(None, false, false),
+            ReservationOutcome::Release
+        );
+    }
+
+    #[test]
+    fn renamed_allocation_of_the_same_class_releases_the_planned_one() {
+        // Planned `gguf-kv:<key>` vs reported `gguf:active-kv`: the report
+        // carries a KV allocation under another id, so the planned row would
+        // otherwise be charged on top of the reported one.
+        assert_eq!(
+            reservation_outcome(None, true, true),
+            ReservationOutcome::Release
+        );
+        assert_eq!(
+            classify_external_allocation("gguf-kv:/m.gguf"),
+            classify_external_allocation("gguf:active-kv")
+        );
+        assert_ne!(
+            classify_external_allocation("gguf-scratch:/m.gguf"),
+            classify_external_allocation("gguf:active-kv")
+        );
+    }
+
+    #[test]
+    fn retained_unreported_reservation_is_not_double_counted_as_residual() {
+        const MIB: usize = 1024 * 1024;
+        // The load grew device usage by 1,000 MiB: 400 weights reported, 600
+        // transient workspace admitted but not reported. Keeping the workspace
+        // reservation means it must come out of the residual, or the same
+        // bytes would be charged twice (once planned, once as runtime-observed).
+        let reported = 400 * MIB;
+        let retained_unreported = 600 * MIB;
+        assert_eq!(
+            untracked_observed_bytes(1_000 * MIB, reported + retained_unreported, 0),
+            0
+        );
+        // Genuine overhead beyond both is still attributed.
+        assert_eq!(
+            untracked_observed_bytes(1_360 * MIB, reported + retained_unreported, 0),
+            360 * MIB
+        );
+    }
+
+    #[test]
     fn automatic_safe_budget_clamps_to_cap_and_live_free_memory() {
         const GIB: usize = 1024 * 1024 * 1024;
         let (budget, reserve) = auto_safe_budget_from_inputs(24 * GIB, Some(16 * GIB), 12 * GIB);
@@ -2123,6 +2692,47 @@ mod tests {
     }
 
     #[test]
+    fn arena_region_preserves_mixed_and_unattributed_logical_owners() {
+        let owners = [
+            PoolOwner::onnx(1, 2, PoolAllocationClass::TransientWorkspace),
+            PoolOwner::gguf(3, 4, PoolAllocationClass::KvCache),
+            PoolOwner::unattributed(PoolBackend::Native, PoolAllocationClass::BlockTable),
+        ];
+        let usage = arena_region_usage(kapsl_hal::gpu_arena::GpuDevicePoolSnapshot {
+            capacity_bytes: 4096,
+            allocated_bytes: 768,
+            live_allocation_count: 3,
+            free_bytes: 3328,
+            free_range_count: 2,
+            largest_free_range_bytes: 2048,
+            fragmentation_ratio: 1.0 - 2048.0 / 3328.0,
+            owners: owners
+                .into_iter()
+                .map(|owner| kapsl_hal::gpu_arena::PoolOwnerSnapshot {
+                    owner,
+                    usage_bytes: 256,
+                    guaranteed_bytes: 0,
+                    max_bytes: 4096,
+                    admitted: true,
+                    allocatable_bytes: 2048,
+                })
+                .collect(),
+        });
+        assert_eq!(usage.committed_bytes, 4096);
+        assert_eq!(usage.logical_allocated_bytes, Some(768));
+        assert_eq!(usage.reusable_bytes, Some(3328));
+        assert_eq!(usage.largest_free_range_bytes, Some(2048));
+        assert_eq!(usage.virtual_reserved_bytes, 0);
+        assert_eq!(usage.owners[0].owner, Some(MemoryOwner::new(1, 2)));
+        assert_eq!(usage.owners[0].backend, "onnx");
+        assert_eq!(usage.owners[1].owner, Some(MemoryOwner::new(3, 4)));
+        assert_eq!(usage.owners[1].class, MemoryAllocationClass::KvCache);
+        assert_eq!(usage.owners[2].owner, None);
+        assert_eq!(usage.owners[2].backend, "native");
+        assert_eq!(usage.owners[2].class, MemoryAllocationClass::BlockTable);
+    }
+
+    #[test]
     fn pool_snapshot_maps_every_live_and_owner_metric() {
         let metrics = pool_snapshot_metrics(kapsl_hal::gpu_arena::GpuDevicePoolSnapshot {
             capacity_bytes: 1_000,
@@ -2155,5 +2765,59 @@ mod tests {
         assert_eq!(metrics.owners[0].max_bytes, 800);
         assert!(metrics.owners[0].admitted);
         assert_eq!(metrics.owners[0].allocatable_bytes, 400);
+    }
+
+    #[test]
+    fn a_pool_refusal_names_the_need_the_pool_and_the_ledger() {
+        // The check-i numbers: a 600 MB ONNX model at 4 sessions against a
+        // 256 MiB pool on a budget cut to 1463812096 bytes.
+        let message = PoolRefusal {
+            capacity_bytes: 268_435_456,
+            free_bytes: 268_435_456,
+            budget_bytes: Some(1_463_812_096),
+            available_bytes: Some(155_189_248),
+        }
+        .refuse(0, 2_400_000_000, "the pool has admitted workloads");
+        // The harness-parsed text comes first and is unchanged.
+        assert!(
+            message.starts_with(&pool_floor_refusal(
+                0,
+                268_435_456,
+                2_400_000_000,
+                "the pool has admitted workloads"
+            )),
+            "{message}"
+        );
+        for part in [
+            "268435456 of 268435456 bytes free",
+            "plans 2400000000 pooled bytes",
+            "budget is 1463812096 bytes with 155189248 bytes available",
+        ] {
+            assert!(message.contains(part), "message lacks `{part}`: {message}");
+        }
+        // Without a ledger snapshot the ledger clause is left out.
+        let no_ledger = PoolRefusal {
+            capacity_bytes: 2,
+            free_bytes: 0,
+            budget_bytes: None,
+            available_bytes: None,
+        }
+        .refuse(1, 1, "the pool still has live allocations");
+        assert!(!no_ledger.contains("ledger"), "{no_ledger}");
+    }
+
+    #[test]
+    fn the_pool_floor_refusal_text_is_the_one_the_harness_parses() {
+        // GPU run 4 and run 5 logged exactly this text for YOLOX under a tight budget.
+        assert_eq!(
+            pool_floor_refusal(0, 268_435_456, 1_088_552_216, "the pool has admitted workloads"),
+            "automatic CUDA pool on device 0 is 268435456 bytes but the dynamic load requires at least 1088552216 bytes; \
+             the pool has admitted workloads and cannot be rematerialized"
+        );
+        assert_eq!(
+            pool_floor_refusal(1, 1, 2, "the pool still has live allocations"),
+            "automatic CUDA pool on device 1 is 1 bytes but the dynamic load requires at least 2 bytes; \
+             the pool still has live allocations and cannot be rematerialized"
+        );
     }
 }

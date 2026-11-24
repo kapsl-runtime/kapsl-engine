@@ -42,7 +42,7 @@ pub(super) fn preprocess_image_frame(
         }
         MediaChannelMode::Bgr => {
             let mut rgb = image.to_rgb8().into_raw();
-            for chunk in rgb.chunks_exact_mut(3) {
+            for chunk in rgb.as_chunks_mut::<3>().0 {
                 chunk.swap(0, 2);
             }
             Ok((rgb, target_width, target_height, 3))

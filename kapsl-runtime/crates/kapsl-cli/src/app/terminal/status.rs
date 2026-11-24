@@ -58,12 +58,50 @@ pub(crate) fn print_startup_ready(
 
     let label_width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
     for (label, url) in rows {
-        eprintln!(
-            "  {}  {:label_width$}  {}",
-            ansi.teal("→"),
-            ansi.dim(label),
-            ansi.teal(url),
-        );
+        eprintln!("{}", endpoint_line(&ansi, label, url, label_width));
     }
     eprintln!();
+}
+
+/// One `→  Label  url` row. The label is padded before it is styled: padding
+/// a styled string counts its escape codes as width, which misaligned the
+/// column whenever color was on.
+fn endpoint_line(ansi: &Ansi, label: &str, url: &str, label_width: usize) -> String {
+    format!(
+        "  {}  {}  {}",
+        ansi.teal("→"),
+        ansi.dim(&format!("{:label_width$}", label)),
+        ansi.teal(url),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn endpoint_urls_line_up_with_color_on() {
+        let ansi = Ansi::with_color(true);
+        let api = strip_ansi(&endpoint_line(&ansi, "API", "http://127.0.0.1:9095/api", 9));
+        let inference = strip_ansi(&endpoint_line(&ansi, "Inference", "/tmp/kapsl.sock", 9));
+        assert_eq!(api.find("http"), inference.find("/tmp"));
+        assert_eq!(api, "  →  API        http://127.0.0.1:9095/api");
+    }
 }

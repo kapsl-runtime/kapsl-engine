@@ -211,9 +211,27 @@ unsafe extern "C" fn initialize(
     KAPSL_STATUS_OK
 }
 
+/// A runtime-managed single-allocation report (the SDK dropped `MemoryReport::runtime`).
+fn runtime_report(
+    allocation_id: &str,
+    domain: MemoryDomain,
+    class: MemoryAllocationClass,
+    bytes: usize,
+) -> MemoryReport {
+    MemoryReport {
+        allocations: vec![kapsl_engine_api::MemoryAllocation {
+            allocation_id: allocation_id.to_string(),
+            domain,
+            class,
+            source: kapsl_engine_api::MemoryAllocationSource::RuntimeManaged,
+            bytes,
+        }],
+    }
+}
+
 fn report_memory(state: &State, bytes: usize, out: *mut KapslOwnedBuffer) {
     output(
-        serde_json::to_vec(&MemoryReport::runtime(
+        serde_json::to_vec(&runtime_report(
             "fake-memory",
             MemoryDomain::Cuda {
                 device_id: state.device as usize,
@@ -491,7 +509,7 @@ unsafe extern "C" fn actual_memory(
     _error: *mut KapslOwnedBuffer,
 ) -> i32 {
     let state = unsafe { state(handle) };
-    let mut report = MemoryReport::runtime(
+    let mut report = runtime_report(
         "fake-memory",
         MemoryDomain::Cuda {
             device_id: state.device as usize,
@@ -508,18 +526,22 @@ unsafe extern "C" fn actual_memory(
     if matches!(state.mode.as_str(), "host-memory" | "mixed-memory")
         && state.loaded.load(Ordering::Acquire)
     {
-        report.extend(MemoryReport::single(
+        report.allocations.extend(
+            MemoryReport::single(
             "host-session",
             MemoryDomain::Host,
             MemoryAllocationClass::ModelSession,
             1024,
-        ));
-        report.extend(MemoryReport::single(
+        ).allocations,
+        );
+        report.allocations.extend(
+            MemoryReport::single(
             "host-weights",
             MemoryDomain::Host,
             MemoryAllocationClass::PersistentWeights,
             512,
-        ));
+        ).allocations,
+        );
     }
     output(serde_json::to_vec(&report).unwrap(), out);
     KAPSL_STATUS_OK

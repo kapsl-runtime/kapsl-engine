@@ -33,9 +33,15 @@ pub(crate) struct AddModelCommandArgs {
     #[arg(long, default_value_t = 1, value_name = "N")]
     pub(crate) tp_degree: usize,
 
-    /// HTTP request timeout (ms) for the load call — large models may take longer to respond
-    #[arg(long, default_value_t = 30000, value_name = "MS")]
+    /// HTTP request timeout (ms) for the load call. Without --no-wait this covers
+    /// memory admission and the full model load, so large models need room.
+    #[arg(long, default_value_t = 600000, value_name = "MS")]
     pub(crate) timeout_ms: u64,
+
+    /// Return as soon as the runtime queues the load instead of waiting for the
+    /// memory authority to grant or deny it
+    #[arg(long)]
+    pub(crate) no_wait: bool,
 }
 
 #[derive(clap::Args, Debug)]

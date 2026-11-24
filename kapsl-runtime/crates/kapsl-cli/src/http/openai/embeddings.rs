@@ -744,8 +744,10 @@ fn decode_embedding_output(
 
     let values = packet
         .data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     if values.iter().any(|value| !value.is_finite()) {
         return Err("Embedding backend returned a non-finite value".to_string());
@@ -1126,8 +1128,10 @@ mod tests {
         let decode_i64 = |packet: &BinaryTensorPacket| {
             packet
                 .data
-                .chunks_exact(8)
-                .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| i64::from_ne_bytes(*bytes))
                 .collect::<Vec<_>>()
         };
 

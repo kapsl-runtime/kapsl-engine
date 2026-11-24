@@ -9,64 +9,85 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+
+mod profile;
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_CHECKSUM_WORKERS: usize = 4;
 const MIN_PARALLEL_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Diagnostic wall time, including scheduling/preemption, not CPU or disk time.
-#[derive(Debug, Default)]
-pub(super) struct FileTiming {
-    pub bytes: u64,
-    pub read: Duration,
-    pub hash: Duration,
-    pub elapsed: Duration,
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Algorithm {
+    Sha256,
+    Blake3,
 }
 
 pub(super) fn sha256_file(path: &Path) -> io::Result<String> {
-    Ok(hash_file::<false>(path)?.0)
+    hash_file(path, Algorithm::Sha256)
 }
 
-fn hash_file<const PROFILE: bool>(path: &Path) -> io::Result<(String, FileTiming)> {
-    let started = PROFILE.then(Instant::now);
-    let mut timing = FileTiming::default();
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
-    loop {
-        let read_started = PROFILE.then(Instant::now);
-        let read = reader.read(&mut buffer)?;
-        if let Some(started) = read_started {
-            timing.read += started.elapsed();
-            timing.bytes += read as u64;
+fn hash_file(path: &Path, algorithm: Algorithm) -> io::Result<String> {
+    hash_file_measured::<false>(path, algorithm).0
+}
+
+// Const specialization keeps clock reads out of normal verification, including
+// its inner read/hash loop. Both modes hash the same bytes with the same buffers.
+fn hash_file_measured<const PROFILE: bool>(
+    path: &Path,
+    algorithm: Algorithm,
+) -> (io::Result<String>, profile::HashMeasurements) {
+    let mut measurements = profile::HashMeasurements::default();
+    let result = (|| {
+        let opened = profile::measure::<PROFILE, _>(&mut measurements.open_ns, || File::open(path));
+        let mut reader = BufReader::new(opened?);
+        let mut sha256 = Sha256::new();
+        let mut blake3 = blake3::Hasher::new();
+        let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+        loop {
+            let read = profile::measure::<PROFILE, _>(&mut measurements.read_ns, || {
+                reader.read(&mut buffer)
+            })?;
+            if read == 0 {
+                break;
+            }
+            if PROFILE {
+                measurements.bytes_read += read as u64;
+            }
+            profile::measure::<PROFILE, _>(&mut measurements.hash_ns, || match algorithm {
+                Algorithm::Sha256 => sha256.update(&buffer[..read]),
+                Algorithm::Blake3 => {
+                    blake3.update(&buffer[..read]);
+                }
+            });
         }
-        if read == 0 {
-            break;
-        }
-        let hash_started = PROFILE.then(Instant::now);
-        hasher.update(&buffer[..read]);
-        if let Some(started) = hash_started {
-            timing.hash += started.elapsed();
-        }
-    }
-    let hash_started = PROFILE.then(Instant::now);
-    let digest = hasher.finalize();
-    if let Some(started) = hash_started {
-        timing.hash += started.elapsed();
-    }
-    if let Some(started) = started {
-        timing.elapsed = started.elapsed();
-    }
-    Ok((format!("{digest:x}"), timing))
+        Ok(profile::measure::<PROFILE, _>(
+            &mut measurements.hash_ns,
+            || match algorithm {
+                Algorithm::Sha256 => format!("{:x}", sha256.finalize()),
+                Algorithm::Blake3 => blake3.finalize().to_hex().to_string(),
+            },
+        ))
+    })();
+    (result, measurements)
 }
 
 pub(super) fn verify_installed_files(
     root: &Path,
     files: &BTreeMap<String, String>,
+    algorithm: Algorithm,
 ) -> io::Result<bool> {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    verify_with_workers(root, files, available)
+    if std::env::var("KAPSL_PACK_VERIFICATION_PROFILING").as_deref() == Ok("1") {
+        let (result, report) = profile::verify(root, files, available, algorithm);
+        // Emit only after every worker has joined. Logging cannot serialize
+        // file reads or inflate an individual file's measured hash time.
+        if let Ok(json) = serde_json::to_string(&report) {
+            log::info!("KAPSL_PACK_VERIFICATION_PROFILE {json}");
+        }
+        result
+    } else {
+        verify_with_workers(root, files, available, algorithm)
+    }
 }
 
 struct FileCheck<'a> {
@@ -79,26 +100,17 @@ fn verify_with_workers(
     root: &Path,
     files: &BTreeMap<String, String>,
     available_workers: usize,
+    algorithm: Algorithm,
 ) -> io::Result<bool> {
-    verify_observed::<false>(root, files, available_workers, &|_, _, _, _| {})
+    verify_using(root, files, available_workers, algorithm, hash_file)
 }
 
-/// Uses the production scheduler and reader. The observer runs once per file;
-/// callers must keep diagnostics separate from qualification measurements.
-pub(super) fn verify_installed_files_profiled(
-    root: &Path,
-    files: &BTreeMap<String, String>,
-    observer: &(impl Fn(usize, &Path, &FileTiming, bool) + Sync),
-) -> io::Result<bool> {
-    let available = std::thread::available_parallelism().map_or(1, usize::from);
-    verify_observed::<true>(root, files, available, observer)
-}
-
-fn verify_observed<const PROFILE: bool>(
+fn verify_using(
     root: &Path,
     files: &BTreeMap<String, String>,
     available_workers: usize,
-    observer: &(impl Fn(usize, &Path, &FileTiming, bool) + Sync),
+    algorithm: Algorithm,
+    hash: impl Fn(&Path, Algorithm) -> io::Result<String> + Sync,
 ) -> io::Result<bool> {
     let mut checks = Vec::with_capacity(files.len());
     let mut total_bytes = 0_u64;
@@ -121,10 +133,7 @@ fn verify_observed<const PROFILE: bool>(
         .min(checks.len());
     if workers <= 1 || total_bytes < MIN_PARALLEL_BYTES {
         for check in checks {
-            let (actual, timing) = hash_file::<PROFILE>(&check.path)?;
-            let valid = actual.eq_ignore_ascii_case(check.digest);
-            observer(0, &check.path, &timing, valid);
-            if !valid {
+            if !hash(&check.path, algorithm)?.eq_ignore_ascii_case(check.digest) {
                 return Ok(false);
             }
         }
@@ -136,19 +145,16 @@ fn verify_observed<const PROFILE: bool>(
     checks.sort_by_key(|check| std::cmp::Reverse(check.bytes));
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
-    let worker = |worker_id| -> io::Result<bool> {
+    let worker = || -> io::Result<bool> {
         while !failed.load(Ordering::Relaxed) {
             let Some(check) = checks.get(next.fetch_add(1, Ordering::Relaxed)) else {
                 break;
             };
-            match hash_file::<PROFILE>(&check.path) {
-                Ok((actual, timing)) => {
-                    let valid = actual.eq_ignore_ascii_case(check.digest);
-                    observer(worker_id, &check.path, &timing, valid);
-                    if !valid {
-                        failed.store(true, Ordering::Relaxed);
-                        return Ok(false);
-                    }
+            match hash(&check.path, algorithm) {
+                Ok(actual) if actual.eq_ignore_ascii_case(check.digest) => {}
+                Ok(_) => {
+                    failed.store(true, Ordering::Relaxed);
+                    return Ok(false);
                 }
                 Err(error) => {
                     failed.store(true, Ordering::Relaxed);
@@ -161,11 +167,10 @@ fn verify_observed<const PROFILE: bool>(
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers - 1);
-        for worker_id in 1..workers {
-            let worker = &worker;
+        for _ in 1..workers {
             match std::thread::Builder::new()
                 .name("kapsl-pack-checksum".into())
-                .spawn_scoped(scope, move || worker(worker_id))
+                .spawn_scoped(scope, worker)
             {
                 Ok(handle) => handles.push(handle),
                 // The caller also drains the work queue. A thread limit only
@@ -173,7 +178,7 @@ fn verify_observed<const PROFILE: bool>(
                 Err(_) => break,
             }
         }
-        let mut result = worker(0);
+        let mut result = worker();
         for handle in handles {
             let joined = handle
                 .join()
@@ -192,7 +197,7 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
-    fn fixture() -> (tempfile::TempDir, BTreeMap<String, String>) {
+    pub(super) fn fixture(algorithm: Algorithm) -> (tempfile::TempDir, BTreeMap<String, String>) {
         let root = tempfile::tempdir().unwrap();
         let mut files = BTreeMap::new();
         for (index, bytes) in [20 * 1024 * 1024, 12 * 1024 * 1024, 17, 0]
@@ -202,169 +207,127 @@ mod tests {
             let name = format!("file-{index}");
             let path = root.path().join(&name);
             File::create(&path).unwrap().set_len(bytes).unwrap();
-            files.insert(name, sha256_file(&path).unwrap());
+            files.insert(name, hash_file(&path, algorithm).unwrap());
         }
         (root, files)
     }
 
     #[test]
     fn verifies_large_small_and_empty_files_with_bounded_parallelism() {
-        let (root, mut files) = fixture();
-        // Hexadecimal digest case remains compatible with signed manifests.
-        for digest in files.values_mut() {
-            *digest = digest.to_ascii_uppercase();
+        for algorithm in [Algorithm::Sha256, Algorithm::Blake3] {
+            let (root, mut files) = fixture(algorithm);
+            // Hexadecimal digest case remains compatible with signed manifests.
+            for digest in files.values_mut() {
+                *digest = digest.to_ascii_uppercase();
+            }
+            assert!(verify_with_workers(root.path(), &files, 1, algorithm).unwrap());
+            assert!(verify_with_workers(root.path(), &files, usize::MAX, algorithm).unwrap());
         }
-        assert!(verify_with_workers(root.path(), &files, 1).unwrap());
-        assert!(verify_with_workers(root.path(), &files, usize::MAX).unwrap());
     }
 
     #[test]
     fn rejects_each_tampered_file_after_successful_verification() {
-        let (root, files) = fixture();
-        assert!(verify_with_workers(root.path(), &files, 4).unwrap());
-        for name in files.keys() {
-            let path = root.path().join(name);
-            let mut file = File::options().read(true).write(true).open(&path).unwrap();
-            let metadata = file.metadata().unwrap();
-            let original_len = metadata.len();
-            let modified = metadata.modified().unwrap();
-            let offset = original_len.saturating_sub(1);
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            file.write_all(&[1]).unwrap();
-            file.set_times(std::fs::FileTimes::new().set_modified(modified))
-                .unwrap();
-            // Restoring mtime (and retaining length for nonempty files) must
-            // not hide a change, including after the large libraries.
-            assert!(
-                !verify_with_workers(root.path(), &files, 4).unwrap(),
-                "{name}"
-            );
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            file.write_all(&[0]).unwrap();
-            file.set_len(original_len).unwrap();
-            assert!(
-                verify_with_workers(root.path(), &files, 4).unwrap(),
-                "{name}"
-            );
+        for algorithm in [Algorithm::Sha256, Algorithm::Blake3] {
+            let (root, files) = fixture(algorithm);
+            assert!(verify_with_workers(root.path(), &files, 4, algorithm).unwrap());
+            for name in files.keys() {
+                let path = root.path().join(name);
+                let mut file = File::options().read(true).write(true).open(&path).unwrap();
+                let metadata = file.metadata().unwrap();
+                let original_len = metadata.len();
+                let modified = metadata.modified().unwrap();
+                let offset = original_len.saturating_sub(1);
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.write_all(&[1]).unwrap();
+                file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                    .unwrap();
+                // Restoring mtime (and retaining length for nonempty files) must
+                // not hide a change, including after the large libraries.
+                assert!(
+                    !verify_with_workers(root.path(), &files, 4, algorithm).unwrap(),
+                    "{name}"
+                );
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                file.write_all(&[0]).unwrap();
+                file.set_len(original_len).unwrap();
+                assert!(
+                    verify_with_workers(root.path(), &files, 4, algorithm).unwrap(),
+                    "{name}"
+                );
+            }
         }
     }
 
     #[test]
     fn rejects_missing_or_non_file_entries() {
-        let (root, mut files) = fixture();
-        files.insert("missing".into(), "00".repeat(32));
-        assert!(!verify_with_workers(root.path(), &files, 4).unwrap());
-        std::fs::create_dir(root.path().join("missing")).unwrap();
-        assert!(!verify_with_workers(root.path(), &files, 4).unwrap());
-    }
-    #[test]
-    fn diagnostic_reads_all_bytes_and_rejects_changed_digest_and_replacement() {
-        let (root, mut files) = fixture();
-        let observed = std::sync::Mutex::new(BTreeMap::new());
-        assert!(
-            verify_installed_files_profiled(root.path(), &files, &|_, path, timing, valid| {
-                assert!(valid);
-                assert!(timing.elapsed >= timing.read + timing.hash);
-                observed.lock().unwrap().insert(
-                    path.file_name().unwrap().to_str().unwrap().to_string(),
-                    timing.bytes,
-                );
-            })
-            .unwrap()
-        );
-        let observed = observed.into_inner().unwrap();
-        assert_eq!(observed.len(), files.len());
-        for name in files.keys() {
-            assert_eq!(
-                observed[name],
-                root.path().join(name).metadata().unwrap().len()
-            );
+        for algorithm in [Algorithm::Sha256, Algorithm::Blake3] {
+            let (root, mut files) = fixture(algorithm);
+            files.insert("missing".into(), "00".repeat(32));
+            assert!(!verify_with_workers(root.path(), &files, 4, algorithm).unwrap());
+            std::fs::create_dir(root.path().join("missing")).unwrap();
+            assert!(!verify_with_workers(root.path(), &files, 4, algorithm).unwrap());
         }
-        files.insert("file-2".into(), "00".repeat(32));
-        assert!(!verify_installed_files_profiled(root.path(), &files, &|_, _, _, _| {}).unwrap());
-        files.insert(
-            "file-2".into(),
-            sha256_file(&root.path().join("file-2")).unwrap(),
-        );
-        let replacement = root.path().join("replacement");
-        std::fs::write(&replacement, [1; 17]).unwrap();
-        std::fs::remove_file(root.path().join("file-2")).unwrap();
-        std::fs::rename(replacement, root.path().join("file-2")).unwrap();
-        assert!(!verify_installed_files_profiled(root.path(), &files, &|_, _, _, _| {}).unwrap());
     }
-
     #[test]
-    fn concurrent_validations_each_cover_the_entire_manifest() {
-        let (root, files) = fixture();
+    fn concurrent_blake3_checks_reject_same_size_replacement() {
+        let (root, files) = fixture(Algorithm::Blake3);
         std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..3)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let count = AtomicUsize::new(0);
-                        assert!(verify_observed::<true>(
-                            root.path(),
-                            &files,
-                            4,
-                            &|_, _, _, valid| {
-                                assert!(valid);
-                                count.fetch_add(1, Ordering::Relaxed);
-                            }
-                        )
-                        .unwrap());
-                        assert_eq!(count.load(Ordering::Relaxed), files.len());
-                    })
-                })
-                .collect();
-            for handle in handles {
-                handle.join().unwrap();
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    assert!(verify_with_workers(root.path(), &files, 4, Algorithm::Blake3).unwrap())
+                });
             }
         });
+        let path = root.path().join("file-2");
+        let modified = path.metadata().unwrap().modified().unwrap();
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, [1_u8; 17]).unwrap();
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        // Explicit remove also permits the test on Windows.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        assert!(!verify_with_workers(root.path(), &files, 4, Algorithm::Blake3).unwrap());
     }
 
     #[test]
-    fn sha256_known_vectors() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("vector");
-        for (bytes, expected) in [
-            (
-                b"".as_slice(),
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            ),
-            (
-                b"abc".as_slice(),
-                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-            ),
-        ] {
-            std::fs::write(&path, bytes).unwrap();
-            assert_eq!(sha256_file(&path).unwrap(), expected);
-            assert_eq!(hash_file::<true>(&path).unwrap().0, expected);
-        }
-    }
-    #[test]
-    fn worker_panic_is_an_error_and_other_workers_are_joined() {
-        let (root, files) = fixture();
-        let barrier = std::sync::Barrier::new(2);
-        let visits = AtomicUsize::new(0);
-        let result = verify_observed::<true>(root.path(), &files, 2, &|worker, _, _, _| {
-            if visits.fetch_add(1, Ordering::Relaxed) < 2 {
-                barrier.wait();
-            }
-            if worker == 1 {
-                panic!("injected worker failure");
-            }
-        });
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "pack checksum worker panicked"
-        );
-        assert!(verify_with_workers(root.path(), &files, 2).unwrap());
-    }
-
-    #[test]
-    fn file_read_errors_are_not_successful_checksums() {
-        let root = tempfile::tempdir().unwrap();
-        // Opening or reading a directory fails across the supported hosts.
-        assert!(hash_file::<true>(root.path()).is_err());
-        assert!(sha256_file(root.path()).is_err());
+    fn read_errors_and_worker_panics_fail_closed() {
+        let (root, files) = fixture(Algorithm::Blake3);
+        let error = verify_using(root.path(), &files, 4, Algorithm::Blake3, |_, _| {
+            Err(io::Error::other("injected read error"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected read error"));
+        // Wait at most two seconds for a worker to reach the injected panic.
+        // The caller succeeds, so the error must come from joining the worker.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let receiver = std::sync::Mutex::new(receiver);
+        let caller_waited = AtomicBool::new(false);
+        let error = verify_using(
+            root.path(),
+            &files,
+            2,
+            Algorithm::Blake3,
+            |path, algorithm| {
+                if std::thread::current().name() == Some("kapsl-pack-checksum") {
+                    sender.send(()).unwrap();
+                    panic!("injected worker panic");
+                }
+                if !caller_waited.swap(true, Ordering::SeqCst) {
+                    receiver
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .expect("checksum worker must start for panic injection");
+                }
+                hash_file(path, algorithm)
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("pack checksum worker panicked"));
     }
 }
