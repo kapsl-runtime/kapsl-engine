@@ -715,7 +715,6 @@ fn test_openai_routes() -> warp::filters::BoxedFilter<(warp::reply::Response,)> 
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 
@@ -894,7 +893,6 @@ fn test_openai_routes_with_model() -> warp::filters::BoxedFilter<(warp::reply::R
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 
@@ -926,7 +924,6 @@ fn test_openai_routes_with_session_capture(
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 
@@ -961,7 +958,6 @@ fn test_openai_routes_with_embedding_model(
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 

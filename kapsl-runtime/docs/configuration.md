@@ -389,7 +389,7 @@ by its participant but is not device-free.
 
 | Variable | Description |
 |----------|-------------|
-| `KAPSL_LOG_SENSITIVE_IDS` | Set to `1` to include request/session IDs in logs (off by default for privacy) |
+| `KAPSL_LOG_SENSITIVE_IDS` | Set to `1` to include full request IDs in logs (off by default for privacy). Session IDs and OpenAI `user` values are never logged |
 | `RUST_LOG` | Shared runtime and dependency log filter (default `warn`); e.g. `warn,kapsl::access=info` |
 | `KAPSL_LOG_FORMAT` | Shared stderr format: `text` (default) or `json`; see [Logging](logging.md) |
 

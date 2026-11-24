@@ -114,7 +114,7 @@ impl ResolvedRuntimeConfig {
         log_auth_configuration(&self.auth_state);
         if !self.log_sensitive_ids {
             log::info!(
-                "Sensitive request/session identifiers are redacted in logs (set {}=1 to disable redaction)",
+                "Request identifiers are redacted in logs (set {}=1 to disable redaction); session identifiers are never logged",
                 LOG_SENSITIVE_IDS_ENV
             );
         }

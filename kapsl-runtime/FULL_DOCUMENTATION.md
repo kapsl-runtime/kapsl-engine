@@ -630,7 +630,7 @@ Primary runtime env vars:
 - `KAPSL_PROVIDER_POLICY` (`fastest` or `manifest`)
 - `KAPSL_LLM_ISOLATE_PROCESS`
 - `KAPSL_LLM_ALLOW_SCHEDULER_MICROBATCH`: allow the scheduler to micro-batch LLM requests.
-- `KAPSL_LOG_SENSITIVE_IDS` (set truthy to disable request/session redaction)
+- `KAPSL_LOG_SENSITIVE_IDS` (set truthy to disable request-ID redaction; session IDs are never logged)
 - `KAPSL_RAG_STORAGE_ROOT`
 - `KAPSL_EXTENSIONS_ROOT`
 - `KAPSL_EXT_CONFIG_ROOT`
