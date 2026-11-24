@@ -23,7 +23,6 @@ cp "$repo_root/.github/licenses/LLAMA-CPP-LICENSE" "$test_root/repo/.github/lice
 cp "$repo_root/kapsl-runtime/include/kapsl_llama_cpp_backend.h" \
   "$test_root/repo/kapsl-runtime/include/"
 cp "$repo_root/LICENSE" "$repo_root/NOTICE" "$test_root/repo/"
-cp "$repo_root/kapsl-runtime/Cargo.toml" "$test_root/repo/kapsl-runtime/Cargo.toml"
 
 cat > "$test_root/fake-pack.c" <<'EOF'
 #include "kapsl_llama_cpp_backend.h"

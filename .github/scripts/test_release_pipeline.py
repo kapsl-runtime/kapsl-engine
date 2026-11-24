@@ -404,8 +404,22 @@ class NativeCacheTests(TestCase):
                 (repo / relative).mkdir(parents=True, exist_ok=True)
             for relative in (".github/scripts/package-linux-llama-cpp-backend-packs.sh",
                              ".github/licenses/LLAMA-CPP-LICENSE", "LICENSE", "NOTICE",
-                             "kapsl-runtime/include/kapsl_llama_cpp_backend.h", "kapsl-runtime/Cargo.toml"):
+                             "kapsl-runtime/include/kapsl_llama_cpp_backend.h"):
                 shutil.copyfile(ROOT / relative, repo / relative)
+            verifier = ".github/scripts/verify-llama-cpp-integration-checkout.sh"
+            shutil.copyfile(ROOT / verifier, repo / verifier)
+            (repo / verifier).chmod(0o755)
+            # The pack source is an exact, clean kapsl-integrations checkout.
+            integrations = repo / "kapsl-integrations-llama"
+            integrations.mkdir()
+            (integrations / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.92.0"\n')
+            git = ["git", "-C", str(integrations), "-c", "user.name=Kapsl test",
+                   "-c", "user.email=test@example.invalid"]
+            subprocess.run(git + ["init", "-q"], check=True)
+            subprocess.run(git + ["add", "rust-toolchain.toml"], check=True)
+            subprocess.run(git + ["commit", "-qm", "fixture"], check=True)
+            integrations_ref = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
+                                              capture_output=True, text=True).stdout.strip()
             binary = root / "bin"
             binary.mkdir()
             for name in ("file", "ldd", "nm", "patchelf", "sha256sum", "tar"):
@@ -418,7 +432,8 @@ target = pathlib.Path(sys.argv[sys.argv.index("--target-dir") + 1])
 (target / "release").mkdir(parents=True, exist_ok=True)
 (target / "release/libkapsl_backend_llama_cpp.so").write_bytes(b"fixture")
 with open(os.environ["CARGO_FIXTURE_LOG"], "a") as stream:
-    stream.write(json.dumps({"args": sys.argv[1:], "pic": os.environ.get("CMAKE_POSITION_INDEPENDENT_CODE")}) + "\\n")
+    stream.write(json.dumps({"args": sys.argv[1:], "pic": os.environ.get("CMAKE_POSITION_INDEPENDENT_CODE"),
+                             "toolchain": os.environ.get("RUSTUP_TOOLCHAIN")}) + "\\n")
 ''')
             cargo.chmod(0o755)
             scratch = root / "scratch"
@@ -431,7 +446,16 @@ with open(os.environ["CARGO_FIXTURE_LOG"], "a") as stream:
                 "KAPSL_VERSION": "0.2.7", "KAPSL_LLAMA_BUILD_ONLY": "true",
                 "KAPSL_LLAMA_TARGET_ROOT": str(cache), "CARGO_FIXTURE_LOG": str(log),
                 "KAPSL_LLAMA_CPU_LIBRARY": "", "KAPSL_LLAMA_CUDA_LIBRARY": "",
+                "KAPSL_LLAMA_INTEGRATIONS_REF": integrations_ref,
             }
+            unpinned = values.copy()
+            del unpinned["KAPSL_LLAMA_INTEGRATIONS_REF"]
+            for environment in (unpinned, values | {"KAPSL_LLAMA_INTEGRATIONS_REF": "0" * 40}):
+                result = subprocess.run(["bash", ".github/scripts/package-linux-llama-cpp-backend-packs.sh"],
+                                        cwd=repo, env=environment | {"KAPSL_LLAMA_PACK_PROFILE": "cpu"},
+                                        capture_output=True, text=True, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(log.exists())
             for profile in ("cpu", "cuda12"):
                 result = subprocess.run(["bash", ".github/scripts/package-linux-llama-cpp-backend-packs.sh"],
                                         cwd=repo, env=values | {"KAPSL_LLAMA_PACK_PROFILE": profile},
@@ -444,6 +468,9 @@ with open(os.environ["CARGO_FIXTURE_LOG"], "a") as stream:
             for call in calls:
                 self.assertIn("--locked", call["args"])
                 self.assertEqual(call["pic"], "ON")
+                self.assertEqual(call["toolchain"], "1.92.0")
+                manifest = call["args"][call["args"].index("--manifest-path") + 1]
+                self.assertEqual(manifest, "kapsl-integrations-llama/Cargo.toml")
             self.assertIn("cuda12-shared-pool", calls[1]["args"])
             self.assertEqual(list((repo / "dist").iterdir()), [])
 
