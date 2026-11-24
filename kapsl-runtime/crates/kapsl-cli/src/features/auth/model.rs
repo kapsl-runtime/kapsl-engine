@@ -28,6 +28,11 @@ pub(crate) enum ApiAuthorizationError {
 pub(crate) struct AuthorizedAccess {
     pub(crate) grant: ApiAuthGrant,
     pub(crate) mode: &'static str,
+    /// Hashed identity of the authorizing credential, for session scoping.
+    /// Only the MCP adapter consumes it so far; HTTP and gRPC routes still
+    /// derive it from the raw header via `scope_session_id_for_authorization`.
+    #[cfg_attr(not(feature = "mcp-server"), allow(dead_code))]
+    pub(crate) principal: ApiPrincipal,
 }
 
 impl ApiAuthGrant {
