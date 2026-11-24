@@ -9,9 +9,12 @@ name = "kapsl-pack-verification-bench"
 path = "main.rs"
 
 [dependencies]
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Match the engine's locked hash implementation for comparable measurements.
+# Match the engine's locked hash implementations for comparable measurements.
 sha2 = "=0.10.9"
+blake3 = "=1.8.7"
 
 [dev-dependencies]
 tempfile = "3.10"

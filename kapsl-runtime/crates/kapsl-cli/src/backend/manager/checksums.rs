@@ -10,6 +10,9 @@ use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+// Explicit so the module also resolves when the pack-verification harness
+// includes this file through `#[path]` (which resolves children from `manager/`).
+#[path = "checksums/profile.rs"]
 mod profile;
 
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;

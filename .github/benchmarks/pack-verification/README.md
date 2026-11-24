@@ -22,3 +22,23 @@ CPU allocation and storage bandwidth affect the result.
 This isolates verification cost. Signature checks, adapter loading, inference
 and end-to-end startup qualification remain the engine's responsibility. This
 benchmark does not replace or change the release's 1.5x startup threshold.
+It times the SHA-256 `files` map only; packs that sign a BLAKE3 map
+(`files_blake3`) are verified with BLAKE3 by the engine.
+
+## Correctness tests
+
+The same crate runs the checksum module's unit tests (SHA-256 and BLAKE3,
+tampering, missing files, read errors, worker panics and the per-file profiler)
+without building the engine, ORT or any backend runtime. CI runs them on Linux,
+macOS and Windows:
+
+```sh
+cargo test --locked --manifest-path .github/benchmarks/pack-verification/Cargo.toml
+```
+
+## Per-file timings in a real launch
+
+Set `KAPSL_PACK_VERIFICATION_PROFILING=1` on the engine. Each validation then
+logs one `KAPSL_PACK_VERIFICATION_PROFILE` JSON record with per-file bytes and
+open, read and hash wall times. These are diagnostics, not qualification
+measurements; leave the variable unset for qualification runs.
