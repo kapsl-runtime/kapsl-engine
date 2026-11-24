@@ -119,7 +119,11 @@ impl GpuRegionSource for RegionRecord {
 }
 
 pub(crate) struct GpuDevicePool {
+    /// Inventory (NVML) id: the key the runtime uses everywhere else.
     device_id: usize,
+    /// CUDA runtime ordinal of the opened device (differs from `device_id` when
+    /// CUDA numbers the GPUs differently from the inventory).
+    ordinal: usize,
     device: Option<Arc<CudaDevice>>,
     registry: GpuRegionRegistry,
     regions: Mutex<BTreeMap<GpuRegionId, Arc<RegionRecord>>>,
@@ -127,10 +131,11 @@ pub(crate) struct GpuDevicePool {
 }
 
 impl GpuDevicePool {
-    pub(crate) fn new(device: Arc<CudaDevice>) -> Arc<Self> {
+    pub(crate) fn new(device: Arc<CudaDevice>, device_id: usize) -> Arc<Self> {
         Arc::new(Self {
-            device_id: device.ordinal(),
-            registry: GpuRegionRegistry::new(device.ordinal()),
+            device_id,
+            ordinal: device.ordinal(),
+            registry: GpuRegionRegistry::new(device_id),
             device: Some(device),
             regions: Mutex::new(BTreeMap::new()),
             next_allocation: AtomicU64::new(1),
@@ -168,7 +173,7 @@ impl GpuDevicePool {
         self: &Arc<Self>,
         arena: Arc<GpuArenaRegion>,
     ) -> Result<GpuRegionLease, String> {
-        if arena.device().ordinal() != self.device_id {
+        if arena.device().ordinal() != self.ordinal {
             return Err("arena belongs to another CUDA device".into());
         }
         Ok(self.insert(

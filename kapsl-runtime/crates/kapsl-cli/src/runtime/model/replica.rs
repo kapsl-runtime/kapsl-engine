@@ -148,7 +148,53 @@ pub(super) async fn load_replica(
         (None, None)
     };
 
-    let worker = start_isolated_worker(&plan).await?;
+    // An isolated worker is another process with its own ledger. Reserve its
+    // memory in this process before spawning it, and keep the reservation for
+    // as long as the worker lives (MEM-08).
+    let worker_memory = if plan.isolate_process {
+        let domains = isolated_worker_domains(&plan, device_mesh.as_ref(), device_info);
+        if domains.is_empty() {
+            None
+        } else {
+            // A GGUF's lease is what its backend plans for an in-process load.
+            #[cfg(feature = "gpu-device-pool")]
+            let planned = planned_gguf_report_for_worker(
+                &plan.loader.manifest,
+                onnx_route.as_ref(),
+                &domains,
+                device_info,
+                plan.backend_tuning.onnx(),
+                &resources,
+                plan.base_model_id,
+                plan.replica_id,
+                &plan.model_file_path,
+            );
+            #[cfg(not(feature = "gpu-device-pool"))]
+            let planned: Result<kapsl_engine_api::MemoryReport, String> =
+                Err("built without gpu-device-pool: the file-size estimate".to_string());
+            Some(
+                reserve_isolated_worker_memory(
+                    &plan.model_file_path,
+                    &domains,
+                    &resources,
+                    plan.base_model_id,
+                    plan.replica_id,
+                    EngineKind::resolve(&plan.loader.manifest),
+                    onnx_peak_sessions(
+                        EngineKind::resolve(&plan.loader.manifest),
+                        &plan.backend_tuning,
+                    ),
+                    plan.use_pipeline_backend,
+                    plan.priority_weight,
+                    planned.as_ref().map_err(String::as_str),
+                )
+                .await?,
+            )
+        }
+    } else {
+        None
+    };
+    let worker = start_isolated_worker(&plan, worker_memory).await?;
     let mut engines = if let Some(worker) = worker {
         let engine_count = if role.is_primary() && !plan.use_pipeline_backend {
             device_mesh
@@ -264,17 +310,14 @@ pub(super) async fn load_replica(
             )
         })?;
         logical_provider = Some(selection.logical_provider.clone());
+        // `select_mesh_devices` only returns devices this process can use, so
+        // there is no requested-id fallback: a raw manifest id could name a
+        // device the selection just excluded.
         let device_id = selection
             .devices
             .first()
             .map(|device| device.id)
-            .unwrap_or_else(|| {
-                plan.loader
-                    .manifest
-                    .hardware_requirements
-                    .device_id
-                    .unwrap_or(0) as usize
-            });
+            .ok_or_else(|| format!("No usable device for {}", role.selection_context(&plan)))?;
         // Use the exact provider selected from the manifest/fallback policy.
         // The generic factory's final CPU fallback would otherwise let an
         // autoscaled CUDA/TensorRT replica silently change execution mode.
@@ -462,10 +505,15 @@ fn create_pipeline_backend(
     .with_memory_owner(plan.base_model_id, plan.replica_id);
     #[cfg(feature = "gpu-device-pool")]
     {
+        // An ONNX pipeline uses the pool's environment allocator only with the
+        // opt-in; the other kinds follow the pool on their devices.
+        let pool_allowed = !EngineKind::resolve(&plan.loader.manifest).uses_onnx_session()
+            || onnx_cuda_pool_opt_in();
         backend = backend.with_env_allocators(
-            device_ids
-                .iter()
-                .any(|&device_id| resources.uses_env_allocators(device_id)),
+            pool_allowed
+                && device_ids
+                    .iter()
+                    .any(|&device_id| resources.uses_env_allocators(device_id)),
         );
     }
 
@@ -553,6 +601,31 @@ fn model_info_for_plan(
         manifest.task.clone(),
         manifest.preprocess_kind(),
     )
+}
+
+/// Memory domains an isolated worker will occupy: the selected mesh devices of
+/// a primary load, or the first selected device of a single replica.
+fn isolated_worker_domains(
+    plan: &ModelLoadPlan,
+    mesh: Option<&kapsl_hal::device_mesh::DeviceMesh>,
+    device_info: &DeviceInfo,
+) -> Vec<MemoryDomain> {
+    let devices: Vec<kapsl_hal::device::Device> = match mesh {
+        Some(mesh) => (0..mesh.world_size)
+            .filter_map(|rank| mesh.get_device(rank).map(|device| (*device).clone()))
+            .collect(),
+        None => select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
+            .map(|selection| selection.devices.into_iter().take(1).collect())
+            .unwrap_or_default(),
+    };
+    let mut domains: Vec<MemoryDomain> = Vec::new();
+    for device in &devices {
+        let domain = MemoryDomain::for_provider(&device.backend.to_string(), device.id);
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains
 }
 
 fn log_package_plan(plan: &ModelLoadPlan) {

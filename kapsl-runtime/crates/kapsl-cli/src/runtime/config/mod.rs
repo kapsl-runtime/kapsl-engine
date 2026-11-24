@@ -593,16 +593,52 @@ pub(crate) struct MeshDeviceSelection {
     pub(crate) logical_provider: String,
 }
 
-pub(crate) fn select_mesh_devices(
-    requirements: &kapsl_core::HardwareRequirements,
+/// Free bytes under the memory ledger for an engine CUDA device, installed once
+/// the memory authority exists. Placement of unpinned models reads it.
+type DeviceRoomFn = Box<dyn Fn(usize) -> usize + Send + Sync>;
+static DEVICE_ROOM: std::sync::OnceLock<DeviceRoomFn> = std::sync::OnceLock::new();
+/// Device chosen for each unpinned single-device model, so every plan of one
+/// model (primary load, replicas, preliminary admission) agrees on it even
+/// though the room under the ledger changes as soon as the model is admitted.
+static DEFAULT_PLACEMENTS: std::sync::Mutex<Vec<(u32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn install_device_room(room: impl Fn(usize) -> usize + Send + Sync + 'static) {
+    let _ = DEVICE_ROOM.set(Box::new(room));
+}
+
+/// The device with the most room; ties go to the lowest id.
+pub(crate) fn choose_device_by_room(
+    candidates: &[usize],
+    room: impl Fn(usize) -> usize,
+) -> Option<usize> {
+    candidates
+        .iter()
+        .copied()
+        .max_by_key(|&id| (room(id), std::cmp::Reverse(id)))
+}
+
+/// Default placement of an unpinned model: ONE visible CUDA device, chosen by
+/// the room left under the ledger. Replicas across devices happen only when the
+/// manifest asks for a multi-device strategy (`pool`, `data-parallel`, ...), and
+/// an explicit `device_id` is never overridden. Pins the choice into
+/// `requirements.device_id` so every later selection sees the same device.
+/// Returns the chosen device when it pinned one.
+pub(crate) fn pin_default_cuda_device(
+    requirements: &mut kapsl_core::HardwareRequirements,
     device_info: &DeviceInfo,
-) -> Result<MeshDeviceSelection, String> {
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+    base_model_id: u32,
+) -> Option<usize> {
+    if requirements.device_id.is_some() {
+        return None;
+    }
     let strategy = requirements
         .strategy
         .as_deref()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let allow_multi = matches!(
+    if matches!(
         strategy.as_str(),
         "pool"
             | "round-robin"
@@ -611,11 +647,151 @@ pub(crate) fn select_mesh_devices(
             | "pipeline-parallel"
             | "tensor-parallel"
             | "auto"
-    );
-    let mut preferred_device_id = requirements.device_id.map(|id| id as usize);
-    if allow_multi {
-        preferred_device_id = None;
+    ) {
+        return None;
     }
+    let usable = usable_device_info(device_info, map);
+    let providers = candidate_providers(requirements, &usable);
+    let wants_cuda = providers.iter().any(|provider| {
+        matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "cuda" | "tensorrt"
+        )
+    }) || (providers.is_empty() && usable.has_cuda);
+    if !wants_cuda {
+        return None;
+    }
+    let candidates: Vec<usize> = usable
+        .devices
+        .iter()
+        .filter(|device| is_cuda_device(device))
+        .filter(|device| {
+            requirements
+                .min_vram_mb
+                .is_none_or(|min| device.memory_mb >= min)
+        })
+        .map(|device| device.id)
+        .collect();
+    if candidates.len() < 2 {
+        return None;
+    }
+    let mut chosen = DEFAULT_PLACEMENTS.lock().unwrap();
+    let device = match chosen.iter().find(|(id, _)| *id == base_model_id) {
+        Some((_, device)) if candidates.contains(device) => *device,
+        _ => {
+            // Without a ledger yet (startup planning) spread by how many default
+            // placements each device already has, then by id.
+            let tally = |id: usize| chosen.iter().filter(|(_, d)| *d == id).count();
+            let device = if DEVICE_ROOM.get().is_some() {
+                choose_device_by_room(&candidates, |id| DEVICE_ROOM.get().map_or(0, |f| f(id)))
+            } else {
+                choose_device_by_room(&candidates, |id| usize::MAX - tally(id))
+            }?;
+            chosen.retain(|(id, _)| *id != base_model_id);
+            chosen.push((base_model_id, device));
+            device
+        }
+    };
+    requirements.device_id = Some(device as i32);
+    log::info!(
+        "[placement] model {base_model_id}: no device pinned and no multi-device strategy; placing on CUDA device {device} (visible candidates {candidates:?}, most room under the ledger)"
+    );
+    Some(device)
+}
+
+/// An explicitly requested CUDA device that this process cannot use.
+///
+/// Typed so the load path can reject the request at admission with a clear
+/// message instead of failing later inside a backend, and so it is never
+/// mistaken for a memory denial (which the priority arbiter retries by
+/// evicting lower-priority models; no eviction can make a hidden device appear).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceUnavailable {
+    pub(crate) device_id: usize,
+    pub(crate) detail: String,
+}
+
+impl std::fmt::Display for DeviceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model requests CUDA device {}, which this process cannot use: {}",
+            self.device_id, self.detail
+        )
+    }
+}
+
+impl std::error::Error for DeviceUnavailable {}
+
+fn is_cuda_device(device: &kapsl_hal::device::Device) -> bool {
+    device.backend.to_string().eq_ignore_ascii_case("cuda")
+}
+
+/// Why a CUDA inventory device cannot be used by this process, or `None` when
+/// it can (or when no CUDA mapping is installed, which is the legacy identity).
+fn cuda_device_problem(
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+    device: &kapsl_hal::device::Device,
+) -> Option<kapsl_llm::cuda_ordinal::CudaOrdinalError> {
+    if !is_cuda_device(device) {
+        return None;
+    }
+    map?.ordinal_or_error(device.id).err()
+}
+
+/// The inventory restricted to devices this process can use: CUDA devices that
+/// are hidden from the process (for example by `CUDA_VISIBLE_DEVICES`) or that
+/// could not be matched to a CUDA ordinal are not managed by the memory layer
+/// and must never be a placement target.
+fn usable_device_info(
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+) -> DeviceInfo {
+    let mut usable = device_info.clone();
+    usable
+        .devices
+        .retain(|device| cuda_device_problem(map, device).is_none());
+    if usable.has_cuda && !usable.devices.iter().any(is_cuda_device) {
+        usable.has_cuda = false;
+    }
+    usable
+}
+
+/// Parse a dotted CUDA version ("12.4", "13", "12.4.1") into numeric parts.
+fn parse_cuda_version(version: &str) -> Option<Vec<u64>> {
+    let parts: Vec<u64> = version
+        .trim()
+        .split('.')
+        .map(|part| part.trim().parse::<u64>().ok())
+        .collect::<Option<_>>()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// Numeric comparison of dotted versions: `13.0 >= 9.0` (a string compare says
+/// otherwise). Missing trailing parts count as zero, so `12 == 12.0`. Either
+/// side failing to parse is a failed requirement (fail closed).
+pub(crate) fn cuda_version_at_least(device_version: &str, min_version: &str) -> bool {
+    let (Some(device), Some(min)) = (
+        parse_cuda_version(device_version),
+        parse_cuda_version(min_version),
+    ) else {
+        return false;
+    };
+    let len = device.len().max(min.len());
+    for i in 0..len {
+        let d = device.get(i).copied().unwrap_or(0);
+        let m = min.get(i).copied().unwrap_or(0);
+        if d != m {
+            return d > m;
+        }
+    }
+    true
+}
+
+fn candidate_providers(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+) -> Vec<String> {
     let mut providers: Vec<String> = Vec::new();
     if let Some(pref) = &requirements.preferred_provider {
         providers.push(pref.clone());
@@ -652,7 +828,101 @@ pub(crate) fn select_mesh_devices(
         }
         push_if_missing("cpu");
     }
+    providers
+}
 
+/// Deny a request that names a CUDA device this process cannot use. The
+/// request is checked whatever the topology: a pool or data-parallel strategy
+/// does not make an explicit `device_id` optional.
+pub(crate) fn check_requested_device_usable(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+) -> Result<(), DeviceUnavailable> {
+    let Some(requested) = requirements
+        .device_id
+        .and_then(|id| usize::try_from(id).ok())
+    else {
+        return Ok(());
+    };
+    let providers = candidate_providers(requirements, device_info);
+    let wants_cuda = providers.iter().any(|provider| {
+        matches!(
+            provider.trim().to_ascii_lowercase().as_str(),
+            "cuda" | "tensorrt"
+        )
+    }) || (providers.is_empty() && device_info.has_cuda);
+    if !wants_cuda {
+        return Ok(());
+    }
+    let Some(device) = device_info
+        .devices
+        .iter()
+        .find(|device| is_cuda_device(device) && device.id == requested)
+    else {
+        return Ok(());
+    };
+    let Some(problem) = cuda_device_problem(map, device) else {
+        return Ok(());
+    };
+    let usable: Vec<usize> = device_info
+        .devices
+        .iter()
+        .filter(|device| is_cuda_device(device) && cuda_device_problem(map, device).is_none())
+        .map(|device| device.id)
+        .collect();
+    Err(DeviceUnavailable {
+        device_id: requested,
+        detail: format!(
+            "{problem}; CUDA devices this process can use: {usable:?} \
+             (set CUDA_VISIBLE_DEVICES to include it, or request one of those devices)"
+        ),
+    })
+}
+
+pub(crate) fn select_mesh_devices(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+) -> Result<MeshDeviceSelection, String> {
+    select_mesh_devices_with(
+        requirements,
+        device_info,
+        kapsl_llm::cuda_ordinal::installed().as_deref(),
+    )
+}
+
+/// [`select_mesh_devices`] with the process's CUDA visibility passed in. Every
+/// placement path goes through here, so hidden or unmatched CUDA devices are
+/// removed once, before any provider branch or fallback can pick them.
+pub(crate) fn select_mesh_devices_with(
+    requirements: &kapsl_core::HardwareRequirements,
+    device_info: &DeviceInfo,
+    map: Option<&kapsl_llm::cuda_ordinal::CudaOrdinalMap>,
+) -> Result<MeshDeviceSelection, String> {
+    check_requested_device_usable(requirements, device_info, map)
+        .map_err(|error| error.to_string())?;
+    let usable = usable_device_info(device_info, map);
+    let device_info = &usable;
+    let strategy = requirements
+        .strategy
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let allow_multi = matches!(
+        strategy.as_str(),
+        "pool"
+            | "round-robin"
+            | "data-parallel"
+            | "pipeline"
+            | "pipeline-parallel"
+            | "tensor-parallel"
+            | "auto"
+    );
+    let mut preferred_device_id = requirements.device_id.map(|id| id as usize);
+    if allow_multi {
+        preferred_device_id = None;
+    }
+    let providers = candidate_providers(requirements, device_info);
     let mut selected: Vec<kapsl_hal::device::Device> = Vec::new();
     let mut selected_provider: Option<String> = None;
     if !providers.is_empty() {
@@ -677,8 +947,8 @@ pub(crate) fn select_mesh_devices(
                     if let Some(min_ver) = &requirements.min_cuda_version {
                         matches.retain(|d| {
                             d.cuda_version
-                                .as_ref()
-                                .map(|ver| ver >= min_ver)
+                                .as_deref()
+                                .map(|ver| cuda_version_at_least(ver, min_ver))
                                 .unwrap_or(false)
                         });
                     }
@@ -748,4 +1018,46 @@ pub(crate) fn select_mesh_devices(
         devices: selected,
         logical_provider,
     })
+}
+
+#[cfg(test)]
+#[path = "visibility_tests.rs"]
+mod visibility_tests;
+
+#[cfg(test)]
+mod cuda_version_tests {
+    use super::cuda_version_at_least;
+
+    #[test]
+    fn versions_compare_numerically_not_as_strings() {
+        assert!(cuda_version_at_least("13.0", "9.0"));
+        assert!(!cuda_version_at_least("9.0", "13.0"));
+        assert!(cuda_version_at_least("12.10", "12.9"));
+        assert!(!cuda_version_at_least("11.8", "12.0"));
+        assert!(cuda_version_at_least("12.0", "12.0"));
+        assert!(cuda_version_at_least("12", "12.0"));
+        assert!(cuda_version_at_least("12.4.1", "12.4"));
+        assert!(!cuda_version_at_least("12.4", "12.4.1"));
+    }
+
+    #[test]
+    fn an_unparseable_version_fails_the_requirement() {
+        assert!(!cuda_version_at_least("", "12.0"));
+        assert!(!cuda_version_at_least("12.x", "12.0"));
+        assert!(!cuda_version_at_least("12.0", "twelve"));
+    }
+}
+
+#[cfg(test)]
+mod default_placement_tests {
+    use super::choose_device_by_room;
+
+    #[test]
+    fn the_device_with_the_most_room_wins_and_ties_go_to_the_lowest_id() {
+        let room = |id: usize| [8usize, 20, 20][id];
+        assert_eq!(choose_device_by_room(&[0, 1, 2], room), Some(1));
+        assert_eq!(choose_device_by_room(&[0, 2], room), Some(2));
+        assert_eq!(choose_device_by_room(&[1, 0], |_| 5), Some(0));
+        assert_eq!(choose_device_by_room(&[], |_| 5), None);
+    }
 }

@@ -208,16 +208,16 @@ impl ApiAuthState {
         }
     }
 
-    pub(crate) fn role_token_config(&self) -> ApiRoleTokenConfig {
-        self.role_tokens.clone()
+    pub(crate) fn role_token_status(&self) -> ApiRoleTokenStatus {
+        self.role_tokens.status()
     }
 
     pub(crate) fn update_role_token_config(
         &mut self,
         payload: ApiRoleTokenConfig,
-    ) -> Result<ApiRoleTokenConfig, String> {
+    ) -> Result<ApiRoleTokenStatus, String> {
         self.role_tokens.update_from_payload(payload)?;
-        Ok(self.role_tokens.clone())
+        Ok(self.role_tokens.status())
     }
 
     pub(crate) fn status_response(&self) -> ApiAuthStatusResponse {
@@ -299,7 +299,7 @@ impl ApiAuthState {
                 Some(self.key_view(key, user, now))
             })
             .collect::<Vec<_>>();
-        keys.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        keys.sort_by_key(|key| std::cmp::Reverse(key.created_at));
         keys
     }
 

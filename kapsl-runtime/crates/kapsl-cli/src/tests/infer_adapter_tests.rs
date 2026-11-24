@@ -55,8 +55,10 @@ fn test_parse_media_image_payload_to_float32_nchw() {
     let values: Vec<f32> = request
         .input
         .data
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("4 bytes per f32")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_ne_bytes(*chunk))
         .collect();
     assert_eq!(values, vec![1.0, 0.0, 0.0]);
 }
@@ -150,4 +152,41 @@ fn test_adapter_registry_rejects_framework_mismatch() {
     assert!(err
         .to_string()
         .contains("No infer adapter supports framework"));
+}
+
+#[test]
+fn the_native_route_carries_min_tokens_to_the_request_metadata() {
+    // Run 9, check l: the exact body the harness posted to /api/models/<id>/infer.
+    let prompt = "What is 5 times 3?";
+    let payload = json!({
+        "input": {
+            "shape": [prompt.len()],
+            "dtype": "string",
+            "data": prompt.as_bytes(),
+        },
+        "max_tokens": 64,
+        "min_tokens": 20,
+        "temperature": 0
+    });
+    let registry = default_request_adapter_registry();
+    let request =
+        parse_inference_request_with_registry(payload, "gguf", &registry).expect("payload parses");
+    let metadata = request
+        .metadata
+        .expect("generation parameters become metadata");
+    assert_eq!(metadata.max_new_tokens, Some(64));
+    assert_eq!(metadata.min_new_tokens, Some(20));
+    assert_eq!(metadata.temperature, Some(0.0));
+}
+
+#[test]
+fn min_new_tokens_is_accepted_under_its_other_name() {
+    let payload = json!({
+        "input": {"shape": [2], "dtype": "string", "data": [104, 105]},
+        "min_new_tokens": 7
+    });
+    let registry = default_request_adapter_registry();
+    let request =
+        parse_inference_request_with_registry(payload, "gguf", &registry).expect("payload parses");
+    assert_eq!(request.metadata.unwrap().min_new_tokens, Some(7));
 }

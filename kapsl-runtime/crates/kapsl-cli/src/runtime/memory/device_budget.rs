@@ -4,6 +4,12 @@ use std::collections::HashMap;
 pub(crate) const AUTO_POOL_ALIGNMENT_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const AUTO_POOL_MIN_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const AUTO_POOL_GROWTH_FLOOR_BYTES: usize = 256 * 1024 * 1024;
+/// Growth room is also a share of the safe budget (1/16). CUDA backing is
+/// immutable and cannot grow once a workload is admitted, so a later dynamic
+/// load of a different model (a vision model next to a started GGUF) can only
+/// use room reserved here. The pool is charged to the ledger in full, so the
+/// room is accounted, not hidden.
+pub(crate) const AUTO_POOL_GROWTH_BUDGET_DIVISOR: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AutoPoolSizingInput {
@@ -61,7 +67,9 @@ pub(crate) fn choose_auto_pool_capacity(input: AutoPoolSizingInput) -> AutoPoolS
     let allocatable_capacity = available_after_external.saturating_sub(retained_reserve);
     // Automatic mode is demand-sized. Retain bounded growth room instead of
     // eagerly converting every otherwise-free byte into an immutable backing.
-    let growth_headroom = (required_pool_bytes / 4).max(AUTO_POOL_GROWTH_FLOOR_BYTES);
+    let growth_headroom = (required_pool_bytes / 4)
+        .max(AUTO_POOL_GROWTH_FLOOR_BYTES)
+        .max(input.safe_budget_bytes / AUTO_POOL_GROWTH_BUDGET_DIVISOR);
     let raw_capacity = required_pool_bytes
         .saturating_add(growth_headroom)
         .min(allocatable_capacity);
@@ -267,6 +275,14 @@ impl DeviceBudgetLedger {
         Ok(current)
     }
 
+    /// Bytes currently charged to one external allocation, or 0 if unknown.
+    pub(crate) fn external_bytes(&self, device_id: usize, allocation_id: &str) -> usize {
+        self.devices
+            .get(&device_id)
+            .and_then(|device| device.allocations.get(allocation_id))
+            .map_or(0, |allocation| allocation.bytes)
+    }
+
     pub(crate) fn release_external(
         &mut self,
         device_id: usize,
@@ -357,6 +373,73 @@ mod tests {
     }
 
     #[test]
+    fn two_onnx_models_that_outgrow_the_budget_together_at_peak_are_denied() {
+        use crate::runtime::model::onnx_arena_peak_bytes;
+        // GPU run 5 and 6 ledger rows at 4 busy sessions: ResNet-50 1,761,607,680 B
+        // and ZFNet-512 2,437,110,191 B, 4,198,717,871 B together.
+        const RESNET: usize = 102_576_593;
+        const ZFNET: usize = 349_005_501;
+        const BUDGET: usize = 4_000_000_000;
+        let owner_a = MemoryOwner::new(1, 0);
+        let owner_b = MemoryOwner::new(2, 0);
+
+        let admit = |ledger: &mut DeviceBudgetLedger,
+                     name: &str,
+                     owner: MemoryOwner,
+                     weights: usize,
+                     workspace: usize| {
+            reserve_for(ledger, name, weights, owner)?;
+            ledger
+                .reserve_external(
+                    DEVICE,
+                    &format!("{name}:workspace"),
+                    workspace,
+                    owner,
+                    MemoryAllocationClass::TransientWorkspace,
+                )
+                .map(|_| ())
+        };
+        let new_ledger = || {
+            let mut ledger = DeviceBudgetLedger::default();
+            ledger.insert_device(DEVICE, BUDGET, 0).unwrap();
+            ledger
+        };
+
+        // The peak plan: weights and workspace, claims summing to the peak.
+        let mut ledger = new_ledger();
+        let resnet_peak = onnx_arena_peak_bytes(RESNET, 4);
+        admit(
+            &mut ledger,
+            "resnet",
+            owner_a,
+            RESNET * 4,
+            resnet_peak - RESNET * 4,
+        )
+        .expect("ResNet-50 alone fits");
+        let zfnet_peak = onnx_arena_peak_bytes(ZFNET, 4);
+        let denied = admit(
+            &mut ledger,
+            "zfnet",
+            owner_b,
+            ZFNET * 4,
+            zfnet_peak - ZFNET * 4,
+        )
+        .expect_err("ZFNet-512 next to it outgrows the budget at peak");
+        assert!(denied.contains("memory admission rejected"), "{denied}");
+
+        // The earlier plan (weights per session plus one max(model / 4, 64 MiB)
+        // workspace) admits both although together they reach 4.2 GB.
+        let old_plan = |model: usize| (model * 4, (model / 4).max(64 * 1024 * 1024));
+        let mut ledger = new_ledger();
+        let (weights, workspace) = old_plan(RESNET);
+        admit(&mut ledger, "resnet", owner_a, weights, workspace).unwrap();
+        let (weights, workspace) = old_plan(ZFNET);
+        admit(&mut ledger, "zfnet", owner_b, weights, workspace)
+            .expect("the load-time plan lets both in");
+        const { assert!(1_761_607_680usize + 2_437_110_191 > BUDGET) };
+    }
+
+    #[test]
     fn auto_pool_subtracts_weights_and_retains_unpooled_headroom() {
         let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
             safe_budget_bytes: 20 * GIB,
@@ -364,8 +447,31 @@ mod tests {
             minimum_pool_bytes: 0,
             unpooled_reserve_bytes: Some(2 * GIB),
         });
-        assert_eq!(decision.capacity_bytes, Some(512 * 1024 * 1024));
+        // 256 MiB minimum plus growth room of 1/16 of the safe budget (1.25 GiB).
+        assert_eq!(
+            decision.capacity_bytes,
+            Some(256 * 1024 * 1024 + 20 * GIB / 16)
+        );
         assert_eq!(decision.unpooled_reserve_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn auto_pool_leaves_room_for_a_later_vision_model_load() {
+        // The pool cannot grow once a workload is admitted, so the process-start
+        // pool must already hold the floor of a ~1.1 GB dynamic ONNX load (the
+        // YOLOX package next to a started GGUF) on a 24 GB card.
+        let decision = choose_auto_pool_capacity(AutoPoolSizingInput {
+            safe_budget_bytes: 22_440_339_047,
+            planned_external_bytes: 759_835_488,
+            minimum_pool_bytes: 0,
+            unpooled_reserve_bytes: None,
+        });
+        let capacity = decision.capacity_bytes.expect("automatic pool");
+        assert!(
+            capacity >= 1_088_552_216,
+            "pool {capacity} too small for the dynamic load"
+        );
+        assert_eq!(capacity % AUTO_POOL_ALIGNMENT_BYTES, 0);
     }
 
     #[test]
@@ -380,7 +486,8 @@ mod tests {
         });
         let capacity = decision.capacity_bytes.expect("automatic pool");
         let expected_reserve = (safe_budget / 5).max(GIB).min(safe_budget / 3);
-        let expected_capacity = 512 * 1024 * 1024;
+        let expected_capacity = (256 * 1024 * 1024 + safe_budget / 16) / AUTO_POOL_ALIGNMENT_BYTES
+            * AUTO_POOL_ALIGNMENT_BYTES;
         assert_eq!(capacity % AUTO_POOL_ALIGNMENT_BYTES, 0);
         assert_eq!(decision.unpooled_reserve_bytes, expected_reserve);
         assert_eq!(capacity, expected_capacity);
@@ -517,6 +624,22 @@ mod tests {
 
         ledger.release_external(DEVICE, "weights", OWNER);
         assert_eq!(ledger.snapshot(DEVICE).expect("device").external_bytes, 0);
+    }
+
+    #[test]
+    fn external_bytes_reports_the_current_charge_of_one_allocation() {
+        let mut ledger = ledger();
+        reserve(&mut ledger, "weights", 8 * GIB).expect("planned load");
+        reserve(&mut ledger, "gguf-scratch:m", GIB).expect("planned scratch");
+        ledger
+            .reconcile_external(DEVICE, "weights", 7 * GIB)
+            .expect("actual weights");
+
+        assert_eq!(ledger.external_bytes(DEVICE, "weights"), 7 * GIB);
+        // Never reconciled: still the admitted (planned) bytes.
+        assert_eq!(ledger.external_bytes(DEVICE, "gguf-scratch:m"), GIB);
+        assert_eq!(ledger.external_bytes(DEVICE, "missing"), 0);
+        assert_eq!(ledger.external_bytes(DEVICE + 1, "weights"), 0);
     }
 
     #[test]
