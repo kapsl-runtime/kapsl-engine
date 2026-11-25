@@ -165,6 +165,26 @@ pub(crate) fn stop_model_and_replicas(
         }
     }
 
+    for deployment in resources.managed_servers() {
+        match deployment.shutdown_model(base_model_id) {
+            Ok(count) if count > 0 => log::info!(
+                "Stopped {} managed {} runtime(s) for model {}",
+                count,
+                deployment.name(),
+                base_model_id
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                return Err(format!(
+                    "managed {} teardown for model {} did not complete: {}",
+                    deployment.name(),
+                    base_model_id,
+                    error
+                ));
+            }
+        }
+    }
+
     for replica in &replicas {
         if let Err(error) = models
             .registry()

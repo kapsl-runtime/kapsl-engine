@@ -3,6 +3,14 @@
 use super::*;
 
 mod bridge;
+mod server;
+mod sglang;
+
+use self::server::managed_kv_participant_config;
+pub(crate) use self::server::{ManagedServerDeployment, PreparedManagedServerDeployment};
+pub(crate) use self::sglang::{
+    create_managed_sglang_engine, prepare_managed_sglang, validate_managed_sglang_launch_policy,
+};
 
 use self::bridge::{
     map_ureq_body_error, ManagedVllmBridgeError, ManagedVllmBridgeTelemetry, ManagedVllmByteStream,
@@ -4848,30 +4856,24 @@ fn build_kv_transfer_config(
     if vmm_conformance && !live_resize {
         return Err("managed vLLM VMM conformance requires live resize".to_string());
     }
-    let memory_domains = device_ids
-        .iter()
-        .map(|device_id| serde_json::json!({"kind": "cuda", "device_id": device_id}))
-        .collect::<Vec<_>>();
-    let rank_device_map = device_ids
-        .iter()
-        .enumerate()
-        .map(|(rank, device_id)| (rank.to_string(), serde_json::json!(device_id)))
-        .collect::<serde_json::Map<_, _>>();
-    let mut extra = serde_json::json!({
-        "kapsl_control_endpoint": control_endpoint,
-        "kapsl_participant_id": participant_id,
-        "kapsl_model_fingerprint": model_fingerprint,
-        "kapsl_kv_mode": "shared_pool",
-        "kapsl_memory_domains": memory_domains,
-        "kapsl_rank_device_map": rank_device_map,
-        "kapsl_lease_ttl_ms": lease_ttl_ms,
-        "kapsl_live_resize": live_resize,
-        "kapsl_vmm_conformance": vmm_conformance,
-    });
-    if let Some(grant) = provisioning_grant {
-        extra["kapsl_provisioning_grant"] = serde_json::to_value(grant)
-            .map_err(|error| format!("serialize managed vLLM provisioning grant: {error}"))?;
-    }
+    // The connector reads the same participant configuration document every
+    // adapter does; vLLM carries it as the connector's extra config.
+    let mut extra = managed_kv_participant_config(
+        control_endpoint,
+        participant_id,
+        model_fingerprint,
+        kapsl_kv_abi::KvParticipantMode::SharedPool,
+        device_ids,
+        lease_ttl_ms,
+    )?;
+    extra.live_resize = live_resize;
+    extra.vmm_conformance = vmm_conformance;
+    extra.provisioning_grant = provisioning_grant.cloned();
+    extra
+        .validate()
+        .map_err(|error| format!("managed vLLM participant config: {error}"))?;
+    let extra = serde_json::to_value(&extra)
+        .map_err(|error| format!("serialize managed vLLM participant config: {error}"))?;
     serde_json::to_string(&serde_json::json!({
         "kv_connector": "KapslConnectorV1",
         "kv_role": "kv_both",

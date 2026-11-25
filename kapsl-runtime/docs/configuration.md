@@ -128,6 +128,7 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
 | `KAPSL_VLLM_MEMORY_MODE` | Managed-vLLM KV policy override. Omitted, `exact`, or `auto` preserves the package's exact policy; `legacy-fraction` (also `legacy`/`legacy_fraction`) is the explicit compatibility rollback. Exact cannot override an explicitly authored legacy policy. |
 | `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge mode. Omitted or `wire` uses the typed byte relay; `async-translated`, `translated`, or `legacy` retains response translation for rollback. |
+| `KAPSL_SGLANG_PYTHON` | Python executable of the operator-provided managed-SGLang environment (SGLang `0.5.23` with `kapsl-sglang-adapter` `0.2.0`). Required to load a package whose serving backend is `sglang`; there is no signed SGLang pack. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -269,6 +270,61 @@ headers, JSON body, or SSE bytes without reconstructing completion events.
 Client authorization is never forwarded. Set
 `KAPSL_VLLM_BRIDGE_MODE=async-translated` (or `legacy`) only to roll a replica
 back to the translated compatibility path.
+
+### Managed SGLang
+
+A SafeTensors causal-LM generation package built with
+`--serving-backend sglang` is served by SGLang. `auto` never selects SGLang.
+Kapsl launches it the way it launches vLLM: a supervised child on a loopback
+port, reached through the same Kapsl and OpenAI-compatible APIs, restarted
+within bounds, and stopped as a process group when the model is unloaded.
+
+SGLang joins as an **opaque** KV participant. It keeps its own KV pool and
+allocates all of it at startup, so the accounting differs from managed vLLM:
+
+- Kapsl bounds the pool with `--max-total-tokens` and admits the server's
+  whole static footprint at model load: SafeTensors weights, a workspace
+  estimate, and the pool. The pool is sized from `config.json` (two 16-bit
+  vectors per layer and KV head, per token).
+- Each request then takes a capacity lease through the KV control socket
+  before SGLang gives it KV memory. A lease is charged against the device
+  budget on top of the admitted pool, so the device needs headroom beyond the
+  static footprint for requests to be admitted. A request Kapsl cannot admit
+  yet stays queued inside SGLang.
+- The replica becomes routable when SGLang answers `/health` and its
+  participant has registered a pool no larger than the one admitted. A larger
+  pool keeps it unroutable.
+
+There is no signed SGLang backend pack. Set `KAPSL_SGLANG_PYTHON` to the Python
+executable of an environment that has SGLang `0.5.23` and
+`kapsl-sglang-adapter` `0.2.0` installed; any other version fails at startup.
+Kapsl starts the adapter's launcher from it (`python -m
+kapsl_sglang_adapter.launch`, the module behind `kapsl-sglang-serve`), which
+refuses to start SGLang unless the adapter will govern it. The participant's
+identity reaches the adapter as one JSON document in
+`KAPSL_KV_PARTICIPANT_CONFIG`. The path requires a Linux `gpu-device-pool`
+build, one CUDA device, and one scheduler rank.
+
+Optional package-level settings live under `metadata.serving.sglang`; an
+unknown key is an error:
+
+```yaml
+metadata:
+  serving:
+    backend: sglang
+    sglang:
+      max_total_tokens: 16384       # KV pool size in tokens
+      context_length: 8192          # passed as --context-length
+      kv_pool_bytes: 268435456      # admit this instead of the estimate
+      startup_timeout_seconds: 300  # 30 to 1800
+```
+
+`max_total_tokens` defaults to 4096 tokens for each unit of `--batch-size`.
+Set `kv_pool_bytes` when the model's KV geometry cannot be read from
+`config.json`. Kapsl sets `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false` for
+the child: SGLang's default health probe generates a token, which needs a lease
+like any request, so an exhausted device budget would otherwise look like a
+dead server.
 
 ### External KV participants
 

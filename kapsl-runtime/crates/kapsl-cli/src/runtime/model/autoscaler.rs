@@ -250,7 +250,9 @@ fn managed_vllm_has_internal_batching_headroom(
     model: &ModelInfo,
     metrics: Option<&EngineMetrics>,
 ) -> bool {
-    if model.device != "vllm" {
+    // Every managed server batches internally; SGLang reports its live KV
+    // leases as active sequences.
+    if !matches!(model.device.as_str(), "vllm" | "sglang") {
         return false;
     }
     let Some(metrics) = metrics else {
@@ -308,6 +310,23 @@ mod managed_vllm_autoscaling_tests {
         assert!(!managed_vllm_has_internal_batching_headroom(
             &model("CUDAExecutionProvider"),
             Some(&EngineMetrics::default())
+        ));
+        let sglang = model("sglang");
+        assert!(managed_vllm_has_internal_batching_headroom(
+            &sglang,
+            Some(&EngineMetrics {
+                batch_size: 4,
+                kv_cache_sequences: 3,
+                ..Default::default()
+            })
+        ));
+        assert!(!managed_vllm_has_internal_batching_headroom(
+            &sglang,
+            Some(&EngineMetrics {
+                batch_size: 4,
+                kv_cache_sequences: 4,
+                ..Default::default()
+            })
         ));
     }
 

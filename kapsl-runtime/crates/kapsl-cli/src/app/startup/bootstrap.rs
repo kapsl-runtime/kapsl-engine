@@ -360,9 +360,34 @@ async fn prepare_managed_backends(
         None
     };
     drop(preliminary_admission);
+    // Every managed backend registers with the same KV coordinator, so a
+    // later backend adopts the control socket an earlier one settled.
+    let managed_sglang = if startup_plans
+        .iter()
+        .any(|(_, plan)| plan.uses_managed_sglang())
+    {
+        for (_, plan) in startup_plans
+            .iter()
+            .filter(|(_, plan)| plan.uses_managed_sglang())
+        {
+            validate_managed_sglang_launch_policy(plan.manifest())?;
+        }
+        let prepared = prepare_managed_sglang(
+            config.state_dir.as_deref(),
+            config.kv_control.socket_path.as_deref(),
+            config.kv_control.lease_ttl_ms,
+        )?;
+        config.kv_control.socket_path = Some(prepared.control_socket);
+        Some(prepared.deployment)
+    } else {
+        None
+    };
     config.kv_control.validate(&config.transport)?;
     if let Some(deployment) = managed_vllm {
         resources.install_managed_vllm(deployment)?;
+    }
+    if let Some(deployment) = managed_sglang {
+        resources.install_managed_server(deployment)?;
     }
     Ok(())
 }

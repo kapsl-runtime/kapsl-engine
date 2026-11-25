@@ -140,14 +140,31 @@ async fn runtime_shutdown_signal() -> Result<&'static str, std::io::Error> {
 }
 
 fn shutdown_managed_backends(resources: &RuntimeResources) -> Result<(), DynError> {
-    let Some(deployment) = resources.managed_vllm() else {
-        return Ok(());
-    };
-    let stopped = deployment
-        .shutdown_all()
-        .map_err(|error| format!("managed backend shutdown failed: {error}"))?;
-    if stopped > 0 {
-        log::info!("Stopped {stopped} managed vLLM runtime(s) during core shutdown");
+    // Stop every deployment before reporting, so one failed fence does not
+    // leave another backend's children running.
+    let mut failures = Vec::new();
+    for deployment in resources.managed_servers() {
+        match deployment.shutdown_all() {
+            Ok(stopped) if stopped > 0 => log::info!(
+                "Stopped {stopped} managed {} runtime(s) during core shutdown",
+                deployment.name()
+            ),
+            Ok(_) => {}
+            Err(error) => failures.push(format!("{}: {error}", deployment.name())),
+        }
     }
-    Ok(())
+    if let Some(deployment) = resources.managed_vllm() {
+        match deployment.shutdown_all() {
+            Ok(stopped) if stopped > 0 => {
+                log::info!("Stopped {stopped} managed vLLM runtime(s) during core shutdown")
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("vLLM: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("managed backend shutdown failed: {}", failures.join("; ")).into())
+    }
 }

@@ -201,11 +201,15 @@ async fn handle_chat_completion(
         );
     }
 
-    let is_managed_vllm = models
+    // A managed server speaks the OpenAI protocol itself, so its requests are
+    // relayed rather than rendered into a prompt.
+    let managed_server = models
         .registry()
         .get(resolved.id)
-        .is_some_and(|model| model.device == "vllm");
-    if is_managed_vllm {
+        .map(|model| model.device)
+        .filter(|device| matches!(device.as_str(), "vllm" | "sglang"));
+    let is_managed_server = managed_server.is_some();
+    if managed_server.as_deref() == Some("vllm") {
         inference.observe_managed_vllm_ingress(
             &resolved.name,
             managed_vllm_mode.metric_mode(chat.stream),
@@ -230,7 +234,7 @@ async fn handle_chat_completion(
     let scoped_session_id =
         scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
 
-    if is_managed_vllm && managed_vllm_mode == ManagedVllmOpenAiMode::Wire {
+    if is_managed_server && managed_vllm_mode == ManagedVllmOpenAiMode::Wire {
         if let Some(object) = normalized_body.as_object_mut() {
             object.insert(
                 "model".to_string(),
@@ -265,7 +269,7 @@ async fn handle_chat_completion(
 
     // A UTF-8 prompt tensor is shaped `[1, byte_len]`, matching the RAG and
     // native inference path. `[1]` only validates for a one-byte prompt.
-    let data = if is_managed_vllm {
+    let data = if is_managed_server {
         match managed_vllm_chat_input(&chat.messages, &stops) {
             Ok(data) => data,
             Err(error) => {

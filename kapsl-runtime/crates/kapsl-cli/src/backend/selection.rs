@@ -36,6 +36,7 @@ pub(crate) enum ServingBackendPolicy {
     #[serde(alias = "llama-cpp", alias = "llama.cpp")]
     LlamaCpp,
     Vllm,
+    Sglang,
 }
 
 impl ServingBackendPolicy {
@@ -44,6 +45,7 @@ impl ServingBackendPolicy {
             Self::Auto => "auto",
             Self::LlamaCpp => "llama_cpp",
             Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
         }
     }
 
@@ -52,8 +54,9 @@ impl ServingBackendPolicy {
             "auto" => Ok(Self::Auto),
             "llama_cpp" | "llama-cpp" | "llama.cpp" => Ok(Self::LlamaCpp),
             "vllm" => Ok(Self::Vllm),
+            "sglang" => Ok(Self::Sglang),
             other => Err(format!(
-                "unknown metadata.serving.backend `{other}`; expected `auto`, `llama_cpp`, or `vllm`"
+                "unknown metadata.serving.backend `{other}`; expected `auto`, `llama_cpp`, `vllm`, or `sglang`"
             )),
         }
     }
@@ -66,6 +69,7 @@ pub(crate) enum ResolvedServingBackend {
     Builtin,
     LlamaCpp,
     Vllm,
+    Sglang,
 }
 
 impl ResolvedServingBackend {
@@ -74,7 +78,14 @@ impl ResolvedServingBackend {
             Self::Builtin => "builtin",
             Self::LlamaCpp => "llama_cpp",
             Self::Vllm => "vllm",
+            Self::Sglang => "sglang",
         }
+    }
+
+    /// Whether Kapsl launches and supervises this backend as a child server
+    /// that owns its own GPU memory.
+    pub(crate) fn is_managed_server(self) -> bool {
+        matches!(self, Self::Vllm | Self::Sglang)
     }
 }
 
@@ -173,7 +184,8 @@ pub(crate) fn manifest_serving_backend(
         return Ok(None);
     };
     let value = value.as_str().ok_or_else(|| {
-        "metadata.serving.backend must be a string: `auto`, `llama_cpp`, or `vllm`".to_string()
+        "metadata.serving.backend must be a string: `auto`, `llama_cpp`, `vllm`, or `sglang`"
+            .to_string()
     })?;
     ServingBackendPolicy::parse_manifest_value(value).map(Some)
 }
@@ -261,6 +273,12 @@ pub(crate) fn validate_serving_backend_declaration(manifest: &Manifest) -> Resul
             "metadata.serving.backend `vllm` requires explicit format=`safetensors`, model_type=`causal-lm`, and task=`generate` axes for model `{}`",
             manifest.project_name
         )),
+        // SGLang serves the same model contract as vLLM.
+        Some(ServingBackendPolicy::Sglang) if is_vllm_model_contract(manifest) => Ok(()),
+        Some(ServingBackendPolicy::Sglang) => Err(format!(
+            "metadata.serving.backend `sglang` requires explicit format=`safetensors`, model_type=`causal-lm`, and task=`generate` axes for model `{}`",
+            manifest.project_name
+        )),
     }
 }
 
@@ -292,6 +310,17 @@ pub(crate) fn resolve_serving_backend(
                 manifest.project_name
             ));
         }
+        // SGLang is never chosen by `auto`: it must be asked for by name.
+        Some(ServingBackendPolicy::Sglang) if has_cuda => (
+            ResolvedServingBackend::Sglang,
+            "package explicitly requires SGLang on CUDA",
+        ),
+        Some(ServingBackendPolicy::Sglang) => {
+            return Err(format!(
+                "model `{}` requires serving backend `sglang`, but no CUDA device is available",
+                manifest.project_name
+            ));
+        }
         Some(ServingBackendPolicy::Auto) if kind.is_gguf() => (
             ResolvedServingBackend::LlamaCpp,
             "auto policy: GGUF is served by llama.cpp",
@@ -318,11 +347,12 @@ pub(crate) fn validate_runtime_serving_backend(
     manifest: &Manifest,
     decision: ServingBackendDecision,
 ) -> Result<(), String> {
-    if decision.selected == ResolvedServingBackend::Vllm
+    if decision.selected.is_managed_server()
         && !cfg!(all(feature = "gpu-device-pool", target_os = "linux"))
     {
         return Err(format!(
-            "selected managed serving backend `vllm` ({}), but this Kapsl binary is not a Linux gpu-device-pool build. Use the Kapsl CUDA distribution; refusing to fall back to a different backend.",
+            "selected managed serving backend `{}` ({}), but this Kapsl binary is not a Linux gpu-device-pool build. Use the Kapsl CUDA distribution; refusing to fall back to a different backend.",
+            decision.selected.as_str(),
             decision.reason
         ));
     }
@@ -531,7 +561,7 @@ pub(crate) fn preliminary_memory_admission(
     decision: ServingBackendDecision,
     device_info: &DeviceInfo,
 ) -> Result<PreliminaryMemoryAdmission, String> {
-    if decision.selected != ResolvedServingBackend::Vllm {
+    if !decision.selected.is_managed_server() {
         return Ok(PreliminaryMemoryAdmission {
             status: MemoryAdmissionStatus::Accepted,
             required_bytes: None,
@@ -807,6 +837,17 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
                 "external".to_string(),
                 None,
             )
+        } else if decision.selected == ResolvedServingBackend::Sglang {
+            // No signed SGLang pack exists, so there is nothing to download:
+            // the operator provides the environment when the runtime starts.
+            (
+                "sglang".to_string(),
+                false,
+                false,
+                0,
+                "external".to_string(),
+                None,
+            )
         } else if let Some(onnx_profile) = onnx_profile {
             let mut target = BackendTarget::current(&planned_device_info);
             target.accelerator = onnx_profile.accelerator();
@@ -901,7 +942,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
         "memory_available_bytes": memory.available_bytes,
         "memory_reason": memory.reason,
         "execution_mode": execution_mode,
-        "external_process": decision.selected == ResolvedServingBackend::Vllm,
+        "external_process": decision.selected.is_managed_server(),
         "cuda": has_cuda,
         "cuda_source": cuda_source,
         "reason": selection_reason,
@@ -992,6 +1033,39 @@ mod tests {
                 .selected,
             ResolvedServingBackend::Builtin
         );
+    }
+
+    #[test]
+    fn sglang_is_selected_only_by_name_and_only_on_cuda() {
+        let mut safetensors = manifest("safetensors", "causal-lm", "generate");
+        set_policy(&mut safetensors, "sglang");
+        let decision = resolve_serving_backend(&safetensors, true).expect("CUDA decision");
+        assert_eq!(decision.requested, Some(ServingBackendPolicy::Sglang));
+        assert_eq!(decision.selected, ResolvedServingBackend::Sglang);
+        assert_eq!(decision.selected.as_str(), "sglang");
+        assert!(decision.selected.is_managed_server());
+        assert!(resolve_serving_backend(&safetensors, false)
+            .unwrap_err()
+            .contains("requires serving backend `sglang`, but no CUDA device is available"));
+
+        let mut gguf = manifest("gguf", "causal-lm", "generate");
+        set_policy(&mut gguf, "sglang");
+        assert!(validate_serving_backend_declaration(&gguf)
+            .unwrap_err()
+            .contains("`sglang` requires explicit format=`safetensors`"));
+
+        let result = validate_runtime_serving_backend(&safetensors, decision);
+        if cfg!(all(feature = "gpu-device-pool", target_os = "linux")) {
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.contains("managed serving backend `sglang`"));
+            assert!(error.contains("not a Linux gpu-device-pool build"));
+        }
+
+        assert!(!ResolvedServingBackend::Builtin.is_managed_server());
+        assert!(!ResolvedServingBackend::LlamaCpp.is_managed_server());
+        assert!(ResolvedServingBackend::Vllm.is_managed_server());
     }
 
     #[test]

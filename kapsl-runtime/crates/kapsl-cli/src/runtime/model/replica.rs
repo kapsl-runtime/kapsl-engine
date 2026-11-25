@@ -90,6 +90,10 @@ pub(super) async fn load_replica(
     if plan.serving_backend.selected == ResolvedServingBackend::Vllm {
         return load_managed_vllm_replica(plan, role, device_info, resources, shared_metrics).await;
     }
+    if plan.serving_backend.selected == ResolvedServingBackend::Sglang {
+        return load_managed_sglang_replica(plan, role, device_info, resources, shared_metrics)
+            .await;
+    }
 
     // Resolve and verify native packs before any backend library or model
     // session is constructed. Preliminary admission runs before a download.
@@ -479,6 +483,93 @@ async fn load_managed_vllm_replica(
         scheduler,
         swap_handles,
         model_info: model_info_for_plan(&plan, role, "vllm"),
+    })
+}
+
+/// Load one SGLang replica: a supervised server on a single CUDA device whose
+/// static footprint is admitted here and whose requests lease KV capacity
+/// through the KV control socket.
+async fn load_managed_sglang_replica(
+    plan: ModelLoadPlan,
+    role: ReplicaLoadRole,
+    device_info: &DeviceInfo,
+    resources: Arc<RuntimeResources>,
+    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
+) -> Result<LoadedReplica, DynError> {
+    if plan.isolate_process {
+        log::info!(
+            "Ignoring generic process-isolation metadata for model {}: managed SGLang already runs in a supervised child process",
+            plan.base_model_id
+        );
+    }
+    if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
+        return Err(
+            "managed SGLang runs one scheduler rank on one CUDA device; pipeline and tensor-parallel topologies are not supported"
+                .into(),
+        );
+    }
+    let deployment = resources
+        .managed_server(ResolvedServingBackend::Sglang)
+        .ok_or_else(|| {
+            "managed SGLang was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
+                .to_string()
+        })?;
+    let selection = select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
+        .map_err(|error| {
+        format!(
+            "Failed to select a CUDA device for {}: {}",
+            role.selection_context(&plan),
+            error
+        )
+    })?;
+    let device_id = select_managed_vllm_device_ids(&selection.devices, 1, plan.replica_id)?[0];
+    let memory_domains = [MemoryDomain::Cuda { device_id }];
+    let backend = create_managed_sglang_engine(
+        deployment,
+        &plan.loader.manifest,
+        &plan.model_file_path,
+        plan.base_model_id,
+        plan.replica_id,
+        device_id,
+        plan.batch_size.max(1),
+    )?;
+    let backend = load_runtime_backend(
+        backend.into(),
+        &plan.model_file_path,
+        &memory_domains,
+        &resources,
+        plan.base_model_id,
+        plan.replica_id,
+        EngineKind::Native,
+        plan.priority_weight,
+        &role.load_context(&plan, Some(device_id)),
+    )
+    .await?;
+    let engine = monitor_runtime_backend(
+        backend,
+        plan.base_model_id,
+        &plan.loader.manifest.version,
+        shared_metrics,
+    );
+    let swap_handles = vec![engine.clone()];
+    let scheduler = Arc::new(
+        Scheduler::new(
+            vec![engine],
+            plan.batch_size,
+            1,
+            plan.scheduler_queue_size,
+            true,
+            plan.scheduler_max_micro_batch,
+            plan.scheduler_queue_delay_ms,
+            None,
+        )
+        .with_queue_overflow_policy(plan.queue_overflow_policy),
+    );
+    log::info!("✓ Loaded managed SGLang engine instance");
+    Ok(LoadedReplica {
+        scheduler,
+        swap_handles,
+        model_info: model_info_for_plan(&plan, role, "sglang"),
     })
 }
 

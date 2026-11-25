@@ -37,6 +37,8 @@ const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const RESIZE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+mod managed_opaque;
+
 /// Physical data-plane storage retained for the lifetime of a provisioned
 /// shared pool. Implementations clear every newly assigned block before its
 /// handle is published to a participant.

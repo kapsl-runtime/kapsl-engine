@@ -48,6 +48,8 @@ pub(crate) struct RuntimeResources {
     priority: Arc<PriorityArbiter>,
     pressure: Arc<ResourcePressure>,
     managed_vllm: RwLock<Option<Arc<ManagedVllmDeployment>>>,
+    /// Managed backends on the neutral launcher, at most one per backend.
+    managed_servers: RwLock<Vec<Arc<ManagedServerDeployment>>>,
 }
 
 impl RuntimeResources {
@@ -66,6 +68,7 @@ impl RuntimeResources {
                 priority: PriorityArbiter::new(),
                 pressure: ResourcePressure::from_env(),
                 managed_vllm: RwLock::new(None),
+                managed_servers: RwLock::new(Vec::new()),
             }))
         }
     }
@@ -90,6 +93,7 @@ impl RuntimeResources {
             priority: PriorityArbiter::new(),
             pressure: ResourcePressure::from_env(),
             managed_vllm: RwLock::new(None),
+            managed_servers: RwLock::new(Vec::new()),
         }))
     }
 
@@ -123,6 +127,39 @@ impl RuntimeResources {
 
     pub(crate) fn managed_vllm(&self) -> Option<Arc<ManagedVllmDeployment>> {
         self.managed_vllm.read().clone()
+    }
+
+    pub(crate) fn install_managed_server(
+        &self,
+        deployment: Arc<ManagedServerDeployment>,
+    ) -> Result<(), String> {
+        let mut current = self.managed_servers.write();
+        if current
+            .iter()
+            .any(|installed| installed.backend() == deployment.backend())
+        {
+            return Err(format!(
+                "managed {} deployment is already configured",
+                deployment.name()
+            ));
+        }
+        current.push(deployment);
+        Ok(())
+    }
+
+    pub(crate) fn managed_server(
+        &self,
+        backend: ResolvedServingBackend,
+    ) -> Option<Arc<ManagedServerDeployment>> {
+        self.managed_servers
+            .read()
+            .iter()
+            .find(|deployment| deployment.backend() == backend)
+            .cloned()
+    }
+
+    pub(crate) fn managed_servers(&self) -> Vec<Arc<ManagedServerDeployment>> {
+        self.managed_servers.read().clone()
     }
 
     #[cfg(feature = "gpu-device-pool")]
