@@ -4810,7 +4810,8 @@ mod tests {
         assert_eq!(deferred.failure, None);
         assert_eq!(deferred.current_block_count, 4);
         assert!(coordinator.managed_participant_is_active("vllm").unwrap());
-        assert_eq!(backing.released_to_blocks.load(Ordering::Acquire), 4);
+        assert_eq!(backing.mapped_blocks.load(Ordering::Acquire), 4);
+        assert_eq!(backing.released_to_blocks.load(Ordering::Acquire), 0);
 
         coordinator
             .release(&registration.participant_id, &lease.lease_id, None)
