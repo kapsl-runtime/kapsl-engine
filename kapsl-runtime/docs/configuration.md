@@ -239,7 +239,10 @@ decision, and normal CUDA allocation failure still fails the child closed.
 certified BLNHC virtual address range sized for `maximum_concurrency`, while
 initially mapping only the exact admitted physical prefix. At or above the grow
 threshold Kapsl admits and maps aligned, zeroed CUDA VMM segments before
-publishing new native vLLM blocks. Below the shrink threshold for the idle
+publishing new native vLLM blocks. It grows the same way as soon as a
+request's reservation does not fit the mapped pool, without waiting for the
+threshold or the next supervision tick; that request stays in vLLM's waiting
+queue until the new blocks are active. Below the shrink threshold for the idle
 interval, vLLM first retires a free physical tail and workers then unmap it
 before Kapsl lowers the authority charge. vLLM places request blocks itself
 and cycles through the whole pool, so a running sequence can own blocks in the

@@ -36,6 +36,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 64;
 const RESIZE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a reservation that did not fit keeps asking for growth. A
+/// connector repeats a waiting reservation many times a second, so demand
+/// that is still real is always fresher than this.
+const UNMET_KV_DEMAND_TTL: Duration = Duration::from_secs(5);
 
 /// Physical data-plane storage retained for the lifetime of a provisioned
 /// shared pool. Implementations clear every newly assigned block before its
@@ -220,6 +224,9 @@ pub(crate) struct ManagedVllmKvResizeSnapshot {
     pub(crate) pending_generation: Option<u64>,
     pub(crate) pending_target_block_count: Option<u64>,
     pub(crate) failure: Option<String>,
+    /// Blocks a recent reservation needed that the mapped pool could not
+    /// supply. Zero when every recent reservation fitted.
+    pub(crate) unmet_demand_blocks: u64,
 }
 
 impl SharedPoolSet {
@@ -729,6 +736,44 @@ impl SharedPoolSet {
         Ok(())
     }
 
+    /// Whether every pool the reservation draws on has the free blocks for it.
+    fn has_free_blocks_for(&self, reservations: &[KvGroupReservation]) -> bool {
+        let mut needed_by_pool = BTreeMap::<&str, u64>::new();
+        for reservation in reservations {
+            let Some(group) = self.groups.get(&reservation.group_id) else {
+                return false;
+            };
+            let blocks = u64::from(reservation.token_capacity)
+                .div_ceil(u64::from(group.allocation_granularity_tokens))
+                .max(u64::from(reservation.minimum_blocks.unwrap_or(0)));
+            needed_by_pool
+                .entry(group.capacity_pool_id.as_str())
+                .and_modify(|current| *current = (*current).max(blocks))
+                .or_insert(blocks);
+        }
+        let state = self.state.lock();
+        needed_by_pool.into_iter().all(|(pool_id, needed)| {
+            let available = state.free_by_pool.get(pool_id).map_or(0, Vec::len);
+            usize::try_from(needed).is_ok_and(|needed| needed <= available)
+        })
+    }
+
+    /// Largest number of blocks one reservation takes from a single pool.
+    fn reservation_blocks(&self, reservations: &[KvGroupReservation]) -> u64 {
+        reservations
+            .iter()
+            .filter_map(|reservation| {
+                let group = self.groups.get(&reservation.group_id)?;
+                Some(
+                    u64::from(reservation.token_capacity)
+                        .div_ceil(u64::from(group.allocation_granularity_tokens))
+                        .max(u64::from(reservation.minimum_blocks.unwrap_or(0))),
+                )
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
     fn reserve(
         &self,
         reservations: &[KvGroupReservation],
@@ -957,6 +1002,10 @@ struct ParticipantRecord {
     shared_pools: Option<Arc<SharedPoolSet>>,
     shared_activation: Option<SharedPoolActivation>,
     resize: Option<SharedPoolResizeRecord>,
+    /// Blocks the latest reservation needed that an elastic pool could not
+    /// supply, and when. Live resize grows the pool on this signal: leased
+    /// utilization alone never shows a request the pool turned away.
+    unmet_demand: Option<(u64, Instant)>,
 }
 
 struct ParticipantSnapshot {
@@ -1510,6 +1559,9 @@ pub(crate) struct ExternalKvCoordinator {
     /// every other participant's lease traffic needs that lock and times out
     /// after two seconds.
     provisioning: Mutex<()>,
+    /// Wakes live-resize supervisors when a reservation did not fit, so the
+    /// pool grows now instead of at the next two-second supervision tick.
+    unmet_kv_demand: tokio::sync::Notify,
     next_participant_slot: AtomicU32,
     next_participant_epoch: AtomicU64,
     next_provisioning_generation: AtomicU64,
@@ -1544,6 +1596,7 @@ impl ExternalKvCoordinator {
             state: Mutex::new(CoordinatorState::default()),
             registration_settled: Condvar::new(),
             provisioning: Mutex::new(()),
+            unmet_kv_demand: tokio::sync::Notify::new(),
             next_participant_slot: AtomicU32::new(0),
             next_participant_epoch: AtomicU64::new(1),
             next_provisioning_generation: AtomicU64::new(1),
@@ -1962,7 +2015,7 @@ impl ExternalKvCoordinator {
         &self,
         participant_base: &str,
     ) -> Result<Option<ManagedVllmKvResizeSnapshot>, String> {
-        let (pools, pending_generation, pending_target, failure) = {
+        let (pools, pending_generation, pending_target, failure, unmet_demand_blocks) = {
             let state = self.state.lock();
             let Some(participant_id) = managed_participant_id_locked(&state, participant_base)?
             else {
@@ -1994,7 +2047,17 @@ impl ExternalKvCoordinator {
                     )
                 })
                 .unwrap_or((None, None, None));
-            (pools, pending_generation, pending_target, failure)
+            let unmet_demand_blocks = participant
+                .unmet_demand
+                .filter(|(_, recorded)| recorded.elapsed() <= UNMET_KV_DEMAND_TTL)
+                .map_or(0, |(blocks, _)| blocks);
+            (
+                pools,
+                pending_generation,
+                pending_target,
+                failure,
+                unmet_demand_blocks,
+            )
         };
         let (_pool_id, _bindings, minimum, current, maximum, alignment) =
             pools.elastic_shape().map_err(|error| error.to_string())?;
@@ -2006,7 +2069,52 @@ impl ExternalKvCoordinator {
             pending_generation,
             pending_target_block_count: pending_target,
             failure,
+            unmet_demand_blocks,
         }))
+    }
+
+    /// Resolves when a reservation next fails for lack of mapped capacity.
+    ///
+    /// A notification that arrives while nobody waits is dropped. That is
+    /// fine: a connector repeats a waiting reservation many times a second.
+    pub(crate) async fn wait_for_unmet_kv_demand(&self) {
+        self.unmet_kv_demand.notified().await;
+    }
+
+    /// Remember that an elastic pool turned a reservation away.
+    ///
+    /// Demand counts only while nothing is already answering it. A connector
+    /// keeps repeating its reservation while a growth is being mapped, and
+    /// the last refusal can be reported just after that growth landed; either
+    /// would otherwise start a second growth the request no longer needs.
+    fn record_unmet_demand(&self, participant_id: &str, reservations: &[KvGroupReservation]) {
+        {
+            let mut state = self.state.lock();
+            let Some(participant) = state.participants.get_mut(participant_id) else {
+                return;
+            };
+            if !participant
+                .registration
+                .capabilities
+                .features
+                .contains(&KvFeature::LivePoolResize)
+            {
+                return;
+            }
+            let growing = participant
+                .resize
+                .as_ref()
+                .is_some_and(|resize| resize.target_block_count > resize.from_block_count);
+            let Some(pools) = participant.shared_pools.as_ref() else {
+                return;
+            };
+            if growing || pools.has_free_blocks_for(reservations) {
+                return;
+            }
+            participant.unmet_demand =
+                Some((pools.reservation_blocks(reservations), Instant::now()));
+        }
+        self.unmet_kv_demand.notify_waiters();
     }
 
     /// Begin one ordered live CUDA VMM resize. Growth precharges authority and
@@ -2148,6 +2256,15 @@ impl ExternalKvCoordinator {
             deadline: Instant::now() + RESIZE_ACK_TIMEOUT,
             failure: None,
         });
+        if target_block_count > current {
+            // This growth answers the demand seen so far. A reservation that
+            // still does not fit afterwards records it again.
+            state
+                .participants
+                .get_mut(&participant_id)
+                .expect("managed participant remained registered under coordinator lock")
+                .unmet_demand = None;
+        }
         log::info!(
             "[kv-control] started live KV resize for participant '{}' generation={} blocks={}->{} stage={:?}",
             participant_id,
@@ -2452,6 +2569,7 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     shared_pools: None,
                     shared_activation: None,
                     resize: None,
+                    unmet_demand: None,
                 },
             );
             return Ok(receipt);
@@ -2551,6 +2669,7 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                     active: false,
                 }),
                 resize: None,
+                unmet_demand: None,
             },
         );
         drop(state);
@@ -2754,7 +2873,15 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
         let (memory, public_groups, mut shared_allocation) = if let Some(pools) =
             shared_pools.as_ref()
         {
-            let (groups, allocation) = pools.reserve(&request.groups)?;
+            let (groups, allocation) = match pools.reserve(&request.groups) {
+                Ok(reserved) => reserved,
+                Err(error) => {
+                    if matches!(error, KvContractError::CapacityExhausted { .. }) {
+                        self.record_unmet_demand(participant_id, &request.groups);
+                    }
+                    return Err(error);
+                }
+            };
             (None, groups, Some(allocation))
         } else {
             let bytes_by_domain = registration
@@ -4835,6 +4962,126 @@ mod tests {
 
         // Growth only adds blocks behind the mapped tail.
         coordinator.request_managed_vllm_resize("vllm", 8).unwrap();
+    }
+
+    /// Reserve distinct sequences until the pool turns one away.
+    fn fill_until_exhausted(
+        coordinator: &ExternalKvCoordinator,
+        participant_id: &str,
+    ) -> (usize, KvReserveRequest) {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        for filled in 0..64 {
+            let mut request = reservation(None);
+            request.sequence.request_id = format!("request-{filled}");
+            request.sequence.sequence_id = format!("request-{filled}");
+            match coordinator.reserve(participant_id, &request) {
+                Ok(_) => {}
+                Err(KvContractError::CapacityExhausted { .. }) => return (filled, request),
+                Err(error) => panic!("unexpected reservation error: {error}"),
+            }
+        }
+        panic!("the pool never filled");
+    }
+
+    #[test]
+    fn reservation_an_elastic_pool_cannot_fit_asks_for_growth() {
+        let (_memory, coordinator, _backing, registration, _receipt) = elastic_coordinator();
+        let unmet = || {
+            coordinator
+                .managed_vllm_resize_snapshot("vllm")
+                .unwrap()
+                .unwrap()
+                .unmet_demand_blocks
+        };
+        assert_eq!(unmet(), 0);
+
+        let (filled, _turned_away) =
+            fill_until_exhausted(&coordinator, &registration.participant_id);
+        assert!(filled > 0, "the mapped pool held no sequence at all");
+        // 32 tokens at 16 tokens per block.
+        assert_eq!(unmet(), 2);
+
+        // Demand nobody repeats is no longer a reason to grow.
+        if let Some(stale) = Instant::now().checked_sub(UNMET_KV_DEMAND_TTL * 2) {
+            coordinator
+                .state
+                .lock()
+                .participants
+                .get_mut(&registration.participant_id)
+                .unwrap()
+                .unmet_demand = Some((2, stale));
+            assert_eq!(unmet(), 0);
+            fill_until_exhausted(&coordinator, &registration.participant_id);
+            assert_eq!(unmet(), 2);
+        }
+
+        // Growth answers the demand recorded so far.
+        coordinator.request_managed_vllm_resize("vllm", 8).unwrap();
+        assert_eq!(unmet(), 0);
+
+        // The connector keeps repeating its reservation until the new blocks
+        // are mapped and activated. Those refusals belong to the growth that
+        // is already under way and must not start a second one.
+        fill_until_exhausted(&coordinator, &registration.participant_id);
+        assert_eq!(unmet(), 0);
+    }
+
+    #[test]
+    fn fixed_pool_exhaustion_does_not_ask_for_growth() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (coordinator, _provisioner, entered, proceed) = gated_coordinator();
+        proceed.send(()).unwrap();
+        let registration = shared_registration();
+        let receipt = coordinator.register(&registration).unwrap();
+        entered.recv().unwrap();
+        coordinator
+            .attach(&registration.participant_id, &shared_attachment(&receipt))
+            .unwrap();
+        coordinator
+            .activate(&registration.participant_id, receipt.participant_epoch)
+            .unwrap();
+
+        let (filled, _turned_away) =
+            fill_until_exhausted(&coordinator, &registration.participant_id);
+        assert!(filled > 0);
+        assert!(coordinator
+            .state
+            .lock()
+            .participants
+            .get(&registration.participant_id)
+            .unwrap()
+            .unmet_demand
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unmet_demand_wakes_a_waiting_supervisor() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (_memory, coordinator, _backing, registration, _receipt) = elastic_coordinator();
+        let waiter = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.wait_for_unmet_kv_demand().await }
+        });
+        let (_filled, turned_away) =
+            fill_until_exhausted(&coordinator, &registration.participant_id);
+
+        // A connector repeats the reservation while its request waits; the
+        // supervisor is woken by whichever repeat finds it listening.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if waiter.is_finished() {
+                break;
+            }
+            let error = coordinator
+                .reserve(&registration.participant_id, &turned_away)
+                .expect_err("the pool is still full");
+            assert!(matches!(error, KvContractError::CapacityExhausted { .. }));
+        }
+        assert!(waiter.is_finished(), "unmet KV demand woke nobody");
+        waiter.await.unwrap();
     }
 
     #[test]
