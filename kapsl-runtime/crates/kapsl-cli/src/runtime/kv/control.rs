@@ -21,7 +21,7 @@ use kapsl_kv_abi::{
     KvSequenceKey, KvSharedPoolAllocationMode, KvSharedPoolAttachment, KvSharedPoolDescriptor,
     KvSharedPoolDetachRequest, KvVmmSegmentDescriptor, KAPSL_KV_ABI_VERSION,
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1263,6 +1263,31 @@ struct CoordinatorState {
     sequences: HashMap<(String, KvSequenceKey), String>,
     managed_readiness_fences: HashMap<String, Weak<ManagedVllmKvReadinessFence>>,
     provisional_grants: HashMap<String, ProvisionalKvGrantRecord>,
+    /// Participants whose shared pools are being provisioned by a `register`
+    /// call that has released the state lock for the physical work. They
+    /// occupy their namespace exactly like a registered participant.
+    registering: BTreeSet<String>,
+}
+
+/// Marks one participant as registering for the duration of its physical pool
+/// provisioning, and wakes every waiter when that settles either way.
+struct PendingRegistration<'a> {
+    coordinator: &'a ExternalKvCoordinator,
+    participant_id: &'a str,
+    published: bool,
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.coordinator
+                .state
+                .lock()
+                .registering
+                .remove(self.participant_id);
+        }
+        self.coordinator.registration_settled.notify_all();
+    }
 }
 
 fn participant_matches_managed_base(participant_id: &str, participant_base: &str) -> bool {
@@ -1478,6 +1503,13 @@ fn validate_shared_attachment(
 pub(crate) struct ExternalKvCoordinator {
     memory: Arc<MemoryAuthority>,
     state: Mutex<CoordinatorState>,
+    /// Signalled whenever an entry leaves `CoordinatorState::registering`.
+    registration_settled: Condvar,
+    /// Serializes physical pool provisioning. Allocating and clearing a pool
+    /// takes seconds on a busy device, so it runs without the state lock:
+    /// every other participant's lease traffic needs that lock and times out
+    /// after two seconds.
+    provisioning: Mutex<()>,
     next_participant_slot: AtomicU32,
     next_participant_epoch: AtomicU64,
     next_provisioning_generation: AtomicU64,
@@ -1510,6 +1542,8 @@ impl ExternalKvCoordinator {
         Ok(Arc::new(Self {
             memory,
             state: Mutex::new(CoordinatorState::default()),
+            registration_settled: Condvar::new(),
+            provisioning: Mutex::new(()),
             next_participant_slot: AtomicU32::new(0),
             next_participant_epoch: AtomicU64::new(1),
             next_provisioning_generation: AtomicU64::new(1),
@@ -1559,12 +1593,16 @@ impl ExternalKvCoordinator {
         // MemoryAuthority serializes the snapshot, candidate decision, and
         // physical adapter reservations. No child can register between them.
         let mut state = self.state.lock();
-        if state.participants.keys().any(|participant_id| {
-            participant_matches_managed_base(participant_id, &request.participant_base)
-        }) || state
-            .provisional_grants
-            .values()
-            .any(|grant| managed_bases_overlap(&grant.participant_base, &request.participant_base))
+        if state
+            .participants
+            .keys()
+            .chain(state.registering.iter())
+            .any(|participant_id| {
+                participant_matches_managed_base(participant_id, &request.participant_base)
+            })
+            || state.provisional_grants.values().any(|grant| {
+                managed_bases_overlap(&grant.participant_base, &request.participant_base)
+            })
         {
             return Err(format!(
                 "managed participant base '{}' already has a live participant or provisional grant",
@@ -1817,16 +1855,25 @@ impl ExternalKvCoordinator {
         participant_base: &str,
     ) -> Result<usize, String> {
         let cancelled_grants = self.cancel_provisional_kv_grants(participant_base);
-        let participant_ids = self
-            .state
-            .lock()
-            .participants
-            .keys()
-            .filter(|participant_id| {
+        let participant_ids = {
+            let mut state = self.state.lock();
+            // A registration that the reaped backend started may still be
+            // provisioning its pools. Wait for it to settle so the pools it
+            // publishes are retired here instead of outliving the backend.
+            while state.registering.iter().any(|participant_id| {
                 participant_matches_managed_base(participant_id, participant_base)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+            }) {
+                self.registration_settled.wait(&mut state);
+            }
+            state
+                .participants
+                .keys()
+                .filter(|participant_id| {
+                    participant_matches_managed_base(participant_id, participant_base)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let mut retired = 0usize;
         for participant_id in &participant_ids {
             if self.retire_one_participant_after_backend_exit(participant_id)? {
@@ -2025,6 +2072,21 @@ impl ExternalKvCoordinator {
             };
         }
         let target_block_count = if target_block_count < current {
+            // The backend places request blocks itself and cycles through
+            // every mapped block, so while a sequence runs its blocks can lie
+            // anywhere, including the tail. The tail is known to be free only
+            // while the participant holds no lease; the check shares the
+            // state lock with `reserve`, so no sequence can start in between.
+            let active_sequences = state
+                .sequences
+                .keys()
+                .filter(|(candidate, _)| *candidate == participant_id)
+                .count();
+            if active_sequences != 0 {
+                return Err(format!(
+                    "managed KV resize was not admitted: participant '{participant_id}' holds {active_sequences} active sequence lease(s), so its tail blocks may be in use"
+                ));
+            }
             pools
                 .normalize_shrink_target(target_block_count)
                 .map_err(|error| format!("managed KV resize was not admitted: {error}"))?
@@ -2349,6 +2411,12 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
 
         self.expire_stale();
         let mut state = self.state.lock();
+        // Tensor-parallel ranks register one identity from several
+        // connections. Later callers wait for the first one's pools and then
+        // receive its receipt below instead of provisioning a second set.
+        while state.registering.contains(&registration.participant_id) {
+            self.registration_settled.wait(&mut state);
+        }
         if let Some(existing) = state.participants.get(&registration.participant_id) {
             if existing.registration == *registration {
                 return Ok(existing.receipt.clone());
@@ -2417,27 +2485,52 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 (owner, None, None)
             };
         let participant_epoch = self.next_participant_epoch.fetch_add(1, Ordering::Relaxed);
+        // Declared before the final state guard so it drops after it.
+        let pending_registration;
         let (receipt, shared_pools) = if is_shared {
             let provisioner = self.shared_pool_provisioner.as_ref().ok_or_else(|| {
                 KvContractError::invalid_capabilities(
                     "shared_pool was requested but no isolated data-plane provisioner is configured",
                 )
             })?;
-            let provisioned = provisioner.provision(
-                registration,
-                owner,
-                participant_epoch,
-                precharged,
-                minimum_block_count,
-            )?;
+            // Reserve the identity, then provision without the state lock.
+            // Holding it here stalled every other participant's reserve,
+            // commit, release and heartbeat for as long as the device took to
+            // allocate and clear the pool.
+            state
+                .registering
+                .insert(registration.participant_id.clone());
+            drop(state);
+            let mut pending = PendingRegistration {
+                coordinator: self,
+                participant_id: &registration.participant_id,
+                published: false,
+            };
+            let provisioned = {
+                let _provisioning = self.provisioning.lock();
+                provisioner.provision(
+                    registration,
+                    owner,
+                    participant_epoch,
+                    precharged,
+                    minimum_block_count,
+                )?
+            };
             let receipt = KvRegistrationReceipt {
                 participant_id: registration.participant_id.clone(),
                 participant_epoch,
                 shared_pools: provisioned.descriptors.clone(),
             };
             let pools = SharedPoolSet::new(registration, &receipt, owner, provisioned)?;
+            state = self.state.lock();
+            state.registering.remove(&registration.participant_id);
+            pending.published = true;
+            // Waiters are woken when `pending` drops, after the participant
+            // below has been inserted and the state lock released.
+            pending_registration = Some(pending);
             (receipt, Some(pools))
         } else {
+            pending_registration = None;
             (
                 KvRegistrationReceipt::opaque(
                     registration.participant_id.clone(),
@@ -2460,6 +2553,8 @@ impl kapsl_kv_abi::KvCoordinator for ExternalKvCoordinator {
                 resize: None,
             },
         );
+        drop(state);
+        drop(pending_registration);
         log::info!(
             "[kv-control] registered participant '{}' backend={} model={} tier={:?} metadata={:?} epoch={}",
             registration.participant_id,
@@ -4048,6 +4143,78 @@ mod tests {
         }
     }
 
+    /// Holds `provision` open until the test lets it finish, standing in for
+    /// a device that takes seconds to allocate and clear a pool.
+    struct GatedProvisioner {
+        inner: TestSharedProvisioner,
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        proceed: Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: std::sync::atomic::AtomicUsize,
+        fail_next: AtomicBool,
+    }
+
+    impl SharedPoolProvisioner for GatedProvisioner {
+        fn provision(
+            &self,
+            registration: &KvParticipantRegistration,
+            owner: MemoryOwner,
+            participant_epoch: u64,
+            precharged: Option<MemoryLease>,
+            minimum_block_count: Option<u64>,
+        ) -> Result<ProvisionedSharedPools, KvContractError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.entered
+                .lock()
+                .send(())
+                .expect("test observes provisioning");
+            self.proceed
+                .lock()
+                .recv()
+                .expect("test releases provisioning");
+            if self.fail_next.swap(false, Ordering::AcqRel) {
+                return Err(KvContractError::Internal {
+                    message: "injected provisioning failure".to_string(),
+                });
+            }
+            self.inner.provision(
+                registration,
+                owner,
+                participant_epoch,
+                precharged,
+                minimum_block_count,
+            )
+        }
+    }
+
+    type GatedCoordinator = (
+        Arc<ExternalKvCoordinator>,
+        Arc<GatedProvisioner>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    );
+
+    fn gated_coordinator() -> GatedCoordinator {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        let provisioner = Arc::new(GatedProvisioner {
+            inner: TestSharedProvisioner {
+                backing: Arc::new(TestSharedBacking::default()),
+            },
+            entered: Mutex::new(entered_tx),
+            proceed: Mutex::new(proceed_rx),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_next: AtomicBool::new(false),
+        });
+        let coordinator = ExternalKvCoordinator::new_with_shared_pool_provisioner(
+            test_memory(),
+            Duration::from_secs(30),
+            Some(provisioner.clone()),
+            allowed_test_profiles(),
+        )
+        .unwrap();
+        (coordinator, provisioner, entered_rx, proceed_tx)
+    }
+
     fn test_memory() -> Arc<MemoryAuthority> {
         let info = DeviceInfo {
             cpu_cores: 1,
@@ -4616,6 +4783,188 @@ mod tests {
         assert_eq!(final_snapshot.minimum_block_count, 2);
         assert_eq!(backing.released_to_blocks.load(Ordering::Acquire), 2);
         assert_eq!(kv_snapshot_bytes(&memory), (2 * 4096, 2 * 4096));
+    }
+
+    #[test]
+    fn live_resize_shrink_waits_for_a_moment_without_leases() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (_memory, coordinator, backing, registration, _receipt) = elastic_coordinator();
+        let lease = coordinator
+            .reserve(&registration.participant_id, &reservation(None))
+            .unwrap();
+
+        // vLLM chose the blocks for this sequence itself and may have taken
+        // them from the tail, so the coordinator cannot retire it yet. The
+        // refusal is an ordinary deferral: nothing is fenced or released.
+        let error = coordinator
+            .request_managed_vllm_resize("vllm", 2)
+            .expect_err("a shrink under a running sequence must be deferred");
+        assert!(error.contains("resize was not admitted"), "{error}");
+        assert!(error.contains("1 active sequence lease"), "{error}");
+        let deferred = coordinator
+            .managed_vllm_resize_snapshot("vllm")
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.pending_generation, None);
+        assert_eq!(deferred.failure, None);
+        assert_eq!(deferred.current_block_count, 4);
+        assert!(coordinator.managed_participant_is_active("vllm").unwrap());
+        assert_eq!(backing.released_to_blocks.load(Ordering::Acquire), 4);
+
+        coordinator
+            .release(&registration.participant_id, &lease.lease_id, None)
+            .unwrap();
+        coordinator.request_managed_vllm_resize("vllm", 2).unwrap();
+        let admitted = coordinator
+            .managed_vllm_resize_snapshot("vllm")
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.pending_target_block_count, Some(2));
+    }
+
+    #[test]
+    fn live_resize_growth_is_admitted_while_sequences_run() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (_memory, coordinator, _backing, registration, _receipt) = elastic_coordinator();
+        coordinator
+            .reserve(&registration.participant_id, &reservation(None))
+            .unwrap();
+
+        // Growth only adds blocks behind the mapped tail.
+        coordinator.request_managed_vllm_resize("vllm", 8).unwrap();
+    }
+
+    #[test]
+    fn registration_provisions_pools_without_holding_the_coordinator_lock() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (coordinator, provisioner, entered, proceed) = gated_coordinator();
+        let mut other = registration();
+        other.participant_id = "other:engine".to_string();
+        coordinator.register(&other).unwrap();
+
+        let first = std::thread::spawn({
+            let coordinator = coordinator.clone();
+            move || coordinator.register(&shared_registration())
+        });
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("registration reached provisioning");
+
+        // The pool is still being provisioned. Another participant's lease
+        // traffic must not wait for it: connectors give up after two seconds.
+        assert!(
+            coordinator.state.try_lock().is_some(),
+            "registration held the coordinator lock while provisioning"
+        );
+        let lease = coordinator
+            .reserve("other:engine", &reservation(None))
+            .unwrap();
+        coordinator
+            .commit(
+                "other:engine",
+                &KvCommitRequest {
+                    lease_id: lease.lease_id.clone(),
+                    computed_tokens: 16,
+                    prefix: None,
+                },
+            )
+            .unwrap();
+        coordinator.heartbeat("other:engine").unwrap();
+        coordinator
+            .release("other:engine", &lease.lease_id, None)
+            .unwrap();
+
+        // The identity is occupied even though it is not registered yet.
+        let Err(error) = coordinator.reserve_provisional_kv_grant(&provisional_request(vec![
+            ProvisionalKvCandidate {
+                block_count: 4,
+                bytes_per_block: 4096,
+                effective_target_concurrency: 2,
+            },
+        ])) else {
+            panic!("a registering identity must not receive a second grant");
+        };
+        assert!(error.contains("already has a live participant"), "{error}");
+
+        // A second rank registering the same identity waits for the first
+        // one's pools and receives the same receipt.
+        let second = std::thread::spawn({
+            let coordinator = coordinator.clone();
+            move || coordinator.register(&shared_registration())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!second.is_finished());
+
+        proceed.send(()).unwrap();
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(provisioner.calls.load(Ordering::Acquire), 1);
+        assert_eq!(coordinator.participant_count(), 2);
+    }
+
+    #[test]
+    fn failed_provisioning_releases_the_registering_identity() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (coordinator, provisioner, entered, proceed) = gated_coordinator();
+        provisioner.fail_next.store(true, Ordering::Release);
+
+        let failed = std::thread::spawn({
+            let coordinator = coordinator.clone();
+            move || coordinator.register(&shared_registration())
+        });
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("registration reached provisioning");
+        proceed.send(()).unwrap();
+        assert!(failed.join().unwrap().is_err());
+        assert!(coordinator.state.lock().registering.is_empty());
+        assert_eq!(coordinator.participant_count(), 0);
+
+        // The identity is free again for a registration that can succeed.
+        let retry = std::thread::spawn({
+            let coordinator = coordinator.clone();
+            move || coordinator.register(&shared_registration())
+        });
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("retry reached provisioning");
+        proceed.send(()).unwrap();
+        retry.join().unwrap().unwrap();
+        assert_eq!(provisioner.calls.load(Ordering::Acquire), 2);
+        assert_eq!(coordinator.participant_count(), 1);
+    }
+
+    #[test]
+    fn supervised_retirement_waits_for_a_registration_that_is_still_provisioning() {
+        use kapsl_kv_abi::KvCoordinator as _;
+
+        let (coordinator, _provisioner, entered, proceed) = gated_coordinator();
+        let register = std::thread::spawn({
+            let coordinator = coordinator.clone();
+            move || coordinator.register(&shared_registration())
+        });
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("registration reached provisioning");
+
+        // The backend that asked for these pools has been reaped. Retiring
+        // "nothing" now would leave the pools behind once they are published.
+        let retire = std::thread::spawn({
+            let coordinator = coordinator.clone();
+            move || coordinator.retire_participants_after_backend_exit("vllm")
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!retire.is_finished());
+
+        proceed.send(()).unwrap();
+        register.join().unwrap().unwrap();
+        assert_eq!(retire.join().unwrap().unwrap(), 1);
+        assert_eq!(coordinator.participant_count(), 0);
     }
 
     #[test]

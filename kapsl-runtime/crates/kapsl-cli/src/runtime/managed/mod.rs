@@ -4017,7 +4017,9 @@ async fn supervise_managed_vllm_live_resize(
         if since.elapsed() >= policy.shrink_idle && resize.current_block_count > floor {
             let raw = resize.current_block_count.saturating_sub(step).max(floor);
             let aligned = raw / resize.resize_alignment_blocks * resize.resize_alignment_blocks;
-            *low_utilization_since = None;
+            // The idle timer is cleared once the shrink is admitted. A shrink
+            // deferred because a sequence is running is retried every tick
+            // until the replica has a moment without one.
             Some(aligned.max(floor))
         } else {
             None
@@ -4027,6 +4029,10 @@ async fn supervise_managed_vllm_live_resize(
         None
     };
     let Some(target) = target.filter(|target| *target != resize.current_block_count) else {
+        if target.is_some() {
+            // Alignment left nothing to release; start a fresh idle window.
+            *low_utilization_since = None;
+        }
         return Ok(());
     };
     let resize_coordinator = coordinator.clone();
@@ -4037,7 +4043,10 @@ async fn supervise_managed_vllm_live_resize(
     .await
     .map_err(|error| format!("live KV resize task failed: {error}"))?;
     let generation = match requested {
-        Ok(generation) => generation,
+        Ok(generation) => {
+            *low_utilization_since = None;
+            generation
+        }
         Err(error) if error.contains("resize was not admitted") => {
             log::debug!(
                 "[vllm-supervisor] deferred live KV resize model={} target_blocks={}: {}",
