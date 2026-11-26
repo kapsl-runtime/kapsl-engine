@@ -17,9 +17,13 @@ pub(crate) const MANAGED_SGLANG_ADAPTER_ID: &str = "kapsl-sglang-adapter";
 pub(crate) const MANAGED_SGLANG_ADAPTER_VERSION: &str = "0.2.0";
 pub(crate) const MANAGED_SGLANG_BACKEND_VERSION: &str = "0.5.23";
 
-/// Python executable of an operator-provided SGLang environment. There is no
-/// signed SGLang backend pack, so this is the only way to select one.
+/// Python executable of an operator-provided SGLang environment. When set it
+/// overrides the signed managed-SGLang backend pack: Kapsl validates and runs
+/// that environment and never installs or substitutes the pack.
 const MANAGED_SGLANG_PYTHON_ENV: &str = "KAPSL_SGLANG_PYTHON";
+/// Package-layout override naming an unpacked SGLang backend root that
+/// contains `bin/python`.
+const MANAGED_SGLANG_BUNDLE_ENV: &str = "KAPSL_SGLANG_BUNDLE";
 /// Module behind the adapter's `kapsl-sglang-serve` launcher, which refuses to
 /// start SGLang unless the adapter will govern it.
 const MANAGED_SGLANG_LAUNCH_MODULE: &str = "kapsl_sglang_adapter.launch";
@@ -31,7 +35,7 @@ const KV_ELEMENT_BYTES: u64 = 2;
 /// page is one token.
 const KV_PADDING_TOKENS: u64 = 1;
 
-/// Validate the operator's SGLang environment and prepare the deployment.
+/// Validate the SGLang environment and prepare the deployment.
 pub(crate) fn prepare_managed_sglang(
     state_dir: Option<&Path>,
     requested_control_socket: Option<&Path>,
@@ -61,24 +65,116 @@ pub(crate) fn prepare_managed_sglang(
     )
 }
 
-fn discover_sglang_python() -> Result<PathBuf, String> {
-    let python = std::env::var_os(MANAGED_SGLANG_PYTHON_ENV)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CertifiedManagedSglangSource {
+    Missing,
+    LazyCache,
+    Other,
+}
+
+/// Identify whether the environment that discovery would select comes from
+/// the signed lazy-pack cache, as `certified_managed_vllm_source` does for
+/// vLLM. A cache entry has to pass through `BackendManager`, which checks the
+/// signed install record and installed-file hashes, on every run, so this
+/// never executes one before the manager has validated it.
+pub(crate) fn certified_managed_sglang_source() -> CertifiedManagedSglangSource {
+    // An explicit Python is wholly operator-managed. `prepare` still probes it
+    // and reports an unusable one; the lazy manager must not replace it.
+    if explicit_sglang_python().is_some() {
+        return CertifiedManagedSglangSource::Other;
+    }
+    let cached_python = managed_sglang_cache_python_candidate();
+    for candidate in managed_sglang_pre_cache_candidates() {
+        if cached_python.as_ref() != Some(&candidate)
+            && fs::symlink_metadata(&candidate).is_ok()
+            && validate_sglang_python(&candidate).is_ok()
+        {
+            return CertifiedManagedSglangSource::Other;
+        }
+    }
+    if cached_python
+        .as_deref()
+        .is_some_and(|path| fs::symlink_metadata(path).is_ok())
+    {
+        CertifiedManagedSglangSource::LazyCache
+    } else {
+        CertifiedManagedSglangSource::Missing
+    }
+}
+
+fn explicit_sglang_python() -> Option<PathBuf> {
+    std::env::var_os(MANAGED_SGLANG_PYTHON_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| {
-            format!(
-                "managed SGLang needs {MANAGED_SGLANG_PYTHON_ENV} to name the Python executable of an environment with SGLang {MANAGED_SGLANG_BACKEND_VERSION} and {MANAGED_SGLANG_ADAPTER_ID} {MANAGED_SGLANG_ADAPTER_VERSION} installed; there is no signed SGLang backend pack"
-            )
-        })?;
-    probe_sglang_python(&python)
-        .and_then(|environment| check_sglang_environment(&environment))
-        .map_err(|error| {
+}
+
+/// Environments laid out outside the lazy-pack cache: a backend root named by
+/// `KAPSL_SGLANG_BUNDLE`, or one installed beside the Kapsl binary.
+fn managed_sglang_pre_cache_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(bundle) =
+        std::env::var_os(MANAGED_SGLANG_BUNDLE_ENV).filter(|value| !value.is_empty())
+    {
+        candidates.push(PathBuf::from(bundle).join("bin/python"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("backends/sglang/bin/python"));
+            candidates.push(parent.join("../backends/sglang/bin/python"));
+        }
+    }
+    candidates
+}
+
+/// Where `BackendManager` installs the signed SGLang pack.
+fn managed_sglang_cache_python_candidate() -> Option<PathBuf> {
+    backend_cache_root().map(|cache| {
+        cache
+            .join(runtime_release_version())
+            .join("sglang")
+            .join(MANAGED_SGLANG_PACK_PROFILE)
+            .join("bin/python")
+    })
+}
+
+fn validate_sglang_python(python: &Path) -> Result<(), String> {
+    probe_sglang_python(python).and_then(|environment| check_sglang_environment(&environment))
+}
+
+/// Find the SGLang environment: an explicit `KAPSL_SGLANG_PYTHON` override,
+/// otherwise the first usable environment from a bundle, the layout beside the
+/// binary, or the signed pack in the lazy-pack cache.
+fn discover_sglang_python() -> Result<PathBuf, String> {
+    if let Some(python) = explicit_sglang_python() {
+        validate_sglang_python(&python).map_err(|error| {
             format!(
                 "{MANAGED_SGLANG_PYTHON_ENV}={} is not a usable managed-SGLang environment: {error}",
                 python.display()
             )
         })?;
-    Ok(python)
+        return Ok(python);
+    }
+    let mut candidates = managed_sglang_pre_cache_candidates();
+    candidates.extend(managed_sglang_cache_python_candidate());
+    let mut seen = HashSet::new();
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        if !seen.insert(candidate.clone()) || fs::symlink_metadata(&candidate).is_err() {
+            continue;
+        }
+        match validate_sglang_python(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+        }
+    }
+    Err(format!(
+        "no certified managed-SGLang environment is available. Expected SGLang {MANAGED_SGLANG_BACKEND_VERSION} with {MANAGED_SGLANG_ADAPTER_ID} {MANAGED_SGLANG_ADAPTER_VERSION}. Kapsl installs the signed SGLang backend pack on first use unless it is offline or KAPSL_LAZY_BACKENDS is off; `kapsl backend ensure` installs it ahead of time, and {MANAGED_SGLANG_PYTHON_ENV} selects an environment of your own. {}",
+        if failures.is_empty() {
+            "No installed environment was found.".to_string()
+        } else {
+            format!("Rejected: {}", failures.join("; "))
+        }
+    ))
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]

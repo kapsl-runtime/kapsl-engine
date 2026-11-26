@@ -18,8 +18,8 @@ verifies the signed index, artifact signature, checksum, platform, accelerator,
 ABI, and installed files, and atomically activates it. A second run uses the
 validated cache.
 
-The bridge rollout publishes managed vLLM, three standard-ABI ORT profiles,
-and two in-process llama.cpp profiles:
+The bridge rollout publishes managed vLLM, managed SGLang, three standard-ABI
+ORT profiles, and two in-process llama.cpp profiles:
 
 ```text
 llama-cpp/cpu
@@ -27,8 +27,13 @@ llama-cpp/cuda12
 onnx/cpu
 onnx/cuda12
 onnx/tensorrt10
+sglang/cu130
 vllm/cu130-flash-attn
 ```
+
+The managed vLLM and SGLang packs use external execution: each carries a
+Python environment that Kapsl launches as a supervised child process. SGLang is
+installed only for a package that names `sglang` as its serving backend.
 
 An ONNX model resolves exactly one execution provider after provider policy and
 declared fallbacks are resolved. The CPU pack contains and activates no CUDA
@@ -298,6 +303,9 @@ connected machine.
 `KAPSL_VLLM_PYTHON` and `KAPSL_VLLM_BUNDLE` remain development and legacy
 layout overrides. Every discovered vLLM environment still has to match the
 certified Python, PyTorch, CUDA, vLLM, connector, and shared-pool profile tuple.
+`KAPSL_SGLANG_PYTHON` and `KAPSL_SGLANG_BUNDLE` are the equivalent SGLang
+overrides; a discovered SGLang environment has to match the certified SGLang
+and adapter versions, KV ABI, and adapter configuration variable.
 
 ## Installed-file verification diagnostics
 

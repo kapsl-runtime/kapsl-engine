@@ -29,6 +29,7 @@ pub(crate) const BACKEND_INDEX_SCHEMA_VERSION: u32 = 1;
 pub(crate) const BACKEND_PACK_SCHEMA_VERSION: u32 = 1;
 pub(crate) const BACKEND_RUNTIME_ABI: u32 = 1;
 pub(crate) const MANAGED_VLLM_PACK_PROFILE: &str = "cu130-flash-attn";
+pub(crate) const MANAGED_SGLANG_PACK_PROFILE: &str = "cu130";
 pub(crate) const ONNX_CPU_PACK_PROFILE: &str = "cpu";
 pub(crate) const ONNX_CUDA12_PACK_PROFILE: &str = "cuda12";
 pub(crate) const ONNX_TENSORRT10_PACK_PROFILE: &str = "tensorrt10";
@@ -670,19 +671,35 @@ impl BackendManager {
     }
 
     pub(crate) fn plan_vllm(&self, target: &BackendTarget) -> ManagerResult<BackendPackPlan> {
+        self.plan_managed_server_pack("vllm", MANAGED_VLLM_PACK_PROFILE, "vLLM", target)
+    }
+
+    pub(crate) fn plan_sglang(&self, target: &BackendTarget) -> ManagerResult<BackendPackPlan> {
+        self.plan_managed_server_pack("sglang", MANAGED_SGLANG_PACK_PROFILE, "SGLang", target)
+    }
+
+    /// Plan the pack of a server Kapsl launches as a child process. Such a
+    /// pack carries a Python environment, so it must use external execution.
+    fn plan_managed_server_pack(
+        &self,
+        backend: &str,
+        profile: &str,
+        name: &str,
+        target: &BackendTarget,
+    ) -> ManagerResult<BackendPackPlan> {
         let index = self.load_index()?;
-        let pack = self.select_pack(&index, "vllm", Some(MANAGED_VLLM_PACK_PROFILE), target)?;
+        let pack = self.select_pack(&index, backend, Some(profile), target)?;
         if pack.execution_mode != BackendExecutionMode::External {
-            return Err(BackendManagerError::new(
-                "the managed vLLM backend pack must use external execution mode",
-            ));
+            return Err(BackendManagerError::new(format!(
+                "the managed {name} backend pack must use external execution mode"
+            )));
         }
         let installed = self.installed_pack_is_valid(&pack).unwrap_or(false);
         Ok(BackendPackPlan {
             selected_backend: pack.backend.clone(),
             profile: pack.profile.clone(),
             selection_reason: format!(
-                "explicit vLLM profile `{}` matched the signed backend index",
+                "explicit {name} profile `{}` matched the signed backend index",
                 pack.profile
             ),
             installed,
@@ -770,6 +787,11 @@ impl BackendManager {
 
     pub(crate) fn ensure_vllm(&self, target: &BackendTarget) -> ManagerResult<PathBuf> {
         let plan = self.plan_vllm(target)?;
+        self.ensure_pack(&plan.manifest)
+    }
+
+    pub(crate) fn ensure_sglang(&self, target: &BackendTarget) -> ManagerResult<PathBuf> {
+        let plan = self.plan_sglang(target)?;
         self.ensure_pack(&plan.manifest)
     }
 
@@ -2226,6 +2248,18 @@ pub(crate) fn execute_backend_command(
                         MANAGED_VLLM_PACK_PROFILE,
                         installed.display()
                     );
+                } else if decision.selected == crate::backend::ResolvedServingBackend::Sglang
+                    && ensured.insert((
+                        "sglang".to_string(),
+                        MANAGED_SGLANG_PACK_PROFILE.to_string(),
+                    ))
+                {
+                    let installed = manager.ensure_sglang(&target)?;
+                    println!(
+                        "Ensured backend sglang/{} at {}",
+                        MANAGED_SGLANG_PACK_PROFILE,
+                        installed.display()
+                    );
                 } else if let Some(profile) = onnx_profile {
                     let mut onnx_target = target.clone();
                     onnx_target.accelerator = profile.accelerator();
@@ -2299,12 +2333,7 @@ pub(crate) fn execute_backend_command(
                         "{} uses the embedded ORT rollback ({})",
                         manifest.project_name, reason
                     );
-                } else if decision.selected == crate::backend::ResolvedServingBackend::Sglang {
-                    println!(
-                        "{} is served by SGLang from an operator-provided environment (KAPSL_SGLANG_PYTHON); there is no signed pack to install",
-                        manifest.project_name
-                    );
-                } else if decision.selected != crate::backend::ResolvedServingBackend::Vllm {
+                } else if !decision.selected.is_managed_server() {
                     println!(
                         "{} uses the in-process {} backend; no lazy pack is required by this runtime build",
                         manifest.project_name,
@@ -3204,11 +3233,17 @@ mod tests {
             pack.entrypoint.clone(),
             blake3::hash(b"#!/bin/sh\nexit 0\n").to_hex().to_string(),
         )]));
+        write_signed_index(root, vec![pack.clone()], signing);
+    }
+
+    /// Replace the fixture's signed index. Call it before the manager first
+    /// loads the index, which it caches afterwards.
+    fn write_signed_index(root: &Path, packs: Vec<BackendPackManifest>, signing: &SigningKey) {
         let index = BackendIndex {
             schema_version: BACKEND_INDEX_SCHEMA_VERSION,
             runtime_version: "0.2.3".into(),
             generated_at: "2026-09-19T00:00:00Z".into(),
-            packs: vec![pack.clone()],
+            packs,
         };
         let bytes = serde_json::to_vec(&index).unwrap();
         fs::write(root.join("backend-index.json"), &bytes).unwrap();
@@ -3217,6 +3252,52 @@ mod tests {
             sign_index(signing, &bytes),
         )
         .unwrap();
+    }
+
+    fn sglang_pack(vllm: &BackendPackManifest) -> BackendPackManifest {
+        let mut sglang = vllm.clone();
+        sglang.backend = "sglang".to_string();
+        sglang.profile = MANAGED_SGLANG_PACK_PROFILE.to_string();
+        sglang.pack_version = "0.5.23".to_string();
+        sglang
+    }
+
+    #[test]
+    fn sglang_and_vllm_packs_are_planned_from_their_own_index_entries() {
+        let (root, manager, vllm, signing) = fixture();
+        let sglang = sglang_pack(&vllm);
+        write_signed_index(root.path(), vec![vllm.clone(), sglang.clone()], &signing);
+
+        let plan = manager.plan_sglang(&cuda_target()).unwrap();
+        assert_eq!(plan.manifest, sglang);
+        assert_eq!(plan.selected_backend, "sglang");
+        assert_eq!(plan.profile, MANAGED_SGLANG_PACK_PROFILE);
+        assert_eq!(plan.execution_mode, "external");
+        assert!(plan.selection_reason.contains("SGLang"));
+        assert!(plan.download_required);
+        assert_eq!(manager.plan_vllm(&cuda_target()).unwrap().manifest, vllm);
+    }
+
+    #[test]
+    fn sglang_pack_must_be_in_the_signed_index() {
+        // The fixture index carries only the vLLM pack.
+        let (_root, manager, _vllm, _signing) = fixture();
+        let error = manager.plan_sglang(&cuda_target()).unwrap_err().to_string();
+        assert!(
+            error.contains("no compatible signed backend pack for `sglang`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn sglang_pack_must_use_external_execution_mode() {
+        let (root, manager, vllm, signing) = fixture();
+        let mut sglang = sglang_pack(&vllm);
+        sglang.execution_mode = BackendExecutionMode::Native;
+        write_signed_index(root.path(), vec![vllm, sglang], &signing);
+        let error = manager.plan_sglang(&cuda_target()).unwrap_err().to_string();
+        assert!(error.contains("managed SGLang"), "{error}");
+        assert!(error.contains("external execution mode"), "{error}");
     }
 
     #[test]

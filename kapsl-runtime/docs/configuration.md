@@ -128,7 +128,8 @@ creation remains deferred until the first pooled model targets that device.
 | `KAPSL_VLLM_BUNDLE` | Development/package-layout override pointing at a bundle root containing `bin/python`. |
 | `KAPSL_VLLM_MEMORY_MODE` | Managed-vLLM KV policy override. Omitted, `exact`, or `auto` preserves the package's exact policy; `legacy-fraction` (also `legacy`/`legacy_fraction`) is the explicit compatibility rollback. Exact cannot override an explicitly authored legacy policy. |
 | `KAPSL_VLLM_BRIDGE_MODE` | Managed OpenAI bridge mode. Omitted or `wire` uses the typed byte relay; `async-translated`, `translated`, or `legacy` retains response translation for rollback. |
-| `KAPSL_SGLANG_PYTHON` | Python executable of the operator-provided managed-SGLang environment (SGLang `0.5.23` with `kapsl-sglang-adapter` `0.2.0`). Required to load a package whose serving backend is `sglang`; there is no signed SGLang pack. |
+| `KAPSL_SGLANG_PYTHON` | Override pointing at the Python executable of an operator-provided managed-SGLang environment (SGLang `0.5.23` with `kapsl-sglang-adapter` `0.2.0`). When set, Kapsl validates and uses it instead of the signed `sglang/cu130` pack and never installs that pack. Packaged installs discover the verified lazy cache automatically. |
+| `KAPSL_SGLANG_BUNDLE` | Package-layout override pointing at an unpacked managed-SGLang backend root containing `bin/python`. |
 | `KAPSL_GPU_DEVICE_POOL_DISABLED` | Internal process override. It has highest precedence and keeps admission accounting active without a physical pool. |
 | `KAPSL_ISOLATED_WORKER_GPU_POOL` | `true` attests that each isolated worker owns an exclusive GPU/MIG boundary. |
 
@@ -295,10 +296,18 @@ allocates all of it at startup, so the accounting differs from managed vLLM:
   participant has registered a pool no larger than the one admitted. A larger
   pool keeps it unroutable.
 
-There is no signed SGLang backend pack. Set `KAPSL_SGLANG_PYTHON` to the Python
-executable of an environment that has SGLang `0.5.23` and
-`kapsl-sglang-adapter` `0.2.0` installed; any other version fails at startup.
-Kapsl starts the adapter's launcher from it (`python -m
+Kapsl installs the certified managed-SGLang pack, `sglang/cu130`, from the
+signed backend index on first use if it is not cached, and the backend manager
+re-validates a cached pack on every start, as for managed vLLM. The pack
+carries Python `3.12.3`, PyTorch `2.14.1`, torchvision `0.29.2`, torchaudio
+`2.11.0` (CUDA `13.0` wheels), SGLang `0.5.23`, and `kapsl-sglang-adapter`
+`0.2.0` with KV ABI `1.5`. Before starting SGLang, Kapsl checks the SGLang and
+adapter versions, the adapter's KV ABI, and its configuration variable; any
+other version fails at startup. `kapsl backend ensure` and `kapsl bundle`
+prepare the pack ahead of time, and with `--offline` or
+`KAPSL_LAZY_BACKENDS=0` it must already be installed. To use an environment
+of your own instead, set `KAPSL_SGLANG_PYTHON` to its Python executable; Kapsl
+then never installs the pack. Kapsl starts the adapter's launcher from it (`python -m
 kapsl_sglang_adapter.launch`, the module behind `kapsl-sglang-serve`), which
 refuses to start SGLang unless the adapter will govern it. The participant's
 identity reaches the adapter as one JSON document in
