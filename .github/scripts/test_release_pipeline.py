@@ -673,6 +673,131 @@ class CpuSmokeWorkflowTests(TestCase):
         self.assertNotIn("gpu-device-pool-integration.yml", self.source)
 
 
+def github_path_filter(patterns):
+    """Match paths the way GitHub's `paths` filter does: patterns apply in
+    order, a later `!pattern` excludes, `**/` may match zero directories and
+    `*` does not cross `/`."""
+    compiled = []
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        body = pattern[1:] if negated else pattern
+        regex = re.escape(body)
+        regex = regex.replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+        compiled.append((negated, re.compile(regex + r"\Z")))
+
+    def matches(path):
+        included = False
+        for negated, regex in compiled:
+            if regex.match(path):
+                included = not negated
+        return included
+
+    return matches
+
+
+class LlamaCppCpuSmokeWorkflowTests(TestCase):
+    def setUp(self):
+        self.source = workflow("llama-cpp-cpu-conformance")
+        self.lock = json.loads((ROOT / ".github/llama-cpp-cpu-parity.lock.json").read_text())
+
+    def trigger(self, event):
+        block = self.source.split(f"  {event}:\n", 1)[1]
+        block = re.split(r"\n  [a-z_]+:\n", block, maxsplit=1)[0]
+        return github_path_filter(re.findall(r'^      - "([^"]+)"', block, re.MULTILINE))
+
+    def test_runtime_and_real_pack_inputs_run_the_parity_smoke(self):
+        for event in ("pull_request", "push"):
+            matches = self.trigger(event)
+            for path in (
+                "rust-toolchain.toml", ".cargo/config.toml", "kapsl-runtime/Cargo.lock",
+                "kapsl-runtime/Cargo.toml", "kapsl-runtime/crates/kapsl-cli/Cargo.toml",
+                "kapsl-runtime/crates/kapsl-cli/src/backend/llama_cpp/mod.rs",
+                "kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs",
+                "kapsl-runtime/crates/kapsl-backend-llama-cpp/src/pack.rs",
+                "kapsl-runtime/include/kapsl_llama_cpp_backend.h",
+                ".github/llama-cpp-cpu-parity.lock.json", ".github/licenses/LLAMA-CPP-LICENSE",
+                ".github/scripts/certify-llama-cpp-cpu-parity.sh",
+                ".github/scripts/llama_cpp_cpu_parity.py",
+                ".github/scripts/generate-backend-index.py",
+                ".github/scripts/package-linux-llama-cpp-backend-packs.sh",
+            ):
+                with self.subTest(event=event, path=path):
+                    self.assertTrue(matches(path))
+
+    def test_documentation_and_test_only_changes_do_not_compile(self):
+        matches = self.trigger("pull_request")
+        for path in (
+            "kapsl-runtime/README.md", "kapsl-runtime/docs/configuration.md",
+            "kapsl-runtime/crates/kapsl-cli/README.md",
+            ".github/workflows/llama-cpp-cpu-conformance.yml",
+            ".github/scripts/test_llama_cpp_cpu_parity.py",
+            ".github/scripts/test_release_pipeline.py", "docs/architecture.md",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(matches(path))
+
+    def test_develop_pushes_warm_caches_and_cover_the_workflow_itself(self):
+        push = self.source.split("  push:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
+        self.assertIn("    branches:\n      - develop\n", push)
+        self.assertTrue(self.trigger("push")(".github/workflows/llama-cpp-cpu-conformance.yml"))
+        # PR caches stay read-only; the develop runs save them.
+        self.assertNotIn("save-pr-cache", self.source)
+
+    def test_skipped_triggers_remain_covered_by_lightweight_checks(self):
+        triggers, steps = workflow("installer-smoke").split("\njobs:\n", 1)
+        for path in (
+            ".github/llama-cpp-cpu-parity.lock.json",
+            ".github/scripts/certify-llama-cpp-cpu-parity.sh",
+            ".github/scripts/llama_cpp_cpu_parity.py",
+            ".github/scripts/test_llama_cpp_cpu_parity.py",
+            ".github/workflows/llama-cpp-cpu-conformance.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'      - "{path}"', triggers)
+        self.assertIn("run: python3 .github/scripts/test_llama_cpp_cpu_parity.py", steps)
+
+    def test_the_model_is_pinned_and_verified_before_use(self):
+        model = self.lock["model"]
+        self.assertEqual(self.lock["schema_version"], 1)
+        self.assertRegex(model["commit"], r"\A[0-9a-f]{40}\Z")
+        self.assertRegex(model["sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(model["path"], r"\A[\w.-]+\.gguf\Z")
+        self.assertIn("/resolve/$MODEL_COMMIT/$MODEL_PATH", self.source)
+        self.assertLess(self.source.index("Verify pinned parity model"),
+                        self.source.index("Run embedded versus pack llama.cpp CPU parity"))
+        certify = (ROOT / ".github/scripts/certify-llama-cpp-cpu-parity.sh").read_text()
+        self.assertIn('sha256sum "$KAPSL_LLAMA_PARITY_MODEL"', certify)
+
+    def test_both_routes_run_offline_and_are_proven_by_their_logs(self):
+        certify = (ROOT / ".github/scripts/certify-llama-cpp-cpu-parity.sh").read_text()
+        self.assertIn("run_case embedded \"$reference_port\" 0 \"$model_package\"", certify)
+        self.assertIn("run_case pack \"$candidate_port\" 1 \"$bundle_path\"", certify)
+        self.assertIn("--offline", certify)
+        self.assertIn("Activated signed llama.cpp backend pack llama-cpp/cpu", certify)
+        self.assertIn("Using GgufBackend (llama.cpp)", certify)
+        # The default feature set is the one portable installers ship.
+        build = certify.split("cargo build", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("--features", build)
+        self.assertNotIn("--no-default-features", build)
+
+    def test_evidence_is_unconditional_and_the_job_is_host_only(self):
+        self.assertIn("if: always()", self.source)
+        self.assertIn("path: dist/llama-cpp-cpu-smoke", self.source)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.source)
+        self.assertNotIn("self-hosted", self.source)
+        self.assertNotIn("secrets.", self.source)
+
+
+class GithubPathFilterTests(TestCase):
+    def test_later_negations_exclude_and_double_star_spans_zero_directories(self):
+        matches = github_path_filter(["kapsl-runtime/**", "!kapsl-runtime/**/*.md"])
+        self.assertTrue(matches("kapsl-runtime/src/main.rs"))
+        self.assertFalse(matches("kapsl-runtime/README.md"))
+        self.assertFalse(matches("kapsl-runtime/docs/a/b.md"))
+        self.assertFalse(matches("docs/README.md"))
+        self.assertFalse(github_path_filter(["*.md"])("docs/README.md"))
+
+
 class ConformanceToolingTests(TestCase):
     def test_ort_qualification_request_matches_the_utf8_tensor_contract(self):
         source = step(workflow("vllm-shared-pool-conformance"),
