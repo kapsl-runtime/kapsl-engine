@@ -32,6 +32,7 @@ fn test_state_dir_namespaces_runtime_state_paths() {
         state_dir: Some(state_dir.clone()),
         topology: "data-parallel".to_string(),
         tp_degree: 1,
+        idle_unload_seconds: None,
         worker: false,
         worker_model_id: None,
         onnx_memory_pattern: None,

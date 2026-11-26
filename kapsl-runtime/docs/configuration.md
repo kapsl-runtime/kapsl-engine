@@ -20,6 +20,8 @@ Options:
   --tcp-port <PORT>           IPC TCP port (default: 9096)
   --http-host <HOST>          HTTP bind host (default: 127.0.0.1)
   --http-port <PORT>          HTTP/API/UI port (default: 9095)
+  --idle-unload-seconds <SECONDS>
+                              Stop a model after this long without requests (default: off)
   --provider <BACKEND>        cpu | cuda | tensorrt | metal | rocm | directml
   --admin-token <TOKEN>       Set admin token at startup
   --log-level <LEVEL>         trace | debug | info | warn | error (default: info)
@@ -89,6 +91,58 @@ Options:
 | `KAPSL_BACKEND_INDEX_PATH` | Use a local signed index and adjacent `.sig` file |
 | `KAPSL_BACKEND_PUBLIC_KEYS` | Additional trusted raw Ed25519 public keys for development or controlled rotation |
 
+### Idle model unloading
+
+By default a model stays loaded until you stop or remove it. If Kapsl shares a
+GPU with other work, such as a training job, you can have Kapsl stop models
+that are not being used so the other work can use their memory:
+
+```bash
+kapsl run --idle-unload-seconds 900 ./models/assistant.aimod
+```
+
+| Variable | Description |
+|----------|-------------|
+| `KAPSL_IDLE_UNLOAD_SECONDS` | Same as `--idle-unload-seconds`. The flag wins when both are set, and `0` from either turns idle unloading off |
+
+The setting applies to every model in the process, including models added
+later with `kapsl add-model` or `POST /api/models/start`.
+
+A model's idle timer starts when it finishes loading and starts again each
+time an inference request ends. A request counts as running from the moment
+Kapsl accepts it until its response is complete. A streaming response keeps
+counting until the stream ends or the client disconnects. Requests on every
+interface count: the native and OpenAI-compatible HTTP routes, gRPC, MCP, and
+the socket, TCP, and shared-memory transports. Health checks, metrics, and
+model listings do not count.
+
+Kapsl checks every few seconds. When a model has had no running request for
+the configured time, Kapsl stops it and all of its replicas, exactly as
+`POST /api/models/{id}/stop` does. It does not stop a model while work is
+queued on it, or while a start, stop, swap, or scale operation for that model
+is running. A request that arrives just as the model is stopped either
+finishes on the loaded model or gets the usual "model not loaded" error. It
+is never cut off partway through.
+
+A model stopped this way:
+
+- stays in `kapsl list` and `GET /api/models` as inactive, keeping its ID and
+  package path;
+- answers inference requests with the same "not loaded" error as a manually
+  stopped model;
+- is not reloaded automatically. Start it again with `POST /api/models/start`,
+  passing the same `model_id` and `model_path` to keep its ID, or with
+  `kapsl add-model`, which assigns a new ID.
+
+Stopping a model frees its weights, KV cache, and backend workspaces. On a
+CUDA device that uses Kapsl's device pool (see below), that memory goes back
+to the pool first. Kapsl releases the pool's whole allocation to the GPU
+driver once the last model using that device has stopped. While any other
+model on the same GPU stays loaded, the freed memory stays reserved for Kapsl
+and other processes cannot use it.
+
+Each idle stop is logged at `info` level with an `[idle-unload]` prefix.
+
 ### GPU memory and shared KV
 
 The stable CUDA application profile enables `gguf-cuda-shared-kv` and defaults
@@ -110,10 +164,12 @@ workspaces and paged KV.
 The default unpooled reserve is 20% of the safe budget with a 1 GiB floor and
 one-third cap. It protects room for backend scratch, native-KV compatibility
 fallback, and later model additions. The automatic pool minimum is 256 MiB.
-The backing allocation is process-lifetime and cannot grow or shrink; later
+The backing allocation cannot grow or shrink while models use it; later
 model starts still pass admission only while the retained headroom is
-available. When the process starts without models, implicit automatic pool
-creation remains deferred until the first pooled model targets that device.
+available. Once the last model using a device's pool has stopped, Kapsl
+releases the allocation and creates a new one for the next pooled model.
+When the process starts without models, implicit automatic pool creation
+remains deferred until the first pooled model targets that device.
 
 | Variable | Description |
 |----------|-------------|
