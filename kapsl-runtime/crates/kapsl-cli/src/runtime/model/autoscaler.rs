@@ -96,9 +96,9 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
 
                 if let Some(target_replicas) = should_scale_up {
                     let live_resize_headroom =
-                        model_runtime.managed_vllm_has_live_resize_headroom(base_model_id);
+                        model_runtime.has_in_place_kv_headroom(&model_info, base_model_id);
                     if healthy_replicas == current_replicas
-                        && should_defer_managed_vllm_replication(
+                        && should_defer_process_replication(
                             &model_info,
                             pool_metrics.as_ref(),
                             live_resize_headroom,
@@ -109,7 +109,8 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
                             (metrics.kv_cache_sequences, metrics.batch_size)
                         });
                         log::info!(
-                            "Auto-scaler: deferring managed vLLM model {} process replication; internal continuous batching has {}/{} active sequences (live_resize_headroom={})",
+                            "Auto-scaler: deferring managed {} model {} process replication; internal continuous batching has {}/{} active sequences (live_resize_headroom={})",
+                            model_info.device,
                             base_model_id,
                             active,
                             target,
@@ -246,13 +247,12 @@ pub(crate) fn spawn_auto_scaler_task(config: AutoScalerTaskConfig) -> tokio::tas
     })
 }
 
-fn managed_vllm_has_internal_batching_headroom(
-    model: &ModelInfo,
-    metrics: Option<&EngineMetrics>,
-) -> bool {
-    // Every managed server batches internally; SGLang reports its live KV
-    // leases as active sequences.
-    if !matches!(model.device.as_str(), "vllm" | "sglang") {
+/// Whether a replica that batches requests itself still has room under its
+/// batch target. Always `false` for a backend that leaves batching to Kapsl.
+fn has_internal_batching_headroom(model: &ModelInfo, metrics: Option<&EngineMetrics>) -> bool {
+    let batches_internally = serving_backend_strategy_for_device(&model.device)
+        .is_some_and(|backend| backend.batches_internally());
+    if !batches_internally {
         return false;
     }
     let Some(metrics) = metrics else {
@@ -261,18 +261,18 @@ fn managed_vllm_has_internal_batching_headroom(
     metrics.batch_size == 0 || metrics.kv_cache_sequences < metrics.batch_size
 }
 
-fn should_defer_managed_vllm_replication(
+fn should_defer_process_replication(
     model: &ModelInfo,
     metrics: Option<&EngineMetrics>,
     live_resize_headroom: bool,
     scale_up_enforces_minimum: bool,
 ) -> bool {
     !scale_up_enforces_minimum
-        && (live_resize_headroom || managed_vllm_has_internal_batching_headroom(model, metrics))
+        && (live_resize_headroom || has_internal_batching_headroom(model, metrics))
 }
 
 #[cfg(test)]
-mod managed_vllm_autoscaling_tests {
+mod managed_server_autoscaling_tests {
     use super::*;
 
     fn model(device: &str) -> ModelInfo {
@@ -288,9 +288,9 @@ mod managed_vllm_autoscaling_tests {
     }
 
     #[test]
-    fn managed_vllm_replication_waits_for_internal_target_saturation() {
+    fn managed_server_replication_waits_for_internal_target_saturation() {
         let managed = model("vllm");
-        assert!(managed_vllm_has_internal_batching_headroom(
+        assert!(has_internal_batching_headroom(
             &managed,
             Some(&EngineMetrics {
                 batch_size: 16,
@@ -298,7 +298,7 @@ mod managed_vllm_autoscaling_tests {
                 ..Default::default()
             })
         ));
-        assert!(!managed_vllm_has_internal_batching_headroom(
+        assert!(!has_internal_batching_headroom(
             &managed,
             Some(&EngineMetrics {
                 batch_size: 16,
@@ -306,13 +306,13 @@ mod managed_vllm_autoscaling_tests {
                 ..Default::default()
             })
         ));
-        assert!(managed_vllm_has_internal_batching_headroom(&managed, None));
-        assert!(!managed_vllm_has_internal_batching_headroom(
+        assert!(has_internal_batching_headroom(&managed, None));
+        assert!(!has_internal_batching_headroom(
             &model("CUDAExecutionProvider"),
             Some(&EngineMetrics::default())
         ));
         let sglang = model("sglang");
-        assert!(managed_vllm_has_internal_batching_headroom(
+        assert!(has_internal_batching_headroom(
             &sglang,
             Some(&EngineMetrics {
                 batch_size: 4,
@@ -320,7 +320,7 @@ mod managed_vllm_autoscaling_tests {
                 ..Default::default()
             })
         ));
-        assert!(!managed_vllm_has_internal_batching_headroom(
+        assert!(!has_internal_batching_headroom(
             &sglang,
             Some(&EngineMetrics {
                 batch_size: 4,
@@ -338,13 +338,13 @@ mod managed_vllm_autoscaling_tests {
             kv_cache_sequences: 0,
             ..Default::default()
         };
-        assert!(should_defer_managed_vllm_replication(
+        assert!(should_defer_process_replication(
             &managed,
             Some(&idle),
             true,
             false,
         ));
-        assert!(!should_defer_managed_vllm_replication(
+        assert!(!should_defer_process_replication(
             &managed,
             Some(&idle),
             true,
