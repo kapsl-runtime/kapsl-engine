@@ -2,7 +2,8 @@
 
 Status: proposal. Nothing here is implemented. SGLang runs under Kapsl only as
 an opaque KV participant (kapsl-engine #273, kapsl-integrations #44,
-kapsl-sdk #223), and that path has not run on a GPU yet.
+kapsl-sdk #223). Phases 0 and 1 ran on an RTX 3090 on 2026-11-26; their
+results are under "Phases".
 
 Date: 2026-11-26
 
@@ -18,9 +19,13 @@ Date: 2026-11-26
 3. **Take one thing from kvcached**: mapping by page anywhere in the pool, so a
    busy replica can give memory back. Kapsl's elastic profile can only retire a
    free tail. This is a later phase and applies to vLLM as well.
-4. **The buffer layout is open.** SGLang's per-layer buffers can be backed as
-   they are, which needs a KV ABI change, or as views of one packed range,
-   which needs none. A GPU probe decides, and the ABI is not changed before it.
+4. **Back SGLang's per-layer buffers as they are (striped).** The phase 1
+   probe found both layouts correct. Striped attaches to SGLang's own
+   virtual-memory backing, which cost nothing measurable, and live growth and
+   idle retirement worked on it. Packed needs no KV ABI change but replaces
+   how SGLang builds its pool, and showed a possible throughput cost in one
+   run. Striped needs a minor ABI addition (a stripe count), which is the next
+   decision.
 
 The sections below give the reasons, what was read to reach them, and what is
 still unverified.
@@ -183,12 +188,14 @@ tokens (7 granules).
 Striped keeps the SGLang patch small and costs an ABI change and many small
 allocations. Packed costs nothing in Kapsl and more in SGLang.
 
-The source leans towards striped. Upstream removed its own strided layout in
-the pinned release, and its kernels assume K and V of a layer sit in one
-allocation, so views of our own making would work against the code we attach
-to. Upstream's `--enable-unified-memory` is the packed candidate worth testing;
-its constraints for a plain MHA model were not read. Phase 1 tests both, and
-the ABI is not changed before it reports.
+Phase 1 settled correctness for both (results under "Phases"). Striped is
+recommended: it runs on SGLang's own backing at no measured cost, and growth
+and retirement were demonstrated on it. Packed also gave identical outputs,
+including with CUDA graphs, so SGLang's attention path accepts strided
+per-layer views. But it means replacing how `MHATokenToKVPool` creates its
+buffers, and one load run was markedly slower than the normal layout.
+SGLang's own `--enable-unified-memory` is not an option: it accepts only
+hybrid Mamba and sliding-window models.
 
 ### Memory source
 
@@ -218,15 +225,26 @@ Shrink, first delivery:
 SGLang at TP 1 runs scheduler and model in one process, so the worker and
 scheduler stages of the vLLM protocol collapse into one acknowledgement.
 
-Growth may need no fence at all. It maps memory above anything a running batch
-uses and then extends the allocator's free list from the scheduler thread.
-That is a reading of the code, to be confirmed in phase 1 with SGLang's default
-overlap scheduling.
+Growth needs no fence. Phase 1 grew the pool twice while 2 and 4 requests
+were running under SGLang's default overlap scheduling, from the scheduler
+thread between steps; every request completed and later outputs were
+unchanged. So growth does not need what vLLM pays for with
+`--no-async-scheduling` (7 to 15%). Retirement ran on an idle server only.
 
-A resize must not overlap a forward pass. vLLM needed `--no-async-scheduling`
-for that and pays 7 to 15% for it. Where SGLang's equivalent boundary is
-(its overlap mode runs scheduling and forward on separate streams) is an open
-question and decides the cost.
+SGLang keeps the pool's capacity in six places, and a resize has to update
+all of them in one step: the pool's `size`, the allocator's `size` (and
+`num_pages` on paged allocators), `ModelRunner.max_total_num_tokens`,
+`Scheduler.max_total_num_tokens`, and the scheduler's `pool_stats_observer`
+and `invariant_checker`. The observer is a frozen, slotted dataclass. Missing
+one trips SGLang's idle leak check ("pool memory leak detected") and the
+scheduler exits; the probe hit exactly that once. The list is specific to
+SGLang 0.5.23 and has to be re-checked on every version bump.
+
+The reservation is fixed when the pool is created. SGLang sizes it from the
+first `config_from_budget` call and backs only what the post-capture call
+asks for, so the most a replica can ever grow to is chosen at startup. The
+arena also backs 2 MiB of every buffer at creation: 96 MiB for the 48 buffers
+of the test model, the floor of a striped replica.
 
 ### Engine
 
@@ -301,21 +319,61 @@ documentation comments, not from tracing an allocation.
 
 | Phase | Work | Needs a GPU |
 |---|---|---|
-| 0 | Opaque tier on a real server (#273, #44): hooks fire, leases are taken, admission holds | yes |
-| 1 | Probe, no Kapsl changes: both layouts on the pinned build, growth and tail retirement on a live server, attention output unchanged | yes |
-| 2 | SGLang profile; the striped descriptor only if phase 1 picks that layout | no |
+| 0 | Opaque tier on a real server (#273, #44): hooks fire, leases are taken, admission holds. **Passed 2026-11-26.** | yes |
+| 1 | Probe, no Kapsl changes: both layouts on the pinned build, growth and tail retirement on a live server, attention output unchanged. **Passed 2026-11-26.** | yes |
+| 2 | SGLang profile and the striped pool descriptor in the KV ABI | no |
 | 3 | Adapter: import and map exported segments, growth | yes |
 | 4 | Engine: profile-keyed grants, shared supervision, load plan without the KV pool | partly |
 | 5 | Shrink when idle, with radix eviction | yes |
 | 6 | Mapping by page, for SGLang and vLLM | yes |
 
-Nothing after phase 1 should start before it reports.
+### Setup of the runs
 
-### Phase 1 checks
+One RTX 3090 (24 GB, driver 595.99.02, CUDA 13.2), SGLang 0.5.23 with torch
+2.14.1 (CUDA 13.0) and flashinfer 0.7.2 as the attention backend,
+Qwen2.5-0.5B-Instruct (24 layers, 2 KV heads of 64, bf16, page size 1).
+Correctness: 8 fixed prompts, greedy, 48 tokens, compared token for token
+with an unmodified server after flushing its prefix cache. Load: 1,589-token
+prompts, 128 output tokens, output tokens per second. Every number is a
+single run. The probe is an SGLang plugin plus driver scripts, kept outside
+this repository.
+
+### Phase 0 results
+
+- The first run found an adapter bug: SGLang 0.5.23 reports the KV pool size
+  as NumPy integers, and adapter 0.2.0 refused the pool at registration, so
+  SGLang shut down (correctly, rather than serve ungoverned). Fixed in
+  kapsl-integrations 9f02230.
+- With the fix: the participant registered, outputs through Kapsl were 8/8
+  identical, and 100/100 requests succeeded at concurrency 1, 8 and 16.
+  24 requests needing about 41,000 tokens against a 16,384-token pool all
+  completed, queueing for leases instead of failing.
+- Cost of the opaque tier: about 10% at concurrency 8 and 16 (1,478 / 1,464
+  tokens/s through Kapsl against 1,636 / 1,626 for plain SGLang with the same
+  16,384-token pool). Sending the load straight to the managed server gave
+  the same numbers as going through Kapsl, so the cost is the adapter's lease
+  calls inside SGLang's scheduler, not Kapsl's HTTP bridge.
+- In two runs, about 9 leases were still counted for up to 45 s after a
+  saturating load; an instrumented run (72 leases granted, 72 returned, none
+  counted afterwards) did not reproduce it. Unexplained; the lease lifetime
+  cleared them.
+
+### Phase 1 results
+
+| Check | Result |
+|---|---|
+| 1. Striped (`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1`) | Pass. 8/8 identical. The arena's handles are POSIX file descriptors, so they can be exported and imported. Throughput 890 / 1,881 / 2,908 tokens/s at concurrency 4 / 8 / 16 against 863 / 1,809 / 2,862 for the normal pool: no measurable cost. |
+| 2a. Packed, plugin: per-layer K and V as strided views of one tensor | Pass for correctness. 8/8 identical with CUDA graphs on; no extra GPU memory (3,366 against 3,412 MiB). One load run at concurrency 8 gave 1,025 tokens/s against 1,664 to 1,809 for the normal layout in other runs: a possible cost, not measured in a matched sweep. |
+| 2b. Packed, `--enable-unified-memory` | Not applicable: SGLang accepts it only for hybrid Mamba and sliding-window models. |
+| 3. Growth on a live server | Pass. 4,096 to 16,384 to 32,768 tokens with 2 and 4 requests running; 192 MiB mapped per step in 7.6 to 7.7 ms; all requests completed; 8/8 identical afterwards. |
+| 4. Tail retirement | Pass. 32,768 to 16,384 to 4,096 tokens on an idle server; 192 MiB unmapped per step in 9 to 12 ms; GPU memory dropped by about that; 8/8 identical afterwards. A boundary inside one mapping was refused, as CUDA requires. The probe flushed the whole prefix cache first; evicting only the tail is still to be written. |
+| 5. Cost | The virtual-memory backing: none measurable (check 1). Growth: no fence needed (check 3). |
+
+### Phase 1 checks as specified
 
 Run on the pinned SGLang build with the launch flags Kapsl uses, one MHA model
 and greedy decoding. Outputs are compared token for token with an unmodified
-server. A probe plugin and its driver scripts are written but have not run.
+server.
 
 1. **Striped.** Start with `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1`. Pass: same
    outputs, and the arena's backed bytes match the pool size.
@@ -337,13 +395,13 @@ allocator has to be replaced, as kvcached does, and the plan is costed again.
 
 ## Open questions
 
-1. How to add and retire allocator slots on a live server. SGLang's `resize`
-   cannot do it, so this is new adapter code against the free-list internals
-   of each allocator class.
-2. Where is the safe boundary for a resize relative to a forward pass, and what
-   does it cost in throughput?
-3. Does the VMM backing work with the attention backends and CUDA graphs our
-   launch flags select? It is off by default upstream.
+1. Adding and retiring slots on a live server works for the token allocator
+   (page size 1) by editing its free list and the six capacity fields
+   directly. The paged and sliding-window allocators are untested.
+2. Growth needs no boundary against a forward pass. Retirement was only tried
+   on an idle server; retiring while other requests run still needs a design.
+3. The virtual-memory backing works with flashinfer and CUDA graphs on an
+   RTX 3090. Other attention backends (FA3 on Hopper, triton) are untested.
 4. Hybrid and sliding-window pools (`MLATokenToKVPool`, SWA, Mamba) are out of
    scope for the first profile. kvcached covers them with separate patches.
 5. Tensor-parallel SGLang: one region per rank, resized together, as for vLLM.
