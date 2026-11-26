@@ -54,7 +54,9 @@ on:
       - ".github/scripts/verify-managed-sglang-adapter-wheel.py"
       - ".github/scripts/test-verify-managed-sglang-adapter-wheel.sh"
       - ".github/scripts/verify-sglang-integration-checkout.sh"
+      - ".github/scripts/test-managed-sglang-release-contract.sh"
       - ".github/sglang-integration.lock"
+      - "kapsl-runtime/crates/kapsl-cli/src/runtime/managed/sglang.rs"
       - ".github/scripts/managed_vllm_gpu_conformance.py"
       - ".github/scripts/test_managed_vllm_gpu_conformance.py"
       - ".github/scripts/managed_vllm_scaling_conformance.py"
@@ -221,6 +223,7 @@ jobs:
           bash -n .github/scripts/test-bootstrap-sglang-backend.sh
           bash -n .github/scripts/verify-sglang-integration-checkout.sh
           bash -n .github/scripts/test-verify-managed-sglang-adapter-wheel.sh
+          bash -n .github/scripts/test-managed-sglang-release-contract.sh
           bash -n .github/scripts/test-generate-backend-index.sh
           bash -n .github/scripts/verify-public-backend-release.sh
           python3 -m py_compile .github/scripts/generate-backend-index.py
@@ -298,6 +301,9 @@ jobs:
 
       - name: Test managed-SGLang adapter wheel verification
         run: .github/scripts/test-verify-managed-sglang-adapter-wheel.sh
+
+      - name: Test managed-SGLang release pins
+        run: .github/scripts/test-managed-sglang-release-contract.sh
 
       - name: Test managed-vLLM GPU conformance evidence parser
         run: python3 .github/scripts/test_managed_vllm_gpu_conformance.py
