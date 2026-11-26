@@ -299,7 +299,7 @@ class BuildPlanTests(TestCase):
         version, matrix = build.plan(self.values, self.manifest)
         self.assertEqual(version, "0.2.7")
         self.assertEqual([item["component"] for item in matrix["include"]],
-                         ["engine", "llama-cpu", "llama-cuda12", "vllm"])
+                         ["engine", "llama-cpu", "llama-cuda12", "vllm", "sglang"])
         targets = [item["target"] for item in matrix["include"] if item["target"]]
         self.assertEqual(len(targets), len(set(targets)))
 
@@ -356,7 +356,7 @@ class AssemblyTests(TestCase):
 
     def test_complete_component_set_is_moved_without_duplicate_disk_usage(self):
         self.assemble()
-        self.assertEqual(len(list(self.output.iterdir())), 11)
+        self.assertEqual(len(list(self.output.iterdir())), 14)
         self.assertTrue(all(not list(directory.iterdir()) for directory in self.root.iterdir()))
 
     def test_missing_component_fails_without_moving_existing_outputs(self):

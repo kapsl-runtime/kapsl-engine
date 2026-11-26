@@ -27,6 +27,7 @@ def components(stable, cache_only=False):
     ]
     if not cache_only:
         result.append({"component": "vllm", "target": "", "profile": ""})
+        result.append({"component": "sglang", "target": "", "profile": ""})
         if not stable:
             result.append({"component": "ort-cpu", "target": "", "profile": ""})
     return result
