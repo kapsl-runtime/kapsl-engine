@@ -15,7 +15,7 @@ pub(crate) struct PriorityReclaimResult {
     pub(crate) released_bytes: usize,
 }
 
-fn model_authority_bytes(snapshot: &MemorySnapshot, model_id: u32) -> usize {
+pub(super) fn model_authority_bytes(snapshot: &MemorySnapshot, model_id: u32) -> usize {
     snapshot
         .rows
         .iter()

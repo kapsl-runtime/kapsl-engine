@@ -138,6 +138,14 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 1)]
     pub(crate) tp_degree: usize,
 
+    /// Stop a model after it has served no inference requests for this many
+    /// seconds, releasing its memory, for example so a training job on the
+    /// same GPU can use it. Off by default; 0 also turns it off. A stopped
+    /// model stays listed as inactive and can be started again with
+    /// POST /api/models/start. Also read from KAPSL_IDLE_UNLOAD_SECONDS.
+    #[arg(long, value_name = "SECONDS")]
+    pub(crate) idle_unload_seconds: Option<u64>,
+
     /// Run as isolated worker process (internal)
     #[arg(long, hide = true)]
     pub(crate) worker: bool,
