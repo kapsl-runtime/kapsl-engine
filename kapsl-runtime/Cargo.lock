@@ -2350,20 +2350,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f85d199a812ee32c69fdee932f57ddd25677bab5ddbf82b12535af2544091338"
 
 [[package]]
-name = "kapsl-backend-llama-cpp"
-version = "0.1.0"
-dependencies = [
- "futures",
- "kapsl-backend-abi",
- "kapsl-engine-api",
- "kapsl-llama-cpp-sys-2",
- "kapsl-llm",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "kapsl-backends"
 version = "0.3.0"
 source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=efb6db4cec93365c22a32c11ff4907e3a4d370a2#efb6db4cec93365c22a32c11ff4907e3a4d370a2"

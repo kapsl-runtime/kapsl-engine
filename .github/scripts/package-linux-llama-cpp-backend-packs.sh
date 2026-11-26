@@ -30,12 +30,23 @@ done
 
 header="kapsl-runtime/include/kapsl_llama_cpp_backend.h"
 llama_license=".github/licenses/LLAMA-CPP-LICENSE"
-for required in "$header" "$llama_license" LICENSE NOTICE kapsl-runtime/Cargo.toml; do
+for required in "$header" "$llama_license" LICENSE NOTICE; do
   if [ ! -f "$required" ]; then
     echo "Missing required llama.cpp pack input: $required" >&2
     exit 1
   fi
 done
+
+# The pack source lives in kapsl-integrations. Release builds check out the
+# exact commit pinned in .github/llama-cpp-integration.lock beside the engine
+# and resolve only the published SDK crates locked by that repository.
+integrations_dir="${KAPSL_LLAMA_INTEGRATIONS_DIR:-kapsl-integrations-llama}"
+verifier=".github/scripts/verify-llama-cpp-integration-checkout.sh"
+
+verify_integrations_checkout() {
+  : "${KAPSL_LLAMA_INTEGRATIONS_REF:?KAPSL_LLAMA_INTEGRATIONS_REF is required to build llama.cpp packs}"
+  "$verifier" "$integrations_dir" "$KAPSL_LLAMA_INTEGRATIONS_REF"
+}
 
 work_parent="${RUNNER_TEMP:-/tmp}"
 work_root="$(mktemp -d "${work_parent%/}/kapsl-llama-packs.XXXXXX")"
@@ -62,9 +73,16 @@ build_profile() {
   # A caller-owned target survives packaging cleanup and can be restored on
   # another runner. Keep CPU and CUDA/PIC feature builds in separate targets.
   target_dir="${KAPSL_LLAMA_TARGET_ROOT:-$work_root/targets}/$profile"
+  # Build with the toolchain reviewed for the pinned integrations commit.
+  toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+    "$integrations_dir/rust-toolchain.toml" | head -n 1)"
+  if [ -z "$toolchain" ]; then
+    echo "Pinned kapsl-integrations checkout does not declare a Rust toolchain." >&2
+    exit 1
+  fi
   cargo_args=(
     build
-    --manifest-path kapsl-runtime/Cargo.toml
+    --manifest-path "$integrations_dir/Cargo.toml"
     -p kapsl-backend-llama-cpp
     --release
     --locked
@@ -75,7 +93,10 @@ build_profile() {
   # The backend entrypoint is a cdylib which statically links llama.cpp's
   # C/CUDA archives. Force every CMake target (including nvcc objects) to be
   # position independent so the final shared object is linkable on Linux.
-  CMAKE_POSITION_INDEPENDENT_CODE=ON cargo "${cargo_args[@]}"
+  # This function runs in a command substitution, where errexit is cleared, so
+  # stop explicitly instead of packaging a stale library from a cached target.
+  CMAKE_POSITION_INDEPENDENT_CODE=ON RUSTUP_TOOLCHAIN="$toolchain" \
+    cargo "${cargo_args[@]}" || exit 1
   printf '%s\n' "$target_dir/release/libkapsl_backend_llama_cpp.so"
 }
 
@@ -142,7 +163,14 @@ package_profile() {
   root="$work_root/payload-$profile"
   mkdir -p "$root/lib" "$root/include" "$root/licenses"
 
+  if [ -z "$override" ]; then
+    verify_integrations_checkout
+  fi
   library="$(build_profile "$profile" "$feature" "$override" "$kv_mode")"
+  if [ -z "$override" ]; then
+    # The build must not modify the certified source checkout.
+    verify_integrations_checkout
+  fi
   if [ ! -f "$library" ]; then
     echo "llama.cpp $profile build did not produce $library" >&2
     exit 1

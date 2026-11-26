@@ -61,14 +61,22 @@ and pack both fail closed if either the callbacks or capability bit are absent.
 A separately signed `kv_mode: native` CUDA pack remains available as the
 backend-owned-KV rollback. It is rejected unless an operator explicitly sets
 `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1`; that override cannot authorize a pack
-whose signed mode is `shared_pool`. Release jobs build the shared candidate
-only from an exact certified `kapsl-sdk` commit. The public-candidate GPU gate
+whose signed mode is `shared_pool`. The public-candidate GPU gate
 then checks first-use download/cache reuse, allocation ownership and cleanup,
 single-process CUDA participation, and the 2% throughput / 5% latency budgets
 before the shared pack is promoted.
 The CUDA archive carries its resolved non-driver CUDA dependency closure and
 redistribution notices beside the entrypoint with an `$ORIGIN` runpath; host
 NVIDIA driver libraries are explicitly excluded.
+
+The llama.cpp pack source lives in `kapsl-integrations` (`integrations/llama-cpp`)
+and resolves only published SDK crates. Release jobs check out the exact
+integrations commit in `.github/llama-cpp-integration.lock` and verify that the
+checkout is clean. They then build both profiles with that repository's
+committed Rust toolchain and `Cargo.lock`. Packaging, the dependency-closure
+checks, and signing remain in the engine. The packager checks each binary's
+`KAPSL_LLAMA_CPP_KV_MODE` marker against its manifest's `kv_mode`, and the
+backend-index publisher signs the archives.
 
 ONNX Runtime remains in the Kapsl process. The generic native host opens the
 verified entrypoint from a canonical pack-local absolute path and retains it

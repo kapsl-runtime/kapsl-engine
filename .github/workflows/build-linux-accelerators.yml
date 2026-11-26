@@ -91,12 +91,52 @@ jobs:
         if: matrix.component != 'vllm'
         uses: ./.github/actions/setup-rust
 
-      - name: Cache engine and native backend dependencies
-        if: matrix.component == 'engine' || startsWith(matrix.component, 'llama-')
+      - name: Cache engine dependencies
+        if: matrix.component == 'engine'
         uses: ./.github/actions/cache-rust-build
         with:
           key: release-linux-x86_64-cuda1263-ubuntu2204-${{ matrix.component }}
           workspaces: kapsl-runtime -> ${{ matrix.target }}
+
+      - name: Resolve certified llama.cpp integrations commit
+        if: startsWith(matrix.component, 'llama-')
+        id: llama-integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '\r\n' < .github/llama-cpp-integration.lock)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "KAPSL_LLAMA_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout certified llama.cpp adapter
+        if: startsWith(matrix.component, 'llama-')
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.llama-integrations.outputs.ref }}
+          path: kapsl-integrations-llama
+
+      - name: Verify certified llama.cpp integrations checkout
+        if: startsWith(matrix.component, 'llama-')
+        run: .github/scripts/verify-llama-cpp-integration-checkout.sh kapsl-integrations-llama "$KAPSL_LLAMA_INTEGRATIONS_REF"
+
+      - name: Install certified llama.cpp packaging toolchain
+        if: startsWith(matrix.component, 'llama-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' kapsl-integrations-llama/rust-toolchain.toml | head -n 1)"
+          rustup toolchain install "$toolchain" --profile minimal
+
+      # The target stays outside the integrations checkout, which must remain
+      # clean, under the per-profile engine target root that later runs restore.
+      - name: Cache llama.cpp backend dependencies
+        if: startsWith(matrix.component, 'llama-')
+        uses: ./.github/actions/cache-rust-build
+        with:
+          key: release-linux-x86_64-cuda1263-ubuntu2204-${{ matrix.component }}
+          workspaces: kapsl-integrations-llama -> ../kapsl-runtime/${{ matrix.target }}
 
       - name: Build kapsl with statically compiled GGUF CUDA
         if: matrix.component == 'engine'

@@ -28,6 +28,9 @@ on:
       - ".github/scripts/package-linux-llama-cpp-backend-packs.sh"
       - ".github/scripts/test-package-linux-llama-cpp-backend-packs.sh"
       - ".github/scripts/test-llama-cpp-backend-release-contract.sh"
+      - ".github/scripts/verify-llama-cpp-integration-checkout.sh"
+      - ".github/scripts/test-verify-llama-cpp-integration-checkout.sh"
+      - ".github/llama-cpp-integration.lock"
       - ".github/scripts/benchmark-llama-cpp-backend-pack.py"
       - ".github/scripts/certify-llama-cpp-backend-pack-performance.sh"
       - ".github/scripts/test-gpu-device-pool-integration.sh"
@@ -41,7 +44,6 @@ on:
       - "kapsl-runtime/crates/kapsl-cli/src/app/cli/commands/packages.rs"
       - "kapsl-runtime/crates/kapsl-cli/src/backend/bundle.rs"
       - "kapsl-runtime/crates/kapsl-cli/src/backend/manager.rs"
-      - "kapsl-runtime/crates/kapsl-backend-llama-cpp/**"
       - ".github/scripts/bootstrap-vllm-backend.sh"
       - ".github/scripts/package-linux-vllm-backend.sh"
       - ".github/scripts/managed-vllm-cu130.lock"
@@ -200,6 +202,8 @@ jobs:
           bash -n .github/scripts/package-linux-llama-cpp-backend-packs.sh
           bash -n .github/scripts/test-package-linux-llama-cpp-backend-packs.sh
           bash -n .github/scripts/test-llama-cpp-backend-release-contract.sh
+          bash -n .github/scripts/verify-llama-cpp-integration-checkout.sh
+          bash -n .github/scripts/test-verify-llama-cpp-integration-checkout.sh
           bash -n .github/scripts/certify-llama-cpp-backend-pack-performance.sh
           bash -n .github/scripts/bootstrap-vllm-backend.sh
           bash -n .github/scripts/package-linux-vllm-backend.sh
@@ -266,6 +270,9 @@ jobs:
 
       - name: Test llama.cpp backend release contract
         run: .github/scripts/test-llama-cpp-backend-release-contract.sh
+
+      - name: Test exact llama.cpp integrations checkout verification
+        run: .github/scripts/test-verify-llama-cpp-integration-checkout.sh
 
       - name: Test managed-vLLM backend bootstrap
         run: .github/scripts/test-bootstrap-vllm-backend.sh
