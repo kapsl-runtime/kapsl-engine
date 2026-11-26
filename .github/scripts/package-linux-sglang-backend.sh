@@ -71,11 +71,13 @@ ln -sfn python3.12 "$payload/python/bin/python"
 
 bootstrap_python="$payload/python/bin/python"
 "$bootstrap_python" -m ensurepip --upgrade
+# Whatever is installed here ships in the pack, so it carries the certified
+# lock's pins. The adapter build needs only setuptools; setuptools >= 70.1
+# builds wheels without the separate `wheel` package.
 "$bootstrap_python" -m pip install \
   --disable-pip-version-check \
   --no-cache-dir \
-  "setuptools==80.10.2" \
-  "wheel==0.45.1"
+  "setuptools==84.2.1"
 
 "$bootstrap_python" -m pip wheel \
   --disable-pip-version-check \

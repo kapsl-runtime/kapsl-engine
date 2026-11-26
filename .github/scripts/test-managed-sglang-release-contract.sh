@@ -58,6 +58,42 @@ if grep -Eiq '^kapsl[-_.]sglang[-_.]adapter==' "$lock_file"; then
   exit 1
 fi
 
+# The packager installs into the pack's own Python, which the bootstrap copies
+# into the installed environment, so everything it installs ships. Each
+# package must carry the certified lock's exact pin, and setuptools, which
+# builds the adapter, must be among them.
+packager_installs="$(awk '
+  /-m pip install/ { collecting = 1; sub(/.*-m pip install/, "") }
+  collecting {
+    continued = sub(/\\[[:space:]]*$/, "")
+    for (i = 1; i <= NF; i++) {
+      word = $i
+      gsub(/"/, "", word)
+      if (word !~ /^-/) print word
+    }
+    if (!continued) collecting = 0
+  }
+' "$packager")"
+if [ -z "$packager_installs" ]; then
+  echo "$packager installs nothing into the pack's Python; expected the lock's setuptools." >&2
+  exit 1
+fi
+while IFS= read -r requirement; do
+  if [[ ! "$requirement" =~ ^[A-Za-z0-9_.-]+==[^=]+$ ]]; then
+    echo "$packager installs $requirement without an exact name==version pin." >&2
+    exit 1
+  fi
+  if ! grep -Fxq -- "$requirement" "$lock_file"; then
+    echo "$packager installs $requirement into the pack, but $lock_file does not pin it." >&2
+    exit 1
+  fi
+done <<< "$packager_installs"
+lock_setuptools="$(grep -E '^setuptools==' "$lock_file" || true)"
+if [ -z "$lock_setuptools" ] || ! grep -Fxq -- "$lock_setuptools" <<< "$packager_installs"; then
+  echo "$packager must install the lock's setuptools pin (${lock_setuptools:-none in the lock})." >&2
+  exit 1
+fi
+
 if ! grep -Exq '[0-9a-f]{40}' "$integration_lock" \
   || [ "$(grep -c . "$integration_lock")" != "1" ]; then
   echo "$integration_lock must contain exactly one lowercase 40-hex commit." >&2
