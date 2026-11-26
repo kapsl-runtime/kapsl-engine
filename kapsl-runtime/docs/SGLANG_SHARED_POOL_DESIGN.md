@@ -123,7 +123,21 @@ Read from the SGLang source at tag `v0.5.23` (`python/sglang/srt/`). Not run.
   startup step. A live pool needs its own way to add free slots at the top and
   to retire a free tail.
 - **Radix cache.** Finished requests' tokens stay in the pool until evicted,
-  so "no live lease" does not mean "free tail".
+  so "no live lease" does not mean "free tail". `Scheduler.flush_cache()`
+  resets the cache and the allocator, and only on an idle server.
+- **Mapping memory it did not create.** `utils/cuda_vmm_utils.py` has
+  `VmmReservation.map_existing`, which maps a caller-owned allocation into a
+  reservation, and `import_peer_handle` and `import_and_map_alloc` for
+  shareable handles received as file descriptors. SGLang uses them between its
+  own ranks. They are what an adapter needs to map segments the runtime
+  exported.
+- **Its own packed layout is gone in this release.**
+  `PageMajorMHATokenToKVPool` is marked non-constructible ("the strided 4-D
+  view builder and its write kernel are gone") and server arguments reject it.
+  The class comment points to `--enable-unified-memory` for a page-major
+  layout with per-layer views. In the normal path the K and V buffers of a
+  layer are two halves of one allocation, so that paged kernels reach V from a
+  single base.
 - **No KV connector interface.** The adapter attaches through SGLang's plugin
   hooks, which fail open. The adapter's launcher is built to fail closed
   instead, and a shared-pool tier has to keep that property.
@@ -166,9 +180,15 @@ bytes per token across all 56. A 2 MiB granule holds 4,096 tokens of one
 buffer. Packed, the smallest step that is a whole number of granules is 512
 tokens (7 granules).
 
-No recommendation yet. Striped keeps the SGLang patch small and costs an ABI
-change and many small allocations. Packed costs nothing in Kapsl and more in
-SGLang. Phase 1 tests both.
+Striped keeps the SGLang patch small and costs an ABI change and many small
+allocations. Packed costs nothing in Kapsl and more in SGLang.
+
+The source leans towards striped. Upstream removed its own strided layout in
+the pinned release, and its kernels assume K and V of a layer sit in one
+allocation, so views of our own making would work against the code we attach
+to. Upstream's `--enable-unified-memory` is the packed candidate worth testing;
+its constraints for a plain MHA model were not read. Phase 1 tests both, and
+the ABI is not changed before it reports.
 
 ### Memory source
 
@@ -197,6 +217,11 @@ Shrink, first delivery:
 
 SGLang at TP 1 runs scheduler and model in one process, so the worker and
 scheduler stages of the vLLM protocol collapse into one acknowledgement.
+
+Growth may need no fence at all. It maps memory above anything a running batch
+uses and then extends the allocator's free list from the scheduler thread.
+That is a reading of the code, to be confirmed in phase 1 with SGLang's default
+overlap scheduling.
 
 A resize must not overlap a forward pass. vLLM needed `--no-async-scheduling`
 for that and pays 7 to 15% for it. Where SGLang's equivalent boundary is
@@ -236,6 +261,42 @@ It also removes the reason shrink waits for an idle replica in vLLM.
 - Priorities with preemption of running requests. Kapsl has per-model priority
   weights and reclaim; mapping them onto elastic regions is separate work.
 
+## Making the in-process pool resizable
+
+A separate question: can the pool that llama.cpp and ONNX Runtime share inside
+Kapsl resize the way a vLLM pool does?
+
+Today it is one `cudaMallocAsync` allocation per device (`GpuArenaRegion` in
+kapsl-hal) with a byte-range allocator on top, sized once and charged in full.
+Both ways to change that stay inside one process, so neither needs what makes
+the vLLM profile heavy: exported handles, acknowledgements, fencing by
+generation.
+
+| | A. More than one arena | B. The arena on a VMM region |
+|---|---|---|
+| How | grow by installing another arena region; shrink by retiring one that holds no lease | reserve the address range once; map and unmap segments under the range allocator |
+| Exists today | `GpuDevicePool` is already a catalogue of regions: `install_arena`, `acquire_region` choosing among candidates, `retire_arena` | `GpuVmmRegion` in kapsl-hal (reserved range, `grow_to`, `shrink_boundary`), used for vLLM pools |
+| Missing | a policy that adds an arena when admission needs room and retires an empty one | an allocator that hands out only mapped bytes and knows which segments are entirely free |
+| Unit that comes back | a whole arena with nothing left in it | any segment with nothing left in it |
+
+What can come back in either:
+
+- llama.cpp KV pages: yes. They are separate arena allocations, taken and
+  released as sequences come and go. This is the same kind of memory a vLLM
+  pool returns.
+- ONNX Runtime workspaces: only when ONNX Runtime's own arena releases them.
+- Model weights: no, not while the model is loaded.
+
+So the gain is real for llama.cpp KV and small for ONNX. Fragmentation decides
+how much of it is reachable: one long-lived allocation pins its segment or its
+arena. Keeping long-lived allocations (weights) apart from short-lived ones (KV
+pages, workspaces) is what makes shrinking effective.
+
+Not verified, and it decides between A and B: how the llama.cpp KV store and
+the ONNX pool client take extents from the arena, and whether either can use
+more than one region. The statement about KV pages comes from the allocator's
+documentation comments, not from tracing an allocation.
+
 ## Phases
 
 | Phase | Work | Needs a GPU |
@@ -254,13 +315,14 @@ Nothing after phase 1 should start before it reports.
 
 Run on the pinned SGLang build with the launch flags Kapsl uses, one MHA model
 and greedy decoding. Outputs are compared token for token with an unmodified
-server.
+server. A probe plugin and its driver scripts are written but have not run.
 
 1. **Striped.** Start with `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1`. Pass: same
    outputs, and the arena's backed bytes match the pool size.
-2. **Packed.** A plugin makes the per-layer buffers views of one tensor. Pass:
-   same outputs with CUDA graphs on, and GPU memory no higher than the
-   baseline, which rules out a hidden copy of the pool.
+2. **Packed.** Two variants: SGLang's own `--enable-unified-memory`, and a
+   plugin that makes the per-layer buffers views of one tensor. Pass: same
+   outputs with CUDA graphs on, and GPU memory no higher than the baseline,
+   which rules out a hidden copy of the pool.
 3. **Growth on a live server.** Back more of the pool and add the new slots to
    the allocator between scheduler steps while requests run. Pass: running
    requests finish with the same outputs and new requests use the added slots.
