@@ -706,7 +706,7 @@ class LlamaCppCpuSmokeWorkflowTests(TestCase):
         return github_path_filter(re.findall(r'^      - "([^"]+)"', block, re.MULTILINE))
 
     def test_runtime_and_real_pack_inputs_run_the_parity_smoke(self):
-        for event in ("pull_request", "push"):
+        for event in ("pull_request",):
             matches = self.trigger(event)
             for path in (
                 "rust-toolchain.toml", ".cargo/config.toml", "kapsl-runtime/Cargo.lock",
@@ -736,12 +736,14 @@ class LlamaCppCpuSmokeWorkflowTests(TestCase):
             with self.subTest(path=path):
                 self.assertFalse(matches(path))
 
-    def test_develop_pushes_warm_caches_and_cover_the_workflow_itself(self):
-        push = self.source.split("  push:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
-        self.assertIn("    branches:\n      - develop\n", push)
-        self.assertTrue(self.trigger("push")(".github/workflows/llama-cpp-cpu-conformance.yml"))
-        # PR caches stay read-only; the develop runs save them.
-        self.assertNotIn("save-pr-cache", self.source)
+    def test_the_smoke_runs_cold_and_adds_no_actions_caches(self):
+        # The repository's Actions cache is over its limit; this non-required
+        # smoke must not save build or model caches that evict CI's caches.
+        triggers = self.source.split("\njobs:\n", 1)[0]
+        self.assertNotIn("\n  push:", triggers)
+        self.assertIn("\n  workflow_dispatch:", triggers)
+        for forbidden in ("cache-rust-build", "actions/cache", "Swatinem/rust-cache", "save-pr-cache"):
+            self.assertNotIn(forbidden, self.source)
 
     def test_skipped_triggers_remain_covered_by_lightweight_checks(self):
         triggers, steps = workflow("installer-smoke").split("\njobs:\n", 1)

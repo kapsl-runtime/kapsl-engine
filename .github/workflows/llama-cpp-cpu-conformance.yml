@@ -18,24 +18,6 @@ on:
       - "kapsl-runtime/**"
       - "!kapsl-runtime/docs/**"
       - "!kapsl-runtime/**/*.md"
-  push:
-    # Pull requests cannot save build caches. Runs on develop keep the engine,
-    # pack and model caches warm for them and catch regressions after merge.
-    branches:
-      - develop
-    paths:
-      - ".github/llama-cpp-cpu-parity.lock.json"
-      - ".github/licenses/LLAMA-CPP-LICENSE"
-      - ".github/scripts/certify-llama-cpp-cpu-parity.sh"
-      - ".github/scripts/llama_cpp_cpu_parity.py"
-      - ".github/scripts/generate-backend-index.py"
-      - ".github/scripts/package-linux-llama-cpp-backend-packs.sh"
-      - ".github/workflows/llama-cpp-cpu-conformance.yml"
-      - "rust-toolchain.toml"
-      - ".cargo/**"
-      - "kapsl-runtime/**"
-      - "!kapsl-runtime/docs/**"
-      - "!kapsl-runtime/**/*.md"
   workflow_dispatch:
 
 permissions:
@@ -46,6 +28,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Deliberately cold: the repository's Actions cache is already over its
+  # limit, so this non-required smoke saves no build or model cache and does
+  # not evict the required CI caches.
   llama-cpp-cpu-smoke:
     name: llama.cpp CPU correctness smoke
     runs-on: ubuntu-22.04
@@ -110,25 +95,7 @@ jobs:
       - name: Install Rust
         uses: ./.github/actions/setup-rust
 
-      - name: Cache engine and llama.cpp pack build dependencies
-        uses: ./.github/actions/cache-rust-build
-        with:
-          key: llama-cpp-cpu-ubuntu22.04
-          # The engine and the CPU pack build in separate targets, as release
-          # packaging does. Only compilation dependencies are cached.
-          workspaces: |
-            kapsl-runtime -> target
-            kapsl-runtime -> target-llama/cpu
-
-      - name: Restore pinned parity model
-        id: model-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/kapsl-parity-models/${{ steps.parity-inputs.outputs.model_sha256 }}
-          key: llama-cpp-cpu-parity-model-${{ steps.parity-inputs.outputs.model_sha256 }}
-
       - name: Download pinned parity model
-        if: steps.model-cache.outputs.cache-hit != 'true'
         env:
           MODEL_REPOSITORY: ${{ steps.parity-inputs.outputs.model_repository }}
           MODEL_COMMIT: ${{ steps.parity-inputs.outputs.model_commit }}
@@ -137,7 +104,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          directory="$HOME/.cache/kapsl-parity-models/$MODEL_SHA256"
+          directory="$RUNNER_TEMP/kapsl-parity-model"
           mkdir -p "$directory"
           curl --fail --location --proto '=https' --retry 5 --retry-delay 10 \
             --output "$directory/$MODEL_PATH.partial" \
@@ -152,7 +119,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          model="$HOME/.cache/kapsl-parity-models/$MODEL_SHA256/$MODEL_PATH"
+          model="$RUNNER_TEMP/kapsl-parity-model/$MODEL_PATH"
           actual_bytes="$(stat -c %s "$model")"
           if [ "$actual_bytes" != "$MODEL_BYTES" ]; then
             echo "Parity model is $actual_bytes bytes, expected $MODEL_BYTES" >&2

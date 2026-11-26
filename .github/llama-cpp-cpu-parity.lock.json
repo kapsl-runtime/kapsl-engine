@@ -2,10 +2,10 @@
   "schema_version": 1,
   "model": {
     "source": "huggingface",
-    "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-    "commit": "9217f5db79a29953eb74d5343926648285ec7e67",
-    "path": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-    "bytes": 491400032,
-    "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+    "repository": "bartowski/SmolLM2-135M-Instruct-GGUF",
+    "commit": "09816acd5d99df7be770d85ea30822623dab342c",
+    "path": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "bytes": 105454432,
+    "sha256": "2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d"
   }
 }
