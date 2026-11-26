@@ -18,6 +18,9 @@ Date: 2026-11-26
 3. **Take one thing from kvcached**: mapping by page anywhere in the pool, so a
    busy replica can give memory back. Kapsl's elastic profile can only retire a
    free tail. This is a later phase and applies to vLLM as well.
+4. **The buffer layout is open.** SGLang's per-layer buffers can be backed as
+   they are, which needs a KV ABI change, or as views of one packed range,
+   which needs none. A GPU probe decides, and the ABI is not changed before it.
 
 The sections below give the reasons, what was read to reach them, and what is
 still unverified.
@@ -115,9 +118,10 @@ Read from the SGLang source at tag `v0.5.23` (`python/sglang/srt/`). Not run.
 - **What that backing is for.** Sizing the pool once after CUDA graph capture
   (`managers/scheduler.py`, `post_capture_resize_kv_pool`). `commit_range` only
   grows, and no unmap exists. It is a mechanism to build on, not elasticity.
-- **Allocator resize.** The allocators have `resize(config)`
-  (`mem_cache/allocator/base.py` and others). Whether it can run after startup,
-  and whether it can shrink, is not verified.
+- **Allocator resize.** `resize(config)` in `mem_cache/allocator/base.py` sets
+  the new size and then calls `clear()`, which drops every allocation. It is a
+  startup step. A live pool needs its own way to add free slots at the top and
+  to retire a free tail.
 - **Radix cache.** Finished requests' tokens stay in the pool until evicted,
   so "no live lease" does not mean "free tail".
 - **No KV connector interface.** The adapter attaches through SGLang's plugin
@@ -135,37 +139,43 @@ Read from the SGLang source at tag `v0.5.23` (`python/sglang/srt/`). Not run.
 - The same `MemoryAuthority` and the same `GpuSharedPoolProvisioner` that serve
   vLLM. No SGLang-specific pool, ledger or budget.
 
-### Layout mapping
+### Layout: the open choice
 
-One logical block is one token step across every buffer. For a model whose
-buffers all have the same row size, the step that keeps every buffer on a
-granule boundary is `granularity / gcd(granularity, row_bytes)` tokens.
+The KV ABI describes an elastic pool as one contiguous range of blocks whose
+mapped prefix is covered by segments. Each segment is one CUDA allocation. The
+driver maps an allocation from offset zero only, and unmaps only a whole
+mapping (CUDA Driver API, `cuMemMap` and `cuMemUnmap`). One segment therefore
+backs one contiguous piece of one buffer.
 
-Example, computed from the model configuration and not measured: Qwen2.5-1.5B
-has 28 layers, 2 KV heads of 128, fp16, so 512 bytes per token per buffer.
-One 2 MiB granule holds 4,096 tokens in one buffer; a step is 4,096 tokens and
-maps 56 granules, 112 MiB.
+SGLang keeps 2 x layers buffers. There are two ways to put them on that
+contract.
 
-The KV ABI describes an elastic pool as one range with a minimum, mapped and
-maximum block count. SGLang needs one resize to cover 2 x layers ranges. Two
-ways to express it:
-
-| Option | Change | Cost |
+| | Striped: SGLang's buffers as they are | Packed: one range, per-layer views |
 |---|---|---|
-| A. Striped pool: one binding with a stripe count and stride | new optional field in the pool descriptor (ABI minor) | one generation, one acknowledgement per resize |
-| B. One binding per buffer, resized together | none in the ABI | 56 bindings for a 28-layer model, and a resize that half-applies has to be undone |
+| How | each buffer gets its own backed prefix inside SGLang's arena | one tensor holds every layer's K and V for a token; each `k_buffer[i]` and `v_buffer[i]` is a strided view of it |
+| Patch surface in SGLang | small: replace where `KvVmmArena` gets its memory | larger: replace how `MHATokenToKVPool` creates its buffers |
+| KV ABI | new optional stripe count, and a stripe index per segment (minor version) | unchanged: it is the layout the vLLM profile already uses |
+| Segments per growth step | one per buffer: 56 for a 28-layer model | one |
+| Smallest step, Qwen2.5-1.5B | 4,096 tokens, 112 MiB | 512 tokens, 14 MiB |
+| Main risk | allocation and handle count grows with layers x steps | attention backends, CUDA graphs and copy paths must accept non-contiguous per-layer buffers |
+| Evidence | SGLang's own startup path uses the arena | kvcached's default CUDA layout maps one compound page across all layers, on SGLang up to 0.5.20; how it derives the per-layer tensors was not read |
 
-Recommended: A.
+The step sizes are computed from the model configuration, not measured: 28
+layers, 2 KV heads of 128, fp16, so 512 bytes per token per buffer and 28,672
+bytes per token across all 56. A 2 MiB granule holds 4,096 tokens of one
+buffer. Packed, the smallest step that is a whole number of granules is 512
+tokens (7 granules).
+
+No recommendation yet. Striped keeps the SGLang patch small and costs an ABI
+change and many small allocations. Packed costs nothing in Kapsl and more in
+SGLang. Phase 1 tests both.
 
 ### Memory source
 
-`KvVmmArena` maps memory it creates itself. The adapter replaces that one step:
-it imports the segments the runtime exported and maps them into the same
-address range. Tensor creation, allocator and attention stay SGLang's.
-
-This is the difference from kvcached, which replaces SGLang's pool and
-allocator classes. A smaller patch surface is the reason to prefer SGLang's own
-arena as the seam.
+In both layouts the runtime creates, zeroes and exports the segments, and the
+adapter imports and maps them into an address range SGLang reserved. Striped,
+that replaces the one step where `KvVmmArena` maps memory it created itself.
+Packed, the adapter also creates the tensor and the per-layer views.
 
 ### Resize
 
@@ -173,7 +183,8 @@ Growth, driven as for vLLM by a refused reservation or by utilization:
 
 1. the runtime creates and zeroes the segments and exports them;
 2. the adapter maps them at the end of each buffer's backed prefix;
-3. the adapter extends the allocator's token range;
+3. the adapter adds the new token slots to the allocator's free list (its own
+   code; `resize` would clear the allocator);
 4. the adapter acknowledges, and the runtime activates the capacity.
 
 Shrink, first delivery:
@@ -210,8 +221,8 @@ To let a busy replica give memory back, the mapped state has to be a set of
 ranges, not one count, and the server's allocator has to prefer low slots or
 tolerate holes. kvcached shows both are workable. It needs:
 
-- the ABI to carry mapped ranges (the striped descriptor above should be
-  designed with this in mind);
+- the ABI to carry mapped ranges (if the striped descriptor is added, it
+  should be designed with this in mind);
 - allocator changes in each backend, which is the invasive part;
 - a decline message, so a server can refuse a range it cannot free.
 
@@ -230,20 +241,43 @@ It also removes the reason shrink waits for an idle replica in vLLM.
 | Phase | Work | Needs a GPU |
 |---|---|---|
 | 0 | Opaque tier on a real server (#273, #44): hooks fire, leases are taken, admission holds | yes |
-| 1 | Probe, no Kapsl changes: SGLang's VMM backing on our pinned build; allocator `resize` after startup; unmap of a tail; attention correct before and after | yes |
-| 2 | ABI: striped pool descriptor, SGLang profile | no |
+| 1 | Probe, no Kapsl changes: both layouts on the pinned build, growth and tail retirement on a live server, attention output unchanged | yes |
+| 2 | SGLang profile; the striped descriptor only if phase 1 picks that layout | no |
 | 3 | Adapter: import and map exported segments, growth | yes |
 | 4 | Engine: profile-keyed grants, shared supervision, load plan without the KV pool | partly |
 | 5 | Shrink when idle, with radix eviction | yes |
 | 6 | Mapping by page, for SGLang and vLLM | yes |
 
-Phase 1 decides whether phases 3 to 5 are possible on SGLang's own seam or need
-allocator replacement as kvcached does. Nothing after it should start before it
-passes.
+Nothing after phase 1 should start before it reports.
+
+### Phase 1 checks
+
+Run on the pinned SGLang build with the launch flags Kapsl uses, one MHA model
+and greedy decoding. Outputs are compared token for token with an unmodified
+server.
+
+1. **Striped.** Start with `SGLANG_ENABLE_POST_CAPTURE_KV_SIZING=1`. Pass: same
+   outputs, and the arena's backed bytes match the pool size.
+2. **Packed.** A plugin makes the per-layer buffers views of one tensor. Pass:
+   same outputs with CUDA graphs on, and GPU memory no higher than the
+   baseline, which rules out a hidden copy of the pool.
+3. **Growth on a live server.** Back more of the pool and add the new slots to
+   the allocator between scheduler steps while requests run. Pass: running
+   requests finish with the same outputs and new requests use the added slots.
+4. **Tail retirement.** After requests finish, evict the radix cache above a
+   boundary, remove those slots from the allocator and unmap. Pass: GPU memory
+   drops by the unmapped amount and later requests are correct.
+5. **Cost.** Throughput at concurrency 1 to 16 against the unmodified server,
+   with whatever boundary check 3 needed between a resize and a forward pass.
+
+Check 1 or 2 failing removes that layout. Check 3 or 4 failing means SGLang's
+allocator has to be replaced, as kvcached does, and the plan is costed again.
 
 ## Open questions
 
-1. Can SGLang's allocator `resize` run on a live server, in both directions?
+1. How to add and retire allocator slots on a live server. SGLang's `resize`
+   cannot do it, so this is new adapter code against the free-list internals
+   of each allocator class.
 2. Where is the safe boundary for a resize relative to a forward pass, and what
    does it cost in throughput?
 3. Does the VMM backing work with the attention backends and CUDA graphs our
@@ -252,5 +286,6 @@ passes.
    scope for the first profile. kvcached covers them with separate patches.
 5. Tensor-parallel SGLang: one region per rank, resized together, as for vLLM.
    Not designed here.
-6. Is the 2 x layers granule round-up acceptable for small models, or should
-   small pools use a smaller step with partial last granules?
+6. Striped layout only: one resize passes 2 x layers handles in a single
+   control message. Is that acceptable for deep models, and is a 112 MiB step
+   too coarse for small ones?
