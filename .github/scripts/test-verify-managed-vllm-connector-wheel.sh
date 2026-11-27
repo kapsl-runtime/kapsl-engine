@@ -67,7 +67,7 @@ PY
 verify() {
   "$verifier" \
     --wheel "$1" \
-    --connector-version 0.7.0 \
+    --connector-version 0.7.1 \
     --profile "$profile" \
     --elastic-profile "$elastic_profile" \
     --planner-schema 1 \
@@ -83,31 +83,31 @@ expect_failure() {
 }
 
 valid="$test_root/valid.whl"
-make_wheel "$valid" 0.7.0 0.7.0 1 kapsl_vllm_connector.plan:main
+make_wheel "$valid" 0.7.1 0.7.1 1 kapsl_vllm_connector.plan:main
 verify "$valid"
 
 wrong_distribution="$test_root/wrong-distribution.whl"
-make_wheel "$wrong_distribution" 0.6.0 0.7.0 1 kapsl_vllm_connector.plan:main
+make_wheel "$wrong_distribution" 0.7.0 0.7.1 1 kapsl_vllm_connector.plan:main
 expect_failure "$wrong_distribution"
 
 wrong_module="$test_root/wrong-module.whl"
-make_wheel "$wrong_module" 0.7.0 0.6.0 1 kapsl_vllm_connector.plan:main
+make_wheel "$wrong_module" 0.7.1 0.7.0 1 kapsl_vllm_connector.plan:main
 expect_failure "$wrong_module"
 
 wrong_schema="$test_root/wrong-schema.whl"
-make_wheel "$wrong_schema" 0.7.0 0.7.0 2 kapsl_vllm_connector.plan:main
+make_wheel "$wrong_schema" 0.7.1 0.7.1 2 kapsl_vllm_connector.plan:main
 expect_failure "$wrong_schema"
 
 wrong_entry_point="$test_root/wrong-entry-point.whl"
-make_wheel "$wrong_entry_point" 0.7.0 0.7.0 1 kapsl_vllm_connector.other:main
+make_wheel "$wrong_entry_point" 0.7.1 0.7.1 1 kapsl_vllm_connector.other:main
 expect_failure "$wrong_entry_point"
 
 wrong_elastic_profile="$test_root/wrong-elastic-profile.whl"
-make_wheel "$wrong_elastic_profile" 0.7.0 0.7.0 1 kapsl_vllm_connector.plan:main vllm-v1-wrong 1 5
+make_wheel "$wrong_elastic_profile" 0.7.1 0.7.1 1 kapsl_vllm_connector.plan:main vllm-v1-wrong 1 5
 expect_failure "$wrong_elastic_profile"
 
 wrong_abi="$test_root/wrong-abi.whl"
-make_wheel "$wrong_abi" 0.7.0 0.7.0 1 kapsl_vllm_connector.plan:main "$elastic_profile" 1 4
+make_wheel "$wrong_abi" 0.7.1 0.7.1 1 kapsl_vllm_connector.plan:main "$elastic_profile" 1 4
 expect_failure "$wrong_abi"
 
 echo "Managed-vLLM connector wheel verifier tests passed."

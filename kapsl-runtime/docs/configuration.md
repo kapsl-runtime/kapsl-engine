@@ -310,7 +310,7 @@ installer no longer downloads this multi-gigabyte pack by default; pass
 complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
-`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.0` with KV ABI
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.1` with KV ABI
 `1.5`. Fixed pools use profile
 `vllm-v1-packed-cuda-ipc/flash-attn`; live-resizable pools use
 `vllm-v1-packed-cuda-vmm/flash-attn-blnhc`. A missing or different bundle fails
@@ -436,9 +436,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
+    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four
@@ -452,8 +452,9 @@ An empty allowlist still permits opaque `kv_connected` participants but rejects
 every external `shared_pool` registration.
 
 The vLLM tuple must come from the opt-in **vLLM Shared-Pool Conformance** GPU
-workflow. That job uses an exact vLLM wheel and SDK ref, invokes the production
-CUDA IPC allocator seam on every requested rank, and tests native
+workflow. That job uses an exact vLLM wheel and the connector built from the
+`kapsl-integrations` commit in `.github/vllm-integration.lock`, invokes the
+production CUDA IPC allocator seam on every requested rank, and tests native
 FlashAttention writes, causal reads, guards, reuse, exhaustion, and synchronized
 detach. It uploads a JSON report on every run but creates the plain-text
 allowlist value only after every gate passes. Its temporary runtime necessarily

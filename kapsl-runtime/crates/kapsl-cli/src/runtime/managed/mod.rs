@@ -25,7 +25,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{ExitStatus, Stdio};
 
 pub(crate) const MANAGED_VLLM_ADAPTER_ID: &str = "kapsl-vllm-connector";
-pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.0";
+pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.1";
 pub(crate) const MANAGED_VLLM_BACKEND_VERSION: &str = "0.26.1rc1.dev1130+g2ec6f0d71";
 pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";
 pub(crate) const MANAGED_VLLM_ELASTIC_PROFILE_ID: &str = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc";
@@ -5090,10 +5090,10 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.0. Keeping
+    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.1. Keeping
     // one exact cross-language fixture catches JSON/digest/arithmetic drift
     // before the executor-backed planner is exercised on a GPU host.
-    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.0","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
+    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.1","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:6f55e57f692f85faf9d1d905132782acc052af87233c0df4b4804ace0bdbfbd1","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -5202,11 +5202,11 @@ mod tests {
     fn certified_profile_matches_certified_tuple() {
         assert_eq!(
             certified_vllm_profile(),
-            "kapsl-vllm-connector,0.7.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
+            "kapsl-vllm-connector,0.7.1,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
         );
         assert_eq!(
             certified_vllm_elastic_profile(),
-            "kapsl-vllm-connector,0.7.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
+            "kapsl-vllm-connector,0.7.1,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
         );
     }
 
@@ -5294,7 +5294,7 @@ mod tests {
         assert_eq!(template.grant_request.candidates[0].bytes_per_block, 1024);
         assert_eq!(
             template.grant_request.geometry_digest,
-            "sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697"
+            "sha256:6f55e57f692f85faf9d1d905132782acc052af87233c0df4b4804ace0bdbfbd1"
         );
     }
 
