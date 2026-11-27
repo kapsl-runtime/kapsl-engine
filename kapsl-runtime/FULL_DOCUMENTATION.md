@@ -111,6 +111,7 @@ Key run flags:
 - `--topology` and `--tp-degree` for parallel topology hints.
 - `--state-dir <PATH>`: root directory for runtime state (rag-data, extensions, extensions-config, auth-store.json). Overrides `KAPSL_RAG_STORAGE_ROOT`, `KAPSL_EXTENSIONS_ROOT`, `KAPSL_EXT_CONFIG_ROOT`, and `KAPSL_AUTH_STORE_PATH` when set.
 - `--shm-size-mb <MIB>` (default `256`): size of the shared memory segment when using `shm` or `hybrid` transport. Also read from `KAPSL_SHM_SIZE_MB`.
+- `--idle-unload-seconds <SECONDS>` (default off): stop a model after it has served no inference requests for this long, freeing its memory for other work on the same GPU. The model stays registered as inactive and must be started again explicitly. Also read from `KAPSL_IDLE_UNLOAD_SECONDS`; `0` turns it off. See [Idle model unloading](docs/configuration.md#idle-model-unloading).
 
 ONNX runtime tuning flags:
 
