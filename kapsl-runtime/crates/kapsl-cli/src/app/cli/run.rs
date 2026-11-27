@@ -146,6 +146,21 @@ pub(crate) struct Args {
     #[arg(long, value_name = "SECONDS")]
     pub(crate) idle_unload_seconds: Option<u64>,
 
+    /// Idle timeout for one model, as MODEL_ID=SECONDS (repeatable). It
+    /// overrides --idle-unload-seconds for that model; 0 keeps the model
+    /// loaded. Also read from KAPSL_MODEL_IDLE_UNLOAD_SECONDS as a
+    /// comma-separated list.
+    #[arg(long, value_name = "MODEL_ID=SECONDS")]
+    pub(crate) idle_unload_model: Vec<String>,
+
+    /// Reload a model that was stopped for being idle when the next request
+    /// for it arrives. The request waits for the load. If the model's memory
+    /// is in use (for example by a training job) the request fails with an
+    /// error that says so and can be retried. Also read from
+    /// KAPSL_IDLE_RELOAD.
+    #[arg(long)]
+    pub(crate) idle_reload: bool,
+
     /// Run as isolated worker process (internal)
     #[arg(long, hide = true)]
     pub(crate) worker: bool,

@@ -46,6 +46,12 @@ pub(crate) fn build_model_reader_routes(
             p99_latency_ms: f64,
             time_to_first_token_ms: f64,
             healthy: bool,
+            /// The idle unloader stopped this model; `reloads_on_request` says
+            /// whether the next request loads it again.
+            idle_unloaded: bool,
+            reloads_on_request: bool,
+            /// Idle timeout that applies to this model, if any.
+            idle_unload_seconds: Option<u64>,
         }
 
         let model_infos = models_for_list.registry().list();
@@ -147,6 +153,11 @@ pub(crate) fn build_model_reader_routes(
                 .with_label_values(&[&model_id_str])
                 .get();
 
+            let idle_unloaded = models_for_list.is_idle_unloaded(model.base_model_id);
+            let reloads_on_request = models_for_list.reloads_on_request(model.base_model_id);
+            let idle_unload_seconds = models_for_list
+                .idle_timeout(model.base_model_id)
+                .map(|timeout| timeout.as_secs());
             statuses.push(ModelStatus {
                 info: model,
                 active_inferences: active,
@@ -172,6 +183,9 @@ pub(crate) fn build_model_reader_routes(
                 p99_latency_ms,
                 time_to_first_token_ms,
                 healthy,
+                idle_unloaded,
+                reloads_on_request,
+                idle_unload_seconds,
             });
         }
 
@@ -215,6 +229,12 @@ pub(crate) fn build_model_reader_routes(
                     onnx_session_pool_waits_total: u64,
                     onnx_session_pool_wait_seconds_total: f64,
                     healthy: bool,
+                    /// The idle unloader stopped this model; `reloads_on_request` says
+                    /// whether the next request loads it again.
+                    idle_unloaded: bool,
+                    reloads_on_request: bool,
+                    /// Idle timeout that applies to this model, if any.
+                    idle_unload_seconds: Option<u64>,
                 }
 
                 #[derive(Serialize)]
@@ -321,6 +341,12 @@ pub(crate) fn build_model_reader_routes(
                             0.0
                         };
 
+                        let idle_unloaded = models_for_get.is_idle_unloaded(model.base_model_id);
+                        let reloads_on_request =
+                            models_for_get.reloads_on_request(model.base_model_id);
+                        let idle_unload_seconds = models_for_get
+                            .idle_timeout(model.base_model_id)
+                            .map(|timeout| timeout.as_secs());
                         let status = ModelDetailStatus {
                             info: model,
                             active_inferences: active,
@@ -345,6 +371,9 @@ pub(crate) fn build_model_reader_routes(
                             onnx_session_pool_waits_total,
                             onnx_session_pool_wait_seconds_total,
                             healthy,
+                            idle_unloaded,
+                            reloads_on_request,
+                            idle_unload_seconds,
                         };
 
                         warp::reply::json(&status)

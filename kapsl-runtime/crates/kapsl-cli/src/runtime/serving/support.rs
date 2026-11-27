@@ -20,6 +20,24 @@ pub(crate) struct ListedModel {
     pub(crate) status: String,
     #[serde(default)]
     pub(crate) healthy: Option<bool>,
+    /// The idle unloader stopped this model.
+    #[serde(default)]
+    pub(crate) idle_unloaded: bool,
+    /// The next request for an idle-unloaded model loads it again.
+    #[serde(default)]
+    pub(crate) reloads_on_request: bool,
+}
+
+impl ListedModel {
+    /// Status shown in the table: an idle-unloaded model is told apart from
+    /// one that was stopped explicitly.
+    fn display_status(&self) -> &str {
+        match (self.idle_unloaded, self.reloads_on_request) {
+            (true, true) => "idle (reloads)",
+            (true, false) => "idle",
+            (false, _) => &self.status,
+        }
+    }
 }
 
 fn runtime_base_url(
@@ -202,7 +220,7 @@ fn render_model_table(models: &[ListedModel], memory: &HashMap<u32, usize>) -> S
                     .filter(|bytes| **bytes > 0)
                     .map(|bytes| format_memory(*bytes))
                     .unwrap_or_else(|| "-".to_string()),
-                table_cell(&model.status).to_string(),
+                table_cell(model.display_status()).to_string(),
                 match model.healthy {
                     Some(true) => "healthy",
                     Some(false) => "unhealthy",
@@ -577,11 +595,14 @@ pub(crate) fn execute_add_model_command(args: AddModelCommandArgs) -> Result<(),
             }
         };
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "model_path": absolute_path.to_string_lossy(),
             "topology": args.topology,
             "tp_degree": args.tp_degree,
         });
+        if let Some(seconds) = args.idle_unload_seconds {
+            payload["idle_unload_seconds"] = seconds.into();
+        }
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| dyn_error_from_message(format!("Failed to serialize request: {}", e)))?;
 
@@ -738,6 +759,29 @@ pub(crate) fn status_code_for_engine_error(error: &EngineError) -> warp::http::S
     }
 }
 
+/// HTTP status and JSON body for a request whose idle-unloaded model could
+/// not be reloaded. Memory that is in use is a temporary condition, so it is
+/// 503 with a retry hint rather than the 429 used for request shedding.
+pub(crate) fn idle_reload_error_reply(
+    error: &IdleReloadError,
+) -> (warp::http::StatusCode, serde_json::Value) {
+    use warp::http::StatusCode;
+
+    let (status, reason) = match error {
+        IdleReloadError::NotLoaded => (StatusCode::SERVICE_UNAVAILABLE, "model_not_loaded"),
+        IdleReloadError::MemoryUnavailable { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "idle_reload_memory_unavailable",
+        ),
+        IdleReloadError::Failed { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "idle_reload_failed"),
+    };
+    let mut body = serde_json::json!({ "error": error.to_string(), "reason": reason });
+    if let Some(seconds) = error.retry_after_seconds() {
+        body["retry_after_seconds"] = seconds.into();
+    }
+    (status, body)
+}
+
 pub(crate) fn inferred_batch_size(shape: &[i64]) -> usize {
     shape
         .first()
@@ -798,6 +842,8 @@ mod command_tests {
             device: "CUDA".to_string(),
             status: "active".to_string(),
             healthy: Some(true),
+            idle_unloaded: false,
+            reloads_on_request: false,
         }
     }
 
@@ -937,6 +983,31 @@ mod command_tests {
         assert!(lines[1].starts_with('2') && lines[1].contains("gguf"));
         assert!(lines[2].starts_with('9') && lines[2].contains("onnx"));
         assert!(lines[2].ends_with("unhealthy"));
+    }
+
+    #[test]
+    fn model_table_tells_idle_unloaded_models_from_stopped_ones() {
+        let models = parse_listed_models(
+            r#"[{"id":1,"name":"stopped","status":"inactive"},
+                {"id":2,"name":"parked","status":"inactive","idle_unloaded":true},
+                {"id":3,"name":"sleeping","status":"inactive","idle_unloaded":true,"reloads_on_request":true}]"#,
+        )
+        .expect("parse model list");
+
+        let output = render_model_table(&models, &HashMap::new());
+        let status = |line: usize| {
+            let cells: Vec<&str> = output.lines().nth(line).unwrap().split("  ").collect();
+            cells
+                .into_iter()
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .nth(6)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(status(1), "inactive");
+        assert_eq!(status(2), "idle");
+        assert_eq!(status(3), "idle (reloads)");
     }
 
     #[test]
