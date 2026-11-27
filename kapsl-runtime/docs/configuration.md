@@ -339,13 +339,14 @@ metadata:
           grow_utilization_percent: 80
           shrink_utilization_percent: 25
           shrink_idle_seconds: 60
-      startup_timeout_seconds: 300
-      enforce_eager: true
+      startup_timeout_seconds: 600
+      enforce_eager: false
 ```
 
 The defaults are a 1,024-token context, exact `auto` sizing, 20% bounded KV
-headroom, the resolved per-replica batch/concurrency target, and a 300-second
-startup timeout. The certified planner loads the pinned vLLM configuration,
+headroom, the resolved per-replica batch/concurrency target, compiled
+execution, and a 600-second startup timeout (300 seconds with
+`enforce_eager: true`). The certified planner loads the pinned vLLM configuration,
 derives the packed cache geometry without allocating the final KV cache, and
 asks `MemoryAuthority` for an exact single-use grant before the serving child
 starts. If the full target does not fit, Kapsl first sheds optional headroom and
@@ -389,18 +390,22 @@ affected charge; it is never reassigned speculatively. A scheduler that finds
 a referenced block in a tail it was asked to retire changes nothing and tries
 again on later steps until the acknowledgement deadline.
 
-`enforce_eager` defaults to `true`: Kapsl launches vLLM with `--enforce-eager`,
-which turns off `torch.compile` and CUDA graphs. Set it to `false` to run with
-vLLM's own compiled defaults. On an RTX 3090, plain vLLM on the pinned build
-decoded a 1.5B model about three times faster at one concurrent request and
-about twice as fast at sixteen with those defaults than with eager execution;
-the gap narrows as models grow. The compiled path costs more at startup
-(compilation and graph capture, so raise `startup_timeout_seconds` if needed)
-and holds CUDA graph memory outside the planned KV grant. Kapsl's check of the
-device budget after backend load still applies and rejects a replica that no
-longer fits. The shared-pool conformance profile was certified with eager
-execution, so validate a compiled launch on your hardware before relying on it,
-in particular together with `live_resize`.
+`enforce_eager` defaults to `false`: vLLM runs with its own compiled defaults,
+`torch.compile` and CUDA graphs. On an RTX 3090 the pinned build decoded a 1.5B
+model about three times faster at one concurrent request and about twice as
+fast at sixteen than with eager execution, under Kapsl as well as on its own;
+the gap narrows as models grow. Set `enforce_eager: true` to launch vLLM with
+`--enforce-eager` instead, which starts faster and holds no CUDA graph memory.
+
+The compiled path costs more at startup: `torch.compile` and graph capture
+took about 25 seconds per 1.5B model with a cold compile cache, which is why
+the default startup timeout is longer. vLLM also keeps a CUDA graph pool for
+the life of the process. Admission charges it on every device before the
+child starts, as 24 MiB per decoder layer (`num_hidden_layers` in
+`config.json`, or in its `text_config`) with a 512 MiB floor, or 2 GiB when
+the config does not say. The pinned build used 0.40 GiB for a 24-layer model
+and 0.48 GiB for 28-layer models. After startup Kapsl logs the figure vLLM
+reported next to the charge, and warns when vLLM used more.
 
 The deprecated top-level `gpu_memory_utilization` field and
 `kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
