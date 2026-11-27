@@ -310,7 +310,7 @@ installer no longer downloads this multi-gigabyte pack by default; pass
 complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
-`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.1` with KV ABI
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.2` with KV ABI
 `1.5`. Fixed pools use profile
 `vllm-v1-packed-cuda-ipc/flash-attn`; live-resizable pools use
 `vllm-v1-packed-cuda-vmm/flash-attn-blnhc`. A missing or different bundle fails
@@ -380,6 +380,20 @@ replica under continuous load therefore keeps its capacity. The stable tensor
 address, one-sequence physical minimum, native block-table ownership, and
 per-rank geometry do not change.
 
+A live-resizable replica runs with vLLM's default scheduling. On the pinned
+build that is async scheduling: vLLM schedules the next model batch while the
+previous one is still running, so two batches are in flight. A physical tail
+may be unmapped only when no batch scheduled earlier can still write it. The
+connector therefore takes the tail out of vLLM's free blocks first, and
+acknowledges the retirement to Kapsl only after every worker has reported
+running every batch scheduled up to that point. Kapsl leaves async scheduling
+on only if the installed connector declares that it does this
+(`kapsl_vllm_connector.LIVE_RESIZE_ASYNC_SCHEDULING`, connector `0.7.2`). For
+a connector that does not, Kapsl starts vLLM with `--no-async-scheduling`,
+which keeps one batch in flight and on an RTX 3090 costs about 30% of output
+throughput. The planner resolves cache geometry for the same scheduling mode
+as the launch. Fixed pools always run with vLLM's default scheduling.
+
 The defaults are 80% grow utilization, 25% shrink utilization, and 60 seconds
 of low utilization before shrink. `maximum_concurrency` is required and cannot
 be below the initial target. Set `live_resize.enabled: false` alone to retain a
@@ -436,9 +450,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+    'kapsl-vllm-connector,0.7.2,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
+    'kapsl-vllm-connector,0.7.2,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four
