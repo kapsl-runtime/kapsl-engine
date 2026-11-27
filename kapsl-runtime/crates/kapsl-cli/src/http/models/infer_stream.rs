@@ -49,6 +49,22 @@ pub(crate) fn build_model_infer_stream_route(
                     ))
                 };
 
+                // With idle reload on, a model stopped for being idle is
+                // loaded again before the stream starts.
+                if let Err(error) = inference.ensure_loaded(model_id).await {
+                    if error != IdleReloadError::NotLoaded {
+                        log::warn!(
+                            "Infer-stream request could not reload model_id={}: {}",
+                            model_id,
+                            error
+                        );
+                        let (status, body) = idle_reload_error_reply(&error);
+                        return Ok::<_, warp::Rejection>(reply_into_response(
+                            warp::reply::with_status(warp::reply::json(&body), status),
+                        ));
+                    }
+                }
+
                 if models.pool(model_id).is_none() {
                     log::warn!("Infer-stream request received for unknown model_id={}", model_id);
                     return Ok::<_, warp::Rejection>(json_error(

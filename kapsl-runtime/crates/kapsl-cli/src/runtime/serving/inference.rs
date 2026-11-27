@@ -17,6 +17,8 @@ pub(crate) struct InferenceService {
     pressure: Arc<ResourcePressure>,
     telemetry: Arc<ModelTelemetry>,
     metrics: Option<kapsl_monitor::metrics::KapslMetrics>,
+    /// Present when idle-unloaded models reload on the next request.
+    idle_reloader: Option<Arc<IdleReloader>>,
 }
 
 impl InferenceService {
@@ -31,6 +33,23 @@ impl InferenceService {
             pressure,
             telemetry,
             metrics: None,
+            idle_reloader: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_idle_reloader(
+        models: Arc<ModelManager>,
+        pressure: Arc<ResourcePressure>,
+        telemetry: Arc<ModelTelemetry>,
+        idle_reloader: Arc<IdleReloader>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            models,
+            pressure,
+            telemetry,
+            metrics: None,
+            idle_reloader: Some(idle_reloader),
         })
     }
 
@@ -39,13 +58,29 @@ impl InferenceService {
         pressure: Arc<ResourcePressure>,
         telemetry: Arc<ModelTelemetry>,
         metrics: kapsl_monitor::metrics::KapslMetrics,
+        idle_reloader: Option<Arc<IdleReloader>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             models,
             pressure,
             telemetry,
             metrics: Some(metrics),
+            idle_reloader,
         })
+    }
+
+    /// Make sure the model is loaded before a route inspects its pool,
+    /// reloading it when the idle unloader stopped it and idle reload is on.
+    /// The inference methods below do this themselves; routes call it first
+    /// so they can answer a failed reload with their own error shape.
+    pub(crate) async fn ensure_loaded(&self, model_id: u32) -> Result<(), IdleReloadError> {
+        if self.models.contains_pool(model_id) {
+            return Ok(());
+        }
+        match &self.idle_reloader {
+            Some(reloader) => reloader.wake(model_id).await,
+            None => Err(IdleReloadError::NotLoaded),
+        }
     }
 
     pub(crate) fn observe_managed_vllm_ingress(
@@ -92,7 +127,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<BinaryTensorPacket, EngineError> {
-        let (pool, _activity) = self.ready_pool(model_id)?;
+        let (pool, _activity) = self.ready_pool(model_id).await?;
         self.apply_pressure_policy(&mut request, priority)?;
         let force_cpu = effective_force_cpu(&request, force_cpu);
         let cancellation = request
@@ -135,7 +170,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<InferenceStream, EngineError> {
-        let (pool, activity) = self.ready_pool(model_id)?;
+        let (pool, activity) = self.ready_pool(model_id).await?;
         self.apply_pressure_policy(&mut request, priority)?;
         let force_cpu = effective_force_cpu(&request, force_cpu);
         let cancellation = request
@@ -172,7 +207,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<OpenAiWireResponse, EngineError> {
-        let (pool, _activity) = self.ready_pool(model_id)?;
+        let (pool, _activity) = self.ready_pool(model_id).await?;
         if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
             validate_openai_wire_generation_cap(&request, cap)?;
         }
@@ -216,7 +251,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<OpenAiWireStreamResponse, EngineError> {
-        let (pool, activity) = self.ready_pool(model_id)?;
+        let (pool, activity) = self.ready_pool(model_id).await?;
         if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
             validate_openai_wire_generation_cap(&request, cap)?;
         }
@@ -256,7 +291,7 @@ impl InferenceService {
         self: &Arc<Self>,
         model_id: u32,
     ) -> Option<Arc<dyn ReplicaScheduler + Send + Sync>> {
-        self.models.contains_pool(model_id).then(|| {
+        self.models.can_serve(model_id).then(|| {
             Arc::new(InferenceServiceScheduler {
                 service: self.clone(),
                 model_id,
@@ -268,9 +303,9 @@ impl InferenceService {
         self: &Arc<Self>,
     ) -> HashMap<u32, Arc<dyn ReplicaScheduler + Send + Sync>> {
         self.models
-            .pools()
+            .servable_model_ids()
             .into_iter()
-            .filter_map(|(model_id, _)| {
+            .filter_map(|model_id| {
                 self.scheduler_for_transport(model_id)
                     .map(|scheduler| (model_id, scheduler))
             })
@@ -280,18 +315,31 @@ impl InferenceService {
     /// Resolve the live pool and count the request as in flight for idle
     /// unloading. Callers hold the guard until the request, including any
     /// response stream, is finished.
-    fn ready_pool(
+    ///
+    /// With idle reload on, a model the idle unloader stopped (or is stopping
+    /// right now) is loaded again first, and the request waits for that.
+    async fn ready_pool(
         &self,
         model_id: u32,
     ) -> Result<(Arc<ReplicaPool<Scheduler>>, ModelActivityGuard), EngineError> {
-        let (pool, activity) = self
-            .models
-            .pool_for_request(model_id)
-            .ok_or(EngineError::ModelNotLoaded)?;
-        if !pool.is_healthy() {
-            return Err(EngineError::overloaded("Model pool is overloaded"));
+        // The second pass covers a model that was stopped again between its
+        // reload and this lookup.
+        for _ in 0..2 {
+            if let Some((pool, activity)) = self.models.pool_for_request(model_id) {
+                if !pool.is_healthy() {
+                    return Err(EngineError::overloaded("Model pool is overloaded"));
+                }
+                return Ok((pool, activity));
+            }
+            let Some(reloader) = &self.idle_reloader else {
+                break;
+            };
+            reloader
+                .wake(model_id)
+                .await
+                .map_err(IdleReloadError::into_engine_error)?;
         }
-        Ok((pool, activity))
+        Err(EngineError::ModelNotLoaded)
     }
 
     fn apply_pressure_policy(
@@ -424,10 +472,12 @@ impl ReplicaScheduler for InferenceServiceScheduler {
     }
 
     fn is_healthy(&self) -> bool {
-        self.service
-            .models
-            .pool(self.model_id)
-            .is_some_and(|pool| pool.is_healthy())
+        match self.service.models.pool(self.model_id) {
+            Some(pool) => pool.is_healthy(),
+            // Stopped for being idle with reload on request: it can take a
+            // request, which loads it again.
+            None => self.service.models.reloads_on_request(self.model_id),
+        }
     }
 
     fn get_metrics(&self) -> EngineMetrics {
@@ -768,6 +818,141 @@ mod tests {
             .await
             .expect("a released claim reopens the model");
         assert_eq!(activity.in_flight(), 0);
+    }
+
+    /// A service whose model the idle unloader stopped, with idle reload on.
+    /// `reload` decides how the reload a request triggers ends.
+    fn idle_unloaded_service(
+        reload: Result<(), IdleReloadError>,
+    ) -> (Arc<InferenceService>, Arc<ModelManager>, Arc<AtomicUsize>) {
+        let registry = Arc::new(ModelRegistry::new());
+        registry.register(ModelInfo::new(
+            MODEL_ID,
+            "model".to_string(),
+            "1".to_string(),
+            "onnx".to_string(),
+            "cpu".to_string(),
+            "basic".to_string(),
+            "/test/model".to_string(),
+        ));
+        let models = ModelManager::new(registry);
+        models.configure_idle_unload(IdleUnloadConfig {
+            reload_on_request: true,
+            ..IdleUnloadConfig::default()
+        });
+        models.install_loaded(
+            MODEL_ID,
+            PathBuf::from("/test/model"),
+            Arc::new(ReplicaPool::new(PoolStrategy::LeastLoaded)),
+            vec![],
+        );
+        models.begin_idle_unload(MODEL_ID);
+        models.stop_runtime(MODEL_ID);
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let reloader = IdleReloader::new(models.clone(), Duration::from_secs(10), {
+            let loads = loads.clone();
+            move |_, _, _| -> futures::future::BoxFuture<'static, Result<LoadedModel, IdleReloadError>> {
+                loads.fetch_add(1, Ordering::SeqCst);
+                let reload = reload.clone();
+                Box::pin(async move {
+                    reload.map(|()| {
+                        let engine: EngineHandle = Arc::new(RecordingEngine {
+                            max_new_tokens: Arc::new(Mutex::new(None)),
+                        });
+                        let scheduler =
+                            Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+                        let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+                        pool.add_replica(0, scheduler);
+                        (Arc::new(pool), Vec::new())
+                    })
+                })
+            }
+        });
+        let pressure = ResourcePressure::new(
+            Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+            pressure_config(),
+        );
+        let service = InferenceService::new_with_idle_reloader(
+            models.clone(),
+            pressure,
+            Arc::new(ModelTelemetry::default()),
+            reloader,
+        );
+        (service, models, loads)
+    }
+
+    #[tokio::test]
+    async fn a_request_for_an_idle_unloaded_model_reloads_it_first() {
+        let (service, models, loads) = idle_unloaded_service(Ok(()));
+        assert!(!models.contains_pool(MODEL_ID));
+        // The transports still resolve the model, so their requests reload it too.
+        let transport = service
+            .scheduler_for_transport(MODEL_ID)
+            .expect("an idle-unloaded model stays addressable");
+        assert!(
+            transport.is_healthy(),
+            "it can take a request, which reloads it"
+        );
+        assert!(service.scheduler_snapshot().contains_key(&MODEL_ID));
+
+        transport
+            .infer(&request(10), Priority::LatencyCritical, false)
+            .await
+            .expect("the request reloads the model and is served");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(models.contains_pool(MODEL_ID));
+        assert!(!models.is_idle_unloaded(MODEL_ID));
+
+        service
+            .infer(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect("the loaded model serves without another reload");
+        let stream = service
+            .infer_stream(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect("start stream");
+        drop(stream);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denied_reload_reaches_the_caller_with_its_reason() {
+        let denied = IdleReloadError::MemoryUnavailable {
+            message: "the memory is in use by a training job".to_string(),
+        };
+        let (service, models, loads) = idle_unloaded_service(Err(denied.clone()));
+
+        assert_eq!(service.ensure_loaded(MODEL_ID).await, Err(denied));
+        let error = service
+            .infer(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect_err("the model's memory is in use");
+        assert!(matches!(error, EngineError::ResourceExhausted { .. }));
+        assert!(error.to_string().contains("training job"), "{error}");
+        // One load attempt served both requests: the second failed fast.
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(models.reloads_on_request(MODEL_ID));
+        assert!(!models.contains_pool(MODEL_ID));
+    }
+
+    #[tokio::test]
+    async fn without_idle_reload_a_stopped_model_is_not_loaded_again() {
+        let state = Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8));
+        let (service, _) = service(state);
+        service.models.begin_idle_unload(MODEL_ID);
+        service.models.stop_runtime(MODEL_ID);
+
+        assert_eq!(
+            service.ensure_loaded(MODEL_ID).await,
+            Err(IdleReloadError::NotLoaded)
+        );
+        let error = service
+            .infer(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect_err("nothing reloads the model");
+        assert!(matches!(error, EngineError::ModelNotLoaded));
+        assert!(service.scheduler_for_transport(MODEL_ID).is_none());
     }
 
     #[tokio::test]
