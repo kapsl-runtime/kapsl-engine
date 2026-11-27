@@ -13,6 +13,18 @@ pub(crate) struct ModelEntry {
     lifecycle: Arc<AsyncMutex<()>>,
     /// Request activity of the installed load; present exactly when `pool` is.
     activity: Option<Arc<ModelActivity>>,
+    /// Topology requested through the start API; `None` uses the planner's
+    /// defaults. Kept across a stop so an idle reload repeats the same load.
+    placement: Option<ModelLoadPlacement>,
+    /// Set while the idle unloader has this model stopped. Any load, explicit
+    /// stop, or removal clears it.
+    idle_unloaded: Option<IdleUnloaded>,
+    /// The idle unloader is about to stop this model; the stop turns this
+    /// into `idle_unloaded`.
+    idle_unload_pending: bool,
+    /// Idle timeout given for this model through the start API. It wins over
+    /// startup configuration; the inner `None` keeps the model loaded.
+    idle_timeout_override: Option<Option<Duration>>,
 }
 
 impl ModelEntry {
@@ -23,8 +35,38 @@ impl ModelEntry {
             swap_handles: Vec::new(),
             lifecycle: Arc::new(AsyncMutex::new(())),
             activity: None,
+            placement: None,
+            idle_unloaded: None,
+            idle_unload_pending: false,
+            idle_timeout_override: None,
         }
     }
+
+    fn reloads_on_request(&self) -> bool {
+        self.pool.is_none()
+            && self.path.is_some()
+            && self
+                .idle_unloaded
+                .is_some_and(|idle| idle.reload_on_request)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IdleUnloaded {
+    /// Policy when the model was stopped: reload it for the next request.
+    reload_on_request: bool,
+}
+
+/// Process-wide idle unloading policy, fixed at startup. The default keeps
+/// every model loaded until it is stopped explicitly.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdleUnloadConfig {
+    /// Timeout for models without their own setting; `None` keeps them loaded.
+    pub(crate) default_timeout: Option<Duration>,
+    /// Per-model timeouts by model ID; `None` keeps that model loaded.
+    pub(crate) model_timeouts: HashMap<u32, Option<Duration>>,
+    /// Reload an idle-unloaded model when the next request for it arrives.
+    pub(crate) reload_on_request: bool,
 }
 
 /// Single owner for model identity, runtime replicas, hot-swap handles, paths,
@@ -35,6 +77,7 @@ pub(crate) struct ModelManager {
     next_model_id: AtomicU32,
     recycled_model_ids: Mutex<Vec<u32>>,
     next_replica_unique_id: AtomicU32,
+    idle_unload: RwLock<IdleUnloadConfig>,
 }
 
 impl ModelManager {
@@ -45,7 +88,129 @@ impl ModelManager {
             next_model_id: AtomicU32::new(0),
             recycled_model_ids: Mutex::new(Vec::new()),
             next_replica_unique_id: AtomicU32::new(1000),
+            idle_unload: RwLock::new(IdleUnloadConfig::default()),
         })
+    }
+
+    /// Install the startup idle unloading policy. Called once, before any
+    /// model is loaded.
+    pub(crate) fn configure_idle_unload(&self, config: IdleUnloadConfig) {
+        *self.idle_unload.write() = config;
+    }
+
+    /// How long this model may stay loaded without requests. The start API's
+    /// per-model value wins, then startup per-model configuration, then the
+    /// process default. `None` keeps the model loaded.
+    pub(crate) fn idle_timeout(&self, model_id: u32) -> Option<Duration> {
+        if let Some(timeout) = self
+            .entries
+            .read()
+            .get(&model_id)
+            .and_then(|entry| entry.idle_timeout_override)
+        {
+            return timeout;
+        }
+        let config = self.idle_unload.read();
+        match config.model_timeouts.get(&model_id) {
+            Some(timeout) => *timeout,
+            None => config.default_timeout,
+        }
+    }
+
+    /// Shortest idle timeout among the loaded models, if any has one.
+    pub(crate) fn shortest_idle_timeout(&self) -> Option<Duration> {
+        self.pools()
+            .into_iter()
+            .filter_map(|(model_id, _)| self.idle_timeout(model_id))
+            .min()
+    }
+
+    /// Set this model's own idle timeout; `None` keeps it loaded.
+    pub(crate) fn set_idle_timeout_override(&self, model_id: u32, timeout: Option<Duration>) {
+        self.entries
+            .write()
+            .entry(model_id)
+            .or_insert_with(ModelEntry::empty)
+            .idle_timeout_override = Some(timeout);
+    }
+
+    /// Announce that the idle unloader is about to stop this model. The stop
+    /// then marks the model idle-unloaded in the same step that drops its
+    /// pool, so no request sees it as plainly "not loaded" in between.
+    /// Callers hold the model's lifecycle lock and call
+    /// [`Self::cancel_idle_unload`] if the stop fails.
+    pub(crate) fn begin_idle_unload(&self, model_id: u32) {
+        if let Some(entry) = self.entries.write().get_mut(&model_id) {
+            entry.idle_unload_pending = true;
+        }
+    }
+
+    /// Withdraw [`Self::begin_idle_unload`] after a stop that did not happen.
+    pub(crate) fn cancel_idle_unload(&self, model_id: u32) {
+        if let Some(entry) = self.entries.write().get_mut(&model_id) {
+            entry.idle_unload_pending = false;
+        }
+    }
+
+    /// Whether the model is stopped because it was idle.
+    pub(crate) fn is_idle_unloaded(&self, model_id: u32) -> bool {
+        self.entries
+            .read()
+            .get(&model_id)
+            .is_some_and(|entry| entry.pool.is_none() && entry.idle_unloaded.is_some())
+    }
+
+    /// Forget that the model was stopped for being idle, so it stays down
+    /// until it is started explicitly. Returns whether it was marked.
+    pub(crate) fn clear_idle_unloaded(&self, model_id: u32) -> bool {
+        self.entries
+            .write()
+            .get_mut(&model_id)
+            .is_some_and(|entry| entry.idle_unloaded.take().is_some())
+    }
+
+    /// Whether the model is stopped for being idle and a request reloads it.
+    pub(crate) fn reloads_on_request(&self, model_id: u32) -> bool {
+        self.entries
+            .read()
+            .get(&model_id)
+            .is_some_and(ModelEntry::reloads_on_request)
+    }
+
+    /// Whether a request for this model can be served: it is loaded, or it
+    /// was stopped for being idle and reloads on request.
+    pub(crate) fn can_serve(&self, model_id: u32) -> bool {
+        self.entries
+            .read()
+            .get(&model_id)
+            .is_some_and(|entry| entry.pool.is_some() || entry.reloads_on_request())
+    }
+
+    /// IDs of every model for which [`Self::can_serve`] holds.
+    pub(crate) fn servable_model_ids(&self) -> Vec<u32> {
+        self.entries
+            .read()
+            .iter()
+            .filter(|(_, entry)| entry.pool.is_some() || entry.reloads_on_request())
+            .map(|(model_id, _)| *model_id)
+            .collect()
+    }
+
+    /// Remember the topology a start request asked for.
+    pub(crate) fn remember_load_placement(&self, model_id: u32, placement: ModelLoadPlacement) {
+        self.entries
+            .write()
+            .entry(model_id)
+            .or_insert_with(ModelEntry::empty)
+            .placement = Some(placement);
+    }
+
+    /// Topology of the model's last API-requested load, if it had one.
+    pub(crate) fn load_placement(&self, model_id: u32) -> Option<ModelLoadPlacement> {
+        self.entries
+            .read()
+            .get(&model_id)
+            .and_then(|entry| entry.placement.clone())
     }
 
     pub(crate) fn registry(&self) -> &Arc<ModelRegistry> {
@@ -168,6 +333,8 @@ impl ModelManager {
         entry.pool = Some(pool);
         entry.swap_handles = swap_handles;
         entry.activity = Some(ModelActivity::new());
+        entry.idle_unloaded = None;
+        entry.idle_unload_pending = false;
     }
 
     pub(crate) fn add_swap_handle(&self, model_id: u32, handle: EngineHandle) {
@@ -222,14 +389,23 @@ impl ModelManager {
     }
 
     fn clear_runtime_entry(&self, model_id: u32, clear_path: bool) {
+        let reload_on_request = self.idle_unload.read().reload_on_request;
         let mut entries = self.entries.write();
         let entry = entries.entry(model_id).or_insert_with(ModelEntry::empty);
+        // Only a stop the idle unloader announced leaves the model
+        // idle-unloaded; every other stop or removal clears that state.
+        let stopped_for_idle = std::mem::take(&mut entry.idle_unload_pending) && !clear_path;
         if clear_path {
+            // The identity is gone: drop everything a later model reusing
+            // this ID must not inherit.
             entry.path = None;
+            entry.placement = None;
+            entry.idle_timeout_override = None;
         }
         entry.pool = None;
         entry.swap_handles.clear();
         entry.activity = None;
+        entry.idle_unloaded = stopped_for_idle.then_some(IdleUnloaded { reload_on_request });
     }
 }
 
@@ -317,6 +493,73 @@ mod tests {
         assert!(manager.pool_for_request(3).is_none());
         second.release_idle_claim();
         assert!(manager.pool_for_request(3).is_some());
+    }
+
+    #[test]
+    fn idle_state_follows_the_model_lifecycle() {
+        let manager = ModelManager::new(Arc::new(ModelRegistry::new()));
+        manager.configure_idle_unload(IdleUnloadConfig {
+            reload_on_request: true,
+            ..IdleUnloadConfig::default()
+        });
+        let install = |manager: &ModelManager| {
+            manager.install_loaded(
+                3,
+                PathBuf::from("/tmp/model.aimod"),
+                Arc::new(ReplicaPool::new(PoolStrategy::LeastLoaded)),
+                Vec::new(),
+            )
+        };
+        let half_minute = Some(Duration::from_secs(30));
+        install(&manager);
+        manager.remember_load_placement(3, ModelLoadPlacement::new("tensor-parallel", 2));
+        manager.set_idle_timeout_override(3, half_minute);
+
+        // An explicit stop is not an idle unload: nothing reloads it.
+        manager.stop_runtime(3);
+        assert!(!manager.is_idle_unloaded(3));
+        assert!(!manager.can_serve(3));
+
+        // A stop the idle unloader announced leaves the model reloadable.
+        install(&manager);
+        manager.begin_idle_unload(3);
+        assert!(!manager.is_idle_unloaded(3), "still loaded");
+        manager.stop_runtime(3);
+        assert!(manager.is_idle_unloaded(3));
+        assert!(manager.reloads_on_request(3));
+        assert!(manager.can_serve(3));
+        // What the reload needs survives the stop.
+        assert_eq!(manager.load_placement(3).map(|p| p.tp_degree), Some(2));
+        assert_eq!(manager.idle_timeout(3), half_minute);
+
+        // Any load clears the mark.
+        install(&manager);
+        assert!(!manager.is_idle_unloaded(3));
+        assert!(!manager.reloads_on_request(3));
+        assert!(manager.can_serve(3));
+
+        // Stopping an idle-unloaded model explicitly keeps it down.
+        manager.begin_idle_unload(3);
+        manager.stop_runtime(3);
+        assert!(manager.clear_idle_unloaded(3));
+        assert!(!manager.clear_idle_unloaded(3));
+        assert!(!manager.can_serve(3));
+
+        // A withdrawn announcement does not mark a later, explicit stop.
+        install(&manager);
+        manager.begin_idle_unload(3);
+        manager.cancel_idle_unload(3);
+        manager.stop_runtime(3);
+        assert!(!manager.is_idle_unloaded(3));
+
+        // Removal forgets everything a later model with this ID must not inherit.
+        install(&manager);
+        manager.begin_idle_unload(3);
+        manager.remove(3);
+        assert!(!manager.is_idle_unloaded(3));
+        assert!(!manager.can_serve(3));
+        assert!(manager.load_placement(3).is_none());
+        assert_eq!(manager.idle_timeout(3), None);
     }
 
     #[tokio::test]

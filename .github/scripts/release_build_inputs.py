@@ -10,6 +10,8 @@ import re
 
 
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?")
+# The exact kapsl-integrations commit the managed-vLLM connector is built from.
+VLLM_INTEGRATION_LOCK = Path(".github/vllm-integration.lock")
 
 
 def flag(environ, name):
@@ -17,6 +19,17 @@ def flag(environ, name):
     if value not in ("true", "false"):
         raise ValueError(f"{name} must be true or false")
     return value == "true"
+
+
+def integration_ref(lock):
+    """Return the one exact commit an integration lock file pins."""
+    try:
+        text = lock.read_text()
+    except OSError:
+        raise ValueError(f"{lock.as_posix()} is missing or unreadable") from None
+    if not re.fullmatch(r"[0-9a-f]{40}\n?", text):
+        raise ValueError(f"{lock.as_posix()} must contain one exact lowercase 40-hex commit")
+    return text.strip()
 
 
 def components(stable, cache_only=False):
@@ -33,7 +46,7 @@ def components(stable, cache_only=False):
     return result
 
 
-def plan(environ, manifest):
+def plan(environ, manifest, vllm_lock):
     stable = flag(environ, "STABLE_RELEASE")
     cache_only = flag(environ, "CACHE_ONLY")
     if environ.get("RELEASE_CHANNEL") not in ("stable", "beta"):
@@ -46,8 +59,10 @@ def plan(environ, manifest):
         if environ.get("GITHUB_REF") != "refs/heads/main" or stable:
             raise ValueError("Cache-only builds are restricted to main and cannot qualify a release")
         version = cargo_match[1]
-    elif not re.fullmatch(r"[0-9a-f]{40}", environ.get("KAPSL_VLLM_SDK_REF", "")):
-        raise ValueError("KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit")
+    else:
+        # Every build that is not cache-only packages managed vLLM, so a
+        # malformed pin fails here rather than after the component fan-out.
+        integration_ref(vllm_lock)
     if not VERSION.fullmatch(version):
         raise ValueError("Release version is invalid")
     if stable and (
@@ -123,7 +138,8 @@ def main():
             assemble(args.assemble, args.output, os.environ["RELEASE_VERSION"],
                      os.environ["GITHUB_SHA"], flag(os.environ, "STABLE_RELEASE"))
         else:
-            version, matrix = plan(os.environ, Path("kapsl-runtime/crates/kapsl-cli/Cargo.toml"))
+            version, matrix = plan(os.environ, Path("kapsl-runtime/crates/kapsl-cli/Cargo.toml"),
+                                   VLLM_INTEGRATION_LOCK)
             with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
                 output.write(f"version={version}\nmatrix={json.dumps(matrix)}\n")
     except (ValueError, KeyError, OSError) as error:

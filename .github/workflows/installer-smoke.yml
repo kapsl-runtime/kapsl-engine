@@ -49,6 +49,9 @@ on:
       - "kapsl-runtime/crates/kapsl-backend-llama-cpp/**"
       - ".github/scripts/bootstrap-vllm-backend.sh"
       - ".github/scripts/package-linux-vllm-backend.sh"
+      - ".github/scripts/verify-vllm-integration-checkout.sh"
+      - ".github/scripts/test-verify-vllm-integration-checkout.sh"
+      - ".github/vllm-integration.lock"
       - ".github/scripts/managed-vllm-cu130.lock"
       - ".github/scripts/test-bootstrap-vllm-backend.sh"
       - ".github/scripts/test-managed-vllm-release-contract.sh"
@@ -220,8 +223,8 @@ jobs:
           bash -n .github/scripts/package-linux-vllm-backend.sh
           bash -n .github/scripts/test-bootstrap-vllm-backend.sh
           bash -n .github/scripts/test-managed-vllm-release-contract.sh
-          bash -n .github/scripts/verify-managed-vllm-sdk-checkout.sh
-          bash -n .github/scripts/test-verify-managed-vllm-sdk-checkout.sh
+          bash -n .github/scripts/verify-vllm-integration-checkout.sh
+          bash -n .github/scripts/test-verify-vllm-integration-checkout.sh
           bash -n .github/scripts/test-verify-managed-vllm-connector-wheel.sh
           bash -n .github/scripts/bootstrap-sglang-backend.sh
           bash -n .github/scripts/package-linux-sglang-backend.sh
@@ -298,8 +301,8 @@ jobs:
       - name: Test managed-vLLM release pins
         run: .github/scripts/test-managed-vllm-release-contract.sh
 
-      - name: Test managed-vLLM SDK checkout verification
-        run: .github/scripts/test-verify-managed-vllm-sdk-checkout.sh
+      - name: Test exact vLLM integrations checkout verification
+        run: .github/scripts/test-verify-vllm-integration-checkout.sh
 
       - name: Test managed-vLLM connector wheel verification
         run: .github/scripts/test-verify-managed-vllm-connector-wheel.sh

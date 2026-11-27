@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Package the certified managed-vLLM backend: a standalone Python, an offline
+# wheelhouse resolved from .github/scripts/managed-vllm-cu130.lock, and the
+# Kapsl vLLM connector built from the exact kapsl-integrations commit in
+# .github/vllm-integration.lock. Kapsl installs it with bootstrap.sh.
+
 : "${KAPSL_VERSION:?KAPSL_VERSION is required}"
-: "${KAPSL_VLLM_SDK_REF:?KAPSL_VLLM_SDK_REF is required and must be an exact 40-hex commit}"
+: "${KAPSL_VLLM_INTEGRATIONS_REF:?KAPSL_VLLM_INTEGRATIONS_REF is required and must be an exact 40-hex commit}"
 
 if [ "${RUNNER_OS:-}" != "Linux" ] || [ "${RUNNER_ARCH:-}" != "X64" ]; then
   echo "The managed-vLLM backend bundle is supported only on Linux x86_64." >&2
   exit 1
 fi
 
-sdk_dir="${KAPSL_VLLM_SDK_DIR:-sdk-vllm}"
-sdk_ref="$KAPSL_VLLM_SDK_REF"
-connector_version="0.7.0"
+integrations_dir="${KAPSL_VLLM_INTEGRATIONS_DIR:-kapsl-integrations-vllm}"
+integrations_ref="$KAPSL_VLLM_INTEGRATIONS_REF"
+connector_version="0.7.1"
 connector_profile="vllm-v1-packed-cuda-ipc/flash-attn"
 connector_elastic_profile="vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
 planner_schema_version="1"
 kv_abi_major="1"
 kv_abi_minor="5"
-connector_root="$sdk_dir/integrations/vllm"
+connector_root="$integrations_dir/integrations/vllm"
 requirements_lock=".github/scripts/managed-vllm-cu130.lock"
-.github/scripts/verify-managed-vllm-sdk-checkout.sh "$sdk_dir" "$sdk_ref"
+.github/scripts/verify-vllm-integration-checkout.sh "$integrations_dir" "$integrations_ref"
 if [ ! -f "$connector_root/pyproject.toml" ]; then
   echo "Missing kapsl-vLLM connector checkout at $connector_root" >&2
   exit 1
@@ -135,7 +140,7 @@ requirements_lock_sha256="$(sha256sum "$requirements_lock" | awk '{ print $1 }')
 cat > "$payload/installed-manifest.json" <<EOF
 {
   "schema_version": 1,
-  "sdk_ref": "$sdk_ref",
+  "integrations_ref": "$integrations_ref",
   "python": "3.12.3",
   "torch": "2.13.0+cu130",
   "torchvision": "0.28.0+cu130",
@@ -159,7 +164,7 @@ cat > "$payload/manifest.json" <<EOF
 {
   "schema_version": 1,
   "kapsl_runtime_version": "$KAPSL_VERSION",
-  "sdk_ref": "$sdk_ref",
+  "integrations_ref": "$integrations_ref",
   "requirements_lock_sha256": "$requirements_lock_sha256",
   "python": "3.12.3",
   "python_archive_sha256": "$python_archive_sha256",

@@ -11,8 +11,8 @@ pub(crate) struct RuntimeSupervisor {
     pub(crate) grpc_server: Option<kapsl_grpc::GrpcServerHandle>,
     pub(crate) monitor: RuntimeMonitor,
     pub(crate) autoscaler_task: tokio::task::JoinHandle<()>,
-    /// Present only when `--idle-unload-seconds` enabled idle unloading.
-    pub(crate) idle_unload_task: Option<tokio::task::JoinHandle<()>>,
+    /// Does nothing until some model has an idle timeout.
+    pub(crate) idle_unload_task: tokio::task::JoinHandle<()>,
     pub(crate) resources: Arc<RuntimeResources>,
     #[cfg(feature = "mcp-server")]
     pub(crate) mcp_server: Option<kapsl_mcp::McpServerHandle>,
@@ -120,9 +120,7 @@ impl RuntimeSupervisor {
         }
         monitor.abort();
         autoscaler_task.abort();
-        if let Some(task) = idle_unload_task {
-            task.abort();
-        }
+        idle_unload_task.abort();
         outcome
     }
 }

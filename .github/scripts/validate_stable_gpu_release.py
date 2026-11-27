@@ -10,7 +10,7 @@ from pathlib import Path
 STABLE_TAG_RE = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
 )
-SDK_REF_RE = re.compile(r"^[0-9a-f]{40}$")
+INTEGRATION_LOCK_RE = re.compile(r"[0-9a-f]{40}\n?")
 
 
 class AuthorizationError(ValueError):
@@ -32,7 +32,7 @@ def authorize(
     ref_name: str,
     release_tag: str,
     manifest: Path,
-    sdk_ref: str | None = None,
+    vllm_integration_lock: Path | None = None,
 ) -> None:
     if event_name != "push":
         raise AuthorizationError("real GPU certification requires a tag push")
@@ -52,10 +52,18 @@ def authorize(
             f"release tag version {expected_version} does not match runtime {actual_version}"
         )
 
-    if sdk_ref is not None and SDK_REF_RE.fullmatch(sdk_ref) is None:
-        raise AuthorizationError(
-            "stable release SDK ref must be an exact lowercase 40-hex commit"
-        )
+    if vllm_integration_lock is not None:
+        try:
+            pinned = vllm_integration_lock.read_text(encoding="utf-8")
+        except OSError as error:
+            raise AuthorizationError(
+                f"vLLM integrations lock is missing or unreadable: {vllm_integration_lock}"
+            ) from error
+        if INTEGRATION_LOCK_RE.fullmatch(pinned) is None:
+            raise AuthorizationError(
+                "stable release vLLM integrations lock must contain one exact "
+                "lowercase 40-hex commit"
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref-name", required=True)
     parser.add_argument("--release-tag", required=True)
     parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--sdk-ref")
+    parser.add_argument("--vllm-integration-lock", type=Path)
     return parser
 
 
@@ -80,7 +88,7 @@ def main() -> int:
             ref_name=args.ref_name,
             release_tag=args.release_tag,
             manifest=args.manifest,
-            sdk_ref=args.sdk_ref,
+            vllm_integration_lock=args.vllm_integration_lock,
         )
     except AuthorizationError as error:
         raise SystemExit(f"stable GPU release authorization failed: {error}")

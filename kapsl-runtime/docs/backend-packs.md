@@ -127,6 +127,14 @@ qualification; preparing an archive does not promote it.
 The engine's existing Ed25519 backend-index publisher remains the sole owner of
 official release signing.
 
+The managed-vLLM pack takes its connector the same way. Release jobs build the
+`kapsl-vllm-connector` wheel from the exact `kapsl-integrations` commit in
+`.github/vllm-integration.lock` and record that commit as `integrations_ref`
+in the pack's installed manifest. The packager, the pack's bootstrap, and the
+engine each pin the connector version, so a lock file that names a commit with
+a different version fails the build before anything is signed. No repository
+variable or workflow input selects the connector.
+
 Host CI pins the canonical integrations-owned parity entrypoint by path and
 SHA-256, plus its tiny ONNX model source, in
 `.github/ort-cpu-parity.lock.json`. The exact integrations commit in

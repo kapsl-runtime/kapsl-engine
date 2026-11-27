@@ -22,6 +22,9 @@ Options:
   --http-port <PORT>          HTTP/API/UI port (default: 9095)
   --idle-unload-seconds <SECONDS>
                               Stop a model after this long without requests (default: off)
+  --idle-unload-model <MODEL_ID=SECONDS>
+                              Idle timeout for one model; 0 keeps it loaded (repeatable)
+  --idle-reload               Reload an idle-unloaded model on its next request (default: off)
   --provider <BACKEND>        cpu | cuda | tensorrt | metal | rocm | directml
   --admin-token <TOKEN>       Set admin token at startup
   --log-level <LEVEL>         trace | debug | info | warn | error (default: info)
@@ -101,12 +104,38 @@ that are not being used so the other work can use their memory:
 kapsl run --idle-unload-seconds 900 ./models/assistant.aimod
 ```
 
-| Variable | Description |
-|----------|-------------|
-| `KAPSL_IDLE_UNLOAD_SECONDS` | Same as `--idle-unload-seconds`. The flag wins when both are set, and `0` from either turns idle unloading off |
+| Flag | Variable | Description |
+|------|----------|-------------|
+| `--idle-unload-seconds <SECONDS>` | `KAPSL_IDLE_UNLOAD_SECONDS` | Idle timeout for every model; `0` turns it off |
+| `--idle-unload-model <MODEL_ID>=<SECONDS>` (repeatable) | `KAPSL_MODEL_IDLE_UNLOAD_SECONDS` (comma-separated entries) | Idle timeout for one model; `0` keeps that model loaded |
+| `--idle-reload` | `KAPSL_IDLE_RELOAD=1` | Load a model that was stopped for being idle again when the next request for it arrives |
 
-The setting applies to every model in the process, including models added
-later with `kapsl add-model` or `POST /api/models/start`.
+A flag wins over its variable. All three are off unless you set them.
+
+#### Which timeout applies to a model
+
+Kapsl uses the first of these that is set for the model:
+
+1. the `idle_unload_seconds` it was started with, through
+   `POST /api/models/start` or `kapsl add-model --idle-unload-seconds`;
+2. its `--idle-unload-model` or `KAPSL_MODEL_IDLE_UNLOAD_SECONDS` entry;
+3. `--idle-unload-seconds`.
+
+A model with none of these, or with `0`, stays loaded. A per-model value also
+works on its own, without `--idle-unload-seconds`.
+
+Models loaded at startup get IDs from 0 in command-line order (`--model` paths
+before positional ones), and `kapsl list` shows every model's ID. This keeps
+an embedding model loaded and stops the LLM after ten idle minutes:
+
+```bash
+kapsl run embed.aimod llm.aimod --idle-unload-model 0=0 --idle-unload-model 1=600
+```
+
+`GET /api/models` reports the timeout in effect for each model as
+`idle_unload_seconds`.
+
+#### What counts as idle
 
 A model's idle timer starts when it finishes loading and starts again each
 time an inference request ends. A request counts as running from the moment
@@ -117,22 +146,63 @@ the socket, TCP, and shared-memory transports. Health checks, metrics, and
 model listings do not count.
 
 Kapsl checks every few seconds. When a model has had no running request for
-the configured time, Kapsl stops it and all of its replicas, exactly as
+its timeout, Kapsl stops it and all of its replicas, exactly as
 `POST /api/models/{id}/stop` does. It does not stop a model while work is
 queued on it, or while a start, stop, swap, or scale operation for that model
-is running. A request that arrives just as the model is stopped either
-finishes on the loaded model or gets the usual "model not loaded" error. It
-is never cut off partway through.
+is running. A request that arrives just as the model is stopped is never cut
+off partway through: it either finishes on the loaded model or finds the
+model stopped.
 
-A model stopped this way:
+#### A stopped model
 
-- stays in `kapsl list` and `GET /api/models` as inactive, keeping its ID and
-  package path;
-- answers inference requests with the same "not loaded" error as a manually
-  stopped model;
-- is not reloaded automatically. Start it again with `POST /api/models/start`,
-  passing the same `model_id` and `model_path` to keep its ID, or with
-  `kapsl add-model`, which assigns a new ID.
+A model stopped for being idle keeps its ID and package path and stays
+listed. `kapsl list` shows its status as `idle`, and `GET /api/models` reports
+it as inactive with `idle_unloaded: true`.
+
+Without `--idle-reload` it answers inference requests with the same "not
+loaded" error as a manually stopped model, and it is not loaded again
+automatically. Start it with `POST /api/models/start`, passing the same
+`model_id` and `model_path` to keep its ID, or with `kapsl add-model`, which
+assigns a new ID.
+
+#### Reloading on the next request
+
+With `--idle-reload`, a model stopped for being idle is loaded again when a
+request for it arrives on any interface. While it is stopped it stays listed
+in `/v1/models` and addressable by name. `kapsl list` shows it as
+`idle (reloads)`, and `GET /api/models` reports `reloads_on_request: true`.
+
+The request waits for the load and is then served. Requests that arrive in
+the meantime wait for the same load. If the client disconnects, the load
+still finishes, so the next request is served straight away. Loading a large
+model can take minutes, so give clients a timeout that covers a cold start.
+
+The reload goes through the same memory admission as a normal start. If the
+memory the model needs is not free, for example because a training job is
+using the GPU, the request fails and the model stays stopped:
+
+| Interface | Response |
+|-----------|----------|
+| OpenAI-compatible routes | HTTP 503 with `Retry-After: 10` and an error message that names the model and the memory that was denied |
+| `/api/models/{id}/infer` and `/infer/stream` | HTTP 503 with `"reason": "idle_reload_memory_unavailable"` and `"retry_after_seconds": 10` |
+| gRPC, MCP, socket, TCP, shared memory | An error carrying the same message |
+
+After a failed reload Kapsl waits 10 seconds before it tries again; requests
+in between get the same error immediately. A reload that fails for another
+reason, such as a backend that does not start, returns HTTP 500 with the
+cause.
+
+Only models stopped by the idle unloader are reloaded. A model you stopped
+yourself stays stopped. To keep an idle-unloaded model down, stop it with
+`POST /api/models/{id}/stop` or remove it.
+
+A reload takes memory back from whatever else is using the device. If
+inference requests can arrive while a training job runs, the reload either
+fails as described above or, if the memory happens to be free at that moment,
+succeeds and holds memory the job may need later. Leave `--idle-reload` off
+when training must never lose memory to inference.
+
+#### Memory that is freed
 
 Stopping a model frees its weights, KV cache, and backend workspaces. On a
 CUDA device that uses Kapsl's device pool (see below), that memory goes back
@@ -141,7 +211,8 @@ driver once the last model using that device has stopped. While any other
 model on the same GPU stays loaded, the freed memory stays reserved for Kapsl
 and other processes cannot use it.
 
-Each idle stop is logged at `info` level with an `[idle-unload]` prefix.
+Each idle stop is logged at `info` level with an `[idle-unload]` prefix, and
+each reload with `[idle-reload]`.
 
 ### GPU memory and shared KV
 
@@ -241,7 +312,7 @@ installer no longer downloads this multi-gigabyte pack by default; pass
 complete binary tuple before starting vLLM:
 Python `3.12.3`, PyTorch `2.13.0+cu130`, torchvision `0.28.0+cu130`, torchaudio
 `2.11.0+cu130`, CUDA runtime `13.0`, vLLM
-`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.0` with KV ABI
+`0.26.1rc1.dev1130+g2ec6f0d71`, and `kapsl-vllm-connector` `0.7.1` with KV ABI
 `1.5`. Fixed pools use profile
 `vllm-v1-packed-cuda-ipc/flash-attn`; live-resizable pools use
 `vllm-v1-packed-cuda-vmm/flash-attn-blnhc`. A missing or different bundle fails
@@ -271,6 +342,7 @@ metadata:
           shrink_utilization_percent: 25
           shrink_idle_seconds: 60
       startup_timeout_seconds: 300
+      enforce_eager: true
 ```
 
 The defaults are a 1,024-token context, exact `auto` sizing, 20% bounded KV
@@ -297,18 +369,40 @@ decision, and normal CUDA allocation failure still fails the child closed.
 certified BLNHC virtual address range sized for `maximum_concurrency`, while
 initially mapping only the exact admitted physical prefix. At or above the grow
 threshold Kapsl admits and maps aligned, zeroed CUDA VMM segments before
-publishing new native vLLM blocks. Below the shrink threshold for the idle
+publishing new native vLLM blocks. It grows the same way as soon as a
+request's reservation does not fit the mapped pool, without waiting for the
+threshold or the next supervision tick; that request stays in vLLM's waiting
+queue until the new blocks are active. Below the shrink threshold for the idle
 interval, vLLM first retires a free physical tail and workers then unmap it
-before Kapsl lowers the authority charge. The stable tensor address,
-one-sequence physical minimum, native block-table ownership, and per-rank
-geometry do not change.
+before Kapsl lowers the authority charge. vLLM places request blocks itself
+and cycles through the whole pool, so a running sequence can own blocks in the
+tail: Kapsl admits a shrink only at a moment when the replica holds no
+sequence lease, and retries every supervisor tick until it finds one. A
+replica under continuous load therefore keeps its capacity. The stable tensor
+address, one-sequence physical minimum, native block-table ownership, and
+per-rank geometry do not change.
 
 The defaults are 80% grow utilization, 25% shrink utilization, and 60 seconds
 of low utilization before shrink. `maximum_concurrency` is required and cannot
 be below the initial target. Set `live_resize.enabled: false` alone to retain a
-fixed exact pool. A live block, incomplete acknowledgement, timeout, CUDA
-release failure, or ambiguous detach fences the replica and retains or
-quarantines the affected charge; it is never reassigned speculatively.
+fixed exact pool. An incomplete acknowledgement, timeout, CUDA release
+failure, or ambiguous detach fences the replica and retains or quarantines the
+affected charge; it is never reassigned speculatively. A scheduler that finds
+a referenced block in a tail it was asked to retire changes nothing and tries
+again on later steps until the acknowledgement deadline.
+
+`enforce_eager` defaults to `true`: Kapsl launches vLLM with `--enforce-eager`,
+which turns off `torch.compile` and CUDA graphs. Set it to `false` to run with
+vLLM's own compiled defaults. On an RTX 3090, plain vLLM on the pinned build
+decoded a 1.5B model about three times faster at one concurrent request and
+about twice as fast at sixteen with those defaults than with eager execution;
+the gap narrows as models grow. The compiled path costs more at startup
+(compilation and graph capture, so raise `startup_timeout_seconds` if needed)
+and holds CUDA graph memory outside the planned KV grant. Kapsl's check of the
+device budget after backend load still applies and rejects a replica that no
+longer fits. The shared-pool conformance profile was certified with eager
+execution, so validate a compiled launch on your hardware before relying on it,
+in particular together with `live_resize`.
 
 The deprecated top-level `gpu_memory_utilization` field and
 `kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
@@ -407,9 +501,9 @@ kapsl run \
   --kv-control-socket /run/kapsl/kv-control.sock \
   --kv-control-lease-ttl-ms 30000 \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
+    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-ipc/flash-attn' \
   --kv-shared-pool-profile \
-    'kapsl-vllm-connector,0.7.0,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
+    'kapsl-vllm-connector,0.7.1,<vllm-version>,vllm-v1-packed-cuda-vmm/flash-attn-blnhc'
 ```
 
 The profile flag is required only for `shared_pool` and is repeatable. Its four
@@ -423,8 +517,9 @@ An empty allowlist still permits opaque `kv_connected` participants but rejects
 every external `shared_pool` registration.
 
 The vLLM tuple must come from the opt-in **vLLM Shared-Pool Conformance** GPU
-workflow. That job uses an exact vLLM wheel and SDK ref, invokes the production
-CUDA IPC allocator seam on every requested rank, and tests native
+workflow. That job uses an exact vLLM wheel and the connector built from the
+`kapsl-integrations` commit in `.github/vllm-integration.lock`, invokes the
+production CUDA IPC allocator seam on every requested rank, and tests native
 FlashAttention writes, causal reads, guards, reuse, exhaustion, and synchronized
 detach. It uploads a JSON report on every run but creates the plain-text
 allowlist value only after every gate passes. Its temporary runtime necessarily
