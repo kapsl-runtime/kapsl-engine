@@ -21,6 +21,9 @@ pub(crate) struct ResolvedRuntimeConfig {
     pub(crate) transport: RuntimeTransportConfig,
     pub(crate) kv_control: KvControlConfig,
     pub(crate) model_loading: ModelLoadingConfig,
+    /// Stop models after this long without inference requests; `None` (the
+    /// default) keeps every model loaded until it is stopped explicitly.
+    pub(crate) idle_unload: Option<Duration>,
     worker: bool,
     worker_model_id: Option<u32>,
     startup_summary: RuntimeStartupSummary,
@@ -111,6 +114,12 @@ impl ResolvedRuntimeConfig {
                 tuning.rust_log
             );
         }
+        if let Some(timeout) = self.idle_unload {
+            log::info!(
+                "Idle unload enabled: a model with no inference requests for {}s is stopped to release its memory",
+                timeout.as_secs()
+            );
+        }
         log_auth_configuration(&self.auth_state);
         if !self.log_sensitive_ids {
             log::info!(
@@ -198,6 +207,10 @@ pub(crate) fn resolve_runtime_config(
     };
     let model_loading = ModelLoadingConfig::from_args(&args)
         .map_err(|error| format!("Invalid model loading configuration: {error}"))?;
+    let idle_unload = resolve_idle_unload(
+        args.idle_unload_seconds,
+        std::env::var(IDLE_UNLOAD_SECONDS_ENV).ok().as_deref(),
+    )?;
     let startup_summary = RuntimeStartupSummary {
         state_dir: args.state_dir.clone(),
         performance_profile: args.performance_profile,
@@ -230,10 +243,27 @@ pub(crate) fn resolve_runtime_config(
         transport,
         kv_control,
         model_loading,
+        idle_unload,
         worker: args.worker,
         worker_model_id: args.worker_model_id,
         startup_summary,
     })
+}
+
+/// Resolve the opt-in idle unload timeout. The CLI flag wins over the
+/// environment, and 0 from either source turns idle unloading off.
+fn resolve_idle_unload(
+    flag_seconds: Option<u64>,
+    env_value: Option<&str>,
+) -> Result<Option<Duration>, String> {
+    let seconds = match (flag_seconds, env_value.map(str::trim)) {
+        (Some(seconds), _) => seconds,
+        (None, None | Some("")) => return Ok(None),
+        (None, Some(raw)) => raw.parse::<u64>().map_err(|_| {
+            format!("{IDLE_UNLOAD_SECONDS_ENV} must be a whole number of seconds, got {raw:?}")
+        })?,
+    };
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn propagate_kv_compression_bits(bits: Option<u8>) {
@@ -272,5 +302,42 @@ fn log_auth_configuration(auth_state: &RwLock<ApiAuthState>) {
             API_WRITER_TOKEN_ENV,
             API_ADMIN_TOKEN_ENV
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_unload_is_off_unless_configured() {
+        assert_eq!(resolve_idle_unload(None, None), Ok(None));
+        assert_eq!(resolve_idle_unload(None, Some("  ")), Ok(None));
+    }
+
+    #[test]
+    fn idle_unload_flag_wins_over_environment() {
+        assert_eq!(
+            resolve_idle_unload(None, Some(" 900 ")),
+            Ok(Some(Duration::from_secs(900)))
+        );
+        assert_eq!(
+            resolve_idle_unload(Some(60), Some("900")),
+            Ok(Some(Duration::from_secs(60)))
+        );
+        assert_eq!(resolve_idle_unload(Some(0), Some("900")), Ok(None));
+        assert_eq!(resolve_idle_unload(None, Some("0")), Ok(None));
+        // An invalid environment value is ignored when the flag decides.
+        assert_eq!(
+            resolve_idle_unload(Some(60), Some("soon")),
+            Ok(Some(Duration::from_secs(60)))
+        );
+    }
+
+    #[test]
+    fn an_invalid_idle_unload_environment_value_is_rejected() {
+        let error = resolve_idle_unload(None, Some("10m")).unwrap_err();
+        assert!(error.contains(IDLE_UNLOAD_SECONDS_ENV), "{error}");
+        assert!(resolve_idle_unload(None, Some("-5")).is_err());
     }
 }

@@ -30,6 +30,11 @@ on:
       - ".github/scripts/test-llama-cpp-backend-release-contract.sh"
       - ".github/scripts/benchmark-llama-cpp-backend-pack.py"
       - ".github/scripts/certify-llama-cpp-backend-pack-performance.sh"
+      - ".github/llama-cpp-cpu-parity.lock.json"
+      - ".github/scripts/certify-llama-cpp-cpu-parity.sh"
+      - ".github/scripts/llama_cpp_cpu_parity.py"
+      - ".github/scripts/test_llama_cpp_cpu_parity.py"
+      - ".github/workflows/llama-cpp-cpu-conformance.yml"
       - ".github/scripts/test-gpu-device-pool-integration.sh"
       - ".github/workflows/lazy-llama-cpp-backend-pack-gpu-certification.yml"
       - ".github/licenses/LLAMA-CPP-LICENSE"
@@ -283,6 +288,9 @@ jobs:
 
       - name: Test llama.cpp backend release contract
         run: .github/scripts/test-llama-cpp-backend-release-contract.sh
+
+      - name: Test llama.cpp CPU parity helper
+        run: python3 .github/scripts/test_llama_cpp_cpu_parity.py
 
       - name: Test managed-vLLM backend bootstrap
         run: .github/scripts/test-bootstrap-vllm-backend.sh

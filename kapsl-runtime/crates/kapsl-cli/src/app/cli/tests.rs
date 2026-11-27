@@ -28,6 +28,24 @@ fn run_accepts_positional_and_backward_compatible_model_paths() {
     );
     assert_eq!(args.model, [PathBuf::from("legacy.aimod")]);
     assert!(args.offline);
+    assert_eq!(args.idle_unload_seconds, None, "idle unload is opt-in");
+}
+
+#[test]
+fn run_accepts_an_idle_unload_timeout() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "run",
+        "model.aimod",
+        "--idle-unload-seconds",
+        "600",
+    ])
+    .unwrap();
+    let Some(KapslCommand::Run(args)) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.idle_unload_seconds, Some(600));
+    assert!(Cli::try_parse_from(["kapsl", "run", "--idle-unload-seconds", "10m"]).is_err());
 }
 
 #[cfg(feature = "mcp-server")]

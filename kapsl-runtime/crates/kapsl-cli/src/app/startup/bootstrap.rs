@@ -236,6 +236,12 @@ impl PreparedServerRuntime {
             }
             None => None,
         };
+        let idle_unload_task = config.idle_unload.map(|timeout| {
+            spawn_idle_unload_task(IdleUnloadTaskConfig {
+                timeout,
+                model_runtime: model_runtime.clone(),
+            })
+        });
         let autoscaler_task = spawn_auto_scaler_task(AutoScalerTaskConfig {
             auto_scaler,
             model_runtime,
@@ -256,6 +262,7 @@ impl PreparedServerRuntime {
             grpc_server,
             monitor,
             autoscaler_task,
+            idle_unload_task,
             resources,
             #[cfg(feature = "mcp-server")]
             mcp_server,

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "model": {
+    "source": "huggingface",
+    "repository": "bartowski/SmolLM2-135M-Instruct-GGUF",
+    "commit": "09816acd5d99df7be770d85ea30822623dab342c",
+    "path": "SmolLM2-135M-Instruct-Q4_K_M.gguf",
+    "bytes": 105454432,
+    "sha256": "2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d"
+  }
+}
