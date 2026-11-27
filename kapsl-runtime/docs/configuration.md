@@ -87,7 +87,7 @@ Options:
 | `KAPSL_OFFLINE` | Set to `1` to forbid backend-index and artifact network access |
 | `KAPSL_LAZY_BACKENDS` | Set to `0` to require lazy backends to be preinstalled |
 | `KAPSL_LAZY_ONNX_PACKS` | Linux x86_64 switch for automatic signed ONNX-pack activation; disabling it does not select embedded ORT and causes ONNX loads to fail closed while the signed route is active |
-| `KAPSL_GENERIC_NATIVE_PACKS` | Signed `adapter_abi: kapsl-backend-v1` ONNX route; defaults to `1`, accepts only explicit boolean values, and may be set to `0` only to select the embedded ORT rollback |
+| `KAPSL_GENERIC_NATIVE_PACKS` | Signed `adapter_abi: kapsl-backend-v1` ONNX route. Defaults to `1` on platforms with published signed ONNX packs (today `linux-x86_64`) and to `0` (embedded ORT) elsewhere, such as Windows and macOS. Accepts only explicit boolean values; an explicit value overrides the platform default |
 | `KAPSL_LAZY_LLAMA_CPP_PACKS` | Linux x86_64 beta switch for signed `llama-cpp/cpu` and `llama-cpp/cuda12` native packs; the CPU profile defaults on only when no eager GGUF backend is compiled |
 | `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV` | Set to `1` to permit only a signed CUDA pack whose `kv_mode` is `native`; the shared-pool pack does not use this rollback override |
 | `KAPSL_BACKEND_INDEX_URL` | Override the signed backend index URL |
