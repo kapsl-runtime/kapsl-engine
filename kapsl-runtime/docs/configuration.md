@@ -366,18 +366,27 @@ decision, and normal CUDA allocation failure still fails the child closed.
 certified BLNHC virtual address range sized for `maximum_concurrency`, while
 initially mapping only the exact admitted physical prefix. At or above the grow
 threshold Kapsl admits and maps aligned, zeroed CUDA VMM segments before
-publishing new native vLLM blocks. Below the shrink threshold for the idle
+publishing new native vLLM blocks. It grows the same way as soon as a
+request's reservation does not fit the mapped pool, without waiting for the
+threshold or the next supervision tick; that request stays in vLLM's waiting
+queue until the new blocks are active. Below the shrink threshold for the idle
 interval, vLLM first retires a free physical tail and workers then unmap it
-before Kapsl lowers the authority charge. The stable tensor address,
-one-sequence physical minimum, native block-table ownership, and per-rank
-geometry do not change.
+before Kapsl lowers the authority charge. vLLM places request blocks itself
+and cycles through the whole pool, so a running sequence can own blocks in the
+tail: Kapsl admits a shrink only at a moment when the replica holds no
+sequence lease, and retries every supervisor tick until it finds one. A
+replica under continuous load therefore keeps its capacity. The stable tensor
+address, one-sequence physical minimum, native block-table ownership, and
+per-rank geometry do not change.
 
 The defaults are 80% grow utilization, 25% shrink utilization, and 60 seconds
 of low utilization before shrink. `maximum_concurrency` is required and cannot
 be below the initial target. Set `live_resize.enabled: false` alone to retain a
-fixed exact pool. A live block, incomplete acknowledgement, timeout, CUDA
-release failure, or ambiguous detach fences the replica and retains or
-quarantines the affected charge; it is never reassigned speculatively.
+fixed exact pool. An incomplete acknowledgement, timeout, CUDA release
+failure, or ambiguous detach fences the replica and retains or quarantines the
+affected charge; it is never reassigned speculatively. A scheduler that finds
+a referenced block in a tail it was asked to retire changes nothing and tries
+again on later steps until the acknowledgement deadline.
 
 The deprecated top-level `gpu_memory_utilization` field and
 `kv_cache.mode: legacy_fraction` remain available only as explicit compatibility

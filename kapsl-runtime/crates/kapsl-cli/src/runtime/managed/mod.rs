@@ -44,6 +44,10 @@ const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
+/// Pause after a growth check that unmet KV demand triggered. A connector
+/// repeats a waiting reservation every 20 ms; this keeps the supervisor from
+/// re-evaluating at that rate while the growth it started is being applied.
+const KV_DEMAND_SUPERVISION_GAP: Duration = Duration::from_millis(100);
 const SUPERVISOR_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RESTARTS: u32 = 5;
 const MAX_CONSECUTIVE_HEALTH_FAILURES: u8 = 15;
@@ -3790,10 +3794,43 @@ fn start_managed_vllm_supervisor(
     tokio::spawn(async move {
         let mut consecutive_health_failures = 0u8;
         let mut low_kv_utilization_since = None;
+        let mut next_tick = tokio::time::Instant::now() + SUPERVISOR_INTERVAL;
+        let mut regular_tick_ran = false;
         loop {
-            tokio::time::sleep(SUPERVISOR_INTERVAL).await;
+            // A regular tick is due one interval after the previous one
+            // finished. Demand wake-ups in between leave that deadline alone,
+            // so a pool that keeps refusing a request cannot starve the
+            // health probe.
+            if regular_tick_ran {
+                next_tick = tokio::time::Instant::now() + SUPERVISOR_INTERVAL;
+            }
+            let demand = wait_for_supervision_tick(&process, &deployment, next_tick).await;
+            regular_tick_ran = !demand;
             if process.shutdown.load(Ordering::Acquire) {
                 break;
+            }
+            if demand {
+                // A request is waiting for KV capacity the pool can still
+                // grow into. Grow now; liveness stays with the regular tick,
+                // which also reports whatever this attempt could not do.
+                if matches!(deployment.participant_is_active(&participant_id), Ok(true)) {
+                    if let Err(error) = supervise_managed_vllm_live_resize(
+                        &process,
+                        &deployment,
+                        &participant_id,
+                        &mut low_kv_utilization_since,
+                    )
+                    .await
+                    {
+                        log::debug!(
+                            "[vllm-supervisor] demand-driven KV growth for model {} deferred to the next tick: {}",
+                            process.spec.served_model_name,
+                            error,
+                        );
+                    }
+                }
+                tokio::time::sleep(KV_DEMAND_SUPERVISION_GAP).await;
+                continue;
             }
 
             let exited = matches!(process.try_wait(), Ok(Some(_)) | Err(_));
@@ -3952,6 +3989,31 @@ fn start_managed_vllm_supervisor(
     });
 }
 
+/// Sleeps until the supervision tick due at `next_tick`. Returns `true` when
+/// unmet KV demand on a live-resize deployment ended the wait early. A tick
+/// that is already due wins over pending demand.
+async fn wait_for_supervision_tick(
+    process: &ManagedVllmProcess,
+    deployment: &ManagedVllmDeployment,
+    next_tick: tokio::time::Instant,
+) -> bool {
+    let coordinator = process
+        .spec
+        .settings
+        .live_resize
+        .as_ref()
+        .and_then(|_| deployment.coordinator().ok());
+    let Some(coordinator) = coordinator else {
+        tokio::time::sleep_until(next_tick).await;
+        return false;
+    };
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(next_tick) => false,
+        _ = coordinator.wait_for_unmet_kv_demand() => true,
+    }
+}
+
 async fn supervise_managed_vllm_live_resize(
     process: &Arc<ManagedVllmProcess>,
     deployment: &Arc<ManagedVllmDeployment>,
@@ -4003,13 +4065,21 @@ async fn supervise_managed_vllm_live_resize(
             .ok_or_else(|| "live KV resize target overflowed".to_string())
     };
 
-    let target = if utilization_percent >= policy.grow_utilization_percent as u64
+    // A reservation the pool turned away is demand that leased utilization
+    // does not show: two requests can fill 70% of a small pool and leave no
+    // room for a third. Grow for it without waiting for the threshold.
+    let target = if (utilization_percent >= policy.grow_utilization_percent as u64
+        || resize.unmet_demand_blocks != 0)
         && resize.current_block_count < resize.maximum_block_count
     {
         *low_utilization_since = None;
         Some(
-            aligned_up(resize.current_block_count.saturating_add(step))?
-                .min(resize.maximum_block_count),
+            aligned_up(
+                resize
+                    .current_block_count
+                    .saturating_add(step.max(resize.unmet_demand_blocks)),
+            )?
+            .min(resize.maximum_block_count),
         )
     } else if utilization_percent <= policy.shrink_utilization_percent as u64 {
         let since = low_utilization_since.get_or_insert_with(Instant::now);
@@ -4017,7 +4087,9 @@ async fn supervise_managed_vllm_live_resize(
         if since.elapsed() >= policy.shrink_idle && resize.current_block_count > floor {
             let raw = resize.current_block_count.saturating_sub(step).max(floor);
             let aligned = raw / resize.resize_alignment_blocks * resize.resize_alignment_blocks;
-            *low_utilization_since = None;
+            // The idle timer is cleared once the shrink is admitted. A shrink
+            // deferred because a sequence is running is retried every tick
+            // until the replica has a moment without one.
             Some(aligned.max(floor))
         } else {
             None
@@ -4027,6 +4099,10 @@ async fn supervise_managed_vllm_live_resize(
         None
     };
     let Some(target) = target.filter(|target| *target != resize.current_block_count) else {
+        if target.is_some() {
+            // Alignment left nothing to release; start a fresh idle window.
+            *low_utilization_since = None;
+        }
         return Ok(());
     };
     let resize_coordinator = coordinator.clone();
@@ -4037,7 +4113,10 @@ async fn supervise_managed_vllm_live_resize(
     .await
     .map_err(|error| format!("live KV resize task failed: {error}"))?;
     let generation = match requested {
-        Ok(generation) => generation,
+        Ok(generation) => {
+            *low_utilization_since = None;
+            generation
+        }
         Err(error) if error.contains("resize was not admitted") => {
             log::debug!(
                 "[vllm-supervisor] deferred live KV resize model={} target_blocks={}: {}",
@@ -4050,11 +4129,12 @@ async fn supervise_managed_vllm_live_resize(
         Err(error) => return Err(error),
     };
     log::info!(
-        "[vllm-supervisor] requested live KV resize model={} generation={} target_blocks={} utilization_percent={}",
+        "[vllm-supervisor] requested live KV resize model={} generation={} target_blocks={} utilization_percent={} unmet_demand_blocks={}",
         process.spec.served_model_name,
         generation,
         target,
         utilization_percent,
+        resize.unmet_demand_blocks,
     );
     Ok(())
 }
