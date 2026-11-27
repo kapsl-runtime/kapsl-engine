@@ -42,7 +42,7 @@ cc = "1"
 [dependencies]
 kapsl-grpc = { version = "0.3.0", optional = true }
 kapsl-core = "=0.3.1"
-kapsl-hal = "=0.3.3"
+kapsl-hal = "=0.3.4"
 nvml-wrapper = "0.10"
 nvml-wrapper-sys = "0.8"
 kapsl-engine-api = "0.3.0"
