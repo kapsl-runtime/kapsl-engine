@@ -530,8 +530,10 @@ pub(super) fn create_runtime_backend_for_device_with_pool(
         }
     }
 
+    // The native and shared-KV GGUF backends serve generation only; pooled
+    // GGUF tasks fall through to the SDK factory's llama.cpp pooled backend.
     #[cfg(feature = "gguf-native")]
-    if engine_kind.is_gguf() {
+    if engine_kind.is_gguf_generate() {
         let backend = if let Some(pool) = allow_pool
             .then(|| resources.device_pool(device_id))
             .flatten()
@@ -549,7 +551,7 @@ pub(super) fn create_runtime_backend_for_device_with_pool(
     }
 
     #[cfg(all(feature = "gguf-cuda-shared-kv", not(feature = "gguf-native")))]
-    if engine_kind.is_gguf() {
+    if engine_kind.is_gguf_generate() {
         let backend = if let Some(pool) = allow_pool
             .then(|| resources.device_pool(device_id))
             .flatten()

@@ -4,10 +4,15 @@
 //! pooling, and normalization. This adapter supplies the missing protocol edge:
 //! OpenAI input parsing, package tokenizer lookup, integer tensor construction,
 //! exact token accounting, and float/base64 response encoding.
+//!
+//! GGUF embedding models report a text input contract instead: they take one
+//! UTF-8 tensor per input (or token IDs in the model's vocabulary), tokenize
+//! with their embedded vocabulary, and embed all inputs of a request in one
+//! call. Their usage counts only token-ID inputs.
 
 use super::*;
 use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD};
-use kapsl_engine_api::{EngineModelInfo, NamedTensor, RequestMetadata};
+use kapsl_engine_api::{EngineError, EngineModelInfo, NamedTensor, RequestMetadata};
 use kapsl_llm::model_paths::find_model_asset;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -862,7 +867,7 @@ async fn handle_embeddings(
         return openai_error(
             StatusCode::BAD_REQUEST,
             format!(
-                "The model '{}' cannot serve embeddings (task={task}); load an ONNX model packaged with task=embed",
+                "The model '{}' cannot serve embeddings (task={task}); load an ONNX or GGUF model packaged with task=embed",
                 resolved.name
             ),
             "invalid_request_error",
@@ -889,6 +894,23 @@ async fn handle_embeddings(
             "server_error",
         );
     };
+    if is_text_input_contract(&engine_info) {
+        let session_id = embedding_session_id(
+            session_header,
+            embedding_request.user.as_deref(),
+            authorization.as_deref(),
+        );
+        return embed_with_text_contract(
+            parsed_input,
+            &engine_info,
+            embedding_request.dimensions,
+            encoding,
+            session_id,
+            &resolved,
+            inference,
+        )
+        .await;
+    }
     let contract = match EmbeddingModelContract::from_engine_info(&engine_info) {
         Ok(contract) => contract,
         Err(message) => {
@@ -953,18 +975,11 @@ async fn handle_embeddings(
         }
     };
 
-    let client_session_id = session_header
-        .map(|session| session.trim().to_string())
-        .filter(|session| !session.is_empty())
-        .or_else(|| {
-            embedding_request
-                .user
-                .as_ref()
-                .map(|user| user.trim().to_string())
-                .filter(|user| !user.is_empty())
-        });
-    let session_id =
-        scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
+    let session_id = embedding_session_id(
+        session_header,
+        embedding_request.user.as_deref(),
+        authorization.as_deref(),
+    );
     let requests = match build_inference_requests(
         prepared.token_ids,
         prepared.pad_token_id,
@@ -982,30 +997,7 @@ async fn handle_embeddings(
         let priority = inference.priority_for_request(&request);
         let output = match inference.infer(resolved.id, request, priority, false).await {
             Ok(output) => output,
-            Err(error) => {
-                let status = status_code_for_engine_error(&error);
-                if status == StatusCode::INTERNAL_SERVER_ERROR {
-                    log::error!(
-                        "Embedding failed: model_id={} status={} error={}",
-                        resolved.id,
-                        status.as_u16(),
-                        error
-                    );
-                } else {
-                    log::warn!(
-                        "Embedding rejected: model_id={} status={} error={}",
-                        resolved.id,
-                        status.as_u16(),
-                        error
-                    );
-                }
-                let error_type = if status == StatusCode::BAD_REQUEST {
-                    "invalid_request_error"
-                } else {
-                    "server_error"
-                };
-                return openai_error(status, error.to_string(), error_type);
-            }
+            Err(error) => return embedding_inference_error(resolved.id, &error),
         };
         let mut rows = match decode_embedding_output(output, 1) {
             Ok(rows) => rows,
@@ -1025,6 +1017,59 @@ async fn handle_embeddings(
         embeddings.push(vector);
     }
 
+    embeddings_response(&resolved.name, &embeddings, encoding, prompt_tokens)
+}
+
+/// The session id for an embedding request: the `x-kapsl-session` header,
+/// else the OpenAI `user` field, scoped to the caller's credential.
+fn embedding_session_id(
+    session_header: Option<String>,
+    user: Option<&str>,
+    authorization: Option<&str>,
+) -> Option<String> {
+    let client_session_id = session_header
+        .map(|session| session.trim().to_string())
+        .filter(|session| !session.is_empty())
+        .or_else(|| {
+            user.map(|user| user.trim().to_string())
+                .filter(|user| !user.is_empty())
+        });
+    scope_session_id_for_authorization(client_session_id.as_deref(), authorization)
+}
+
+fn embedding_inference_error(model_id: u32, error: &EngineError) -> warp::reply::Response {
+    use warp::http::StatusCode;
+
+    let status = status_code_for_engine_error(error);
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        log::error!(
+            "Embedding failed: model_id={} status={} error={}",
+            model_id,
+            status.as_u16(),
+            error
+        );
+    } else {
+        log::warn!(
+            "Embedding rejected: model_id={} status={} error={}",
+            model_id,
+            status.as_u16(),
+            error
+        );
+    }
+    let error_type = if status == StatusCode::BAD_REQUEST {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    openai_error(status, error.to_string(), error_type)
+}
+
+fn embeddings_response(
+    model_name: &str,
+    embeddings: &[Vec<f32>],
+    encoding: EmbeddingEncoding,
+    prompt_tokens: usize,
+) -> warp::reply::Response {
     let data = embeddings
         .iter()
         .enumerate()
@@ -1039,12 +1084,148 @@ async fn handle_embeddings(
     reply_into_response(warp::reply::json(&serde_json::json!({
         "object": "list",
         "data": data,
-        "model": resolved.name,
+        "model": model_name,
         "usage": {
             "prompt_tokens": prompt_tokens,
             "total_tokens": prompt_tokens,
         },
     })))
+}
+
+/// Whether the engine takes UTF-8 text and tokenizes it itself, as GGUF
+/// pooled embedding models do with their embedded vocabulary, instead of
+/// `input_ids` from a package tokenizer.
+fn is_text_input_contract(info: &EngineModelInfo) -> bool {
+    info.input_names.first().is_some_and(|name| name == "text")
+        && info
+            .input_dtypes
+            .first()
+            .and_then(|dtype| TensorDtype::from_str(dtype).ok())
+            == Some(TensorDtype::Utf8)
+}
+
+/// One input tensor per OpenAI input item, and the exact prompt-token count
+/// when the client sent token IDs. Text is tokenized inside the engine, which
+/// does not report per-request token counts, so text inputs count as zero.
+fn text_contract_inputs(
+    parsed: ParsedEmbeddingInput,
+) -> Result<(Vec<BinaryTensorPacket>, usize), String> {
+    match parsed {
+        ParsedEmbeddingInput::Text(texts) => texts
+            .into_iter()
+            .map(|text| {
+                BinaryTensorPacket::new(
+                    vec![text.len() as i64],
+                    TensorDtype::Utf8,
+                    text.into_bytes(),
+                )
+                .map_err(|error| format!("Failed to build embedding input tensor: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|inputs| (inputs, 0)),
+        ParsedEmbeddingInput::Tokens(token_arrays) => {
+            let mut total = 0usize;
+            let mut inputs = Vec::with_capacity(token_arrays.len());
+            for (index, token_ids) in token_arrays.iter().enumerate() {
+                if token_ids.len() > MAX_TOKENS_PER_INPUT {
+                    return Err(format!(
+                        "input[{index}] has {} tokens; at most {MAX_TOKENS_PER_INPUT} are supported",
+                        token_ids.len()
+                    ));
+                }
+                total = total.saturating_add(token_ids.len());
+                inputs.push(integer_packet(
+                    vec![token_ids.len() as i64],
+                    TensorDtype::Int32,
+                    token_ids,
+                )?);
+            }
+            if total > MAX_TOKENS_PER_REQUEST {
+                return Err(format!(
+                    "request has {total} tokens; at most {MAX_TOKENS_PER_REQUEST} are supported"
+                ));
+            }
+            Ok((inputs, total))
+        }
+    }
+}
+
+/// Embed every input of one request in a single engine call (the engine
+/// batches them internally) for a model that takes text directly.
+async fn embed_with_text_contract(
+    parsed: ParsedEmbeddingInput,
+    info: &EngineModelInfo,
+    dimensions: Option<usize>,
+    encoding: EmbeddingEncoding,
+    session_id: Option<String>,
+    resolved: &ResolvedModel,
+    inference: &Arc<InferenceService>,
+) -> warp::reply::Response {
+    use warp::http::StatusCode;
+
+    let native = info
+        .output_shapes
+        .first()
+        .and_then(|shape| shape.last())
+        .copied()
+        .filter(|dimension| *dimension > 0)
+        .map(|dimension| dimension as usize);
+    if let (Some(requested), Some(native)) = (dimensions, native) {
+        if requested > native {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "dimensions={requested} exceeds the model's native embedding size of {native}"
+                ),
+                "invalid_request_error",
+            );
+        }
+    }
+
+    let count = parsed.len();
+    let (inputs, prompt_tokens) = match text_contract_inputs(parsed) {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+        }
+    };
+    let mut inputs = inputs.into_iter();
+    let first = inputs.next().expect("parsed input has at least one item");
+    let mut request = InferenceRequest::new(first).with_metadata(RequestMetadata {
+        request_id: Some(embedding_request_id()),
+        ..RequestMetadata::default()
+    });
+    request.session_id = session_id;
+    request.additional_inputs = inputs
+        .enumerate()
+        .map(|(index, tensor)| NamedTensor {
+            name: format!("text.{}", index + 1),
+            tensor,
+        })
+        .collect();
+
+    let priority = inference.priority_for_request(&request);
+    let output = match inference.infer(resolved.id, request, priority, false).await {
+        Ok(output) => output,
+        Err(error) => return embedding_inference_error(resolved.id, &error),
+    };
+    let mut embeddings = match decode_embedding_output(output, count) {
+        Ok(rows) => rows,
+        Err(message) => {
+            log::error!(
+                "Invalid embedding output: model_id={} error={}",
+                resolved.id,
+                message
+            );
+            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, message, "server_error");
+        }
+    };
+    for embedding in &mut embeddings {
+        if let Err(message) = apply_dimensions(embedding, dimensions) {
+            return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
+        }
+    }
+    embeddings_response(&resolved.name, &embeddings, encoding, prompt_tokens)
 }
 
 #[cfg(test)]
@@ -1138,5 +1319,62 @@ mod tests {
         let too_long = vec![vec![0; MAX_TOKENS_PER_INPUT + 1]];
         let error = validate_token_limits(&too_long, None, None).unwrap_err();
         assert!(error.contains("at most 8192"));
+    }
+
+    fn model_info(input_name: &str, input_dtype: &str) -> EngineModelInfo {
+        EngineModelInfo {
+            input_names: vec![input_name.to_string()],
+            output_names: vec!["embeddings".to_string()],
+            input_shapes: vec![vec![-1]],
+            output_shapes: vec![vec![-1, 384]],
+            input_dtypes: vec![input_dtype.to_string()],
+            output_dtypes: vec!["float32".to_string()],
+            framework: Some("gguf".to_string()),
+            model_version: None,
+            peak_concurrency: Some(1),
+        }
+    }
+
+    #[test]
+    fn gguf_text_contract_is_detected_from_the_engine_contract() {
+        assert!(is_text_input_contract(&model_info("text", "string")));
+        assert!(is_text_input_contract(&model_info("text", "utf8")));
+        // ONNX text encoders take token IDs from the package tokenizer.
+        assert!(!is_text_input_contract(&model_info("input_ids", "int64")));
+        assert!(!is_text_input_contract(&model_info("text", "uint8")));
+    }
+
+    #[test]
+    fn text_contract_sends_one_utf8_tensor_per_input() {
+        let (inputs, tokens) = text_contract_inputs(ParsedEmbeddingInput::Text(vec![
+            "hello".to_string(),
+            "wörld".to_string(),
+        ]))
+        .unwrap();
+        assert_eq!(tokens, 0, "text is tokenized inside the engine");
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].dtype, TensorDtype::Utf8);
+        assert_eq!(inputs[0].data, b"hello");
+        assert_eq!(inputs[1].shape, vec!["wörld".len() as i64]);
+    }
+
+    #[test]
+    fn text_contract_counts_and_bounds_token_inputs() {
+        let (inputs, tokens) = text_contract_inputs(ParsedEmbeddingInput::Tokens(vec![
+            vec![101, 7, 102],
+            vec![5],
+        ]))
+        .unwrap();
+        assert_eq!(tokens, 4);
+        assert_eq!(inputs[0].dtype, TensorDtype::Int32);
+        assert_eq!(inputs[0].shape, vec![3]);
+
+        let error = text_contract_inputs(ParsedEmbeddingInput::Tokens(vec![vec![
+            1;
+            MAX_TOKENS_PER_INPUT
+                + 1
+        ]]))
+        .unwrap_err();
+        assert!(error.contains("at most"), "{error}");
     }
 }

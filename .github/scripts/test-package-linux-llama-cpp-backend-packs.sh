@@ -54,8 +54,13 @@ static const kapsl_llama_cpp_api_v1 API = {
 const kapsl_llama_cpp_api_v1 *kapsl_llama_cpp_backend_v1(void) {
     return &API;
 }
+
+#ifdef TEST_POOLED_TABLE
+const void *kapsl_backend_v1(void) { return 0; }
+#endif
 EOF
 cc -shared -fPIC -O2 \
+  -DTEST_POOLED_TABLE=1 \
   -I "$test_root/repo/kapsl-runtime/include" \
   "$test_root/fake-pack.c" \
   -o "$test_root/libllama-cpu.so"
@@ -159,6 +164,17 @@ for profile, accelerator, capability, kv_mode, kv_capability in (
     payload = json.loads((root / "backend-pack.json").read_text())
     assert payload["profile"] == profile
     assert payload["kv_mode"] == kv_mode
+    if profile == "cpu":
+        # The CPU pack also exports the pooled-task table on the standard ABI.
+        assert template["adapter_abi"] == payload["adapter_abi"] == "kapsl-backend-v1"
+        assert template["formats"] == ["gguf"]
+        assert sorted(template["tasks"]) == ["classify", "embed", "rerank"]
+        assert template["capabilities"]["governed_device_allocator"] is False
+        assert template["capabilities"]["streaming"] is True
+        assert template["accelerator_requirements"]["kind"] == "cpu"
+    else:
+        assert "adapter_abi" not in template
+        assert "adapter_abi" not in payload
     assert (root / "include/kapsl_llama_cpp_backend.h").is_file()
     if profile == "cpu":
         assert not (root / "lib/libcudart.so.12").exists()

@@ -467,7 +467,11 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
             continue;
         }
         for &device_id in &cuda_device_ids {
-            let allocation_id = if kind.is_gguf() && !cfg!(feature = "gguf-native") {
+            // Pooled GGUF tasks always run on llama.cpp, even in gguf-native
+            // builds, so they always share weights by path.
+            let llama_cpp_weights =
+                kind.is_gguf_pooled() || (kind.is_gguf() && !cfg!(feature = "gguf-native"));
+            let allocation_id = if llama_cpp_weights {
                 // llama.cpp shares immutable weights by canonical model path.
                 format!("bootstrap-gguf:{}", plan.model_file_path.display())
             } else {
@@ -520,7 +524,9 @@ pub(crate) fn kind_uses_shared_pool(kind: EngineKind, onnx_pool_opt_in: bool) ->
     if kind.uses_onnx_session() {
         return onnx_pool_opt_in;
     }
-    (kind.is_gguf()
+    // Pooled GGUF tasks run on plain llama.cpp buffers with no shared-pool
+    // participation, whichever generation backend the build compiles in.
+    (kind.is_gguf_generate()
         && (cfg!(any(
             feature = "gguf-native",
             feature = "gguf-cuda-shared-kv"
@@ -650,7 +656,7 @@ fn planned_external_weight_bytes(kind: EngineKind, model_path: &Path) -> Result<
     let bytes = std::fs::metadata(model_path)
         .map_err(|error| format!("stat model {}: {error}", model_path.display()))?
         .len() as usize;
-    if kind.is_gguf() && cfg!(feature = "gguf-native") {
+    if kind.is_gguf_generate() && cfg!(feature = "gguf-native") {
         // The native GGUF path may expand quantized tensors while uploading.
         // Two times the source size is a conservative host-only bootstrap bound;
         // post-load reconciliation remains authoritative.

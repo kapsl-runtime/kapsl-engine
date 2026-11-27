@@ -163,6 +163,23 @@ package_profile() {
       exit 1
       ;;
   esac
+  # The CPU pack also serves pooled GGUF tasks (embed, rerank, classify)
+  # through the backend-neutral table, and its signed manifest declares that
+  # adapter contract. Accelerator packs must not export the table: the
+  # standard ABI requires the governed device allocator there.
+  if printf '%s\n' "$dynamic_symbols" | grep -Eq ' T kapsl_backend_v1$'; then
+    has_pooled_table=true
+  else
+    has_pooled_table=false
+  fi
+  if [ "$accelerator" = cpu ] && [ "$has_pooled_table" != true ]; then
+    echo "llama.cpp $profile entrypoint is missing kapsl_backend_v1 for pooled GGUF tasks" >&2
+    exit 1
+  fi
+  if [ "$accelerator" != cpu ] && [ "$has_pooled_table" = true ]; then
+    echo "llama.cpp $profile entrypoint must not export kapsl_backend_v1 without a governed allocator" >&2
+    exit 1
+  fi
   case "$dynamic_symbols" in
     *" U __isoc23_"*)
       echo "llama.cpp $profile entrypoint requires glibc C23 symbols outside the Linux release baseline." >&2
@@ -210,6 +227,10 @@ package_profile() {
     fi
   done < <(find "$root/lib" -maxdepth 1 -type f -print0 | sort -z)
 
+  adapter_abi_line=""
+  if [ "$accelerator" = cpu ]; then
+    adapter_abi_line='  "adapter_abi": "kapsl-backend-v1",'
+  fi
   cat > "$root/backend-pack.json" <<EOF
 {
   "schema_version": 1,
@@ -217,6 +238,7 @@ package_profile() {
   "profile": "$profile",
   "pack_version": "llama.cpp-0.1.146-kapsl.1",
   "runtime_abi": 1,
+${adapter_abi_line}
   "platform": "linux-x86_64",
   "execution_mode": "native",
   "kv_mode": "$kv_mode",
@@ -278,6 +300,41 @@ template = {
 if accelerator == "cuda":
     template["minimum_cuda"] = "12.0"
     template["minimum_driver"] = "560.28.03"
+if accelerator == "cpu":
+    # The CPU library's `kapsl_backend_v1` table serves pooled GGUF tasks.
+    # Generation stays on the legacy table, which the `kv_mode` fields cover.
+    # These values must match that table's capabilities and descriptor.
+    template.update(
+        {
+            "adapter_abi": "kapsl-backend-v1",
+            "formats": ["gguf"],
+            "model_types": ["causal-lm", "embedding", "seq-classifier"],
+            "tasks": ["classify", "embed", "rerank"],
+            "capabilities": {
+                "batching": False,
+                "streaming": True,
+                "cancellation": True,
+                "memory_reporting": True,
+                "governed_device_allocator": False,
+                "scoped_device_allocator": False,
+                "kv_participation": False,
+                "concurrent_inference": True,
+            },
+            "accelerator_requirements": {
+                "kind": "cpu",
+                "execution_providers": ["cpu"],
+                "implicit_cpu_fallback": False,
+            },
+            "memory_behavior": {
+                "allocation_scope": None,
+                "device_allocation": "none",
+                "planned_reporting": True,
+                "live_reporting": True,
+                "request_reporting": True,
+                "synchronize_before_free": False,
+            },
+        }
+    )
 template_path.write_text(json.dumps(template, indent=2, sort_keys=True) + "\n")
 PY
 

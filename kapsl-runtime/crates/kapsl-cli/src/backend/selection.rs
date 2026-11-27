@@ -842,6 +842,9 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
             }
             let manager = BackendManager::from_env(args.offline)?;
             let plan = manager.plan_llama_cpp(llama_profile, &target)?;
+            if EngineKind::resolve(&manifest).is_gguf_pooled() {
+                crate::backend::validate_llama_cpp_pooled_contract(&plan.manifest, &manifest)?;
+            }
             selection_reason = plan.selection_reason.clone();
             memory = crate::backend::preliminary_llama_cpp_memory_admission(
                 llama_profile,

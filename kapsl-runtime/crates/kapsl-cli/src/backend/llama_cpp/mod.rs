@@ -120,8 +120,15 @@ pub(crate) fn llama_cpp_pack_profile_for_target(
     manifest: &Manifest,
     accelerator: BackendAccelerator,
 ) -> Option<LlamaCppBackendPackProfile> {
-    if !EngineKind::resolve(manifest).is_gguf() {
+    let kind = EngineKind::resolve(manifest);
+    if !kind.is_gguf() {
         return None;
+    }
+    // Only the CPU pack exports the pooled-task table: standard-ABI
+    // accelerator packs must use the governed device allocator, which
+    // llama.cpp's CUDA buffers do not support.
+    if kind.is_gguf_pooled() {
+        return Some(LlamaCppBackendPackProfile::Cpu);
     }
     Some(match accelerator {
         BackendAccelerator::Cpu => LlamaCppBackendPackProfile::Cpu,
@@ -178,6 +185,10 @@ pub(crate) fn ensure_llama_cpp_backend_pack(
     let plan = manager
         .plan_llama_cpp(profile, &target)
         .map_err(|error| error.to_string())?;
+    let pooled = EngineKind::resolve(manifest).is_gguf_pooled();
+    if pooled {
+        validate_llama_cpp_pooled_contract(&plan.manifest, manifest)?;
+    }
     let kv_mode = LlamaCppPackKvMode::from_manifest(&plan.manifest)?;
     if profile == LlamaCppBackendPackProfile::Cuda12
         && kv_mode == LlamaCppPackKvMode::Native
@@ -206,7 +217,52 @@ pub(crate) fn ensure_llama_cpp_backend_pack(
         .ensure_pack(&plan.manifest)
         .map_err(|error| error.to_string())?;
     activate_pack(profile, &plan.manifest, &root)?;
+    if pooled {
+        // The same signed library also exports the backend-neutral table.
+        // Both loaders resolve the same canonical entrypoint, so the dynamic
+        // loader maps llama.cpp once for generation and pooled models alike.
+        super::activate_native_backend_pack(&plan.manifest, &root)?;
+    }
     Ok(true)
+}
+
+/// Fail closed unless the signed llama.cpp pack declares the standard adapter
+/// contract for this pooled GGUF model. Packs built before the pooled table
+/// existed declare no `adapter_abi` and serve generation only.
+pub(crate) fn validate_llama_cpp_pooled_contract(
+    pack: &BackendPackManifest,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let format = kapsl_core::engine_kind::effective_format(manifest);
+    let model_type = kapsl_core::engine_kind::effective_model_type(manifest);
+    let task = kapsl_core::engine_kind::effective_task(manifest);
+    let declares = |values: &[String], value: &str| {
+        values
+            .iter()
+            .any(|declared| declared.trim().eq_ignore_ascii_case(value))
+    };
+    let unsupported = if pack.adapter_abi.as_deref() != Some(super::STANDARD_NATIVE_ADAPTER_ABI) {
+        Some("does not export the backend-neutral pooled-task table".to_string())
+    } else if !declares(&pack.formats, &format) {
+        Some(format!("does not declare format `{format}`"))
+    } else if !declares(&pack.tasks, &task) {
+        Some(format!("does not declare task `{task}`"))
+    } else if !pack.model_types.is_empty() && !declares(&pack.model_types, &model_type) {
+        Some(format!("does not declare model type `{model_type}`"))
+    } else {
+        None
+    };
+    match unsupported {
+        Some(reason) => Err(format!(
+            "signed llama.cpp/{} pack {} {reason}, so it cannot serve GGUF {task} model `{}`; \
+             install a llama.cpp pack that declares the `{}` adapter contract",
+            pack.profile,
+            pack.pack_version,
+            manifest.project_name,
+            super::STANDARD_NATIVE_ADAPTER_ABI
+        )),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn preliminary_llama_cpp_memory_admission(
@@ -218,7 +274,8 @@ pub(crate) fn preliminary_llama_cpp_memory_admission(
     memory_snapshot: Option<&MemorySnapshot>,
 ) -> Result<PreliminaryMemoryAdmission, String> {
     let model_bytes = inspect_model_weight_bytes(model_path, manifest)?;
-    let kv_capacity = estimated_native_kv_bytes(model_path)?;
+    let kv_capacity =
+        estimated_native_kv_bytes(model_path, EngineKind::resolve(manifest).is_gguf_pooled())?;
     let fixed = match profile {
         LlamaCppBackendPackProfile::Cpu => pack.memory.host_bytes,
         LlamaCppBackendPackProfile::Cuda12 => pack.memory.accelerator_bytes,
@@ -304,7 +361,10 @@ pub(crate) fn preliminary_llama_cpp_memory_admission(
     }
 }
 
-fn estimated_native_kv_bytes(model_path: &Path) -> Result<Option<u64>, String> {
+/// Upper bound on llama.cpp-owned KV for `model_path`. Generation keeps one
+/// context per concurrent sequence; a pooled model keeps at most one batch
+/// context (none for encoder models).
+fn estimated_native_kv_bytes(model_path: &Path, pooled: bool) -> Result<Option<u64>, String> {
     if model_path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -317,9 +377,13 @@ fn estimated_native_kv_bytes(model_path: &Path) -> Result<Option<u64>, String> {
     let config = file
         .extract_config()
         .map_err(|error| format!("read GGUF config for preliminary admission: {error}"))?;
-    let concurrency = std::env::var("KAPSL_GGUF_MAX_CONCURRENT")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+    let concurrency = pooled
+        .then_some(1)
+        .or_else(|| {
+            std::env::var("KAPSL_GGUF_MAX_CONCURRENT")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        })
         .filter(|value| *value > 0)
         .or_else(|| {
             std::env::var("KAPSL_GGUF_TARGET_CONCURRENCY")
@@ -510,7 +574,8 @@ pub(crate) fn create_llama_cpp_pack_engine(
     model_id: u32,
     replica_id: u32,
 ) -> Result<Option<Box<dyn Engine>>, String> {
-    if !EngineKind::resolve(manifest).is_gguf() || !lazy_llama_cpp_packs_enabled() {
+    let kind = EngineKind::resolve(manifest);
+    if !kind.is_gguf() || !lazy_llama_cpp_packs_enabled() {
         return Ok(None);
     }
     let profile = llama_cpp_pack_profile_for_manifest(manifest, device_info)
@@ -521,6 +586,26 @@ pub(crate) fn create_llama_cpp_pack_engine(
             profile.profile()
         )
     })?;
+    if kind.is_gguf_pooled() {
+        // Pooled tasks use the pack's backend-neutral table, activated from
+        // the same signed library by `ensure_llama_cpp_backend_pack`.
+        let (backend, profile, pack_version) = pack.identity.clone();
+        let identity = super::NativeBackendPackIdentity {
+            backend,
+            profile,
+            pack_version,
+        };
+        return super::create_native_backend_pack_engine(
+            &identity,
+            manifest,
+            resources,
+            device_id,
+            model_id,
+            replica_id,
+            &serde_json::Map::new(),
+        )
+        .map(Some);
+    }
     let instance =
         PackInstance::initialize(pack, profile, resources, device_id, model_id, replica_id)?;
     Ok(Some(Box::new(PackedLlamaEngine { instance })))
@@ -1193,6 +1278,93 @@ mod tests {
             llama_cpp_pack_profile_for_target(&manifest, BackendAccelerator::Cpu),
             None
         );
+    }
+
+    fn pooled_manifest(model_type: &str, task: &str) -> Manifest {
+        let mut manifest = manifest("gguf");
+        manifest.model_type = Some(model_type.to_string());
+        manifest.task = Some(task.to_string());
+        manifest
+    }
+
+    /// The CPU pack manifest as `package-linux-llama-cpp-backend-packs.sh`
+    /// signs it: legacy generation fields plus the pooled adapter contract.
+    fn pooled_cpu_backend_pack() -> BackendPackManifest {
+        let mut pack = cpu_backend_pack();
+        pack.adapter_abi = Some(crate::backend::STANDARD_NATIVE_ADAPTER_ABI.to_string());
+        pack.formats = vec!["gguf".to_string()];
+        pack.model_types = vec![
+            "causal-lm".to_string(),
+            "embedding".to_string(),
+            "seq-classifier".to_string(),
+        ];
+        pack.tasks = vec![
+            "classify".to_string(),
+            "embed".to_string(),
+            "rerank".to_string(),
+        ];
+        pack
+    }
+
+    #[test]
+    fn pooled_gguf_tasks_always_select_the_cpu_pack() {
+        for (model_type, task) in [
+            ("embedding", "embed"),
+            ("seq-classifier", "rerank"),
+            ("seq-classifier", "classify"),
+        ] {
+            let manifest = pooled_manifest(model_type, task);
+            for accelerator in [BackendAccelerator::Cpu, BackendAccelerator::Cuda] {
+                assert_eq!(
+                    llama_cpp_pack_profile_for_target(&manifest, accelerator),
+                    Some(LlamaCppBackendPackProfile::Cpu),
+                    "{task} on {accelerator:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pooled_contract_accepts_a_pack_that_declares_the_task() {
+        let pack = pooled_cpu_backend_pack();
+        for (model_type, task) in [
+            ("embedding", "embed"),
+            ("causal-lm", "embed"),
+            ("seq-classifier", "rerank"),
+            ("seq-classifier", "classify"),
+        ] {
+            assert!(
+                validate_llama_cpp_pooled_contract(&pack, &pooled_manifest(model_type, task))
+                    .is_ok(),
+                "{model_type}/{task}"
+            );
+        }
+    }
+
+    #[test]
+    fn pooled_contract_rejects_legacy_and_partial_packs() {
+        let manifest = pooled_manifest("embedding", "embed");
+        let error = validate_llama_cpp_pooled_contract(&cpu_backend_pack(), &manifest)
+            .expect_err("a generation-only pack cannot serve embeddings");
+        assert!(error.contains("pooled-task table"), "{error}");
+
+        let mut without_task = pooled_cpu_backend_pack();
+        without_task.tasks = vec!["embed".to_string()];
+        let error = validate_llama_cpp_pooled_contract(
+            &without_task,
+            &pooled_manifest("seq-classifier", "rerank"),
+        )
+        .expect_err("undeclared task");
+        assert!(error.contains("task `rerank`"), "{error}");
+
+        let mut without_type = pooled_cpu_backend_pack();
+        without_type.model_types = vec!["embedding".to_string()];
+        let error = validate_llama_cpp_pooled_contract(
+            &without_type,
+            &pooled_manifest("causal-lm", "embed"),
+        )
+        .expect_err("undeclared model type");
+        assert!(error.contains("model type `causal-lm`"), "{error}");
     }
 
     #[test]
