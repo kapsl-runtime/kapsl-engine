@@ -852,7 +852,6 @@ jobs:
             --port "$direct_port" \
             --attention-backend FLASH_ATTN \
             --max-model-len 1024 \
-            --enforce-eager \
             --enable-prefix-caching \
             --kv-cache-memory-bytes "$DIRECT_KV_BYTES" \
             --tensor-parallel-size "$TP_SIZE" \

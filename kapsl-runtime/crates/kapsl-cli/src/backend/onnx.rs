@@ -234,15 +234,26 @@ pub(crate) fn onnx_backend_pack_requirements(
 }
 
 pub(crate) fn embedded_onnx_rollback_reason(manifest: &Manifest) -> Result<String, String> {
+    let explicit = crate::backend::generic_native_packs_switch_is_set()?;
+    let platform = crate::backend::current_platform();
     if let Some(backend) = manifest_backend_pack_pin(manifest)? {
-        return Err(format!(
-            "model `{}` explicitly pins signed backend `{backend}`, which conflicts with the embedded ORT rollback selected by {GENERIC_NATIVE_PACKS_ENV}=0",
-            manifest.project_name
-        ));
+        return Err(if explicit {
+            format!(
+                "model `{}` explicitly pins signed backend `{backend}`, which conflicts with the embedded ORT rollback selected by {GENERIC_NATIVE_PACKS_ENV}=0",
+                manifest.project_name
+            )
+        } else {
+            format!(
+                "model `{}` explicitly pins signed backend `{backend}`, which conflicts with the embedded ORT rollback used on {platform}, where signed ONNX packs are not published",
+                manifest.project_name
+            )
+        });
     }
-    Ok(format!(
-        "explicit rollback selected by {GENERIC_NATIVE_PACKS_ENV}=0"
-    ))
+    Ok(if explicit {
+        format!("explicit rollback selected by {GENERIC_NATIVE_PACKS_ENV}=0")
+    } else {
+        format!("signed ONNX packs are not published for {platform}, so the embedded ONNX Runtime is used")
+    })
 }
 
 fn env_switch(name: &str, default: bool) -> bool {

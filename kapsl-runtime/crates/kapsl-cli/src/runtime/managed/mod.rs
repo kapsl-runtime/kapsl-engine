@@ -41,6 +41,19 @@ const MANAGED_VLLM_MEMORY_MODE_ENV: &str = "KAPSL_VLLM_MEMORY_MODE";
 const MANAGED_VLLM_VMM_CONFORMANCE_ENV: &str = "KAPSL_VLLM_VMM_CONFORMANCE";
 const MANAGED_VLLM_CHAT_MARKER: &str = "__kapsl_managed_vllm_chat_v1";
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
+/// Compiled launches also run `torch.compile` and capture CUDA graphs: about
+/// 25 seconds per 1.5B model on an RTX 3090 with a cold compile cache, more
+/// for larger models. An authored `startup_timeout_seconds` still wins.
+const DEFAULT_COMPILED_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
+/// CUDA graph memory charged per decoder layer on every device of a compiled
+/// launch. Pinned vLLM, with the capture sizes it picks when Kapsl launches
+/// it (51 sizes up to 512 tokens, full and piecewise graphs), took 0.40 GiB
+/// for a 24-layer 0.5B model and 0.48 GiB for two 28-layer 1.5B models on an
+/// RTX 3090: about 17.5 MiB per layer. The charge keeps a third on top.
+const CUDA_GRAPH_BYTES_PER_LAYER: usize = 24 * 1024 * 1024;
+const CUDA_GRAPH_MIN_BYTES: usize = 512 * 1024 * 1024;
+/// Charge used when config.json does not say how many layers the model has.
+const CUDA_GRAPH_UNKNOWN_DEPTH_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
@@ -752,9 +765,11 @@ struct ManagedVllmSettings {
     max_model_len: usize,
     startup_timeout: Duration,
     /// Launch vLLM with `--enforce-eager`, which turns off `torch.compile`
-    /// and CUDA graphs. Eager launches start faster and hold no graph memory
-    /// outside the planned grant, but small models decode two to three times
-    /// slower. `metadata.serving.vllm.enforce_eager: false` opts out.
+    /// and CUDA graphs. Off by default: small models decode two to three
+    /// times faster compiled. Compiled launches start slower and hold CUDA
+    /// graph memory, which admission charges per layer (see
+    /// `managed_vllm_cuda_graph_bytes`). `metadata.serving.vllm.enforce_eager:
+    /// true` opts back in.
     enforce_eager: bool,
 }
 
@@ -932,8 +947,8 @@ impl ManagedVllmSettings {
             live_resize: None,
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
-            startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-            enforce_eager: true,
+            startup_timeout: DEFAULT_COMPILED_STARTUP_TIMEOUT,
+            enforce_eager: false,
         };
         let Some(vllm) = manifest
             .metadata
@@ -989,6 +1004,15 @@ impl ManagedVllmSettings {
             );
         }
 
+        if let Some(raw) = value("enforce_eager") {
+            settings.enforce_eager = raw.as_bool().ok_or_else(|| {
+                "metadata.serving.vllm.enforce_eager must be a boolean".to_string()
+            })?;
+            if settings.enforce_eager {
+                settings.startup_timeout = DEFAULT_STARTUP_TIMEOUT;
+            }
+        }
+
         if let Some(raw) = value("startup_timeout_seconds") {
             let seconds = raw.as_u64().ok_or_else(|| {
                 "metadata.serving.vllm.startup_timeout_seconds must be an integer".to_string()
@@ -1000,12 +1024,6 @@ impl ManagedVllmSettings {
                 );
             }
             settings.startup_timeout = Duration::from_secs(seconds);
-        }
-
-        if let Some(raw) = value("enforce_eager") {
-            settings.enforce_eager = raw.as_bool().ok_or_else(|| {
-                "metadata.serving.vllm.enforce_eager must be a boolean".to_string()
-            })?;
         }
         settings.apply_memory_mode_override(
             std::env::var(MANAGED_VLLM_MEMORY_MODE_ENV).ok().as_deref(),
@@ -1066,6 +1084,12 @@ impl ManagedVllmSettings {
 
 pub(crate) fn validate_managed_vllm_launch_policy(manifest: &Manifest) -> Result<(), String> {
     ManagedVllmSettings::from_manifest(manifest)?.validate_launch_policy()
+}
+
+/// Whether the manifest's managed vLLM launch captures CUDA graphs, which
+/// admission must charge before the child starts.
+pub(crate) fn managed_vllm_uses_cuda_graphs(manifest: &Manifest) -> Result<bool, String> {
+    Ok(!ManagedVllmSettings::from_manifest(manifest)?.enforce_eager)
 }
 
 fn parse_gpu_memory_utilization(raw: &serde_yaml::Value, path: &str) -> Result<f64, String> {
@@ -4281,6 +4305,8 @@ pub(crate) struct ManagedVllmEngine {
     runtime: Arc<ManagedVllmRuntime>,
     served_model_name: String,
     memory_report: MemoryReport,
+    /// Per-device CUDA graph bytes in `memory_report`; `None` when eager.
+    cuda_graph_charge: Option<usize>,
     loaded: AtomicBool,
     requests: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
@@ -4420,8 +4446,15 @@ impl ManagedVllmEngine {
             launch,
             Some(telemetry),
         ));
-        let memory_report =
-            managed_vllm_memory_report(&model_root, &device_ids, model_id, replica_id)?;
+        let cuda_graphs = !process.spec.settings.enforce_eager;
+        let memory_report = managed_vllm_memory_report(
+            &model_root,
+            &device_ids,
+            model_id,
+            replica_id,
+            cuda_graphs,
+        )?;
+        let cuda_graph_charge = cuda_graphs.then(|| managed_vllm_cuda_graph_bytes(&model_root));
         deployment.register_participant_readiness_fence(&participant_id, &process)?;
 
         let runtime = Arc::new(ManagedVllmRuntime {
@@ -4437,6 +4470,7 @@ impl ManagedVllmEngine {
             runtime,
             served_model_name: manifest.project_name.clone(),
             memory_report,
+            cuda_graph_charge,
             loaded: AtomicBool::new(false),
             requests: Arc::new(AtomicU64::new(0)),
             errors: Arc::new(AtomicU64::new(0)),
@@ -4447,6 +4481,47 @@ impl ManagedVllmEngine {
     fn shutdown_managed_backend(&self) {
         self.loaded.store(false, Ordering::Release);
         self.runtime.shutdown(&self.deployment);
+    }
+
+    /// Compare the per-device CUDA graph charge with what vLLM logged for
+    /// this launch. Admission keeps the charge either way: the logged figure
+    /// is a free-memory difference that other processes on the device can
+    /// distort, so it is only reported, and a larger one is a warning that
+    /// `CUDA_GRAPH_BYTES_PER_LAYER` is too low for this model.
+    fn report_cuda_graph_charge(&self, charged: usize, log_start: u64) {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let log_path = &self.process.spec.log_path;
+        let mut text = String::new();
+        let read = std::fs::File::open(log_path).and_then(|mut file| {
+            file.seek(SeekFrom::Start(log_start))?;
+            // Startup output only; a lossy decode keeps one bad byte from
+            // hiding the line.
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            text = String::from_utf8_lossy(&bytes).into_owned();
+            Ok(())
+        });
+        let mib = |bytes: usize| bytes / (1024 * 1024);
+        match read.ok().and_then(|()| logged_cuda_graph_bytes(&text)) {
+            Some(logged) if logged > charged => log::warn!(
+                "managed vLLM model {} logged {} MiB of CUDA graph memory per device, above the {} MiB admission charged; the device budget may be overcommitted by the difference",
+                self.served_model_name,
+                mib(logged),
+                mib(charged)
+            ),
+            Some(logged) => log::info!(
+                "managed vLLM model {} logged {} MiB of CUDA graph memory per device; admission charged {} MiB",
+                self.served_model_name,
+                mib(logged),
+                mib(charged)
+            ),
+            None => log::info!(
+                "managed vLLM model {} is compiled; admission charged {} MiB of CUDA graph memory per device (vLLM logged no capture figure)",
+                self.served_model_name,
+                mib(charged)
+            ),
+        }
     }
 
     fn request_payload(
@@ -4616,6 +4691,10 @@ impl Engine for ManagedVllmEngine {
         self.process
             .prepare_exact_launch(&self.deployment, &self.runtime.participant_id)
             .await?;
+        // The log is appended across restarts; only this launch's lines count.
+        let log_start = std::fs::metadata(&self.process.spec.log_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         if let Err(error) = self.process.spawn_child() {
             self.shutdown_managed_backend();
             return Err(error);
@@ -4629,6 +4708,9 @@ impl Engine for ManagedVllmEngine {
             return Err(error);
         }
         self.loaded.store(true, Ordering::Release);
+        if let Some(charged) = self.cuda_graph_charge {
+            self.report_cuda_graph_charge(charged, log_start);
+        }
         start_managed_vllm_supervisor(
             self.process.clone(),
             self.deployment.clone(),
@@ -5056,11 +5138,15 @@ fn build_kv_transfer_config(
     .map_err(|error| format!("serialize managed vLLM KV transfer config: {error}"))
 }
 
+/// Weights, workspace and, for a compiled launch (`cuda_graphs`), the CUDA
+/// graph memory vLLM keeps on each device. The KV cache is charged separately
+/// by its exact grant.
 pub(crate) fn managed_vllm_memory_report(
     model_path: &Path,
     device_ids: &[usize],
     model_id: u32,
     replica_id: u32,
+    cuda_graphs: bool,
 ) -> Result<MemoryReport, String> {
     if device_ids.is_empty() {
         return Err("managed vLLM memory reporting requires at least one CUDA device".to_string());
@@ -5114,7 +5200,8 @@ pub(crate) fn managed_vllm_memory_report(
         .ok_or_else(|| "managed vLLM per-device weight rounding overflowed".to_string())?
         / device_ids.len();
     let workspace_bytes = (per_device_weights / 8).max(256 * 1024 * 1024);
-    let mut allocations = Vec::with_capacity(device_ids.len() * 2);
+    let cuda_graph_bytes = cuda_graphs.then(|| managed_vllm_cuda_graph_bytes(model_root));
+    let mut allocations = Vec::with_capacity(device_ids.len() * 3);
     for &device_id in device_ids {
         allocations.push(MemoryAllocation {
             allocation_id: format!("managed-vllm:{model_id}:{replica_id}:weights:{device_id}"),
@@ -5130,8 +5217,70 @@ pub(crate) fn managed_vllm_memory_report(
             source: MemoryAllocationSource::BackendManaged,
             bytes: workspace_bytes,
         });
+        if let Some(bytes) = cuda_graph_bytes {
+            // The graph pool lives as long as the vLLM process.
+            allocations.push(MemoryAllocation {
+                allocation_id: format!(
+                    "managed-vllm:{model_id}:{replica_id}:cuda-graphs:{device_id}"
+                ),
+                domain: MemoryDomain::Cuda { device_id },
+                class: MemoryAllocationClass::ModelSession,
+                source: MemoryAllocationSource::BackendManaged,
+                bytes,
+            });
+        }
     }
     Ok(MemoryReport { allocations })
+}
+
+/// CUDA graph memory to charge on each device of a compiled launch, from the
+/// decoder depth in the model directory's config.json. Every tensor-parallel
+/// rank captures graphs for every layer, so the charge does not shrink with
+/// the rank count.
+pub(crate) fn managed_vllm_cuda_graph_bytes(model_root: &Path) -> usize {
+    match managed_vllm_decoder_layers(model_root) {
+        Some(layers) => layers
+            .saturating_mul(CUDA_GRAPH_BYTES_PER_LAYER)
+            .max(CUDA_GRAPH_MIN_BYTES),
+        None => CUDA_GRAPH_UNKNOWN_DEPTH_BYTES,
+    }
+}
+
+/// Decoder layer count from a Hugging Face config.json, including the text
+/// model of a multimodal config.
+fn managed_vllm_decoder_layers(model_root: &Path) -> Option<usize> {
+    let raw = std::fs::read_to_string(model_root.join("config.json")).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let layers_in = |object: &serde_json::Value| {
+        ["num_hidden_layers", "n_layer", "num_layers", "n_layers"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(serde_json::Value::as_u64))
+            .filter(|layers| *layers > 0)
+            .and_then(|layers| usize::try_from(layers).ok())
+    };
+    layers_in(&config).or_else(|| {
+        ["text_config", "llm_config", "language_config"]
+            .iter()
+            .find_map(|key| config.get(*key).and_then(layers_in))
+    })
+}
+
+/// The largest CUDA graph capture figure vLLM logged ("Graph capturing
+/// finished in N secs, took X GiB"), one line per worker. vLLM measures it as
+/// the drop in free device memory while it captures, so another process
+/// allocating at the same time inflates it.
+fn logged_cuda_graph_bytes(log: &str) -> Option<usize> {
+    const MARKER: &str = "Graph capturing finished in ";
+    log.lines()
+        .filter_map(|line| {
+            let rest = &line[line.find(MARKER)? + MARKER.len()..];
+            let mut words = rest[rest.find("took ")? + "took ".len()..].split_whitespace();
+            let gib = words.next()?.parse::<f64>().ok()?;
+            let unit = words.next()?;
+            (unit.starts_with("GiB") && gib.is_finite() && gib >= 0.0)
+                .then(|| (gib * (1024.0 * 1024.0 * 1024.0)).round() as usize)
+        })
+        .max()
 }
 
 fn estimate_vllm_tokens(text: &str) -> u64 {
@@ -6195,12 +6344,91 @@ serving:
         let model_file = directory.path().join("model.safetensors");
         std::fs::write(&model_file, vec![0_u8; 123]).unwrap();
 
-        let from_directory = managed_vllm_memory_report(directory.path(), &[0], 7, 0).unwrap();
-        let from_model_file = managed_vllm_memory_report(&model_file, &[0], 7, 0).unwrap();
+        let from_directory =
+            managed_vllm_memory_report(directory.path(), &[0], 7, 0, false).unwrap();
+        let from_model_file = managed_vllm_memory_report(&model_file, &[0], 7, 0, false).unwrap();
 
         assert_eq!(from_model_file.allocations, from_directory.allocations);
         assert_eq!(from_model_file.allocations[0].bytes, 123);
-        assert!(managed_vllm_memory_report(&model_file, &[], 7, 0).is_err());
+        assert!(managed_vllm_memory_report(&model_file, &[], 7, 0, false).is_err());
+    }
+
+    #[test]
+    fn compiled_launch_charges_cuda_graph_memory_on_every_device() {
+        const MIB: usize = 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("model.safetensors"), vec![0_u8; 64]).unwrap();
+        std::fs::write(
+            directory.path().join("config.json"),
+            r#"{"model_type": "qwen2", "num_hidden_layers": 28}"#,
+        )
+        .unwrap();
+
+        let eager = managed_vllm_memory_report(directory.path(), &[0, 1], 7, 0, false).unwrap();
+        assert!(eager
+            .allocations
+            .iter()
+            .all(|allocation| !allocation.allocation_id.contains("cuda-graphs")));
+
+        let compiled = managed_vllm_memory_report(directory.path(), &[0, 1], 7, 0, true).unwrap();
+        let graphs = compiled
+            .allocations
+            .iter()
+            .filter(|allocation| allocation.allocation_id.contains("cuda-graphs"))
+            .collect::<Vec<_>>();
+        assert_eq!(graphs.len(), 2);
+        for (allocation, device_id) in graphs.iter().zip([0, 1]) {
+            assert_eq!(allocation.domain, MemoryDomain::Cuda { device_id });
+            assert_eq!(allocation.class, MemoryAllocationClass::ModelSession);
+            // 28 layers at 24 MiB, above the 512 MiB floor and above the
+            // 0.48 GiB pinned vLLM captured for 28-layer Qwen2.5 1.5B.
+            assert_eq!(allocation.bytes, 672 * MIB);
+            assert!(allocation.bytes > 492 * MIB);
+        }
+        assert_eq!(compiled.allocations.len(), eager.allocations.len() + 2);
+    }
+
+    #[test]
+    fn cuda_graph_charge_follows_decoder_depth() {
+        const MIB: usize = 1024 * 1024;
+        let directory = tempfile::tempdir().unwrap();
+        let charge = |config: &str| {
+            std::fs::write(directory.path().join("config.json"), config).unwrap();
+            managed_vllm_cuda_graph_bytes(directory.path())
+        };
+
+        // Shallow models get the floor; 24-layer Qwen2.5 0.5B captured 0.40 GiB.
+        assert_eq!(charge(r#"{"num_hidden_layers": 24}"#), 576 * MIB);
+        assert_eq!(charge(r#"{"num_hidden_layers": 4}"#), 512 * MIB);
+        assert_eq!(charge(r#"{"num_hidden_layers": 80}"#), 1920 * MIB);
+        assert_eq!(charge(r#"{"n_layer": 32}"#), 768 * MIB);
+        // A multimodal config keeps the decoder depth in its text config.
+        assert_eq!(
+            charge(r#"{"vision_config": {"depth": 32}, "text_config": {"num_hidden_layers": 36}}"#),
+            864 * MIB
+        );
+        assert_eq!(charge(r#"{"hidden_size": 1536}"#), 2048 * MIB);
+        assert_eq!(charge(r#"{"num_hidden_layers": 0}"#), 2048 * MIB);
+        assert_eq!(charge("not json"), 2048 * MIB);
+        std::fs::remove_file(directory.path().join("config.json")).unwrap();
+        assert_eq!(managed_vllm_cuda_graph_bytes(directory.path()), 2048 * MIB);
+    }
+
+    #[test]
+    fn logged_cuda_graph_bytes_takes_the_largest_worker_figure() {
+        const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+        let log = "\
+(EngineCore pid=1) INFO 11-27 02:08:11 [gpu_worker.py:512] Initial free memory 23.01 GiB
+(Worker_TP0 pid=2) INFO 11-27 02:08:17 [model_runner.py:895] Graph capturing finished in 5 secs, took 0.48 GiB
+(Worker_TP1 pid=3) INFO 11-27 02:08:17 [model_runner.py:895] Graph capturing finished in 5 secs, took 0.52 GiB\x1b[0m
+(Worker_TP1 pid=3) INFO Graph capturing finished in 5 secs, took -0.10 GiB
+(Worker_TP1 pid=3) INFO Graph capturing finished in 5 secs, took 9.0 MiB
+";
+        assert_eq!(
+            logged_cuda_graph_bytes(log),
+            Some((0.52 * GIB).round() as usize)
+        );
+        assert_eq!(logged_cuda_graph_bytes("no capture here\n"), None);
     }
 
     #[test]
@@ -6291,7 +6519,7 @@ serving:
     }
 
     #[test]
-    fn eager_execution_is_the_default_and_can_be_turned_off() {
+    fn eager_flag_follows_the_setting() {
         let directory = tempfile::tempdir().unwrap();
         let model_root = directory.path().join("model");
         std::fs::create_dir(&model_root).unwrap();
@@ -6325,12 +6553,48 @@ serving:
             ))
         };
 
-        assert!(settings("max_model_len: 1024").unwrap().enforce_eager);
+        assert!(!settings("max_model_len: 1024").unwrap().enforce_eager);
         assert!(settings("enforce_eager: true").unwrap().enforce_eager);
         assert!(!settings("enforce_eager: false").unwrap().enforce_eager);
         assert!(settings("enforce_eager: 0")
             .unwrap_err()
             .contains("enforce_eager must be a boolean"));
+    }
+
+    #[test]
+    fn compiled_launches_get_the_longer_default_startup_timeout() {
+        let settings = |vllm: &str| {
+            settings_from_metadata(&format!(
+                "
+serving:
+  vllm:
+    {vllm}
+"
+            ))
+            .unwrap()
+        };
+
+        assert_eq!(
+            settings("max_model_len: 1024").startup_timeout,
+            DEFAULT_COMPILED_STARTUP_TIMEOUT
+        );
+        assert_eq!(
+            settings("enforce_eager: true").startup_timeout,
+            DEFAULT_STARTUP_TIMEOUT
+        );
+        assert_eq!(
+            settings("enforce_eager: false").startup_timeout,
+            DEFAULT_COMPILED_STARTUP_TIMEOUT
+        );
+        // An authored timeout wins in either mode, whatever the key order.
+        assert_eq!(
+            settings("startup_timeout_seconds: 120\n    enforce_eager: true").startup_timeout,
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            settings("enforce_eager: false\n    startup_timeout_seconds: 90").startup_timeout,
+            Duration::from_secs(90)
+        );
     }
 
     fn test_live_resize_settings() -> ManagedVllmLiveResizeSettings {
