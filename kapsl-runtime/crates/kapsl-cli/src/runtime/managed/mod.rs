@@ -25,7 +25,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{ExitStatus, Stdio};
 
 pub(crate) const MANAGED_VLLM_ADAPTER_ID: &str = "kapsl-vllm-connector";
-pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.1";
+pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.2";
 pub(crate) const MANAGED_VLLM_BACKEND_VERSION: &str = "0.26.1rc1.dev1130+g2ec6f0d71";
 pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";
 pub(crate) const MANAGED_VLLM_ELASTIC_PROFILE_ID: &str = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc";
@@ -145,6 +145,7 @@ pub(crate) fn certified_vllm_elastic_profile() -> String {
 
 pub(crate) struct ManagedVllmDeployment {
     python: PathBuf,
+    connector_capabilities: ManagedVllmConnectorCapabilities,
     control_endpoint: String,
     runtime_root: PathBuf,
     lease_ttl_ms: u64,
@@ -196,18 +197,24 @@ impl ManagedVllmDeployment {
         };
         let shared_pool_profiles = vec![certified_vllm_profile(), certified_vllm_elastic_profile()];
 
-        let python = discover_certified_vllm_python()?;
+        let (python, connector_capabilities) = discover_certified_vllm_python()?;
         log::info!(
-            "Managed vLLM bundle: {} (vLLM {}, connector {}, profiles [{}, {}])",
+            "Managed vLLM bundle: {} (vLLM {}, connector {}, profiles [{}, {}], live-resize scheduling: {})",
             python.display(),
             MANAGED_VLLM_BACKEND_VERSION,
             MANAGED_VLLM_ADAPTER_VERSION,
             MANAGED_VLLM_PROFILE_ID,
             MANAGED_VLLM_ELASTIC_PROFILE_ID,
+            if connector_capabilities.live_resize_async_scheduling {
+                "vLLM default (async)"
+            } else {
+                "--no-async-scheduling"
+            },
         );
 
         let deployment = Arc::new(Self {
             python,
+            connector_capabilities,
             control_endpoint: format!("unix://{}", socket_path.display()),
             runtime_root,
             lease_ttl_ms,
@@ -445,7 +452,20 @@ struct ManagedVllmEnvironment {
     no_async_scheduling_flag: bool,
 }
 
-fn discover_certified_vllm_python() -> Result<PathBuf, String> {
+/// What the installed connector declares about itself beyond the exact
+/// versions in [`ManagedVllmEnvironment`]. The default is a connector that
+/// declares nothing, and Kapsl then launches vLLM as it always has.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ManagedVllmConnectorCapabilities {
+    /// The connector acknowledges a KV tail retirement only after every model
+    /// batch scheduled before it has run, so live resize is safe while vLLM's
+    /// async scheduling keeps two batches in flight. Without this the
+    /// connector accepts live resize only with one batch at a time, and vLLM
+    /// must be started with `--no-async-scheduling`.
+    live_resize_async_scheduling: bool,
+}
+
+fn discover_certified_vllm_python() -> Result<(PathBuf, ManagedVllmConnectorCapabilities), String> {
     let explicit_python = std::env::var_os(MANAGED_VLLM_PYTHON_ENV).map(PathBuf::from);
     let candidates = if let Some(python) = explicit_python.as_ref() {
         vec![python.clone()]
@@ -456,7 +476,7 @@ fn discover_certified_vllm_python() -> Result<PathBuf, String> {
     let mut failures = Vec::new();
     for candidate in candidates {
         match validate_certified_vllm_python(&candidate) {
-            Ok(()) => return Ok(candidate),
+            Ok(capabilities) => return Ok((candidate, capabilities)),
             Err(error) => failures.push(format!("{}: {error}", candidate.display())),
         }
     }
@@ -568,13 +588,16 @@ fn managed_vllm_cache_python_candidate() -> Option<PathBuf> {
     })
 }
 
-fn validate_certified_vllm_python(python: &Path) -> Result<(), String> {
+fn validate_certified_vllm_python(
+    python: &Path,
+) -> Result<ManagedVllmConnectorCapabilities, String> {
     const PROBE: &str = r#"
 import argparse
 import importlib.metadata as md
 import json
 import platform
 import torch
+import kapsl_vllm_connector
 from kapsl_vllm_connector import ADAPTER_PROFILE_ID, ADAPTER_VERSION, ELASTIC_ADAPTER_PROFILE_ID
 from kapsl_vllm_connector.contract import ABI_VERSION
 from kapsl_vllm_connector.planning import PLANNER_SCHEMA_VERSION, planner_json_schema
@@ -620,6 +643,9 @@ print(json.dumps({
     "exact_cache_memory_flag": exact_cache_memory_flag,
     "exact_cache_memory_guard_compatible": exact_cache_memory_guard_compatible,
     "no_async_scheduling_flag": no_async_scheduling_flag,
+    "live_resize_async_scheduling": getattr(
+        kapsl_vllm_connector, "LIVE_RESIZE_ASYNC_SCHEDULING", False
+    ) is True,
 }, sort_keys=True))
 "#;
     let output = Command::new(python)
@@ -636,6 +662,16 @@ print(json.dumps({
     }
     let stdout = String::from_utf8(output.stdout)
         .map_err(|error| format!("environment probe emitted non-UTF-8 output: {error}"))?;
+    parse_certified_vllm_environment(&stdout)
+}
+
+/// Check the probe's report against the certified environment and return what
+/// the connector declared. Every version and flag must match exactly. The
+/// capabilities are the connector's own statement, so they are read, not
+/// compared: a connector that does not declare one is run without it.
+fn parse_certified_vllm_environment(
+    stdout: &str,
+) -> Result<ManagedVllmConnectorCapabilities, String> {
     let mut value: serde_json::Value = serde_json::from_str(stdout.trim())
         .map_err(|error| format!("environment probe emitted invalid JSON: {error}"))?;
     let schema_const = value
@@ -651,10 +687,18 @@ print(json.dumps({
             "connector planner schema mismatch: module={schema_version} schema={schema_const}"
         ));
     }
-    value
+    let report = value
         .as_object_mut()
-        .expect("the environment probe was validated as a JSON object")
-        .remove("planner_schema_const");
+        .expect("the environment probe was validated as a JSON object");
+    report.remove("planner_schema_const");
+    let capabilities = ManagedVllmConnectorCapabilities {
+        live_resize_async_scheduling: report
+            .remove("live_resize_async_scheduling")
+            .and_then(|declared| declared.as_bool())
+            .ok_or_else(|| {
+                "environment probe omitted the live-resize scheduling capability".to_string()
+            })?,
+    };
     let actual: ManagedVllmEnvironment = serde_json::from_value(value)
         .map_err(|error| format!("environment probe emitted invalid fields: {error}"))?;
     let expected = ManagedVllmEnvironment {
@@ -681,7 +725,7 @@ print(json.dumps({
             "binary environment mismatch: {actual:?} != {expected:?}"
         ));
     }
-    Ok(())
+    Ok(capabilities)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -744,6 +788,7 @@ struct ManagedVllmPlannerInvocation {
     resolved_target_concurrency: usize,
     policy: ManagedVllmKvCachePolicy,
     live_resize: Option<ManagedVllmLiveResizeSettings>,
+    connector_capabilities: ManagedVllmConnectorCapabilities,
     timeout: Duration,
     cuda_visible_devices: String,
     output_path: PathBuf,
@@ -2006,6 +2051,35 @@ fn write_canonical_json(value: &serde_json::Value, output: &mut String) -> Resul
     Ok(())
 }
 
+/// Whether a live-resize replica runs with vLLM's default scheduling, which
+/// is async scheduling with two model batches in flight. Kapsl leaves it on
+/// only for a connector that declares it fences a KV tail retirement on those
+/// batches. For any other connector the replica gets `--no-async-scheduling`.
+///
+/// The planner and the server launch both follow this one answer: the
+/// scheduling mode is part of the cache geometry vLLM resolves.
+fn live_resize_keeps_async_scheduling(
+    live_resize: Option<&ManagedVllmLiveResizeSettings>,
+    capabilities: ManagedVllmConnectorCapabilities,
+) -> bool {
+    live_resize.is_some() && capabilities.live_resize_async_scheduling
+}
+
+fn managed_vllm_planner_live_resize_arguments(
+    invocation: &ManagedVllmPlannerInvocation,
+) -> &'static [&'static str] {
+    if invocation.live_resize.is_none() {
+        &[]
+    } else if live_resize_keeps_async_scheduling(
+        invocation.live_resize.as_ref(),
+        invocation.connector_capabilities,
+    ) {
+        &["--live-resize", "--live-resize-async-scheduling"]
+    } else {
+        &["--live-resize"]
+    }
+}
+
 fn run_managed_vllm_planner(
     python: &Path,
     invocation: &ManagedVllmPlannerInvocation,
@@ -2086,9 +2160,7 @@ fn run_managed_vllm_planner(
     if let Some(maximum_concurrency) = expected_policy.maximum_concurrency {
         command.args(["--maximum-concurrency", &maximum_concurrency.to_string()]);
     }
-    if invocation.live_resize.is_some() {
-        command.arg("--live-resize");
-    }
+    command.args(managed_vllm_planner_live_resize_arguments(invocation));
     if expected_policy.strict_concurrency {
         command.arg("--strict-concurrency");
     }
@@ -2895,6 +2967,7 @@ struct ManagedVllmProcessSpec {
     port: u16,
     log_path: PathBuf,
     settings: ManagedVllmSettings,
+    connector_capabilities: ManagedVllmConnectorCapabilities,
     tensor_parallel_size: usize,
     cuda_visible_devices: String,
     planner_invocation: Option<ManagedVllmPlannerInvocation>,
@@ -3015,10 +3088,16 @@ impl ManagedVllmProcess {
         if self.spec.settings.enforce_eager {
             command.arg("--enforce-eager");
         }
-        if self.spec.settings.live_resize.is_some() {
-            // Pinned vLLM enables overlapping async batches by default. Safe
-            // tail unmapping is certified only after the sole in-flight model
-            // batch has settled on every worker.
+        if self.spec.settings.live_resize.is_some()
+            && !live_resize_keeps_async_scheduling(
+                self.spec.settings.live_resize.as_ref(),
+                self.spec.connector_capabilities,
+            )
+        {
+            // Pinned vLLM overlaps two model batches by default. A KV tail
+            // may be unmapped only when no batch scheduled earlier can still
+            // write it. A connector that does not declare that it waits for
+            // those batches is safe only with one batch in flight.
             command.arg("--no-async-scheduling");
         }
         if self.spec.tensor_parallel_size > 1 {
@@ -4335,6 +4414,7 @@ impl ManagedVllmEngine {
                     resolved_target_concurrency,
                     policy: settings.kv_cache_policy.clone(),
                     live_resize: settings.live_resize.clone(),
+                    connector_capabilities: deployment.connector_capabilities,
                     timeout: settings.startup_timeout,
                     cuda_visible_devices: cuda_visible_devices.clone(),
                     output_path: model_root_log.join("kv-plan.json"),
@@ -4358,6 +4438,7 @@ impl ManagedVllmEngine {
                 port,
                 log_path,
                 settings,
+                connector_capabilities: deployment.connector_capabilities,
                 tensor_parallel_size,
                 cuda_visible_devices,
                 planner_invocation,
@@ -5239,10 +5320,10 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.1. Keeping
+    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.2. Keeping
     // one exact cross-language fixture catches JSON/digest/arithmetic drift
     // before the executor-backed planner is exercised on a GPU host.
-    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.1","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:6f55e57f692f85faf9d1d905132782acc052af87233c0df4b4804ace0bdbfbd1","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
+    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.2","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:952c0a538cbf8f402030932e85552f620f07857f7100b181f37b1000a9aef4db","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -5294,6 +5375,7 @@ mod tests {
                 strict: false,
             },
             live_resize: None,
+            connector_capabilities: ManagedVllmConnectorCapabilities::default(),
             timeout: Duration::from_secs(300),
             cuda_visible_devices: "0".to_string(),
             output_path: root.join("kv-plan.json"),
@@ -5338,6 +5420,7 @@ mod tests {
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
                 planner_invocation: None,
+                connector_capabilities: ManagedVllmConnectorCapabilities::default(),
             },
             ManagedVllmLaunchSpec {
                 kv_transfer_config: "{}".to_string(),
@@ -5351,11 +5434,11 @@ mod tests {
     fn certified_profile_matches_certified_tuple() {
         assert_eq!(
             certified_vllm_profile(),
-            "kapsl-vllm-connector,0.7.1,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
+            "kapsl-vllm-connector,0.7.2,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
         );
         assert_eq!(
             certified_vllm_elastic_profile(),
-            "kapsl-vllm-connector,0.7.1,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
+            "kapsl-vllm-connector,0.7.2,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
         );
     }
 
@@ -5443,7 +5526,7 @@ mod tests {
         assert_eq!(template.grant_request.candidates[0].bytes_per_block, 1024);
         assert_eq!(
             template.grant_request.geometry_digest,
-            "sha256:6f55e57f692f85faf9d1d905132782acc052af87233c0df4b4804ace0bdbfbd1"
+            "sha256:952c0a538cbf8f402030932e85552f620f07857f7100b181f37b1000a9aef4db"
         );
     }
 
@@ -6375,6 +6458,7 @@ serving:
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
                 planner_invocation: None,
+                connector_capabilities: ManagedVllmConnectorCapabilities::default(),
             },
             ManagedVllmLaunchSpec {
                 kv_transfer_config: "{}".to_string(),
@@ -6513,8 +6597,20 @@ serving:
         );
     }
 
-    #[test]
-    fn elastic_process_disables_overlapping_vllm_batches() {
+    fn test_live_resize_settings() -> ManagedVllmLiveResizeSettings {
+        ManagedVllmLiveResizeSettings {
+            maximum_concurrency: 8,
+            grow_utilization_percent: 80,
+            shrink_utilization_percent: 25,
+            shrink_idle: Duration::from_secs(60),
+        }
+    }
+
+    /// Number of `--no-async-scheduling` arguments in an elastic launch for a
+    /// connector with the given capabilities.
+    fn elastic_launch_sync_scheduling_flags(
+        capabilities: ManagedVllmConnectorCapabilities,
+    ) -> usize {
         let directory = tempfile::tempdir().unwrap();
         let model_root = directory.path().join("model");
         std::fs::create_dir(&model_root).unwrap();
@@ -6522,23 +6618,154 @@ serving:
         let process = Arc::get_mut(&mut process).expect("test owns the process");
         process.spec.model_root = model_root;
         process.spec.log_path = directory.path().join("vllm.log");
-        process.spec.settings.live_resize = Some(ManagedVllmLiveResizeSettings {
-            maximum_concurrency: 8,
-            grow_utilization_percent: 80,
-            shrink_utilization_percent: 25,
-            shrink_idle: Duration::from_secs(60),
-        });
+        process.spec.settings.live_resize = Some(test_live_resize_settings());
+        process.spec.connector_capabilities = capabilities;
         process.install_exact_launch("{\"exact\":true}".to_string(), 316_416, 309);
 
-        let command = process.build_command().unwrap();
-        let arguments = command
+        process
+            .build_command()
+            .unwrap()
             .get_args()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+            .filter(|argument| *argument == "--no-async-scheduling")
+            .count()
+    }
 
-        assert!(arguments
-            .iter()
-            .any(|argument| argument == "--no-async-scheduling"));
+    #[test]
+    fn elastic_process_disables_overlapping_vllm_batches() {
+        // A connector that declares nothing is safe only with one model batch
+        // in flight. This is the launch every connector up to 0.7.1 gets.
+        assert_eq!(
+            elastic_launch_sync_scheduling_flags(ManagedVllmConnectorCapabilities::default()),
+            1
+        );
+    }
+
+    #[test]
+    fn elastic_process_keeps_async_scheduling_for_a_connector_that_fences_it() {
+        assert_eq!(
+            elastic_launch_sync_scheduling_flags(ManagedVllmConnectorCapabilities {
+                live_resize_async_scheduling: true,
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn fixed_pool_process_never_changes_vllm_scheduling() {
+        for live_resize_async_scheduling in [false, true] {
+            let mut process = test_managed_process();
+            let process = Arc::get_mut(&mut process).expect("test owns the process");
+            process.spec.connector_capabilities = ManagedVllmConnectorCapabilities {
+                live_resize_async_scheduling,
+            };
+
+            assert!(!process
+                .build_command()
+                .unwrap()
+                .get_args()
+                .any(|argument| argument == "--no-async-scheduling"));
+        }
+    }
+
+    #[test]
+    fn planner_resolves_geometry_under_the_scheduling_mode_of_the_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut invocation = synthetic_planner_invocation(directory.path());
+        let fencing = ManagedVllmConnectorCapabilities {
+            live_resize_async_scheduling: true,
+        };
+
+        // A fixed pool is planned without either flag, whatever the connector.
+        invocation.connector_capabilities = fencing;
+        assert!(managed_vllm_planner_live_resize_arguments(&invocation).is_empty());
+
+        invocation.live_resize = Some(test_live_resize_settings());
+        assert_eq!(
+            managed_vllm_planner_live_resize_arguments(&invocation),
+            ["--live-resize", "--live-resize-async-scheduling"]
+        );
+
+        // The launch passes --no-async-scheduling, and the planner forces the
+        // same mode when it is given --live-resize alone.
+        invocation.connector_capabilities = ManagedVllmConnectorCapabilities::default();
+        assert_eq!(
+            managed_vllm_planner_live_resize_arguments(&invocation),
+            ["--live-resize"]
+        );
+    }
+
+    fn certified_environment_report() -> serde_json::Value {
+        serde_json::json!({
+            "python": MANAGED_VLLM_PYTHON_VERSION,
+            "torch": MANAGED_VLLM_TORCH_VERSION,
+            "torchvision": MANAGED_VLLM_TORCHVISION_VERSION,
+            "torchaudio": MANAGED_VLLM_TORCHAUDIO_VERSION,
+            "vllm": MANAGED_VLLM_BACKEND_VERSION,
+            "connector_distribution": MANAGED_VLLM_ADAPTER_VERSION,
+            "connector": MANAGED_VLLM_ADAPTER_VERSION,
+            "profile": MANAGED_VLLM_PROFILE_ID,
+            "elastic_profile": MANAGED_VLLM_ELASTIC_PROFILE_ID,
+            "kv_abi_major": MANAGED_VLLM_KV_ABI_MAJOR,
+            "kv_abi_minor": MANAGED_VLLM_KV_ABI_MINOR,
+            "cuda_runtime": MANAGED_VLLM_CUDA_RUNTIME_VERSION,
+            "cuda_available": true,
+            "planner_schema_version": 1,
+            "planner_schema_const": 1,
+            "exact_cache_memory_flag": true,
+            "exact_cache_memory_guard_compatible": true,
+            "no_async_scheduling_flag": true,
+            "live_resize_async_scheduling": true,
+        })
+    }
+
+    #[test]
+    fn environment_probe_reports_what_the_connector_declares() {
+        let mut report = certified_environment_report();
+        assert_eq!(
+            parse_certified_vllm_environment(&report.to_string()).unwrap(),
+            ManagedVllmConnectorCapabilities {
+                live_resize_async_scheduling: true,
+            }
+        );
+
+        // A connector without the declaration is certified all the same and
+        // keeps the synchronous launch.
+        report["live_resize_async_scheduling"] = serde_json::json!(false);
+        assert_eq!(
+            parse_certified_vllm_environment(&report.to_string()).unwrap(),
+            ManagedVllmConnectorCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn environment_probe_rejects_a_missing_or_malformed_declaration() {
+        let mut report = certified_environment_report();
+        report["live_resize_async_scheduling"] = serde_json::json!("true");
+        assert!(parse_certified_vllm_environment(&report.to_string())
+            .unwrap_err()
+            .contains("live-resize scheduling capability"));
+
+        report
+            .as_object_mut()
+            .unwrap()
+            .remove("live_resize_async_scheduling");
+        assert!(parse_certified_vllm_environment(&report.to_string())
+            .unwrap_err()
+            .contains("live-resize scheduling capability"));
+    }
+
+    #[test]
+    fn environment_probe_still_pins_the_connector_version_exactly() {
+        // The declaration does not replace the pin: the previous connector
+        // is refused even though it would be launched synchronously.
+        let mut report = certified_environment_report();
+        report["connector"] = serde_json::json!("0.7.1");
+        report["connector_distribution"] = serde_json::json!("0.7.1");
+        report["live_resize_async_scheduling"] = serde_json::json!(false);
+
+        assert!(parse_certified_vllm_environment(&report.to_string())
+            .unwrap_err()
+            .contains("binary environment mismatch"));
     }
 
     #[cfg(all(unix, feature = "gpu-device-pool"))]
@@ -6588,6 +6815,7 @@ serving:
         let port = reserve_loopback_port().unwrap();
         let deployment = Arc::new(ManagedVllmDeployment {
             python: directory.path().join("missing-python"),
+            connector_capabilities: ManagedVllmConnectorCapabilities::default(),
             control_endpoint: format!("unix://{}", directory.path().join("kv.sock").display()),
             runtime_root: directory.path().to_path_buf(),
             lease_ttl_ms: 30_000,
@@ -6614,6 +6842,7 @@ serving:
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
                 planner_invocation: Some(invocation.clone()),
+                connector_capabilities: ManagedVllmConnectorCapabilities::default(),
             },
             ManagedVllmLaunchSpec {
                 kv_transfer_config: String::new(),

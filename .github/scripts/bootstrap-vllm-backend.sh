@@ -69,8 +69,8 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.7.1",
-    "connector": "0.7.1",
+    "connector_distribution": "0.7.2",
+    "connector": "0.7.2",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
     "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
     "kv_abi": {"major": 1, "minor": 5},
@@ -100,7 +100,7 @@ PY
   "torchvision==0.28.0+cu130" \
   "torchaudio==2.11.0+cu130" \
   "vllm==0.26.1rc1.dev1130+g2ec6f0d71" \
-  "kapsl-vllm-connector==0.7.1"
+  "kapsl-vllm-connector==0.7.2"
 "$staging_python" -m pip check
 
 "$staging_python" <<'PY'
@@ -136,8 +136,8 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.7.1",
-    "connector": "0.7.1",
+    "connector_distribution": "0.7.2",
+    "connector": "0.7.2",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
     "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
     "kv_abi": {"major": 1, "minor": 5},
