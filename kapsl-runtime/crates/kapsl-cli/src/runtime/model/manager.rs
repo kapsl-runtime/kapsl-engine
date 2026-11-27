@@ -11,6 +11,8 @@ pub(crate) struct ModelEntry {
     pool: Option<Arc<ReplicaPool<Scheduler>>>,
     swap_handles: Vec<EngineHandle>,
     lifecycle: Arc<AsyncMutex<()>>,
+    /// Request activity of the installed load; present exactly when `pool` is.
+    activity: Option<Arc<ModelActivity>>,
 }
 
 impl ModelEntry {
@@ -20,6 +22,7 @@ impl ModelEntry {
             pool: None,
             swap_handles: Vec::new(),
             lifecycle: Arc::new(AsyncMutex::new(())),
+            activity: None,
         }
     }
 }
@@ -94,6 +97,13 @@ impl ModelManager {
         lifecycle.lock_owned().await
     }
 
+    /// Take the model's lifecycle lock only if no load, stop, swap, or scale
+    /// operation holds it. `None` also covers a model with no entry.
+    pub(crate) fn try_lock_lifecycle(&self, model_id: u32) -> Option<OwnedMutexGuard<()>> {
+        let lifecycle = self.entries.read().get(&model_id)?.lifecycle.clone();
+        lifecycle.try_lock_owned().ok()
+    }
+
     pub(crate) fn contains_pool(&self, model_id: u32) -> bool {
         self.entries
             .read()
@@ -106,6 +116,28 @@ impl ModelManager {
             .read()
             .get(&model_id)
             .and_then(|entry| entry.pool.clone())
+    }
+
+    /// Resolve the live pool for one inference request and count the request
+    /// as in flight until the returned guard is dropped. `None` when the model
+    /// is not loaded or the idle unloader is stopping it.
+    pub(crate) fn pool_for_request(
+        &self,
+        model_id: u32,
+    ) -> Option<(Arc<ReplicaPool<Scheduler>>, ModelActivityGuard)> {
+        let entries = self.entries.read();
+        let entry = entries.get(&model_id)?;
+        let pool = entry.pool.clone()?;
+        let guard = entry.activity.as_ref()?.try_begin_request()?;
+        Some((pool, guard))
+    }
+
+    /// Request activity of the model's installed load, if it is loaded.
+    pub(crate) fn activity(&self, model_id: u32) -> Option<Arc<ModelActivity>> {
+        self.entries
+            .read()
+            .get(&model_id)
+            .and_then(|entry| entry.activity.clone())
     }
 
     pub(crate) fn pools(&self) -> Vec<(u32, Arc<ReplicaPool<Scheduler>>)> {
@@ -135,6 +167,7 @@ impl ModelManager {
         entry.path = Some(path);
         entry.pool = Some(pool);
         entry.swap_handles = swap_handles;
+        entry.activity = Some(ModelActivity::new());
     }
 
     pub(crate) fn add_swap_handle(&self, model_id: u32, handle: EngineHandle) {
@@ -196,6 +229,7 @@ impl ModelManager {
         }
         entry.pool = None;
         entry.swap_handles.clear();
+        entry.activity = None;
     }
 }
 
@@ -246,6 +280,43 @@ mod tests {
         let manager = ModelManager::new(registry);
 
         assert_eq!(manager.allocate_model_id(), 1);
+    }
+
+    #[test]
+    fn each_install_gets_fresh_request_activity() {
+        let manager = ModelManager::new(Arc::new(ModelRegistry::new()));
+        let install = |manager: &ModelManager| {
+            manager.install_loaded(
+                3,
+                PathBuf::from("/tmp/model.aimod"),
+                Arc::new(ReplicaPool::new(PoolStrategy::LeastLoaded)),
+                Vec::new(),
+            )
+        };
+        assert!(manager.pool_for_request(3).is_none());
+
+        install(&manager);
+        let (_pool, stale_guard) = manager.pool_for_request(3).expect("loaded");
+        let first = manager.activity(3).expect("activity");
+        assert!(manager.try_lock_lifecycle(3).is_some());
+
+        manager.stop_runtime(3);
+        assert!(manager.activity(3).is_none());
+        assert!(manager.pool_for_request(3).is_none());
+
+        install(&manager);
+        let second = manager.activity(3).expect("activity");
+        assert!(!Arc::ptr_eq(&first, &second));
+        // A guard from the previous load must not keep the new load busy.
+        assert_eq!(second.in_flight(), 0);
+        drop(stale_guard);
+        assert_eq!(second.in_flight(), 0);
+
+        let later = Instant::now() + Duration::from_secs(120);
+        assert!(second.try_claim_idle(Duration::from_secs(60), later));
+        assert!(manager.pool_for_request(3).is_none());
+        second.release_idle_claim();
+        assert!(manager.pool_for_request(3).is_some());
     }
 
     #[tokio::test]

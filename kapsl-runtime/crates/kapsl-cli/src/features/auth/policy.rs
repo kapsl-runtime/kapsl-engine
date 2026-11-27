@@ -86,7 +86,8 @@ fn evaluate_api_access(
     })
 }
 
-/// Native TCP currently delegates per-frame token verification to kapsl-ipc.
+/// Native TCP currently delegates per-frame token verification to the TCP
+/// transport in kapsl-communication.
 /// Keep its exposure policy here beside the API policy until the SDK exposes
 /// a dynamic authorization callback. Local IPC/SHM use OS access controls.
 pub(crate) fn validate_native_tcp_exposure(

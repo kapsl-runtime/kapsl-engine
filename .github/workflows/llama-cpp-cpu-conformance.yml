@@ -1,0 +1,182 @@
+name: llama.cpp CPU Smoke
+
+on:
+  pull_request:
+    # Only runtime and actual pack/harness inputs need compilation. Workflow
+    # and test-only edits are covered by the host-only installer smoke checks,
+    # including edits to this workflow, and runtime documentation changes
+    # neither inference route.
+    paths:
+      - ".github/llama-cpp-cpu-parity.lock.json"
+      - ".github/licenses/LLAMA-CPP-LICENSE"
+      - ".github/scripts/certify-llama-cpp-cpu-parity.sh"
+      - ".github/scripts/llama_cpp_cpu_parity.py"
+      - ".github/scripts/generate-backend-index.py"
+      - ".github/scripts/package-linux-llama-cpp-backend-packs.sh"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "kapsl-runtime/**"
+      - "!kapsl-runtime/docs/**"
+      - "!kapsl-runtime/**/*.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llama-cpp-cpu-conformance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Deliberately cold: the repository's Actions cache is already over its
+  # limit, so this non-required smoke saves no build or model cache and does
+  # not evict the required CI caches.
+  llama-cpp-cpu-smoke:
+    name: llama.cpp CPU correctness smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout engine
+        uses: actions/checkout@v4
+
+      - name: Resolve exact parity inputs
+        id: parity-inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' kapsl-runtime/crates/kapsl-cli/Cargo.toml | cut -d '"' -f2)"
+          echo "KAPSL_VERSION=$version" >> "$GITHUB_ENV"
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          lock = json.loads(pathlib.Path(".github/llama-cpp-cpu-parity.lock.json").read_text())
+          if lock.get("schema_version") != 1:
+              raise SystemExit("llama.cpp CPU parity lock schema must be 1")
+          model = lock.get("model", {})
+          if model.get("source") != "huggingface":
+              raise SystemExit("llama.cpp CPU parity model source is not approved")
+          repository = model.get("repository")
+          if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9][\w.-]*/[\w.-]+", repository):
+              raise SystemExit("llama.cpp CPU parity model repository is invalid")
+          commit = model.get("commit")
+          if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+              raise SystemExit("llama.cpp CPU parity model commit must be an exact lowercase commit")
+          path = model.get("path")
+          if not isinstance(path, str) or not re.fullmatch(r"[\w.-]+\.gguf", path):
+              raise SystemExit("llama.cpp CPU parity model path must be one plain .gguf file name")
+          sha256 = model.get("sha256")
+          if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", sha256):
+              raise SystemExit("llama.cpp CPU parity model SHA-256 is invalid")
+          size = model.get("bytes")
+          if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+              raise SystemExit("llama.cpp CPU parity model size must be a positive integer")
+          outputs = {
+              "model_repository": repository,
+              "model_commit": commit,
+              "model_path": path,
+              "model_sha256": sha256,
+              "model_bytes": str(size),
+          }
+          with pathlib.Path(sys.argv[1]).open("a", encoding="utf-8") as stream:
+              for name, value in outputs.items():
+                  stream.write(f"{name}={value}\n")
+          PY
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils build-essential cmake file libssl-dev openssl patchelf pkg-config
+
+      - name: Install Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Download pinned parity model
+        env:
+          MODEL_REPOSITORY: ${{ steps.parity-inputs.outputs.model_repository }}
+          MODEL_COMMIT: ${{ steps.parity-inputs.outputs.model_commit }}
+          MODEL_PATH: ${{ steps.parity-inputs.outputs.model_path }}
+          MODEL_SHA256: ${{ steps.parity-inputs.outputs.model_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/kapsl-parity-model"
+          mkdir -p "$directory"
+          curl --fail --location --proto '=https' --retry 5 --retry-delay 10 \
+            --output "$directory/$MODEL_PATH.partial" \
+            "https://huggingface.co/$MODEL_REPOSITORY/resolve/$MODEL_COMMIT/$MODEL_PATH"
+          mv "$directory/$MODEL_PATH.partial" "$directory/$MODEL_PATH"
+
+      - name: Verify pinned parity model
+        env:
+          MODEL_PATH: ${{ steps.parity-inputs.outputs.model_path }}
+          MODEL_SHA256: ${{ steps.parity-inputs.outputs.model_sha256 }}
+          MODEL_BYTES: ${{ steps.parity-inputs.outputs.model_bytes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          model="$RUNNER_TEMP/kapsl-parity-model/$MODEL_PATH"
+          actual_bytes="$(stat -c %s "$model")"
+          if [ "$actual_bytes" != "$MODEL_BYTES" ]; then
+            echo "Parity model is $actual_bytes bytes, expected $MODEL_BYTES" >&2
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$model" | awk '{ print $1 }')"
+          if [ "$actual_sha256" != "$MODEL_SHA256" ]; then
+            echo "Parity model digest is $actual_sha256, expected $MODEL_SHA256" >&2
+            exit 1
+          fi
+          echo "KAPSL_LLAMA_PARITY_MODEL=$model" >> "$GITHUB_ENV"
+          echo "KAPSL_LLAMA_PARITY_MODEL_SHA256=$MODEL_SHA256" >> "$GITHUB_ENV"
+
+      - name: Package the llama-cpp/cpu pack
+        env:
+          KAPSL_LLAMA_PACK_PROFILE: cpu
+          KAPSL_LLAMA_TARGET_ROOT: ${{ github.workspace }}/kapsl-runtime/target-llama
+          CMAKE_POSITION_INDEPENDENT_CODE: "ON"
+        run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
+
+      - name: Sign the pack into a test backend index
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/llama-cpu-test-key.pem"
+          openssl genpkey -algorithm ED25519 -out "$key_file"
+          public_key="$(openssl pkey -in "$key_file" -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+          echo "KAPSL_LLAMA_PARITY_PUBLIC_KEY=$public_key" >> "$GITHUB_ENV"
+          .github/scripts/generate-backend-index.py \
+            --version "$KAPSL_VERSION" \
+            --artifacts-dir dist \
+            --output dist/backend-index.json \
+            --signing-key "$key_file" \
+            --expected-public-key "$public_key"
+          rm -f "$key_file"
+          python3 - <<'PY'
+          import json
+          import pathlib
+
+          index = json.loads(pathlib.Path("dist/backend-index.json").read_text())
+          packs = [
+              pack
+              for pack in index["packs"]
+              if pack["backend"] == "llama-cpp" and pack["profile"] == "cpu"
+          ]
+          if len(packs) != 1 or packs[0].get("kv_mode") != "native":
+              raise SystemExit("signed index does not contain exactly one native-KV llama-cpp/cpu pack")
+          PY
+
+      - name: Run embedded versus pack llama.cpp CPU parity
+        run: .github/scripts/certify-llama-cpp-cpu-parity.sh
+
+      - name: Upload llama.cpp CPU parity evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llama-cpp-cpu-smoke-${{ github.run_id }}
+          path: dist/llama-cpp-cpu-smoke
+          if-no-files-found: ignore
+          retention-days: 14

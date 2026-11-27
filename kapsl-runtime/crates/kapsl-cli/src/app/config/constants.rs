@@ -39,6 +39,7 @@ pub(crate) const ORT_BUCKET_MAX_DIMS_ENV: &str = "KAPSL_ORT_BUCKET_MAX_DIMS";
 pub(crate) const MODEL_PEAK_CONCURRENCY_ENV: &str = "KAPSL_MODEL_PEAK_CONCURRENCY";
 pub(crate) const MODEL_PRIORITY_WEIGHTS_ENV: &str = "KAPSL_MODEL_PRIORITY_WEIGHTS";
 pub(crate) const MODEL_LOAD_PARALLELISM_ENV: &str = "KAPSL_MODEL_LOAD_PARALLELISM";
+pub(crate) const IDLE_UNLOAD_SECONDS_ENV: &str = "KAPSL_IDLE_UNLOAD_SECONDS";
 pub(crate) const PROVIDER_POLICY_ENV: &str = "KAPSL_PROVIDER_POLICY";
 
 // Scheduling and runtime pressure policy.

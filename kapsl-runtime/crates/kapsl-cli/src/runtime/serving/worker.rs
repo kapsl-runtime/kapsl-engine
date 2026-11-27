@@ -3,7 +3,7 @@
 use super::*;
 use kapsl_backends::OnnxRuntimeTuning;
 #[cfg(unix)]
-use kapsl_transport::protocol::{
+use kapsl_communication::transport::protocol::{
     blocking as wire, CodecError, StreamResponse, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, OP_INFER_STREAM,
 };
 
@@ -571,14 +571,14 @@ impl Engine for RemoteEngine {
 #[cfg(test)]
 mod remote_engine_tests {
     use super::*;
-    use kapsl_engine_api::BatchingMode;
     #[cfg(unix)]
-    use kapsl_engine_api::{RequestMetadata, TensorDtype};
-    #[cfg(unix)]
-    use kapsl_transport::protocol::{
+    use kapsl_communication::transport::protocol::{
         blocking as test_wire, DEFAULT_MAX_FRAME_PAYLOAD_BYTES, STATUS_OK, STATUS_STREAM_CHUNK,
         STATUS_STREAM_END,
     };
+    use kapsl_engine_api::BatchingMode;
+    #[cfg(unix)]
+    use kapsl_engine_api::{RequestMetadata, TensorDtype};
 
     #[cfg(unix)]
     fn test_packet(value: f32) -> BinaryTensorPacket {
