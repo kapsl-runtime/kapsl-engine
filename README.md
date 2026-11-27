@@ -18,7 +18,9 @@ kapsl run model.aimod
 Managed vLLM and Linux x86_64 ONNX CPU/CUDA 12/TensorRT 10 and llama.cpp
 CPU/CUDA 12 profiles use the signed lazy cache. The ORT CPU candidate is built
 from an exact out-of-tree integrations commit and is distinguished from the
-legacy accelerator bundles by its signed standard-ABI marker. Embedded ORT
+legacy accelerator bundles by its signed standard-ABI marker. The managed-vLLM
+pack builds its connector from the exact `kapsl-integrations` commit in
+`.github/vllm-integration.lock`. Embedded ORT
 remains the default CPU rollback during parity certification. Provider
 fallback remains package-controlled, and TensorRT is selected only when the
 model contract explicitly permits it. The portable core lazily loads llama.cpp

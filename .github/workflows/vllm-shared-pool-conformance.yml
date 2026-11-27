@@ -11,10 +11,6 @@ on:
         description: Exact CUDA release artifact produced earlier in this workflow run
         required: true
         type: string
-      sdk_ref:
-        description: Exact lowercase 40-hex kapsl-sdk commit containing the adapter
-        required: true
-        type: string
       cuda_visible_devices:
         description: Physical GPU ordinals/UUIDs exposed to the probe
         required: true
@@ -43,7 +39,6 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
-          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
           KAPSL_GPU_CANDIDATE_ARTIFACT: ${{ inputs.candidate_artifact }}
         run: |
           set -Eeuo pipefail
@@ -57,7 +52,7 @@ jobs:
             --ref-name "$GITHUB_REF_NAME" \
             --release-tag "$RELEASE_TAG" \
             --manifest kapsl-runtime/crates/kapsl-cli/Cargo.toml \
-            --sdk-ref "$KAPSL_VLLM_SDK_REF"
+            --vllm-integration-lock .github/vllm-integration.lock
 
   flash-attn:
     needs: authorize-stable-release
@@ -79,13 +74,12 @@ jobs:
       EXPECTED_TORCHAUDIO_VERSION: "2.11.0+cu130"
       EXPECTED_TORCHCODEC_VERSION: "0.16.0+cu130"
       EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
-      EXPECTED_CONNECTOR_VERSION: "0.7.0"
+      EXPECTED_CONNECTOR_VERSION: "0.7.1"
       EXPECTED_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-ipc/flash-attn"
       EXPECTED_ELASTIC_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
       EXPECTED_PLANNER_SCHEMA_VERSION: "1"
       EXPECTED_KV_ABI_MAJOR: "1"
       EXPECTED_KV_ABI_MINOR: "5"
-      KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       PYTORCH_INDEX_URL: https://download.pytorch.org/whl/cu130
       VLLM_WHEEL_SHA256: 3bc943a7ba18c547d8777b14c15640b6f4d8f7bd268a4cec76a1fbbf8d8d3c70
@@ -104,7 +98,6 @@ jobs:
             echo "github_run_attempt=$GITHUB_RUN_ATTEMPT"
             echo "engine_ref=$GITHUB_REF"
             echo "engine_sha=$GITHUB_SHA"
-            echo "sdk_ref=$KAPSL_VLLM_SDK_REF"
           } > "$output_dir/run-context.txt"
           {
             echo "OUTPUT_DIR=$output_dir"
@@ -147,24 +140,32 @@ jobs:
         with:
           path: engine
 
-      - name: Validate certified vLLM SDK commit
+      # The engine commit under test pins the connector: the adapter is built
+      # from the exact kapsl-integrations commit in its lock file.
+      - name: Resolve certified vLLM integrations commit
+        id: vllm-integrations
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [[ ! "$KAPSL_VLLM_SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "sdk_ref must be an exact lowercase 40-hex kapsl-sdk commit." >&2
+          ref="$(tr -d '\r\n' < engine/.github/vllm-integration.lock)"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/vllm-integration.lock must contain one exact lowercase 40-hex commit." >&2
             exit 1
           fi
+          echo "integrations_ref=$ref" >> "$OUTPUT_DIR/run-context.txt"
+          echo "KAPSL_VLLM_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/checkout@v4
+      - name: Checkout certified vLLM connector
+        uses: actions/checkout@v4
         with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
-          path: sdk
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.vllm-integrations.outputs.ref }}
+          path: kapsl-integrations-vllm
 
-      - name: Verify certified vLLM SDK checkout
+      - name: Verify certified vLLM integrations checkout
         shell: bash
-        run: engine/.github/scripts/verify-managed-vllm-sdk-checkout.sh sdk "$KAPSL_VLLM_SDK_REF"
+        run: engine/.github/scripts/verify-vllm-integration-checkout.sh kapsl-integrations-vllm "$KAPSL_VLLM_INTEGRATIONS_REF"
 
       - uses: ./engine/.github/actions/setup-rust
 
@@ -204,7 +205,7 @@ jobs:
             "torchaudio==$EXPECTED_TORCHAUDIO_VERSION" \
             "torchcodec==$EXPECTED_TORCHCODEC_VERSION" \
             "$VLLM_WHEEL_PATH"
-          "$VENV_DIR/bin/python" -m build --wheel --outdir "$OUTPUT_DIR/wheels" sdk/integrations/vllm
+          "$VENV_DIR/bin/python" -m build --wheel --outdir "$OUTPUT_DIR/wheels" kapsl-integrations-vllm/integrations/vllm
           "$VENV_DIR/bin/python" -m pip install \
             --constraint "$GITHUB_WORKSPACE/engine/.github/scripts/managed-vllm-cu130.lock" \
             "$OUTPUT_DIR"/wheels/kapsl_vllm_connector-*.whl
@@ -275,7 +276,7 @@ jobs:
           PY
 
       - name: Run dependency-free adapter contract suite
-        working-directory: sdk/integrations/vllm
+        working-directory: kapsl-integrations-vllm/integrations/vllm
         run: $VENV_DIR/bin/python -m unittest discover -s tests -v
 
       - name: Verify pinned vLLM refuses retirement of a live tail block
@@ -287,7 +288,7 @@ jobs:
           import sys
 
           from kapsl_vllm_connector.shared_pool import (
-              SharedPoolImportError,
+              SharedPoolTailBusyError,
               VllmElasticBlockPool,
           )
           from vllm.v1.core.block_pool import BlockPool
@@ -304,8 +305,10 @@ jobs:
           rejected = False
           try:
               elastic.apply(4)
-          except SharedPoolImportError as error:
-              rejected = "live or null" in str(error)
+          except SharedPoolTailBusyError:
+              # Connector 0.7.1 reports a referenced tail with its own error
+              # type, raised before the block pool is touched.
+              rejected = True
           if not rejected or elastic.current_blocks != 8 or pool.num_gpu_blocks != 8:
               raise SystemExit("pinned vLLM live-tail retirement did not fail closed")
           pool.blocks[7].ref_cnt = 0

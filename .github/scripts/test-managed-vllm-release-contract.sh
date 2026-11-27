@@ -6,9 +6,10 @@ bootstrap=".github/scripts/bootstrap-vllm-backend.sh"
 packager=".github/scripts/package-linux-vllm-backend.sh"
 index_generator=".github/scripts/generate-backend-index.py"
 runtime="kapsl-runtime/crates/kapsl-cli/src/runtime/managed/mod.rs"
-sdk_verifier=".github/scripts/verify-managed-vllm-sdk-checkout.sh"
+integration_verifier=".github/scripts/verify-vllm-integration-checkout.sh"
+integration_lock=".github/vllm-integration.lock"
 wheel_verifier=".github/scripts/verify-managed-vllm-connector-wheel.py"
-connector_version="0.7.0"
+connector_version="0.7.1"
 planner_schema_version="1"
 kv_abi_major="1"
 kv_abi_minor="5"
@@ -45,8 +46,9 @@ require_literal "$runtime" "pub(crate) const MANAGED_VLLM_KV_ABI_MINOR: u64 = $k
 require_literal "$runtime" "planner_schema_version: $planner_schema_version,"
 require_literal "$packager" '--constraint "$requirements_lock"'
 require_literal "$bootstrap" '--constraint "$requirements_lock"'
-require_literal "$packager" ': "${KAPSL_VLLM_SDK_REF:?'
-require_literal "$packager" 'verify-managed-vllm-sdk-checkout.sh "$sdk_dir" "$sdk_ref"'
+require_literal "$packager" ': "${KAPSL_VLLM_INTEGRATIONS_REF:?'
+require_literal "$packager" 'verify-vllm-integration-checkout.sh "$integrations_dir" "$integrations_ref"'
+require_literal "$packager" 'connector_root="$integrations_dir/integrations/vllm"'
 require_literal "$packager" 'verify-managed-vllm-connector-wheel.py'
 require_literal "$packager" "connector_version=\"$connector_version\""
 require_literal "$packager" "planner_schema_version=\"$planner_schema_version\""
@@ -55,16 +57,22 @@ require_literal "$packager" "kv_abi_minor=\"$kv_abi_minor\""
 require_literal "$packager" '"connector_distribution": "$connector_version"'
 require_literal "$packager" '"elastic_profile": "$connector_elastic_profile"'
 require_literal "$packager" '"kv_abi": {"major": $kv_abi_major, "minor": $kv_abi_minor}'
-require_literal "$packager" '"sdk_ref": "$sdk_ref"'
+require_literal "$packager" '"integrations_ref": "$integrations_ref"'
+require_literal "$bootstrap" 'manifest.get("integrations_ref")'
 require_literal "$bootstrap" "\"connector_distribution\": \"$connector_version\""
 require_literal "$bootstrap" "\"planner_schema_version\": $planner_schema_version"
 require_literal "$bootstrap" '"elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"'
 require_literal "$bootstrap" "\"kv_abi\": {\"major\": $kv_abi_major, \"minor\": $kv_abi_minor}"
 require_literal "$packager" '"profile": "cu130-flash-attn"'
 require_literal "$packager" '"runtime_abi": 1'
-require_literal "$sdk_verifier" '^[0-9a-f]{40}$'
-require_literal "$sdk_verifier" '--untracked-files=all'
-require_literal "$sdk_verifier" '--ignored=matching'
+require_literal "$integration_verifier" '^[0-9a-f]{40}$'
+require_literal "$integration_verifier" '--untracked-files=all'
+require_literal "$integration_verifier" '--ignored=matching'
+# One exact commit and nothing else: the release never follows a branch or a tag.
+if [[ ! "$(tr -d '\r' < "$integration_lock")" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "$integration_lock must contain exactly one lowercase 40-hex kapsl-integrations commit." >&2
+  exit 1
+fi
 require_literal "$wheel_verifier" '"planner_entry_point": "kapsl_vllm_connector.plan:main"'
 require_literal "$index_generator" 'kapsl-backend-index-v1\0'
 require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
@@ -78,10 +86,13 @@ require_literal "$rust_sdk_verifier" 'package.get("source") != CRATES_IO'
 for workflow in \
   .github/workflows/build-linux-accelerators.yml \
   .github/workflows/vllm-shared-pool-conformance.yml; do
-  require_literal "$workflow" 'KAPSL_VLLM_SDK_REF'
-  require_literal "$workflow" 'verify-managed-vllm-sdk-checkout.sh'
+  require_literal "$workflow" 'vllm-integration.lock'
+  require_literal "$workflow" 'repository: kapsl-runtime/kapsl-integrations'
+  require_literal "$workflow" 'ref: ${{ steps.vllm-integrations.outputs.ref }}'
+  require_literal "$workflow" 'KAPSL_VLLM_INTEGRATIONS_REF'
+  require_literal "$workflow" 'verify-vllm-integration-checkout.sh'
   if [ "$workflow" != ".github/workflows/vllm-shared-pool-conformance.yml" ]; then
-    require_literal "$workflow" '${{ inputs.sdk_ref }}'
+    require_literal "$workflow" 'KAPSL_VLLM_INTEGRATIONS_DIR: kapsl-integrations-vllm'
     require_literal "$workflow" '--expected-public-key "$KAPSL_BACKEND_PUBLIC_KEYS"'
   else
     require_literal "$workflow" "EXPECTED_CONNECTOR_VERSION: \"$connector_version\""
@@ -109,7 +120,7 @@ done
 
 for workflow in .github/workflows/release-runtime-installers.yml .github/workflows/beta-runtime-installers.yml; do
   require_literal "$workflow" './.github/workflows/build-linux-accelerators.yml'
-  require_literal "$workflow" 'sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}'
+  require_literal "$workflow" 'preflight_release_environment.py --signing --vllm-integration'
 done
 
 if grep -Eq 'engine/\.cargo/config\.toml|\[patch\.crates-io\]|patch\.crates-io\.kapsl-' \
@@ -146,12 +157,22 @@ if grep -Fq -- '--index-url "$PYTORCH_INDEX_URL"' \
   exit 1
 fi
 
-if grep -Eq 'KAPSL_VLLM_SDK_REF:-|sdk_ref:.*default:' "$packager" \
+# The lock file is the only source of the connector commit: no repository
+# variable, sdk_ref input or shell default may supply or override it.
+if grep -Eq 'KAPSL_VLLM_SDK_REF|sdk_ref|KAPSL_VLLM_INTEGRATIONS_REF:-|vars\.KAPSL_VLLM' "$packager" \
   .github/workflows/build-linux-accelerators.yml \
   .github/workflows/release-runtime-installers.yml \
   .github/workflows/beta-runtime-installers.yml \
+  .github/workflows/release-infrastructure-preflight.yml \
+  .github/workflows/gpu-device-pool-integration.yml \
   .github/workflows/vllm-shared-pool-conformance.yml; then
-  echo "Managed-vLLM release paths must not carry a fallback SDK ref." >&2
+  echo "Managed-vLLM release paths must take the connector commit only from $integration_lock." >&2
+  exit 1
+fi
+if grep -Fq 'kapsl-runtime/kapsl-sdk' "$packager" \
+  .github/workflows/build-linux-accelerators.yml \
+  .github/workflows/vllm-shared-pool-conformance.yml; then
+  echo "The vLLM connector is built from kapsl-integrations, not kapsl-sdk." >&2
   exit 1
 fi
 

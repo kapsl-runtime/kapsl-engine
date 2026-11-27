@@ -65,12 +65,11 @@ jobs:
       - name: Validate signing and publication configuration before builds
         env:
           GH_TOKEN: ${{ github.token }}
-          KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
           KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
           KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python3 .github/scripts/preflight_release_environment.py --signing --sdk
+        run: python3 .github/scripts/preflight_release_environment.py --signing --vllm-integration
 
   build-runtime-installers:
     name: Build runtime installer (${{ matrix.os }})
@@ -315,7 +314,6 @@ jobs:
       version: ${{ needs.prepare-version.outputs.version }}
       channel: beta
       stable_release: false
-      sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}
     secrets:
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
       KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
