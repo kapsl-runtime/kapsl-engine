@@ -29,6 +29,55 @@ fn run_accepts_positional_and_backward_compatible_model_paths() {
     assert_eq!(args.model, [PathBuf::from("legacy.aimod")]);
     assert!(args.offline);
     assert_eq!(args.idle_unload_seconds, None, "idle unload is opt-in");
+    assert!(args.idle_unload_model.is_empty());
+    assert!(!args.idle_reload, "idle reload is opt-in");
+}
+
+#[test]
+fn run_accepts_per_model_idle_timeouts_and_idle_reload() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "run",
+        "embed.aimod",
+        "llm.aimod",
+        "--idle-unload-seconds",
+        "600",
+        "--idle-unload-model",
+        "0=0",
+        "--idle-unload-model",
+        "1=120",
+        "--idle-reload",
+    ])
+    .unwrap();
+    let Some(KapslCommand::Run(args)) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.idle_unload_seconds, Some(600));
+    assert_eq!(args.idle_unload_model, ["0=0", "1=120"]);
+    assert!(args.idle_reload);
+}
+
+#[test]
+fn add_model_accepts_its_own_idle_timeout() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "add-model",
+        "--model",
+        "llm.aimod",
+        "--idle-unload-seconds",
+        "300",
+    ])
+    .unwrap();
+    let Some(KapslCommand::AddModel(args)) = cli.command else {
+        panic!("expected add-model command");
+    };
+    assert_eq!(args.idle_unload_seconds, Some(300));
+
+    let cli = Cli::try_parse_from(["kapsl", "add-model", "--model", "llm.aimod"]).unwrap();
+    let Some(KapslCommand::AddModel(args)) = cli.command else {
+        panic!("expected add-model command");
+    };
+    assert_eq!(args.idle_unload_seconds, None);
 }
 
 #[test]

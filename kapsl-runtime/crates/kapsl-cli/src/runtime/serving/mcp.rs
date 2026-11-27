@@ -42,7 +42,7 @@ impl EngineFacade for RuntimeMcpEngine {
             .registry()
             .list()
             .into_iter()
-            .filter(|model| self.models.contains_pool(model.id))
+            .filter(|model| self.models.can_serve(model.id))
             .collect::<Vec<_>>();
         serde_json::to_value(models).map_err(|error| error.to_string())
     }
@@ -53,8 +53,14 @@ impl EngineFacade for RuntimeMcpEngine {
         model_id: u32,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        if !self.models.contains_pool(model_id) {
-            return Err(format!("Model {model_id} is not loaded"));
+        // With idle reload on, a model stopped for being idle is loaded
+        // again before the request is served.
+        match self.inference.ensure_loaded(model_id).await {
+            Ok(()) => {}
+            Err(IdleReloadError::NotLoaded) => {
+                return Err(format!("Model {model_id} is not loaded"));
+            }
+            Err(error) => return Err(error.to_string()),
         }
         let model = self
             .models

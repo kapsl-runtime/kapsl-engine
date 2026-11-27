@@ -193,6 +193,9 @@ async fn handle_chat_completion(
         }
     };
 
+    if let Err(response) = ensure_model_loaded(inference, &resolved).await {
+        return response;
+    }
     if models.pool(resolved.id).is_none() {
         return openai_error(
             StatusCode::NOT_FOUND,

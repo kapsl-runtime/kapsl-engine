@@ -42,6 +42,12 @@ pub(crate) struct AddModelCommandArgs {
     /// memory authority to grant or deny it
     #[arg(long)]
     pub(crate) no_wait: bool,
+
+    /// Idle timeout for the new model(s) only: stop a model after this many
+    /// seconds without inference requests. 0 keeps it loaded even when the
+    /// runtime has a default timeout. Omit to use the runtime's setting.
+    #[arg(long, value_name = "SECONDS")]
+    pub(crate) idle_unload_seconds: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]
