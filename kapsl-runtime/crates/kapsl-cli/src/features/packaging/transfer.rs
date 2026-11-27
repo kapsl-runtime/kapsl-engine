@@ -1,3 +1,4 @@
+use super::staged_upload::{self, StagedUploadError};
 use super::*;
 use crate::features::http_client::{
     format_remote_http_error, http_agent_for_transfer, native_tls_http_agent,
@@ -26,6 +27,15 @@ impl RemoteHttpRequestError {
         Self {
             status_code,
             message: format!("{context}: {}", format_remote_http_error(error)),
+        }
+    }
+}
+
+impl From<StagedUploadError> for RemoteHttpRequestError {
+    fn from(error: StagedUploadError) -> Self {
+        Self {
+            status_code: error.status_code,
+            message: error.message,
         }
     }
 }
@@ -85,66 +95,6 @@ impl HttpArtifactTransport {
         Self {
             api_agent,
             transfer_agent,
-        }
-    }
-
-    /// Requests a presigned upload URL when the remote supports that protocol.
-    fn request_presigned_upload_url(
-        &self,
-        artifact_url: &str,
-        authorization_header: Option<&str>,
-    ) -> Result<Option<PresignedUploadResponse>, RemoteHttpRequestError> {
-        let upload_endpoint = format!("{artifact_url}/upload");
-        let mut request = self
-            .transfer_agent
-            .post(&upload_endpoint)
-            .header("Content-Type", "application/json");
-        if let Some(header) = authorization_header {
-            request = request.header("Authorization", header);
-        }
-        match request.send_empty() {
-            Ok(response) => {
-                let body = response.into_body().read_to_string().map_err(|error| {
-                    RemoteHttpRequestError::local(format!(
-                        "Failed to read presigned upload response: {error}"
-                    ))
-                })?;
-                let parsed: serde_json::Value = serde_json::from_str(&body).map_err(|error| {
-                    RemoteHttpRequestError::local(format!(
-                        "Invalid presigned upload response JSON: {error}"
-                    ))
-                })?;
-                let upload_url = parsed["upload_url"]
-                    .as_str()
-                    .ok_or_else(|| {
-                        RemoteHttpRequestError::local(
-                            "Presigned upload response missing 'upload_url' field",
-                        )
-                    })?
-                    .to_string();
-                let method = parsed["method"].as_str().unwrap_or("PUT").to_string();
-                let headers = parsed["headers"]
-                    .as_object()
-                    .map(|object| {
-                        object
-                            .iter()
-                            .filter_map(|(key, value)| {
-                                value.as_str().map(|value| (key.clone(), value.to_string()))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(Some(PresignedUploadResponse {
-                    upload_url,
-                    method,
-                    headers,
-                }))
-            }
-            Err(ureq::Error::StatusCode(404 | 501)) => Ok(None),
-            Err(error) => Err(RemoteHttpRequestError::from_ureq(
-                format!("Failed to request presigned upload URL from {upload_endpoint}"),
-                error,
-            )),
         }
     }
 
@@ -311,45 +261,40 @@ impl ArtifactTransport for HttpArtifactTransport {
         source_path: &Path,
         authorization_header: Option<&str>,
     ) -> Result<u64, RemoteHttpRequestError> {
-        let file_size = fs::metadata(source_path).map_err(|error| {
-            RemoteHttpRequestError::local(format!(
-                "Failed to read .aimod metadata for upload {}: {}",
-                source_path.display(),
-                error
-            ))
-        })?;
-
-        if let Some(presigned) =
-            self.request_presigned_upload_url(artifact_url, authorization_header)?
-        {
-            eprintln!(
-                "  {}",
-                Ansi::new().dim(&format!("Uploading {} bytes...", file_size.len()))
-            );
-            let file = File::open(source_path).map_err(|error| {
+        let size_bytes = fs::metadata(source_path)
+            .map_err(|error| {
                 RemoteHttpRequestError::local(format!(
-                    "Failed to open .aimod for upload {}: {}",
+                    "Failed to read .aimod metadata for upload {}: {}",
                     source_path.display(),
                     error
                 ))
-            })?;
-            let mut request = if presigned.method == "PUT" {
-                self.transfer_agent.put(&presigned.upload_url)
-            } else {
-                self.transfer_agent.post(&presigned.upload_url)
-            };
-            request = request
-                .header("Content-Type", "application/octet-stream")
-                .header("Content-Length", &file_size.len().to_string());
-            for (key, value) in &presigned.headers {
-                request = request.header(key, value);
-            }
-            request.send(file).map_err(|error| {
-                RemoteHttpRequestError::from_ureq("Failed to upload .aimod to presigned URL", error)
-            })?;
-            return Ok(file_size.len());
+            })?
+            .len();
+
+        // Kapsl Hub only publishes packages it has scanned, and only accepts
+        // large ones through object storage, so opt in to a staged upload first.
+        if let Some(plan) = staged_upload::request_upload_plan(
+            &self.transfer_agent,
+            artifact_url,
+            authorization_header,
+            size_bytes,
+        )? {
+            eprintln!(
+                "  {}",
+                Ansi::new().dim(&format!("Uploading {size_bytes} bytes..."))
+            );
+            staged_upload::execute_upload_plan(
+                &self.transfer_agent,
+                artifact_url,
+                authorization_header,
+                source_path,
+                size_bytes,
+                &plan,
+            )?;
+            return Ok(size_bytes);
         }
 
+        // The registry has no object storage: send the package directly.
         let file = File::open(source_path).map_err(|error| {
             RemoteHttpRequestError::local(format!(
                 "Failed to open .aimod for upload {}: {}",
@@ -361,17 +306,25 @@ impl ArtifactTransport for HttpArtifactTransport {
             .transfer_agent
             .put(artifact_url)
             .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", &file_size.len().to_string());
+            .header("Content-Length", &size_bytes.to_string());
         if let Some(header) = authorization_header {
             request = request.header("Authorization", header);
         }
         request.send(file).map_err(|error| {
-            RemoteHttpRequestError::from_ureq(
+            let too_large = matches!(error, ureq::Error::StatusCode(413));
+            let mut error = RemoteHttpRequestError::from_ureq(
                 format!("Failed to upload .aimod to remote backend {artifact_url}"),
                 error,
-            )
+            );
+            if too_large {
+                error.message.push_str(
+                    " (the package is too large for a direct upload, and the registry \
+                     offered no staged upload)",
+                );
+            }
+            error
         })?;
-        Ok(file_size.len())
+        Ok(size_bytes)
     }
 
     fn download(
@@ -388,12 +341,6 @@ impl ArtifactTransport for HttpArtifactTransport {
         }
         self.download_to_file(artifact_url, output_path, authorization_header)
     }
-}
-
-struct PresignedUploadResponse {
-    upload_url: String,
-    method: String,
-    headers: Vec<(String, String)>,
 }
 
 pub(crate) fn fetch_remote_artifact_inventory(
