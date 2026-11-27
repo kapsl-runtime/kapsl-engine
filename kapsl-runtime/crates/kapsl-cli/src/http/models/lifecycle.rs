@@ -1,5 +1,93 @@
 use super::*;
 
+/// Final result of an asynchronous model load, reported to `?wait=true` callers.
+enum ModelLoadOutcome {
+    Active,
+    /// Rejected by the memory authority. `requested` is (domain, bytes) per domain.
+    Denied {
+        message: String,
+        requested: Vec<(String, usize)>,
+    },
+    /// The model names a CUDA device this process cannot use.
+    DeviceUnavailable {
+        message: String,
+        device_id: usize,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl ModelLoadOutcome {
+    fn from_load_error(error: &(dyn std::error::Error + 'static)) -> Self {
+        if let Some(unavailable) = error.downcast_ref::<DeviceUnavailable>() {
+            return Self::DeviceUnavailable {
+                message: error.to_string(),
+                device_id: unavailable.device_id,
+            };
+        }
+        match error.downcast_ref::<MemoryAdmissionFailure>() {
+            Some(failure) => Self::Denied {
+                message: error.to_string(),
+                requested: failure
+                    .requested_bytes()
+                    .iter()
+                    .map(|(domain, bytes)| (domain.to_string(), *bytes))
+                    .collect(),
+            },
+            None => Self::Failed {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    /// HTTP status and JSON body for a waited start request.
+    fn into_reply(self, model_id: u32) -> (warp::http::StatusCode, serde_json::Value) {
+        use warp::http::StatusCode;
+        match self {
+            Self::Active => (
+                StatusCode::OK,
+                serde_json::json!({
+                    "message": "Model loaded",
+                    "model_id": model_id,
+                    "status": "active",
+                }),
+            ),
+            Self::Denied { message, requested } => (
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": message,
+                    "model_id": model_id,
+                    "status": "denied",
+                    "reason": "memory_admission",
+                    "requested": requested
+                        .into_iter()
+                        .map(|(domain, bytes)| serde_json::json!({"domain": domain, "bytes": bytes}))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            Self::DeviceUnavailable { message, device_id } => (
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": message,
+                    "model_id": model_id,
+                    "status": "denied",
+                    "reason": "device_unavailable",
+                    "device_id": device_id,
+                }),
+            ),
+            Self::Failed { message } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": message,
+                    "model_id": model_id,
+                    "status": "failed",
+                }),
+            ),
+        }
+    }
+}
+
 pub(crate) struct ModelLifecycleRoutesConfig {
     pub(crate) model_runtime: Arc<ModelRuntime>,
 }
@@ -19,6 +107,18 @@ pub(crate) fn build_model_lifecycle_routes(
         topology: String,
         #[serde(default = "default_tp_degree")]
         tp_degree: usize,
+        /// Idle timeout for this model only; 0 keeps it loaded. Omitted
+        /// means the runtime's configured timeout applies.
+        idle_unload_seconds: Option<u64>,
+    }
+
+    /// `?wait=true` holds the response until the load is admitted and active,
+    /// denied by the memory authority, or failed. Without it the request
+    /// returns 202 as soon as the load is queued (unchanged behaviour).
+    #[derive(Deserialize, Default)]
+    struct StartModelQuery {
+        #[serde(default)]
+        wait: bool,
     }
 
     fn default_topology() -> String {
@@ -35,7 +135,8 @@ pub(crate) fn build_model_lifecycle_routes(
     let start_model = warp::path!("api" / "models" / "start")
         .and(warp::post())
         .and(warp::body::json())
-        .then(move |req: StartModelRequest| {
+        .and(warp::query::<StartModelQuery>())
+        .then(move |req: StartModelRequest, query: StartModelQuery| {
             let models = models_for_start.clone();
             let model_runtime = model_runtime_for_start.clone();
 
@@ -168,66 +269,43 @@ pub(crate) fn build_model_lifecycle_routes(
                 );
                 model_info.status = ModelStatus::Starting;
                 models.registry().upsert(model_info);
-                tokio::spawn({
+                let load_task = tokio::spawn({
                     let models = models.clone();
                     let model_registry = models.registry().clone();
                     let model_path = model_path.clone();
                     let placement = ModelLoadPlacement::new(req.topology.clone(), req.tp_degree);
+                    let idle_unload_seconds = req.idle_unload_seconds;
                     let model_runtime = model_runtime.clone();
                     async move {
                         let _lifecycle_guard = lifecycle_guard;
-                        // A typed authority rejection may reclaim one idle,
-                        // strictly lower-weight victim at a time and retry from
-                        // a clean load transaction. Ordinary backend failures
-                        // never enter arbitration.
-                        let mut reclaim_attempts = 0usize;
-                        let res = loop {
-                            let model_path_for_attempt = model_path.clone();
-                            let placement_for_attempt = placement.clone();
-                            let model_runtime_for_attempt = model_runtime.clone();
-                            let attempt = tokio::task::spawn_blocking(move || {
-                                model_runtime_for_attempt.load_model_blocking(
-                                    model_id,
-                                    &model_path_for_attempt,
-                                    &placement_for_attempt,
-                                )
-                            })
+                        let res = model_runtime
+                            .load_model_with_reclaim(model_id, &model_path, &placement)
                             .await;
-
-                            let Ok(Err(error)) = &attempt else {
-                                break attempt;
-                            };
-                            let Some(failure) = error.downcast_ref::<MemoryAdmissionFailure>() else {
-                                break attempt;
-                            };
-                            if reclaim_attempts >= 32 {
-                                log::warn!(
-                                    "Priority arbitration for model {} reached its bounded retry limit",
-                                    model_id
-                                );
-                                break attempt;
-                            }
-                            let Some(_reclaimed) = model_runtime
-                                .reclaim_one_lower_priority_model(failure)
-                                .await
-                            else {
-                                break attempt;
-                            };
-                            reclaim_attempts += 1;
-                        };
 
                         match res {
                             Ok(Err(e)) => {
                                 log::error!("Failed to load model {}: {}", model_id, e);
+                                let outcome = ModelLoadOutcome::from_load_error(e.as_ref());
                                 let _ = model_registry.set_status(model_id, ModelStatus::Inactive);
                                 if auto_assigned {
                                     model_registry.unregister(model_id);
                                     models.release_model_id(model_id);
                                 }
+                                outcome
                             }
                             Ok(Ok((pool, handles))) => {
                                 models.install_loaded(model_id, model_path, pool, handles);
+                                // An idle reload repeats this load, so keep
+                                // what the request asked for.
+                                models.remember_load_placement(model_id, placement);
+                                if let Some(seconds) = idle_unload_seconds {
+                                    models.set_idle_timeout_override(
+                                        model_id,
+                                        (seconds > 0).then(|| Duration::from_secs(seconds)),
+                                    );
+                                }
                                 let _ = model_registry.set_status(model_id, ModelStatus::Active);
+                                ModelLoadOutcome::Active
                             }
                             Err(join_err) => {
                                 log::error!(
@@ -240,10 +318,24 @@ pub(crate) fn build_model_lifecycle_routes(
                                     model_registry.unregister(model_id);
                                     models.release_model_id(model_id);
                                 }
+                                ModelLoadOutcome::Failed {
+                                    message: format!("loader task failed: {join_err}"),
+                                }
                             }
                         }
                     }
                 });
+
+                if query.wait {
+                    let outcome = load_task.await.unwrap_or_else(|join_err| {
+                        ModelLoadOutcome::Failed {
+                            message: format!("loader task failed: {join_err}"),
+                        }
+                    });
+                    let (status, body) = outcome.into_reply(model_id);
+                    return warp::reply::with_status(warp::reply::json(&body), status);
+                }
+
                 warp::reply::with_status(
                     warp::reply::json(&SuccessResponse {
                         message: "Model load started".to_string(),
@@ -275,6 +367,21 @@ pub(crate) fn build_model_lifecycle_routes(
                 #[derive(Serialize)]
                 struct ErrorResponse {
                     error: String,
+                }
+
+                // A model the idle unloader stopped is already down. Stopping
+                // it explicitly means "keep it down": cancel the reload that
+                // the next request would otherwise trigger.
+                if models.clear_idle_unloaded(model_id) {
+                    return warp::reply::with_status(
+                        warp::reply::json(&SuccessResponse {
+                            message: format!(
+                                "Model {} was already stopped for being idle; it will stay stopped until started",
+                                model_id
+                            ),
+                        }),
+                        StatusCode::OK,
+                    );
                 }
 
                 // Check if model exists
@@ -368,4 +475,31 @@ pub(crate) fn build_model_lifecycle_routes(
         .or(remove_model)
         .map(reply_into_response)
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hidden_device_request_is_rejected_as_device_unavailable_not_as_a_memory_denial() {
+        let error: Box<dyn std::error::Error + Send + Sync> = Box::new(DeviceUnavailable {
+            device_id: 1,
+            detail: "engine CUDA device 1 is not visible to this process".to_string(),
+        });
+        let outcome = ModelLoadOutcome::from_load_error(error.as_ref());
+        assert!(matches!(
+            outcome,
+            ModelLoadOutcome::DeviceUnavailable { device_id: 1, .. }
+        ));
+        let (status, body) = outcome.into_reply(7);
+        assert_eq!(status, warp::http::StatusCode::CONFLICT);
+        assert_eq!(body["reason"], "device_unavailable");
+        assert_eq!(body["status"], "denied");
+        assert_eq!(body["device_id"], 1);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("requests CUDA device 1"));
+    }
 }

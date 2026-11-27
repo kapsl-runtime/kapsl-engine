@@ -62,8 +62,15 @@ impl RuntimeBootstrap {
         }
         self.config.transport.preflight()?;
 
+        // Map engine CUDA devices to the CUDA runtime's visible ordinals before any
+        // model is planned: admission denies a request for a device this process
+        // cannot see (for example one hidden by `CUDA_VISIBLE_DEVICES`).
+        #[cfg(feature = "gpu-device-pool")]
+        let _ = install_cuda_ordinal_map(&self.device_info);
+
         let registry = Arc::new(Registry::new());
         let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+        models.configure_idle_unload(self.config.idle_unload.clone());
         let shared_metrics = kapsl_monitor::metrics::KapslMetrics::new(&registry);
         let startup_plans =
             plan_startup_models(&self.config.model_paths, &models, load_planner.as_ref())?;
@@ -109,6 +116,10 @@ impl RuntimeBootstrap {
             resources.pressure().clone(),
             monitor.telemetry(),
             model_runtime.shared_metrics().clone(),
+            self.config
+                .idle_unload
+                .reload_on_request
+                .then(|| IdleReloader::for_runtime(model_runtime.clone())),
         );
         load_startup_models(startup_plans, &model_runtime, &models, &auto_scaler).await?;
 
@@ -230,6 +241,9 @@ impl PreparedServerRuntime {
             }
             None => None,
         };
+        let idle_unload_task = spawn_idle_unload_task(IdleUnloadTaskConfig {
+            model_runtime: model_runtime.clone(),
+        });
         let autoscaler_task = spawn_auto_scaler_task(AutoScalerTaskConfig {
             auto_scaler,
             model_runtime,
@@ -250,6 +264,7 @@ impl PreparedServerRuntime {
             grpc_server,
             monitor,
             autoscaler_task,
+            idle_unload_task,
             resources,
             #[cfg(feature = "mcp-server")]
             mcp_server,
@@ -282,6 +297,9 @@ fn log_hardware(device_info: &DeviceInfo) {
             "✗ Not available".to_string()
         }
     );
+    if device_info.has_cuda {
+        log::info!("CUDA versions: {}", cuda_versions().describe());
+    }
     log::info!(
         "Metal: {}",
         if device_info.has_metal {

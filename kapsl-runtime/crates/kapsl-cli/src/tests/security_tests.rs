@@ -72,6 +72,37 @@ fn test_session_scope_ignores_empty_session_ids() {
 }
 
 #[test]
+fn test_session_scope_derivation_is_pinned() {
+    // HTTP, gRPC, and MCP must agree on this derivation, and changing it
+    // silently re-keys every existing session. Values computed independently.
+    assert_eq!(
+        scope_session_id_for_authorization(Some("session-1"), Some("Bearer token123")).as_deref(),
+        Some("ks1_08907f28bfd280fc97054a9e8d7efd625ca6a09463ffed3ff2b4e4d0e5f6ab00")
+    );
+    assert_eq!(
+        scope_session_id_for_authorization(Some("session-1"), None).as_deref(),
+        Some("ks1_efb8e5379f8b1c98f411c20b73e944034d42be6d6d0f5fa8c7e8ad0752fe3498")
+    );
+}
+
+#[cfg(feature = "mcp-server")]
+#[test]
+fn test_mcp_session_scope_requires_engine_issued_principal() {
+    let issued = kapsl_mcp::Principal::new(ApiPrincipal::from_authorization(Some("Bearer key-a")));
+    assert_eq!(
+        scope_mcp_session_id(&issued, Some("session-1")),
+        Ok(scope_session_id_for_authorization(
+            Some("session-1"),
+            Some("Bearer key-a")
+        ))
+    );
+    assert_eq!(scope_mcp_session_id(&issued, Some("  ")), Ok(None));
+
+    let foreign = kapsl_mcp::Principal::new("Bearer key-a".to_string());
+    assert!(scope_mcp_session_id(&foreign, Some("session-1")).is_err());
+}
+
+#[test]
 fn test_format_authorization_header_from_remote_token() {
     assert_eq!(
         format_authorization_header(Some("abc123")),
@@ -544,13 +575,24 @@ async fn test_shared_authorization_and_login_track_live_key_policy() {
                 Some(&authorization),
                 peer.ip(),
             );
-            let status = match decision {
-                Ok(()) => 200,
+            let status = match &decision {
+                Ok(_) => 200,
                 Err(kapsl_mcp::AuthorizationError::Unauthorized) => 401,
                 Err(kapsl_mcp::AuthorizationError::Forbidden)
                 | Err(kapsl_mcp::AuthorizationError::LocalOnly) => 403,
             };
             assert_eq!(status, expected_status, "MCP {case}");
+            if let Ok(principal) = decision {
+                // MCP sessions land in the namespace HTTP and gRPC use for this key.
+                assert_eq!(
+                    scope_mcp_session_id(&principal, Some("shared-session")),
+                    Ok(scope_session_id_for_authorization(
+                        Some("shared-session"),
+                        Some(&authorization)
+                    )),
+                    "MCP {case}"
+                );
+            }
         }
         let filtered = warp::test::request()
             .header("authorization", &authorization)

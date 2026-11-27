@@ -278,6 +278,26 @@ async fn test_system_routes_report_health_and_pressure_state() {
     assert_eq!(stats_json["gpu_memory_total_bytes"], 20);
     assert_eq!(stats_json["foreign_gpu_memory_bytes"], 4);
     assert_eq!(stats_json["pressure_state"], "conserve");
+    // CUDA driver/runtime versions and the GPU sample freshness are served
+    // here; the values are null/"fresh" on a host without a GPU.
+    for key in ["driver_version", "driver_cuda_version", "runtime_version"] {
+        assert!(
+            stats_json["cuda"].get(key).is_some(),
+            "stats `cuda` lacks `{key}`: {}",
+            stats_json["cuda"]
+        );
+    }
+    assert_eq!(stats_json["gpu_sampling"], "fresh");
+    assert!(stats_json["gpu_sampling_age_secs"].is_null());
+    for domain in stats_json["memory_authority"]["domains"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(
+            domain["available_bytes"],
+            domain["authority_available_bytes"]
+        );
+    }
     assert_eq!(stats_json["memory_authority"]["model_bytes"], 1000);
     assert_eq!(stats_json["memory_authority"]["domain_used_bytes"], 1000);
     assert_eq!(
@@ -541,12 +561,160 @@ async fn test_infer_stream_route_returns_not_found_for_unknown_model() {
     assert_eq!(body["error"], "Model 0 not found");
 }
 
+/// What a backend receives of a request's generation parameters.
+type SeenGeneration = (Option<u32>, Option<u32>, Option<f32>);
+
+struct GenerationCaptureEngine {
+    seen: Arc<Mutex<Vec<SeenGeneration>>>,
+}
+
+#[async_trait::async_trait]
+impl Engine for GenerationCaptureEngine {
+    async fn load(&mut self, _model_path: &Path) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    fn infer(&self, request: &InferenceRequest) -> Result<BinaryTensorPacket, EngineError> {
+        let metadata = request.metadata.as_ref();
+        self.seen.lock().push((
+            metadata.and_then(|m| m.max_new_tokens),
+            metadata.and_then(|m| m.min_new_tokens),
+            metadata.and_then(|m| m.temperature),
+        ));
+        BinaryTensorPacket::new(vec![1, 2], TensorDtype::Utf8, b"ok".to_vec())
+    }
+
+    fn infer_stream(&self, request: &InferenceRequest) -> kapsl_engine_api::EngineStream {
+        let result = self.infer(request);
+        Box::pin(futures::stream::once(async move { result }))
+    }
+
+    fn unload(&mut self) {}
+
+    fn metrics(&self) -> EngineMetrics {
+        EngineMetrics::default()
+    }
+
+    fn health_check(&self) -> Result<(), EngineError> {
+        Ok(())
+    }
+}
+
+fn generation_models(seen: Arc<Mutex<Vec<SeenGeneration>>>) -> Arc<ModelManager> {
+    let models = ModelManager::new(Arc::new(ModelRegistry::new()));
+    models.registry().register(ModelInfo::new(
+        4,
+        "gen".into(),
+        "1".into(),
+        "llm".into(),
+        "cpu".into(),
+        "all".into(),
+        "/unused".into(),
+    ));
+    let engine: EngineHandle = Arc::new(GenerationCaptureEngine { seen });
+    let scheduler = Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+    let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+    pool.add_replica(0, scheduler);
+    models.install_loaded(4, PathBuf::from("/unused"), Arc::new(pool), vec![]);
+    models
+}
+
+fn generation_rag(name: &str) -> RagService {
+    let root = unique_temp_path(name);
+    let docs = root.join("docs");
+    fs::create_dir_all(&docs).expect("create rag docs dir");
+    RagService::new(
+        Arc::new(
+            SqliteVectorStore::open(&root.join("vectors.sqlite3")).expect("open vector store"),
+        ),
+        Arc::new(FsDocStore::new(&docs)),
+    )
+}
+
+const GEN_INPUT: &str = r#""input":{"shape":[2],"dtype":"string","data":[104,105]}"#;
+
+/// Run 9b, check l, through the real HTTP handlers: the body the harness posts (top-level
+/// `max_tokens`, `min_tokens`, `temperature` beside `input`) must reach the backend. Before the fix
+/// the handlers' fast path deserialized the body straight into an `InferenceRequest`, never reached
+/// the adapter, and dropped all three: a real GGUF answered `5 times 3 is 15.` (16 bytes) to
+/// `max_tokens: 3` and to `min_tokens: 20` alike.
+#[tokio::test]
+async fn the_infer_route_delivers_top_level_generation_parameters_to_the_backend() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let models = generation_models(seen.clone());
+    let route = build_model_infer_route(ModelInferRouteConfig {
+        models: models.clone(),
+        inference: test_inference_service(models),
+        log_sensitive_ids: false,
+        rag: generation_rag("gen-infer-rag"),
+    });
+    let post = |body: String| {
+        let route = route.clone();
+        async move {
+            warp::test::request()
+                .method("POST")
+                .path("/api/models/4/infer")
+                .header("content-type", "application/json")
+                .body(body)
+                .reply(&route)
+                .await
+        }
+    };
+    let response = post(format!(
+        r#"{{{GEN_INPUT},"max_tokens":3,"min_tokens":20,"temperature":0}}"#
+    ))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "{:?}", response.body());
+    // the other spelling
+    post(format!(r#"{{{GEN_INPUT},"min_new_tokens":7}}"#)).await;
+    // a value the body carries in its own `metadata` object wins over the top-level one
+    post(format!(
+        r#"{{{GEN_INPUT},"max_tokens":3,"metadata":{{"max_new_tokens":9}}}}"#
+    ))
+    .await;
+    // nothing generation-related: nothing invented
+    post(format!(r#"{{{GEN_INPUT}}}"#)).await;
+    assert_eq!(
+        *seen.lock(),
+        vec![
+            (Some(3), Some(20), Some(0.0)),
+            (None, Some(7), None),
+            (Some(9), None, None),
+            (None, None, None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_infer_stream_route_delivers_top_level_generation_parameters_to_the_backend() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let models = generation_models(seen.clone());
+    let route = build_model_infer_stream_route(ModelInferStreamRouteConfig {
+        models: models.clone(),
+        inference: test_inference_service(models),
+        log_sensitive_ids: false,
+        rag: generation_rag("gen-stream-rag"),
+    });
+    let response = warp::test::request()
+        .method("POST")
+        .path("/api/models/4/infer/stream")
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{{GEN_INPUT},"max_tokens":3,"min_tokens":20,"temperature":0}}"#
+        ))
+        .reply(&route)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // the stream is consumed with the body
+    let _ = response.body();
+    assert_eq!(*seen.lock(), vec![(Some(3), Some(20), Some(0.0))]);
+}
+
 fn test_openai_routes() -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
     let models = ModelManager::new(Arc::new(ModelRegistry::new()));
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 
@@ -648,9 +816,10 @@ impl Engine for OpenAiEmbeddingTestEngine {
         let first_token = request
             .input
             .data
-            .chunks_exact(8)
-            .next()
-            .map(|bytes| i64::from_ne_bytes(bytes.try_into().expect("int64 token")))
+            .as_chunks::<8>()
+            .0
+            .first()
+            .map(|bytes| i64::from_ne_bytes(*bytes))
             .unwrap_or_default() as f32;
         let values = [first_token, 2.0, 3.0, 4.0];
         let data = values
@@ -724,7 +893,6 @@ fn test_openai_routes_with_model() -> warp::filters::BoxedFilter<(warp::reply::R
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 
@@ -756,7 +924,6 @@ fn test_openai_routes_with_session_capture(
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
 }
 
@@ -791,8 +958,193 @@ fn test_openai_routes_with_embedding_model(
     build_openai_routes(OpenAiRoutesConfig {
         models: models.clone(),
         inference: test_inference_service(models),
-        log_sensitive_ids: false,
     })
+}
+
+/// A model the idle unloader stopped, with idle reload on. `reload` decides
+/// how the reload a request triggers ends.
+fn idle_unloaded_model(
+    reload: Result<(), IdleReloadError>,
+) -> (Arc<ModelManager>, Arc<InferenceService>) {
+    const MODEL_ID: u32 = 7;
+    let registry = Arc::new(ModelRegistry::new());
+    registry.register(ModelInfo::new(
+        MODEL_ID,
+        "test-model".to_string(),
+        "1".to_string(),
+        "gguf".to_string(),
+        "cpu".to_string(),
+        "all".to_string(),
+        "/tmp/test-model.aimod".to_string(),
+    ));
+    let models = ModelManager::new(registry);
+    models.configure_idle_unload(IdleUnloadConfig {
+        reload_on_request: true,
+        ..IdleUnloadConfig::default()
+    });
+    models.install_loaded(
+        MODEL_ID,
+        PathBuf::from("/tmp/test-model.aimod"),
+        Arc::new(ReplicaPool::new(PoolStrategy::LeastLoaded)),
+        vec![],
+    );
+    models.begin_idle_unload(MODEL_ID);
+    models.stop_runtime(MODEL_ID);
+
+    let reloader = IdleReloader::new(
+        models.clone(),
+        Duration::from_secs(10),
+        move |_,
+              _,
+              _|
+              -> futures::future::BoxFuture<'static, Result<LoadedModel, IdleReloadError>> {
+            let reload = reload.clone();
+            Box::pin(async move {
+                reload.map(|()| {
+                    let engine: EngineHandle = Arc::new(OpenAiTestEngine);
+                    let scheduler =
+                        Arc::new(Scheduler::new(vec![engine], 1, 1, 8, true, 1, 0, None));
+                    let pool = ReplicaPool::new(PoolStrategy::LeastLoaded);
+                    pool.add_replica(0, scheduler);
+                    (Arc::new(pool), Vec::new())
+                })
+            })
+        },
+    );
+    let inference = InferenceService::new_with_idle_reloader(
+        models.clone(),
+        ResourcePressure::new(
+            Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8)),
+            test_pressure_config(),
+        ),
+        Arc::new(ModelTelemetry::default()),
+        reloader,
+    );
+    (models, inference)
+}
+
+fn memory_held_by_training() -> IdleReloadError {
+    IdleReloadError::MemoryUnavailable {
+        message: "model 7 was stopped for being idle and cannot be reloaded right now: the memory it needs is in use, possibly by a training job".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn an_idle_unloaded_model_stays_advertised_and_a_chat_request_reloads_it() {
+    let (models, inference) = idle_unloaded_model(Ok(()));
+    let routes = build_openai_routes(OpenAiRoutesConfig {
+        models: models.clone(),
+        inference,
+    });
+
+    let listed = warp::test::request()
+        .path("/v1/models")
+        .reply(&routes)
+        .await;
+    let listed: serde_json::Value = serde_json::from_slice(listed.body()).expect("models json");
+    assert_eq!(listed["data"].as_array().expect("data array").len(), 1);
+    assert!(!models.contains_pool(7));
+
+    let response = warp::test::request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .reply(&routes)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK, "{:?}", response.body());
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("chat json");
+    assert_eq!(body["choices"][0]["message"]["content"], "hello from Kapsl");
+    assert!(models.contains_pool(7));
+    assert!(!models.is_idle_unloaded(7));
+}
+
+#[tokio::test]
+async fn openai_requests_get_503_and_retry_after_when_the_idle_reload_is_denied() {
+    let (models, inference) = idle_unloaded_model(Err(memory_held_by_training()));
+    let routes = build_openai_routes(OpenAiRoutesConfig {
+        models: models.clone(),
+        inference,
+    });
+
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#,
+        ),
+        ("/v1/responses", r#"{"model":"test-model","input":"hi"}"#),
+    ] {
+        let response = warp::test::request()
+            .method("POST")
+            .path(path)
+            .header("content-type", "application/json")
+            .body(body)
+            .reply(&routes)
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        assert_eq!(response.headers()["retry-after"], "10", "{path}");
+        let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+        assert_eq!(body["error"]["type"], "server_error", "{path}");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.contains("test-model"), "{message}");
+        assert!(message.contains("training job"), "{message}");
+    }
+    assert!(!models.contains_pool(7));
+    assert!(models.reloads_on_request(7), "a later request tries again");
+}
+
+#[tokio::test]
+async fn native_infer_routes_report_a_denied_idle_reload_as_unavailable() {
+    let (models, inference) = idle_unloaded_model(Err(memory_held_by_training()));
+    let infer = build_model_infer_route(ModelInferRouteConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+        log_sensitive_ids: false,
+        rag: generation_rag("idle-reload-infer-rag"),
+    });
+    let stream = build_model_infer_stream_route(ModelInferStreamRouteConfig {
+        models: models.clone(),
+        inference,
+        log_sensitive_ids: false,
+        rag: generation_rag("idle-reload-stream-rag"),
+    });
+
+    let responses = [
+        warp::test::request()
+            .method("POST")
+            .path("/api/models/7/infer")
+            .header("content-type", "application/json")
+            .body(format!(r#"{{{GEN_INPUT}}}"#))
+            .reply(&infer)
+            .await,
+        warp::test::request()
+            .method("POST")
+            .path("/api/models/7/infer/stream")
+            .header("content-type", "application/json")
+            .body(format!(r#"{{{GEN_INPUT}}}"#))
+            .reply(&stream)
+            .await,
+    ];
+    for response in responses {
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+        assert_eq!(body["reason"], "idle_reload_memory_unavailable");
+        assert_eq!(body["retry_after_seconds"], 10);
+        assert!(body["error"]
+            .as_str()
+            .expect("error")
+            .contains("training job"));
+    }
+
+    // A model that is simply unknown keeps its 404.
+    let unknown = warp::test::request()
+        .method("POST")
+        .path("/api/models/99/infer")
+        .header("content-type", "application/json")
+        .body(format!(r#"{{{GEN_INPUT}}}"#))
+        .reply(&infer)
+        .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 }
 
 async fn post_chat_completion(body: &str) -> warp::http::Response<warp::hyper::body::Bytes> {
@@ -1154,4 +1506,50 @@ async fn test_openai_embeddings_base64_encodes_requested_dimensions() {
     let second = f32::from_le_bytes(bytes[4..].try_into().expect("second float"));
     assert!((first - (3.0 / 13.0f32.sqrt())).abs() < 1e-6);
     assert!((second - (2.0 / 13.0f32.sqrt())).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn test_role_token_routes_never_return_token_values() {
+    let auth_state = Arc::new(RwLock::new(ApiAuthState {
+        role_tokens: ApiRoleTokenConfig {
+            reader_token: Some("reader-secret-value".into()),
+            writer_token: None,
+            admin_token: Some("admin-secret-value".into()),
+        },
+        store_path: unique_temp_path("role-token-redaction").join("auth-store.json"),
+        store: ApiAuthStoreFile::default(),
+        key_hash_index: HashMap::new(),
+    }));
+    let routes = build_auth_routes(auth_state).admin;
+
+    let read = warp::test::request()
+        .method("GET")
+        .path("/api/auth/roles")
+        .reply(&routes)
+        .await;
+    assert_eq!(read.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(read.body()).to_string();
+    for secret in ["reader-secret-value", "admin-secret-value"] {
+        assert!(!body.contains(secret), "GET leaked a token: {body}");
+    }
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["reader"]["configured"], true);
+    assert_eq!(json["writer"]["configured"], false);
+    assert_eq!(json["admin"]["configured"], true);
+
+    let update = warp::test::request()
+        .method("POST")
+        .path("/api/auth/roles")
+        .json(&serde_json::json!({
+            "reader_token": "rotated-reader-value",
+            "writer_token": "rotated-writer-value",
+            "admin_token": "rotated-admin-value",
+        }))
+        .reply(&routes)
+        .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    let body = String::from_utf8_lossy(update.body()).to_string();
+    assert!(!body.contains("rotated-"), "POST leaked a token: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["writer"]["configured"], true);
 }

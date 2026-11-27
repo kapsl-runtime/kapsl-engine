@@ -11,6 +11,7 @@ mod tensor;
 pub(crate) use error::InferRequestError;
 use kapsl_engine_api::InferenceRequest;
 pub(crate) use registry::{default_request_adapter_registry, RequestAdapterRegistry};
+pub(crate) use tensor::apply_top_level_generation_params;
 
 /// Converts one supported HTTP payload shape into an engine request.
 pub(crate) trait ModelRequestAdapter: Send + Sync {

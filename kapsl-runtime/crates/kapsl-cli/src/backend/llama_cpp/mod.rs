@@ -559,14 +559,17 @@ impl PackInstance {
             && pack.kv_mode == LlamaCppPackKvMode::SharedPool;
         #[cfg(feature = "gpu-device-pool")]
         let mut shared_pool_host = if requires_shared_pool {
-            let pool = resources.device_pool(device_id).ok_or_else(|| {
-                format!(
-                    "llama.cpp CUDA pack requires the runtime-owned pool for device {device_id}, but no pool was materialized"
-                )
+            use crate::runtime::memory::gpu_pool::GpuRegionRequest;
+            use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolOwner};
+            let pool = resources.memory().gpu_device_pool(device_id)?;
+            let region = pool.acquire_region(GpuRegionRequest::Local {
+                owner: PoolOwner::gguf(model_id, replica_id, PoolAllocationClass::KvCache),
+                bytes: 0,
+                alignment: 1,
             })?;
             Some(Box::new(LlamaCppSharedPoolHost::new(
-                pool, device_id, model_id, replica_id,
-            )))
+                region, device_id, model_id, replica_id,
+            )?))
         } else {
             None
         };

@@ -121,15 +121,19 @@ class PublishedSdkTests(TestCase):
         sdk.validate_packages(self.packages(), require_checksums=True)
         sdk.verify_lockfile(ROOT / "kapsl-runtime/Cargo.lock")
         for name in ("kapsl-ipc", "kapsl-shm", "kapsl-transport"):
-            self.assertEqual(sdk.EXPECTED_VERSIONS[name], "0.4.0")
-        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-engine-api"], "0.3.0")
-        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-hal"], "0.3.1")
+            self.assertNotIn(name, sdk.EXPECTED_VERSIONS)
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-communication"], "0.5.0")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-engine-api"], "0.3.1")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-hal"], "0.3.4")
         self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-backend-abi"], "0.2.0")
-        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-kv-abi"], "0.6.0")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-kv-abi"], "0.6.1")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-llm"], "0.3.8")
+        self.assertEqual(sdk.EXPECTED_VERSIONS["kapsl-llama-cpp-sys-2"], "0.1.146-kapsl.2")
 
     def test_stale_or_uniform_sdk_versions_are_rejected(self):
-        for name, wrong in (("kapsl-hal", "0.3.0"), ("kapsl-transport", "0.3.0"), ("kapsl-engine-api", "0.4.0"),
-                            ("kapsl-kv-abi", "0.6.1"), ("kapsl-ipc", "0.4.1-beta.1")):
+        for name, wrong in (("kapsl-hal", "0.3.1"), ("kapsl-communication", "0.4.0"), ("kapsl-engine-api", "0.4.0"),
+                            ("kapsl-kv-abi", "0.6.0"), ("kapsl-llm", "0.3.7"),
+                            ("kapsl-llama-cpp-2", "0.1.146-kapsl.1")):
             packages = self.packages()
             next(p for p in packages if p["name"] == name)["version"] = wrong
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, name + ": expected"):
@@ -195,19 +199,40 @@ class PublishedSdkTests(TestCase):
 
 
 class EnvironmentTests(TestCase):
-    def test_sdk_ref_must_resolve_before_build_fanout(self):
-        values = {"KAPSL_VLLM_SDK_REF": "a" * 40, "GH_TOKEN": "fixture-token"}
+    def lock(self, content):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "vllm-integration.lock"
+        path.write_text(content)
+        return path
+
+    def test_vllm_integration_commit_must_resolve_before_build_fanout(self):
+        values = {"GH_TOKEN": "fixture-token"}
+        lock = self.lock("a" * 40 + "\n")
         with mock.patch.object(environment.subprocess, "run") as request:
             request.return_value.stdout = "a" * 40 + "\n"
-            environment.validate_sdk(values)
+            environment.validate_vllm_integration(values, lock)
             self.assertEqual(request.call_args.kwargs["timeout"], 30)
+            self.assertEqual(request.call_args.args[0][:3], [
+                "gh", "api", "repos/kapsl-runtime/kapsl-integrations/commits/" + "a" * 40,
+            ])
             request.return_value.stdout = "b" * 40
             with self.assertRaisesRegex(environment.PreflightError, "exact requested revision"):
-                environment.validate_sdk(values)
+                environment.validate_vllm_integration(values, lock)
             request.reset_mock()
+            for content in ("main\n", "a" * 39 + "\n", "A" * 40 + "\n",
+                            "a" * 40 + "\n" + "b" * 40 + "\n", ""):
+                with self.subTest(content=content), self.assertRaises(environment.PreflightError):
+                    environment.validate_vllm_integration(values, self.lock(content))
             with self.assertRaises(environment.PreflightError):
-                environment.validate_sdk(values | {"KAPSL_VLLM_SDK_REF": "main"})
+                environment.validate_vllm_integration(values, lock.with_name("missing.lock"))
+            with self.assertRaises(environment.PreflightError):
+                environment.validate_vllm_integration({}, lock)
             request.assert_not_called()
+
+    def test_committed_vllm_integration_lock_is_the_default_preflight_input(self):
+        self.assertEqual(environment.VLLM_INTEGRATION_LOCK, ROOT / ".github/vllm-integration.lock")
+        self.assertRegex(environment.vllm_integration_ref(), r"\A[0-9a-f]{40}\Z")
 
     def gpu_env(self):
         return {
@@ -218,7 +243,6 @@ class EnvironmentTests(TestCase):
             "GCP_GPU_PROVISIONER_SERVICE_ACCOUNT": "fixture-service-account",
             "GPU_RUNNER_GITHUB_APP_ID": "123",
             "GPU_RUNNER_GITHUB_APP_PRIVATE_KEY": "fixture-private-key",
-            "KAPSL_VLLM_SDK_REF": "a" * 40,
         }
 
     def test_valid_gpu_configuration_and_empty_optional_defaults(self):
@@ -240,7 +264,6 @@ class EnvironmentTests(TestCase):
             "GPU_RUNNER_GITHUB_APP_ID": "invalid-sensitive-value",
             "GCP_GPU_RUNNER_GROUP_ID": "0",
             "GCP_GPU_EXTERNAL_IP": "yes",
-            "KAPSL_VLLM_SDK_REF": "develop",
         }
         for name, value in bad.items():
             with self.subTest(name=name):
@@ -287,16 +310,17 @@ class BuildPlanTests(TestCase):
         self.addCleanup(temporary.cleanup)
         self.manifest = Path(temporary.name) / "Cargo.toml"
         self.manifest.write_text('[package]\nversion = "0.2.7"\n')
+        self.lock = Path(temporary.name) / "vllm-integration.lock"
+        self.lock.write_text("a" * 40 + "\n")
         self.values = {
             "RELEASE_VERSION": "0.2.7", "RELEASE_CHANNEL": "stable",
             "STABLE_RELEASE": "true", "CACHE_ONLY": "false",
-            "KAPSL_VLLM_SDK_REF": "a" * 40,
             "GITHUB_REF": "refs/tags/v0.2.7", "GITHUB_REF_TYPE": "tag",
             "GITHUB_REF_NAME": "v0.2.7", "GITHUB_EVENT_NAME": "push",
         }
 
     def test_stable_parallelizes_engine_and_backend_builds_without_rebuilding_ort(self):
-        version, matrix = build.plan(self.values, self.manifest)
+        version, matrix = build.plan(self.values, self.manifest, self.lock)
         self.assertEqual(version, "0.2.7")
         self.assertEqual([item["component"] for item in matrix["include"]],
                          ["engine", "llama-cpu", "llama-cuda12", "vllm"])
@@ -308,28 +332,37 @@ class BuildPlanTests(TestCase):
             "STABLE_RELEASE": "false", "RELEASE_CHANNEL": "beta",
             "RELEASE_VERSION": "0.2.7-beta.20260907.abcdef12",
             "GITHUB_REF": "refs/heads/develop", "GITHUB_REF_TYPE": "branch",
-        }, self.manifest)
+        }, self.manifest, self.lock)
         self.assertIn("beta", version)
         self.assertEqual(matrix["include"][-1]["component"], "ort-cpu")
         self.assertFalse(any("onnx" in item["component"] for item in matrix["include"]))
 
     def test_cache_warming_is_main_only_and_produces_no_vllm_or_ort_release_parts(self):
         values = self.values | {"CACHE_ONLY": "true", "STABLE_RELEASE": "false",
-                                "GITHUB_REF": "refs/heads/main", "KAPSL_VLLM_SDK_REF": ""}
-        self.assertEqual(len(build.plan(values, self.manifest)[1]["include"]), 3)
+                                "GITHUB_REF": "refs/heads/main"}
+        # Cache warming builds no vLLM pack, so it never reads the connector pin.
+        missing = self.lock.with_name("missing.lock")
+        self.assertEqual(len(build.plan(values, self.manifest, missing)[1]["include"]), 3)
         with self.assertRaisesRegex(ValueError, "restricted to main"):
-            build.plan(values | {"GITHUB_REF": "refs/heads/develop"}, self.manifest)
+            build.plan(values | {"GITHUB_REF": "refs/heads/develop"}, self.manifest, self.lock)
 
-    def test_invalid_stable_context_version_and_sdk_are_rejected(self):
+    def test_invalid_stable_context_version_and_connector_pin_are_rejected(self):
         for name, value in (
             ("GITHUB_EVENT_NAME", "workflow_dispatch"), ("GITHUB_EVENT_NAME", "pull_request"),
             ("GITHUB_REF_TYPE", "branch"), ("GITHUB_REF_NAME", "v0.2.7-beta.1"),
             ("RELEASE_VERSION", "0.2.8"), ("RELEASE_CHANNEL", "beta"),
-            ("RELEASE_VERSION", "0.2.7/../../invalid"), ("KAPSL_VLLM_SDK_REF", "main"),
+            ("RELEASE_VERSION", "0.2.7/../../invalid"),
             ("CACHE_ONLY", "yes"), ("STABLE_RELEASE", "yes"),
         ):
             with self.subTest(name=name, value=value), self.assertRaises(ValueError):
-                build.plan(self.values | {name: value}, self.manifest)
+                build.plan(self.values | {name: value}, self.manifest, self.lock)
+        with self.assertRaisesRegex(ValueError, "missing"):
+            build.plan(self.values, self.manifest, self.lock.with_name("missing.lock"))
+        for content in ("main\n", "a" * 39 + "\n", "A" * 40 + "\n",
+                        "a" * 40 + "\n" + "b" * 40 + "\n", ""):
+            self.lock.write_text(content)
+            with self.subTest(lock=content), self.assertRaisesRegex(ValueError, "40-hex"):
+                build.plan(self.values, self.manifest, self.lock)
 
 
 class AssemblyTests(TestCase):
@@ -521,7 +554,8 @@ class WorkflowTests(TestCase):
             caller_source = workflow(caller)
             self.assertIn("uses: ./.github/workflows/build-linux-accelerators.yml", job(caller_source, "build-cuda-runtime"))
             self.assertNotIn("cache_only:", job(caller_source, "build-cuda-runtime"))
-            self.assertIn("preflight_release_environment.py --signing --sdk", job(caller_source, "prepare-version"))
+            self.assertIn("preflight_release_environment.py --signing --vllm-integration",
+                          job(caller_source, "prepare-version"))
             self.assertEqual(caller_source.count("pattern: runtime-*"),
                              caller_source.count("name: Download installer artifacts"))
 
@@ -673,6 +707,133 @@ class CpuSmokeWorkflowTests(TestCase):
         self.assertNotIn("gpu-device-pool-integration.yml", self.source)
 
 
+def github_path_filter(patterns):
+    """Match paths the way GitHub's `paths` filter does: patterns apply in
+    order, a later `!pattern` excludes, `**/` may match zero directories and
+    `*` does not cross `/`."""
+    compiled = []
+    for pattern in patterns:
+        negated = pattern.startswith("!")
+        body = pattern[1:] if negated else pattern
+        regex = re.escape(body)
+        regex = regex.replace(r"\*\*/", "(?:.*/)?").replace(r"\*\*", ".*").replace(r"\*", "[^/]*")
+        compiled.append((negated, re.compile(regex + r"\Z")))
+
+    def matches(path):
+        included = False
+        for negated, regex in compiled:
+            if regex.match(path):
+                included = not negated
+        return included
+
+    return matches
+
+
+class LlamaCppCpuSmokeWorkflowTests(TestCase):
+    def setUp(self):
+        self.source = workflow("llama-cpp-cpu-conformance")
+        self.lock = json.loads((ROOT / ".github/llama-cpp-cpu-parity.lock.json").read_text())
+
+    def trigger(self, event):
+        block = self.source.split(f"  {event}:\n", 1)[1]
+        block = re.split(r"\n  [a-z_]+:\n", block, maxsplit=1)[0]
+        return github_path_filter(re.findall(r'^      - "([^"]+)"', block, re.MULTILINE))
+
+    def test_runtime_and_real_pack_inputs_run_the_parity_smoke(self):
+        for event in ("pull_request",):
+            matches = self.trigger(event)
+            for path in (
+                "rust-toolchain.toml", ".cargo/config.toml", "kapsl-runtime/Cargo.lock",
+                "kapsl-runtime/Cargo.toml", "kapsl-runtime/crates/kapsl-cli/Cargo.toml",
+                "kapsl-runtime/crates/kapsl-cli/src/backend/llama_cpp/mod.rs",
+                "kapsl-runtime/crates/kapsl-cli/src/runtime/model/backend.rs",
+                "kapsl-runtime/crates/kapsl-backend-llama-cpp/src/pack.rs",
+                "kapsl-runtime/include/kapsl_llama_cpp_backend.h",
+                ".github/llama-cpp-cpu-parity.lock.json", ".github/licenses/LLAMA-CPP-LICENSE",
+                ".github/scripts/certify-llama-cpp-cpu-parity.sh",
+                ".github/scripts/llama_cpp_cpu_parity.py",
+                ".github/scripts/generate-backend-index.py",
+                ".github/scripts/package-linux-llama-cpp-backend-packs.sh",
+            ):
+                with self.subTest(event=event, path=path):
+                    self.assertTrue(matches(path))
+
+    def test_documentation_and_test_only_changes_do_not_compile(self):
+        matches = self.trigger("pull_request")
+        for path in (
+            "kapsl-runtime/README.md", "kapsl-runtime/docs/configuration.md",
+            "kapsl-runtime/crates/kapsl-cli/README.md",
+            ".github/workflows/llama-cpp-cpu-conformance.yml",
+            ".github/scripts/test_llama_cpp_cpu_parity.py",
+            ".github/scripts/test_release_pipeline.py", "docs/architecture.md",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(matches(path))
+
+    def test_the_smoke_runs_cold_and_adds_no_actions_caches(self):
+        # The repository's Actions cache is over its limit; this non-required
+        # smoke must not save build or model caches that evict CI's caches.
+        triggers = self.source.split("\njobs:\n", 1)[0]
+        self.assertNotIn("\n  push:", triggers)
+        self.assertIn("\n  workflow_dispatch:", triggers)
+        for forbidden in ("cache-rust-build", "actions/cache", "Swatinem/rust-cache", "save-pr-cache"):
+            self.assertNotIn(forbidden, self.source)
+
+    def test_skipped_triggers_remain_covered_by_lightweight_checks(self):
+        triggers, steps = workflow("installer-smoke").split("\njobs:\n", 1)
+        for path in (
+            ".github/llama-cpp-cpu-parity.lock.json",
+            ".github/scripts/certify-llama-cpp-cpu-parity.sh",
+            ".github/scripts/llama_cpp_cpu_parity.py",
+            ".github/scripts/test_llama_cpp_cpu_parity.py",
+            ".github/workflows/llama-cpp-cpu-conformance.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'      - "{path}"', triggers)
+        self.assertIn("run: python3 .github/scripts/test_llama_cpp_cpu_parity.py", steps)
+
+    def test_the_model_is_pinned_and_verified_before_use(self):
+        model = self.lock["model"]
+        self.assertEqual(self.lock["schema_version"], 1)
+        self.assertRegex(model["commit"], r"\A[0-9a-f]{40}\Z")
+        self.assertRegex(model["sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(model["path"], r"\A[\w.-]+\.gguf\Z")
+        self.assertIn("/resolve/$MODEL_COMMIT/$MODEL_PATH", self.source)
+        self.assertLess(self.source.index("Verify pinned parity model"),
+                        self.source.index("Run embedded versus pack llama.cpp CPU parity"))
+        certify = (ROOT / ".github/scripts/certify-llama-cpp-cpu-parity.sh").read_text()
+        self.assertIn('sha256sum "$KAPSL_LLAMA_PARITY_MODEL"', certify)
+
+    def test_both_routes_run_offline_and_are_proven_by_their_logs(self):
+        certify = (ROOT / ".github/scripts/certify-llama-cpp-cpu-parity.sh").read_text()
+        self.assertIn("run_case embedded \"$reference_port\" 0 \"$model_package\"", certify)
+        self.assertIn("run_case pack \"$candidate_port\" 1 \"$bundle_path\"", certify)
+        self.assertIn("--offline", certify)
+        self.assertIn("Activated signed llama.cpp backend pack llama-cpp/cpu", certify)
+        self.assertIn("Using GgufBackend (llama.cpp)", certify)
+        # The default feature set is the one portable installers ship.
+        build = certify.split("cargo build", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("--features", build)
+        self.assertNotIn("--no-default-features", build)
+
+    def test_evidence_is_unconditional_and_the_job_is_host_only(self):
+        self.assertIn("if: always()", self.source)
+        self.assertIn("path: dist/llama-cpp-cpu-smoke", self.source)
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", self.source)
+        self.assertNotIn("self-hosted", self.source)
+        self.assertNotIn("secrets.", self.source)
+
+
+class GithubPathFilterTests(TestCase):
+    def test_later_negations_exclude_and_double_star_spans_zero_directories(self):
+        matches = github_path_filter(["kapsl-runtime/**", "!kapsl-runtime/**/*.md"])
+        self.assertTrue(matches("kapsl-runtime/src/main.rs"))
+        self.assertFalse(matches("kapsl-runtime/README.md"))
+        self.assertFalse(matches("kapsl-runtime/docs/a/b.md"))
+        self.assertFalse(matches("docs/README.md"))
+        self.assertFalse(github_path_filter(["*.md"])("docs/README.md"))
+
+
 class ConformanceToolingTests(TestCase):
     def test_ort_qualification_request_matches_the_utf8_tensor_contract(self):
         source = step(workflow("vllm-shared-pool-conformance"),
@@ -782,7 +943,6 @@ class ConformanceEvidenceTests(TestCase):
                 "RUNNER_TEMP": str(container_temp), "GITHUB_ENV": str(env_file),
                 "GITHUB_RUN_ID": "34111507622", "GITHUB_RUN_ATTEMPT": "2",
                 "GITHUB_REF": "refs/tags/v0.2.8", "GITHUB_SHA": "a" * 40,
-                "KAPSL_VLLM_SDK_REF": "b" * 40,
             }
             initializer = step(self.gpu, "Initialize isolated artifact paths")
             script = textwrap.dedent(initializer.split("        run: |\n", 1)[1])
@@ -811,6 +971,107 @@ class ConformanceEvidenceTests(TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("fixture")
             self.assertEqual(uploaded_files(), {context} | {output / relative for relative in evidence})
+
+
+class VllmIntegrationPinTests(TestCase):
+    """Release paths take the vLLM connector only from .github/vllm-integration.lock."""
+
+    RESOLVE = "Resolve certified vLLM integrations commit"
+
+    def test_lock_is_one_exact_commit_line(self):
+        content = (ROOT / ".github/vllm-integration.lock").read_bytes().decode()
+        self.assertRegex(content, r"\A[0-9a-f]{40}\r?\n\Z")
+
+    def test_no_release_path_reads_the_retired_sdk_ref(self):
+        sources = list(WORKFLOWS.glob("*.yml")) + [
+            path for path in (ROOT / ".github/scripts").iterdir()
+            if path.is_file() and not path.name.startswith(("test_", "test-"))
+        ]
+        for path in sources:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for retired in ("KAPSL_VLLM_SDK_REF", "KAPSL_VLLM_SDK_DIR", "sdk_ref", "sdk-ref",
+                            "sdk-vllm", "verify-managed-vllm-sdk-checkout"):
+                with self.subTest(path=path.name, retired=retired):
+                    self.assertNotIn(retired, text)
+
+    def test_build_resolves_the_lock_then_checks_out_verifies_and_packages(self):
+        source = workflow("build-linux-accelerators")
+        block = job(source, "components")
+        names = [self.RESOLVE, "Checkout certified vLLM connector",
+                 "Verify certified vLLM integrations checkout",
+                 "Package certified managed-vLLM backend"]
+        positions = [block.index(f"      - name: {name}\n") for name in names]
+        self.assertEqual(positions, sorted(positions))
+        for name in names:
+            self.assertIn("if: matrix.component == 'vllm'", step(block, name))
+        checkout = step(block, names[1])
+        self.assertIn("repository: kapsl-runtime/kapsl-integrations", checkout)
+        self.assertIn("ref: ${{ steps.vllm-integrations.outputs.ref }}", checkout)
+        self.assertIn(
+            'verify-vllm-integration-checkout.sh kapsl-integrations-vllm "$KAPSL_VLLM_INTEGRATIONS_REF"',
+            step(block, names[2]))
+        self.assertIn("KAPSL_VLLM_INTEGRATIONS_DIR: kapsl-integrations-vllm", step(block, names[3]))
+        prepare = job(source, "prepare")
+        self.assertIn("preflight_release_environment.py --vllm-integration", prepare)
+        self.assertLess(prepare.index("release_build_inputs.py"), prepare.index("--vllm-integration"))
+
+    def test_gpu_conformance_builds_the_connector_the_engine_commit_pins(self):
+        gpu = job(workflow("vllm-shared-pool-conformance"), "flash-attn")
+        self.assertLess(gpu.index("          path: engine\n"), gpu.index(self.RESOLVE))
+        self.assertLess(gpu.index(self.RESOLVE), gpu.index("Install pinned adapter and backend artifacts"))
+        checkout = step(gpu, "Checkout certified vLLM connector")
+        self.assertIn("repository: kapsl-runtime/kapsl-integrations", checkout)
+        self.assertIn("ref: ${{ steps.vllm-integrations.outputs.ref }}", checkout)
+        self.assertIn("kapsl-integrations-vllm/integrations/vllm",
+                      step(gpu, "Install pinned adapter and backend artifacts"))
+        dispatcher = workflow("gpu-device-pool-integration")
+        runner = job(dispatcher, "prepare-vllm-gcp-runner")
+        # The pinned commit must resolve before a GPU VM exists.
+        self.assertLess(runner.index("preflight_release_environment.py --vllm-integration"),
+                        runner.index("gcp_ephemeral_gpu_runner.py identity"))
+        for block in (job(dispatcher, "authorize-stable-release"),
+                      job(workflow("vllm-shared-pool-conformance"), "authorize-stable-release")):
+            self.assertIn("--vllm-integration-lock .github/vllm-integration.lock", block)
+
+    def resolve(self, name, job_name, lock, content):
+        """Run a workflow's real resolve step against one lock file."""
+        script = textwrap.dedent(
+            step(job(workflow(name), job_name), self.RESOLVE).split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / lock).parent.mkdir(parents=True)
+            (root / lock).write_bytes(content.encode())
+            (root / "evidence").mkdir()
+            (root / "evidence/run-context.txt").write_text("engine_sha=fixture\n")
+            values = os.environ | {"GITHUB_ENV": "github-env", "GITHUB_OUTPUT": "github-output",
+                                   "OUTPUT_DIR": "evidence"}
+            result = subprocess.run(["bash", "-c", script], cwd=root, env=values,
+                                    capture_output=True, text=True, check=False)
+            written = {relative: (root / relative).read_text() if (root / relative).exists() else ""
+                       for relative in ("github-env", "github-output", "evidence/run-context.txt")}
+            return result, written
+
+    def test_resolve_steps_export_the_pinned_commit_and_reject_anything_else(self):
+        ref = "c" * 40
+        for name, job_name, lock in (
+            ("build-linux-accelerators", "components", ".github/vllm-integration.lock"),
+            ("vllm-shared-pool-conformance", "flash-attn", "engine/.github/vllm-integration.lock"),
+        ):
+            for content in (ref + "\n", ref + "\r\n"):
+                with self.subTest(workflow=name, content=content):
+                    result, written = self.resolve(name, job_name, lock, content)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(written["github-env"], f"KAPSL_VLLM_INTEGRATIONS_REF={ref}\n")
+                    self.assertEqual(written["github-output"], f"ref={ref}\n")
+                    self.assertEqual(
+                        written["evidence/run-context.txt"],
+                        "engine_sha=fixture\n" + (f"integrations_ref={ref}\n" if job_name == "flash-attn" else ""))
+            for content in ("main\n", ref[:39] + "\n", ref.upper() + "\n", ""):
+                with self.subTest(workflow=name, rejected=content):
+                    result, written = self.resolve(name, job_name, lock, content)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(written["github-env"] + written["github-output"], "")
+                    self.assertEqual(written["evidence/run-context.txt"], "engine_sha=fixture\n")
 
 
 if __name__ == "__main__":

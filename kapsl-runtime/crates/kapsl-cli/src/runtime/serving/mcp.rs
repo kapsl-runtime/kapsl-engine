@@ -3,8 +3,20 @@
 use super::*;
 use kapsl_mcp::{
     AuthorizationError as McpAuthorizationError, EngineFacade, McpServerConfig, McpServerHandle,
-    RequestAuthorizer,
+    Principal, RequestAuthorizer,
 };
+
+/// Scopes an MCP client's session id to the principal issued by
+/// [`RuntimeMcpAuthorizer`], using the same derivation as HTTP and gRPC.
+pub(crate) fn scope_mcp_session_id(
+    principal: &Principal,
+    session_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let principal = principal
+        .downcast_ref::<ApiPrincipal>()
+        .ok_or_else(|| "MCP request principal was not issued by the engine".to_string())?;
+    Ok(principal.scope_session_id(session_id))
+}
 
 struct RuntimeMcpEngine {
     models: Arc<ModelManager>,
@@ -30,18 +42,25 @@ impl EngineFacade for RuntimeMcpEngine {
             .registry()
             .list()
             .into_iter()
-            .filter(|model| self.models.contains_pool(model.id))
+            .filter(|model| self.models.can_serve(model.id))
             .collect::<Vec<_>>();
         serde_json::to_value(models).map_err(|error| error.to_string())
     }
 
     async fn infer(
         &self,
+        principal: &Principal,
         model_id: u32,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        if !self.models.contains_pool(model_id) {
-            return Err(format!("Model {model_id} is not loaded"));
+        // With idle reload on, a model stopped for being idle is loaded
+        // again before the request is served.
+        match self.inference.ensure_loaded(model_id).await {
+            Ok(()) => {}
+            Err(IdleReloadError::NotLoaded) => {
+                return Err(format!("Model {model_id} is not loaded"));
+            }
+            Err(error) => return Err(error.to_string()),
         }
         let model = self
             .models
@@ -55,11 +74,7 @@ impl EngineFacade for RuntimeMcpEngine {
         )
         .map_err(|error| error.to_string())?;
 
-        // Authentication happens at the MCP transport boundary, while the
-        // current engine session namespace is credential-derived. Until the
-        // facade carries a principal identity, do not accept a client-selected
-        // session that could cross credential boundaries.
-        request.session_id = None;
+        request.session_id = scope_mcp_session_id(principal, request.session_id.as_deref())?;
         let priority = self.inference.priority_for_request(&request);
         let force_cpu = request
             .metadata
@@ -90,7 +105,7 @@ impl RequestAuthorizer for RuntimeMcpAuthorizer {
         &self,
         authorization: Option<&str>,
         remote_ip: IpAddr,
-    ) -> Result<(), McpAuthorizationError> {
+    ) -> Result<Principal, McpAuthorizationError> {
         authorize_api_request(
             &self.auth_state,
             ApiRole::Reader,
@@ -98,7 +113,7 @@ impl RequestAuthorizer for RuntimeMcpAuthorizer {
             authorization,
             Some(remote_ip),
         )
-        .map(|_| ())
+        .map(|access| Principal::new(access.principal))
         .map_err(|error| match error {
             ApiAuthorizationError::Unauthorized => McpAuthorizationError::Unauthorized,
             ApiAuthorizationError::Forbidden => McpAuthorizationError::Forbidden,

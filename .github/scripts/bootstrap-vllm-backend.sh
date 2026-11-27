@@ -69,8 +69,8 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.7.0",
-    "connector": "0.7.0",
+    "connector_distribution": "0.7.2",
+    "connector": "0.7.2",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
     "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
     "kv_abi": {"major": 1, "minor": 5},
@@ -82,11 +82,12 @@ if actual != expected:
     raise SystemExit(
         f"managed-vLLM installed manifest mismatch: {actual!r} != {expected!r}"
     )
-sdk_ref = manifest.get("sdk_ref")
-if not isinstance(sdk_ref, str) or re.fullmatch(r"[0-9a-f]{40}", sdk_ref) is None:
+# The kapsl-integrations commit the connector wheel was built from.
+ref = manifest.get("integrations_ref")
+if not isinstance(ref, str) or re.fullmatch(r"[0-9a-f]{40}", ref) is None:
     raise SystemExit(
-        "managed-vLLM installed manifest sdk_ref must be an exact lowercase "
-        f"40-hex commit, got {sdk_ref!r}"
+        "managed-vLLM installed manifest integrations_ref must be an exact "
+        f"lowercase 40-hex commit, got {ref!r}"
     )
 PY
 "$staging_python" -m pip install \
@@ -99,7 +100,7 @@ PY
   "torchvision==0.28.0+cu130" \
   "torchaudio==2.11.0+cu130" \
   "vllm==0.26.1rc1.dev1130+g2ec6f0d71" \
-  "kapsl-vllm-connector==0.7.0"
+  "kapsl-vllm-connector==0.7.2"
 "$staging_python" -m pip check
 
 "$staging_python" <<'PY'
@@ -135,8 +136,8 @@ expected = {
     "torchvision": "0.28.0+cu130",
     "torchaudio": "2.11.0+cu130",
     "vllm": "0.26.1rc1.dev1130+g2ec6f0d71",
-    "connector_distribution": "0.7.0",
-    "connector": "0.7.0",
+    "connector_distribution": "0.7.2",
+    "connector": "0.7.2",
     "profile": "vllm-v1-packed-cuda-ipc/flash-attn",
     "elastic_profile": "vllm-v1-packed-cuda-vmm/flash-attn-blnhc",
     "kv_abi": {"major": 1, "minor": 5},

@@ -24,17 +24,12 @@ const MAX_TOKENS_PER_REQUEST: usize = 300_000;
 pub(crate) struct EmbeddingsConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
-    pub(crate) log_sensitive_ids: bool,
 }
 
 pub(crate) fn build_embeddings_route(
     config: EmbeddingsConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let EmbeddingsConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    } = config;
+    let EmbeddingsConfig { models, inference } = config;
     let tokenizer_cache = Arc::new(TokenizerCache::default());
 
     warp::path!("v1" / "embeddings")
@@ -58,7 +53,6 @@ pub(crate) fn build_embeddings_route(
                             &models,
                             &inference,
                             &tokenizer_cache,
-                            log_sensitive_ids,
                         )
                         .await,
                     )
@@ -744,8 +738,10 @@ fn decode_embedding_output(
 
     let values = packet
         .data
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     if values.iter().any(|value| !value.is_finite()) {
         return Err("Embedding backend returned a non-finite value".to_string());
@@ -808,7 +804,6 @@ fn supports_embeddings(model: &ModelInfo) -> bool {
                 .is_some_and(|kind| kind.eq_ignore_ascii_case("embedding")))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_embeddings(
     body: warp::hyper::body::Bytes,
     session_header: Option<String>,
@@ -816,7 +811,6 @@ async fn handle_embeddings(
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
     tokenizer_cache: &Arc<TokenizerCache>,
-    log_sensitive_ids: bool,
 ) -> warp::reply::Response {
     use warp::http::StatusCode;
 
@@ -875,6 +869,9 @@ async fn handle_embeddings(
         );
     }
 
+    if let Err(response) = ensure_model_loaded(inference, &resolved).await {
+        return response;
+    }
     let Some(pool) = models.pool(resolved.id) else {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -979,10 +976,6 @@ async fn handle_embeddings(
             return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
         }
     };
-    let session_id_for_log = redact_identifier_for_logs(
-        client_session_id.as_deref().unwrap_or("-"),
-        log_sensitive_ids,
-    );
 
     let mut embeddings = Vec::with_capacity(requests.len());
     for request in requests {
@@ -993,17 +986,15 @@ async fn handle_embeddings(
                 let status = status_code_for_engine_error(&error);
                 if status == StatusCode::INTERNAL_SERVER_ERROR {
                     log::error!(
-                        "Embedding failed: model_id={} session_id={} status={} error={}",
+                        "Embedding failed: model_id={} status={} error={}",
                         resolved.id,
-                        session_id_for_log,
                         status.as_u16(),
                         error
                     );
                 } else {
                     log::warn!(
-                        "Embedding rejected: model_id={} session_id={} status={} error={}",
+                        "Embedding rejected: model_id={} status={} error={}",
                         resolved.id,
-                        session_id_for_log,
                         status.as_u16(),
                         error
                     );
@@ -1126,8 +1117,10 @@ mod tests {
         let decode_i64 = |packet: &BinaryTensorPacket| {
             packet
                 .data
-                .chunks_exact(8)
-                .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|bytes| i64::from_ne_bytes(*bytes))
                 .collect::<Vec<_>>()
         };
 

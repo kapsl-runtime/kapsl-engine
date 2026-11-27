@@ -693,8 +693,13 @@ describes the minimum/mapped/maximum blocks, VMM granularity and segments, and
 generation-bound resize stages. Growth maps and zeroes workers first, then
 publishes scheduler blocks; shrink retires a native-free scheduler tail first,
 then unmaps workers and lowers physical accounting. Target and speculative
-forwards share a resize lock. Timeouts and ambiguous detach fence routing and
-retain the charge.
+forwards share a resize lock. With vLLM's async scheduling two model batches
+are in flight, and a block can be free in the scheduler while a batch that was
+scheduled earlier has yet to write it. The scheduler then retires the tail in
+two parts: it removes the tail from the free blocks, and it acknowledges the
+retirement only after every worker has reported running every batch scheduled
+up to that point. The acknowledgement is what releases the unmap. Timeouts and
+ambiguous detach fence routing and retain the charge.
 
 The elastic profile remains disabled outside an explicit package policy and
 exact conformance allowlist. The GPU workflow must prove stable addresses,

@@ -30,6 +30,11 @@ on:
       - ".github/scripts/test-llama-cpp-backend-release-contract.sh"
       - ".github/scripts/benchmark-llama-cpp-backend-pack.py"
       - ".github/scripts/certify-llama-cpp-backend-pack-performance.sh"
+      - ".github/llama-cpp-cpu-parity.lock.json"
+      - ".github/scripts/certify-llama-cpp-cpu-parity.sh"
+      - ".github/scripts/llama_cpp_cpu_parity.py"
+      - ".github/scripts/test_llama_cpp_cpu_parity.py"
+      - ".github/workflows/llama-cpp-cpu-conformance.yml"
       - ".github/scripts/test-gpu-device-pool-integration.sh"
       - ".github/workflows/lazy-llama-cpp-backend-pack-gpu-certification.yml"
       - ".github/licenses/LLAMA-CPP-LICENSE"
@@ -44,6 +49,9 @@ on:
       - "kapsl-runtime/crates/kapsl-backend-llama-cpp/**"
       - ".github/scripts/bootstrap-vllm-backend.sh"
       - ".github/scripts/package-linux-vllm-backend.sh"
+      - ".github/scripts/verify-vllm-integration-checkout.sh"
+      - ".github/scripts/test-verify-vllm-integration-checkout.sh"
+      - ".github/vllm-integration.lock"
       - ".github/scripts/managed-vllm-cu130.lock"
       - ".github/scripts/test-bootstrap-vllm-backend.sh"
       - ".github/scripts/test-managed-vllm-release-contract.sh"
@@ -205,8 +213,8 @@ jobs:
           bash -n .github/scripts/package-linux-vllm-backend.sh
           bash -n .github/scripts/test-bootstrap-vllm-backend.sh
           bash -n .github/scripts/test-managed-vllm-release-contract.sh
-          bash -n .github/scripts/verify-managed-vllm-sdk-checkout.sh
-          bash -n .github/scripts/test-verify-managed-vllm-sdk-checkout.sh
+          bash -n .github/scripts/verify-vllm-integration-checkout.sh
+          bash -n .github/scripts/test-verify-vllm-integration-checkout.sh
           bash -n .github/scripts/test-verify-managed-vllm-connector-wheel.sh
           bash -n .github/scripts/test-generate-backend-index.sh
           bash -n .github/scripts/verify-public-backend-release.sh
@@ -232,79 +240,109 @@ jobs:
           python3 -m py_compile .github/scripts/test_validate_model_package_backend.py
 
       - name: Test llama.cpp performance threshold math
+        if: ${{ !cancelled() }}
         run: .github/scripts/benchmark-llama-cpp-backend-pack.py self-test
 
       - name: Test merged accelerator selection and compatibility
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-install-script.sh
 
       - name: Test merged CUDA archive contents
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-package-linux-cuda-runtime.sh
 
       - name: Test certified ORT CPU release handoff
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-package-linux-ort-cpu-backend.sh
 
       - name: Test certified ORT accelerator release handoff
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-package-linux-ort-accelerator-backends.sh
 
       - name: Test immutable signed backend-release import
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_import_signed_backend_release.py
 
       - name: Test exact ORT integrations checkout verification
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-verify-ort-integration-checkout.sh
 
       - name: Test legacy ONNX accelerator packs
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-package-linux-onnx-backend-packs.sh
 
       - name: Test ONNX backend release contract
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-onnx-backend-release-contract.sh
 
       - name: Test fast release preflight, build isolation and artifact assembly
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_release_pipeline.py
 
       - name: Test native llama.cpp backend packs
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-package-linux-llama-cpp-backend-packs.sh
 
       - name: Test llama.cpp backend release contract
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-llama-cpp-backend-release-contract.sh
 
+      - name: Test llama.cpp CPU parity helper
+        if: ${{ !cancelled() }}
+        run: python3 .github/scripts/test_llama_cpp_cpu_parity.py
+
       - name: Test managed-vLLM backend bootstrap
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-bootstrap-vllm-backend.sh
 
       - name: Test managed-vLLM release pins
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-managed-vllm-release-contract.sh
 
-      - name: Test managed-vLLM SDK checkout verification
-        run: .github/scripts/test-verify-managed-vllm-sdk-checkout.sh
+      - name: Test exact vLLM integrations checkout verification
+        if: ${{ !cancelled() }}
+        run: .github/scripts/test-verify-vllm-integration-checkout.sh
 
       - name: Test managed-vLLM connector wheel verification
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-verify-managed-vllm-connector-wheel.sh
 
       - name: Test managed-vLLM GPU conformance evidence parser
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_managed_vllm_gpu_conformance.py
 
       - name: Test managed-vLLM bridge performance gate math
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_managed_vllm_bridge_benchmark.py
 
       - name: Test managed-vLLM scaling evidence parser
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_managed_vllm_scaling_conformance.py
 
       - name: Test managed-vLLM mixed-backend memory gates
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_certify_mixed_backend_concurrency.py
 
       - name: Test ephemeral GCE GPU runner lifecycle
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_gcp_ephemeral_gpu_runner.py
 
       - name: Test GitHub JIT runner lifecycle
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_github_jit_runner.py
 
       - name: Test model-package serving contract validation
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_validate_model_package_backend.py
 
       - name: Install backend-index hash verifier
+        if: ${{ !cancelled() }}
         run: python3 -m pip install -r .github/requirements-backend-index.txt
 
       - name: Test signed BLAKE3 metadata validation
+        if: ${{ !cancelled() }}
         run: python3 .github/scripts/test_backend_index_blake3.py
 
       - name: Test signed backend-index generation
+        if: ${{ !cancelled() }}
         run: .github/scripts/test-generate-backend-index.sh

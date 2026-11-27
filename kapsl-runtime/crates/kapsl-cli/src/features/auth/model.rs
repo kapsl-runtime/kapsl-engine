@@ -28,6 +28,11 @@ pub(crate) enum ApiAuthorizationError {
 pub(crate) struct AuthorizedAccess {
     pub(crate) grant: ApiAuthGrant,
     pub(crate) mode: &'static str,
+    /// Hashed identity of the authorizing credential, for session scoping.
+    /// Only the MCP adapter consumes it so far; HTTP and gRPC routes still
+    /// derive it from the raw header via `scope_session_id_for_authorization`.
+    #[cfg_attr(not(feature = "mcp-server"), allow(dead_code))]
+    pub(crate) principal: ApiPrincipal,
 }
 
 impl ApiAuthGrant {
@@ -98,6 +103,38 @@ impl ApiRoleTokenConfig {
             return Err("admin_token is required when role auth is enabled".to_string());
         }
         Ok(())
+    }
+}
+
+/// Whether one role has a token configured. Responses carry this instead of
+/// the token, so reading the role configuration never reveals a credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ApiRoleTokenState {
+    pub(crate) configured: bool,
+}
+
+/// What `GET` and `POST /api/auth/roles` return. Token values are accepted on
+/// `POST` through [`ApiRoleTokenConfig`] and are never serialized back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ApiRoleTokenStatus {
+    pub(crate) reader: ApiRoleTokenState,
+    pub(crate) writer: ApiRoleTokenState,
+    pub(crate) admin: ApiRoleTokenState,
+}
+
+impl ApiRoleTokenConfig {
+    pub(crate) fn status(&self) -> ApiRoleTokenStatus {
+        ApiRoleTokenStatus {
+            reader: ApiRoleTokenState {
+                configured: self.reader_token.is_some(),
+            },
+            writer: ApiRoleTokenState {
+                configured: self.writer_token.is_some(),
+            },
+            admin: ApiRoleTokenState {
+                configured: self.admin_token.is_some(),
+            },
+        }
     }
 }
 

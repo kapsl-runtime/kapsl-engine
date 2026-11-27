@@ -7,6 +7,10 @@ use flate2::Compression;
 use futures::StreamExt;
 use infer_adapter::{default_request_adapter_registry, parse_inference_request_with_registry};
 use kapsl_backends::BackendFactory;
+use kapsl_communication::ipc::{IpcServer, TcpServer};
+use kapsl_communication::shm::memory::ShmManager;
+use kapsl_communication::shm::{SchedulerSnapshot, ShmServer};
+use kapsl_communication::transport::TransportServer;
 use kapsl_core::loader::Manifest;
 use kapsl_core::{
     AutoScaler, EngineKind, ModelInfo, ModelRegistry, ModelStatus, PackageLoader, ScalingPolicy,
@@ -16,7 +20,6 @@ use kapsl_engine_api::{
     EngineModelInfo, InferenceRequest, TensorDtype,
 };
 use kapsl_hal::device::DeviceInfo;
-use kapsl_ipc::{IpcServer, TcpServer};
 use kapsl_llm::block_manager::{new_shared_allocator, SharedBlockAllocator};
 use kapsl_llm::global_scheduler::{EngineHandle as KvEngineHandle, GlobalKvScheduler};
 use kapsl_llm::llm_backend::LLMBackend;
@@ -32,9 +35,6 @@ use kapsl_scheduler::{
     determine_priority, PoolStrategy, ReplicaPool, ReplicaScheduler,
     RequestMetadata as SchedulerRequestMetadata, Scheduler,
 };
-use kapsl_shm::memory::ShmManager;
-use kapsl_shm::{SchedulerSnapshot, ShmServer};
-use kapsl_transport::TransportServer;
 use parking_lot::{Mutex, RwLock};
 use prometheus::Registry;
 use rand::rngs::OsRng;
@@ -105,7 +105,19 @@ async fn main() -> Result<(), DynError> {
     observability::init()?;
     config.validate_and_log()?;
 
-    let device_info = Arc::new(DeviceInfo::probe());
+    let mut device_info = DeviceInfo::probe();
+    // kapsl-hal reads the CUDA version from `nvidia-smi`, which can exceed its
+    // probe timeout (Cloud Run L4: 1.4 s). Without a version, manifests with
+    // `min_cuda_version` reject the device, so fill it from NVML.
+    fill_cuda_versions(
+        device_info
+            .devices
+            .iter_mut()
+            .filter(|device| matches!(device.backend, kapsl_hal::device::DeviceBackend::Cuda))
+            .map(|device| &mut device.cuda_version),
+        nvml_cuda_version,
+    );
+    let device_info = Arc::new(device_info);
     RuntimeBootstrap::new(config, device_info)
         .prepare()
         .await?

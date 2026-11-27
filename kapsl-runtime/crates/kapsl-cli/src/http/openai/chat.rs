@@ -47,7 +47,6 @@ impl ManagedVllmOpenAiMode {
 pub(crate) struct ChatCompletionsConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
-    pub(crate) log_sensitive_ids: bool,
 }
 
 enum BoundedChatBody {
@@ -67,7 +66,7 @@ where
     B: Buf,
 {
     futures::pin_mut!(body);
-    let limit = kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES;
+    let limit = kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES;
     let mut collected = Vec::new();
     while let Some(chunk) = body.next().await {
         let mut chunk = match chunk {
@@ -94,11 +93,7 @@ where
 pub(crate) fn build_chat_completions_route(
     config: ChatCompletionsConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let ChatCompletionsConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    } = config;
+    let ChatCompletionsConfig { models, inference } = config;
     let managed_vllm_mode = ManagedVllmOpenAiMode::from_environment();
 
     warp::path!("v1" / "chat" / "completions")
@@ -123,7 +118,6 @@ pub(crate) fn build_chat_completions_route(
                             authorization,
                             &models,
                             &inference,
-                            log_sensitive_ids,
                             managed_vllm_mode,
                         )
                         .await,
@@ -135,7 +129,6 @@ pub(crate) fn build_chat_completions_route(
         .boxed()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_chat_completion(
     body: BoundedChatBody,
     ingress_started: std::time::Instant,
@@ -143,7 +136,6 @@ async fn handle_chat_completion(
     authorization: Option<String>,
     models: &Arc<ModelManager>,
     inference: &Arc<InferenceService>,
-    log_sensitive_ids: bool,
     managed_vllm_mode: ManagedVllmOpenAiMode,
 ) -> warp::reply::Response {
     use warp::http::StatusCode;
@@ -155,7 +147,7 @@ async fn handle_chat_completion(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
                     "Chat completion payload exceeds the {}-byte limit",
-                    kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
+                    kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
                 ),
                 "invalid_request_error",
             );
@@ -201,6 +193,9 @@ async fn handle_chat_completion(
         }
     };
 
+    if let Err(response) = ensure_model_loaded(inference, &resolved).await {
+        return response;
+    }
     if models.pool(resolved.id).is_none() {
         return openai_error(
             StatusCode::NOT_FOUND,
@@ -225,6 +220,7 @@ async fn handle_chat_completion(
     // KV affinity: an explicit session header wins, else the OpenAI end-user id.
     // The internal key is credential-scoped because both values are controlled
     // by the client and must not collide across authentication principals.
+    // Neither value is ever logged: the end-user id is client PII.
     let client_session_id = session_header
         .map(|session| session.trim().to_string())
         .filter(|session| !session.is_empty())
@@ -236,10 +232,6 @@ async fn handle_chat_completion(
         });
     let scoped_session_id =
         scope_session_id_for_authorization(client_session_id.as_deref(), authorization.as_deref());
-    let session_id_for_log = redact_identifier_for_logs(
-        client_session_id.as_deref().unwrap_or("-"),
-        log_sensitive_ids,
-    );
 
     if is_managed_vllm && managed_vllm_mode == ManagedVllmOpenAiMode::Wire {
         if let Some(object) = normalized_body.as_object_mut() {
@@ -262,7 +254,6 @@ async fn handle_chat_completion(
             stream: chat.stream,
             request_id,
             session_id: scoped_session_id,
-            session_id_for_log,
         })
         .await;
     }
@@ -335,7 +326,6 @@ async fn handle_chat_completion(
             stops,
             prompt_tokens,
             include_usage,
-            session_id_for_log,
         })
         .await;
     }
@@ -368,17 +358,15 @@ async fn handle_chat_completion(
             let status = status_code_for_engine_error(&error);
             if status == StatusCode::INTERNAL_SERVER_ERROR {
                 log::error!(
-                    "Chat completion failed: model_id={} session_id={} status={} error={}",
+                    "Chat completion failed: model_id={} status={} error={}",
                     resolved.id,
-                    session_id_for_log,
                     status.as_u16(),
                     error
                 );
             } else {
                 log::warn!(
-                    "Chat completion rejected: model_id={} session_id={} status={} error={}",
+                    "Chat completion rejected: model_id={} status={} error={}",
                     resolved.id,
-                    session_id_for_log,
                     status.as_u16(),
                     error
                 );
@@ -396,7 +384,6 @@ struct ManagedVllmWireArgs {
     stream: bool,
     request_id: String,
     session_id: Option<String>,
-    session_id_for_log: String,
 }
 
 async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Response {
@@ -408,7 +395,6 @@ async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Resp
         stream,
         request_id,
         session_id,
-        session_id_for_log,
     } = args;
 
     let metadata = OpenAiWireMetadata {
@@ -420,7 +406,7 @@ async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Resp
     let generation_cap = match inference.openai_wire_generation_cap(priority) {
         Ok(cap) => cap,
         Err(error) => {
-            return logged_wire_error(model_id, &session_id_for_log, error, "admission");
+            return logged_wire_error(model_id, error, "admission");
         }
     };
     if let Some(cap) = generation_cap {
@@ -447,8 +433,8 @@ async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Resp
             .with_metadata(metadata);
     request.session_id = session_id;
     request.cancellation = Some(kapsl_engine_api::CancellationToken::new());
-    if let Err(error) =
-        request.validate(kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+    if let Err(error) = request
+        .validate(kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
     {
         return openai_error(
             status_code_for_engine_error(&error),
@@ -465,7 +451,7 @@ async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Resp
             Ok(response) => wire_stream_response(response).unwrap_or_else(|error| {
                 openai_error(warp::http::StatusCode::BAD_GATEWAY, error, "server_error")
             }),
-            Err(error) => logged_wire_error(model_id, &session_id_for_log, error, "stream start"),
+            Err(error) => logged_wire_error(model_id, error, "stream start"),
         }
     } else {
         match inference
@@ -475,7 +461,7 @@ async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Resp
             Ok(response) => wire_buffered_response(response).unwrap_or_else(|error| {
                 openai_error(warp::http::StatusCode::BAD_GATEWAY, error, "server_error")
             }),
-            Err(error) => logged_wire_error(model_id, &session_id_for_log, error, "request"),
+            Err(error) => logged_wire_error(model_id, error, "request"),
         }
     }
 }
@@ -503,21 +489,16 @@ fn apply_wire_generation_cap(body: &mut serde_json::Value, cap: u32) {
     }
 }
 
-fn logged_wire_error(
-    model_id: u32,
-    session_id_for_log: &str,
-    error: EngineError,
-    stage: &str,
-) -> warp::reply::Response {
+fn logged_wire_error(model_id: u32, error: EngineError, stage: &str) -> warp::reply::Response {
     let status = status_code_for_engine_error(&error);
     if status == warp::http::StatusCode::INTERNAL_SERVER_ERROR {
         log::error!(
-            "Managed vLLM wire {stage} failed: model_id={model_id} session_id={session_id_for_log} status={} error={error}",
+            "Managed vLLM wire {stage} failed: model_id={model_id} status={} error={error}",
             status.as_u16()
         );
     } else {
         log::warn!(
-            "Managed vLLM wire {stage} rejected: model_id={model_id} session_id={session_id_for_log} status={} error={error}",
+            "Managed vLLM wire {stage} rejected: model_id={model_id} status={} error={error}",
             status.as_u16()
         );
     }
@@ -574,7 +555,6 @@ struct StreamChatArgs {
     stops: Vec<String>,
     prompt_tokens: u64,
     include_usage: bool,
-    session_id_for_log: String,
 }
 
 /// Stream real token deltas as `chat.completion.chunk` events.
@@ -596,7 +576,6 @@ async fn stream_chat_completion(args: StreamChatArgs) -> warp::reply::Response {
         stops,
         prompt_tokens,
         include_usage,
-        session_id_for_log,
     } = args;
 
     let stream = match inference
@@ -607,9 +586,8 @@ async fn stream_chat_completion(args: StreamChatArgs) -> warp::reply::Response {
         Err(error) => {
             let status = status_code_for_engine_error(&error);
             log::warn!(
-                "Chat completion stream start failed: model_id={} session_id={} status={} error={}",
+                "Chat completion stream start failed: model_id={} status={} error={}",
                 model_id,
-                session_id_for_log,
                 status.as_u16(),
                 error
             );
@@ -879,7 +857,11 @@ mod tests {
 
     #[tokio::test]
     async fn chat_body_filter_rejects_before_buffering_above_the_wire_limit() {
-        let body = vec![b'x'; kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES + 1];
+        let body = vec![
+            b'x';
+            kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
+                + 1
+        ];
         let result = warp::test::request()
             .method("POST")
             .body(body)

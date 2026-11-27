@@ -15,7 +15,7 @@ pub(crate) struct PriorityReclaimResult {
     pub(crate) released_bytes: usize,
 }
 
-fn model_authority_bytes(snapshot: &MemorySnapshot, model_id: u32) -> usize {
+pub(super) fn model_authority_bytes(snapshot: &MemorySnapshot, model_id: u32) -> usize {
     snapshot
         .rows
         .iter()
@@ -33,6 +33,9 @@ pub(crate) async fn reclaim_one_lower_priority_model(
     models: &Arc<ModelManager>,
     resources: &Arc<RuntimeResources>,
 ) -> Option<PriorityReclaimResult> {
+    if !failure.is_reclaimable() {
+        return None;
+    }
     let _reclamation = resources.priority().lock_reclamation().await;
     let snapshot = resources.memory().snapshot();
     let candidates = resources.priority().reclaim_candidates(

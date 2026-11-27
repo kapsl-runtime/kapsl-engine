@@ -19,10 +19,10 @@ use types::openai_error;
 pub(crate) struct OpenAiRoutesConfig {
     pub(crate) models: Arc<ModelManager>,
     pub(crate) inference: Arc<InferenceService>,
-    pub(crate) log_sensitive_ids: bool,
 }
 
-/// A model that is loaded, has a live pool, and can serve inference.
+/// A model that can serve inference: it has a live pool, or it was stopped for
+/// being idle and the next request reloads it.
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedModel {
     pub(crate) id: u32,
@@ -45,15 +45,47 @@ pub(crate) fn resolve_model(
     resolve_model_from(&served, requested)
 }
 
-/// The models that are both registered and backed by a live pool. Anything
-/// else cannot serve a request, so it is not addressable and not advertised.
+/// The models that are registered and can serve a request: backed by a live
+/// pool, or stopped for being idle with reload on request. Anything else is
+/// not addressable and not advertised.
 fn served_models(models: &ModelManager) -> Vec<ModelInfo> {
     models
         .registry()
         .list()
         .into_iter()
-        .filter(|model| models.contains_pool(model.id))
+        .filter(|model| models.can_serve(model.id))
         .collect()
+}
+
+/// Reload the resolved model first when the idle unloader stopped it. `Err`
+/// is the response to send when that reload fails. A model that is simply
+/// not loaded is left to each route's existing handling.
+async fn ensure_model_loaded(
+    inference: &InferenceService,
+    model: &ResolvedModel,
+) -> Result<(), warp::reply::Response> {
+    use warp::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
+
+    let error = match inference.ensure_loaded(model.id).await {
+        Ok(()) | Err(IdleReloadError::NotLoaded) => return Ok(()),
+        Err(error) => error,
+    };
+    // A model whose memory is in use is temporarily unavailable, not gone.
+    let status = match error {
+        IdleReloadError::MemoryUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let mut response = openai_error(
+        status,
+        format!("The model '{}' is not ready: {error}", model.name),
+        "server_error",
+    );
+    if let Some(seconds) = error.retry_after_seconds() {
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from(seconds));
+    }
+    Err(response)
 }
 
 fn resolve_model_from(served: &[ModelInfo], requested: &str) -> Result<ResolvedModel, String> {
@@ -136,11 +168,7 @@ fn model_object(model: &ModelInfo) -> serde_json::Value {
 pub(crate) fn build_openai_routes(
     config: OpenAiRoutesConfig,
 ) -> warp::filters::BoxedFilter<(warp::reply::Response,)> {
-    let OpenAiRoutesConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    } = config;
+    let OpenAiRoutesConfig { models, inference } = config;
 
     // GET /v1/models
     let models_for_list = models.clone();
@@ -185,18 +213,13 @@ pub(crate) fn build_openai_routes(
     let chat_completions = chat::build_chat_completions_route(chat::ChatCompletionsConfig {
         models: models.clone(),
         inference: inference.clone(),
-        log_sensitive_ids,
     });
     let embeddings = embeddings::build_embeddings_route(embeddings::EmbeddingsConfig {
         models: models.clone(),
         inference: inference.clone(),
-        log_sensitive_ids,
     });
-    let responses = responses::build_responses_route(responses::ResponsesConfig {
-        models,
-        inference,
-        log_sensitive_ids,
-    });
+    let responses =
+        responses::build_responses_route(responses::ResponsesConfig { models, inference });
 
     list_models
         .or(get_model)

@@ -13,8 +13,8 @@ use crate::backend::{
 };
 use crate::backend::{
     embedded_onnx_rollback_reason, generic_native_backend_packs_enabled,
-    onnx_backend_pack_requirements, onnx_lazy_packs_supported_for_platform,
-    onnx_pack_profile_for_target,
+    generic_native_backend_packs_enabled_for, onnx_backend_pack_requirements,
+    onnx_lazy_packs_supported_for_platform, onnx_pack_profile_for_target,
 };
 use crate::backend::{
     inspect_serving_manifest, resolve_serving_backend, validate_model_contract,
@@ -129,7 +129,7 @@ fn create_bundle(
 
     let (target, target_manifest) = resolve_bundle_target(args.target.as_deref(), detected)?;
     let (index, index_bytes, index_signature) = manager.verified_index_material()?;
-    let signed_onnx_route = generic_native_backend_packs_enabled()?;
+    let signed_onnx_route = generic_native_backend_packs_enabled_for(&target.platform)?;
 
     let scratch = tempfile::tempdir_in(output_parent)?;
     let mut models = Vec::with_capacity(args.model.len());
@@ -742,43 +742,13 @@ fn resolve_bundle_target(
     device_info: &DeviceInfo,
 ) -> Result<(BackendTarget, BundleTarget), DynError> {
     if let Some(requested) = requested {
-        let (platform, accelerator) = [
-            ("-tensorrt", BackendAccelerator::TensorRt),
-            ("-cuda", BackendAccelerator::Cuda),
-            ("-cpu", BackendAccelerator::Cpu),
-        ]
-        .into_iter()
-        .find_map(|(suffix, accelerator)| {
-            requested
-                .strip_suffix(suffix)
-                .map(|platform| (platform.to_string(), accelerator))
-        })
-        .ok_or_else(|| {
-            format!(
-                "Invalid bundle target `{requested}`; expected <os>-<architecture>-cpu, -cuda, or -tensorrt"
-            )
-        })?;
-        let architecture = platform
-            .rsplit_once('-')
-            .map(|(_, architecture)| architecture.to_string())
-            .ok_or_else(|| format!("Invalid bundle platform `{platform}`"))?;
-        let target = BackendTarget {
-            platform: platform.clone(),
-            architecture: architecture.clone(),
-            accelerator,
-            // A cross-target names a runtime family, not a particular host.
-            // Actual minimum versions are enforced again on bundle activation.
-            cuda_version: (accelerator != BackendAccelerator::Cpu).then(|| "999.0".to_string()),
-            driver_version: (accelerator != BackendAccelerator::Cpu).then(|| "9999.0".to_string()),
+        let target = BackendTarget::from_triple(requested)?;
+        let manifest = BundleTarget {
+            platform: target.platform.clone(),
+            architecture: target.architecture.clone(),
+            accelerator: target.accelerator.as_str().to_string(),
         };
-        return Ok((
-            target,
-            BundleTarget {
-                platform,
-                architecture,
-                accelerator: accelerator.as_str().to_string(),
-            },
-        ));
+        return Ok((target, manifest));
     }
 
     let target = BackendTarget::current(device_info);

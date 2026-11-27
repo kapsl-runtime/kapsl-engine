@@ -2,8 +2,12 @@
 
 use super::*;
 
+mod cuda_versions;
+mod gpu_sampler;
 mod monitor;
 
+pub(crate) use cuda_versions::*;
+pub(crate) use gpu_sampler::*;
 pub(crate) use monitor::*;
 
 /// Shared pressure snapshot consumed by ingress and resource policy.
@@ -72,6 +76,14 @@ impl RuntimeResources {
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<Arc<Self>, String> {
         let memory = MemoryAuthority::new_with_cuda_plan(device_info, bootstrap)?;
+        // Placement of unpinned models reads the room left under the ledger.
+        let room_source = memory.clone();
+        crate::runtime::config::install_device_room(move |device_id| {
+            let domain = crate::runtime::memory::MemoryDomain::Cuda { device_id };
+            room_source.snapshot().domain(&domain).map_or(0, |row| {
+                room_source.grantable_bytes(&domain, row.available_bytes)
+            })
+        });
         Ok(Arc::new(Self {
             kv: KvCoordinatorInner::new(memory.clone()),
             memory,

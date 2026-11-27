@@ -28,6 +28,73 @@ fn run_accepts_positional_and_backward_compatible_model_paths() {
     );
     assert_eq!(args.model, [PathBuf::from("legacy.aimod")]);
     assert!(args.offline);
+    assert_eq!(args.idle_unload_seconds, None, "idle unload is opt-in");
+    assert!(args.idle_unload_model.is_empty());
+    assert!(!args.idle_reload, "idle reload is opt-in");
+}
+
+#[test]
+fn run_accepts_per_model_idle_timeouts_and_idle_reload() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "run",
+        "embed.aimod",
+        "llm.aimod",
+        "--idle-unload-seconds",
+        "600",
+        "--idle-unload-model",
+        "0=0",
+        "--idle-unload-model",
+        "1=120",
+        "--idle-reload",
+    ])
+    .unwrap();
+    let Some(KapslCommand::Run(args)) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.idle_unload_seconds, Some(600));
+    assert_eq!(args.idle_unload_model, ["0=0", "1=120"]);
+    assert!(args.idle_reload);
+}
+
+#[test]
+fn add_model_accepts_its_own_idle_timeout() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "add-model",
+        "--model",
+        "llm.aimod",
+        "--idle-unload-seconds",
+        "300",
+    ])
+    .unwrap();
+    let Some(KapslCommand::AddModel(args)) = cli.command else {
+        panic!("expected add-model command");
+    };
+    assert_eq!(args.idle_unload_seconds, Some(300));
+
+    let cli = Cli::try_parse_from(["kapsl", "add-model", "--model", "llm.aimod"]).unwrap();
+    let Some(KapslCommand::AddModel(args)) = cli.command else {
+        panic!("expected add-model command");
+    };
+    assert_eq!(args.idle_unload_seconds, None);
+}
+
+#[test]
+fn run_accepts_an_idle_unload_timeout() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "run",
+        "model.aimod",
+        "--idle-unload-seconds",
+        "600",
+    ])
+    .unwrap();
+    let Some(KapslCommand::Run(args)) = cli.command else {
+        panic!("expected run command");
+    };
+    assert_eq!(args.idle_unload_seconds, Some(600));
+    assert!(Cli::try_parse_from(["kapsl", "run", "--idle-unload-seconds", "10m"]).is_err());
 }
 
 #[cfg(feature = "mcp-server")]
@@ -65,4 +132,36 @@ fn bundle_accepts_multiple_models_and_cross_target() {
         Some(PathBuf::from("signed-backends"))
     );
     assert_eq!(args.output, PathBuf::from("production.kapsl-bundle"));
+}
+
+#[test]
+fn backend_ensure_accepts_explicit_target() {
+    let cli = Cli::try_parse_from([
+        "kapsl",
+        "backend",
+        "ensure",
+        "model.aimod",
+        "--target",
+        "linux-x86_64-cuda",
+    ])
+    .unwrap();
+    let Some(KapslCommand::Backend(args)) = cli.command else {
+        panic!("expected backend command");
+    };
+    let crate::app::BackendSubcommand::Ensure(args) = args.command else {
+        panic!("expected backend ensure");
+    };
+    assert_eq!(args.target.as_deref(), Some("linux-x86_64-cuda"));
+}
+
+#[test]
+fn backend_ensure_target_is_optional() {
+    let cli = Cli::try_parse_from(["kapsl", "backend", "ensure", "model.aimod"]).unwrap();
+    let Some(KapslCommand::Backend(args)) = cli.command else {
+        panic!("expected backend command");
+    };
+    let crate::app::BackendSubcommand::Ensure(args) = args.command else {
+        panic!("expected backend ensure");
+    };
+    assert_eq!(args.target, None);
 }

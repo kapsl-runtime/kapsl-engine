@@ -2,16 +2,23 @@
 
 use super::*;
 
+mod activity;
 mod autoscaler;
 mod backend;
+mod idle_reload;
+mod idle_unload;
 mod lifecycle;
 pub(crate) mod load_plan;
 mod manager;
+mod package_preflight;
 mod replica;
 mod scaling;
 
+pub(crate) use activity::*;
 pub(crate) use autoscaler::*;
 use backend::*;
+pub(crate) use idle_reload::*;
+pub(crate) use idle_unload::*;
 pub(crate) use lifecycle::*;
 pub(crate) use load_plan::*;
 pub(crate) use manager::*;
@@ -130,6 +137,64 @@ impl ModelRuntime {
         stop_model_and_replicas(base_model_id, &self.models, &self.resources)
     }
 
+    pub(crate) fn unload_idle_models(&self, now: Instant) -> Vec<u32> {
+        unload_idle_models(now, &self.models, &self.resources)
+    }
+
+    /// Topology used by loads that do not request their own.
+    pub(crate) fn default_placement(&self) -> ModelLoadPlacement {
+        self.load_planner.default_placement().clone()
+    }
+
+    /// Load a model in a blocking task without installing it. A typed memory
+    /// denial may reclaim one idle, strictly lower-weight victim at a time
+    /// and retry from a clean load transaction; ordinary backend failures
+    /// never enter arbitration. The start API and idle reloads share this, so
+    /// both admit a load the same way. The caller holds the model's lifecycle
+    /// lock. The outer error is a panicked or cancelled loader task.
+    pub(crate) async fn load_model_with_reclaim(
+        self: &Arc<Self>,
+        model_id: u32,
+        model_path: &Path,
+        placement: &ModelLoadPlacement,
+    ) -> Result<
+        Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), DynError>,
+        tokio::task::JoinError,
+    > {
+        let mut reclaim_attempts = 0usize;
+        loop {
+            let model_path_for_attempt = model_path.to_path_buf();
+            let placement_for_attempt = placement.clone();
+            let model_runtime_for_attempt = Arc::clone(self);
+            let attempt = tokio::task::spawn_blocking(move || {
+                model_runtime_for_attempt.load_model_blocking(
+                    model_id,
+                    &model_path_for_attempt,
+                    &placement_for_attempt,
+                )
+            })
+            .await;
+
+            let Ok(Err(error)) = &attempt else {
+                return attempt;
+            };
+            let Some(failure) = error.downcast_ref::<MemoryAdmissionFailure>() else {
+                return attempt;
+            };
+            if reclaim_attempts >= 32 {
+                log::warn!(
+                    "Priority arbitration for model {} reached its bounded retry limit",
+                    model_id
+                );
+                return attempt;
+            }
+            let Some(_reclaimed) = self.reclaim_one_lower_priority_model(failure).await else {
+                return attempt;
+            };
+            reclaim_attempts += 1;
+        }
+    }
+
     /// Load a model using the ambient Tokio runtime from a blocking lifecycle task.
     pub(crate) fn load_model_blocking(
         &self,
@@ -147,6 +212,7 @@ impl ModelRuntime {
         model_path: &Path,
         placement: &ModelLoadPlacement,
     ) -> Result<(Arc<ReplicaPool<Scheduler>>, Vec<EngineHandle>), DynError> {
+        self.preflight_package_admission(model_id, model_path, placement)?;
         let plan = self
             .load_planner
             .prepare(model_id, model_id, 0, model_path, Some(placement))?;
@@ -229,6 +295,7 @@ impl ModelRuntime {
                 &device_ids,
                 plan.base_model_id,
                 plan.replica_id,
+                managed_vllm_uses_cuda_graphs(&plan.loader.manifest)?,
             )?;
             report.allocations.extend(model_report.allocations);
             for device_id in device_ids {
@@ -250,6 +317,7 @@ impl ModelRuntime {
             .resources
             .memory()
             .model_load_plan_with_report(&domains, owner, 0, 0, &report)?;
+        self.resources.memory().check_cuda_load_sampling(&plan)?;
         let admission = self
             .resources
             .memory()
