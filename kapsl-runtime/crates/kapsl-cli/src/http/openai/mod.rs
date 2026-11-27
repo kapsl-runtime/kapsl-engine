@@ -11,6 +11,7 @@ use super::*;
 
 mod chat;
 mod embeddings;
+mod rerank;
 mod responses;
 pub(crate) mod types;
 
@@ -218,6 +219,10 @@ pub(crate) fn build_openai_routes(
         models: models.clone(),
         inference: inference.clone(),
     });
+    let rerank = rerank::build_rerank_route(rerank::RerankConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+    });
     let responses =
         responses::build_responses_route(responses::ResponsesConfig { models, inference });
 
@@ -227,6 +232,8 @@ pub(crate) fn build_openai_routes(
         .or(chat_completions)
         .unify()
         .or(embeddings)
+        .unify()
+        .or(rerank)
         .unify()
         .or(responses)
         .unify()

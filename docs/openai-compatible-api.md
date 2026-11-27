@@ -18,7 +18,8 @@ export OPENAI_API_KEY=unused   # or your Kapsl API token, if auth is enabled
 | `GET /v1/models/{model}` | Single model, same resolution rules as below |
 | `POST /v1/chat/completions` | Streaming and non-streaming |
 | `POST /v1/responses` | Text-only, stateless, streaming and non-streaming |
-| `POST /v1/embeddings` | ONNX models packaged with `task=embed` |
+| `POST /v1/embeddings` | ONNX or GGUF models packaged with `task=embed` |
+| `POST /v1/rerank` | GGUF cross-encoders packaged with `model_type=seq-classifier`, `task=rerank` (Jina/Cohere request shape, not an OpenAI endpoint) |
 
 These routes sit behind the same reader-scope API auth as
 `/api/models/:id/infer`. When the runtime is started with auth enabled, send
@@ -122,15 +123,25 @@ them to constrain output.
 ## Embeddings parameters
 
 `POST /v1/embeddings` accepts every OpenAI input form: one string, an array of
-strings, one integer token-ID array, or an array of token-ID arrays. String
-inputs use the `tokenizer.json` packaged beside the model; token-ID inputs skip
-tokenization. Models must be ONNX packages declared with `task=embed`, which
-routes execution through Kapsl's masked-mean pooling and normalization backend.
+strings, one integer token-ID array, or an array of token-ID arrays. Models
+must be packaged with `task=embed`:
+
+- **ONNX** packages run through Kapsl's masked-mean pooling and normalization
+  backend. String inputs use the `tokenizer.json` packaged beside the model;
+  token-ID inputs skip tokenization.
+- **GGUF** packages (`model_type=embedding`, or `causal-lm` for decoder
+  embedders such as Qwen3-Embedding) run through llama.cpp pooling with the
+  model's own pooling (mean, CLS or last token), overridable with
+  `metadata.embed.pooling`. Strings are tokenized with the vocabulary embedded
+  in the GGUF file, and all inputs of a request are embedded in one engine
+  call. On the default portable build this uses the CPU llama.cpp pack.
 
 `encoding_format` supports `float` (the default) and `base64`. Base64 values are
 the little-endian bytes of the float32 vector. `user` is accepted as a replica
-affinity key, with `X-Kapsl-Session` taking precedence. `usage.prompt_tokens`
-and `usage.total_tokens` are exact for this endpoint and exclude padding.
+affinity key, with `X-Kapsl-Session` taking precedence. For ONNX models
+`usage.prompt_tokens` and `usage.total_tokens` are exact and exclude padding.
+For GGUF models they count token-ID inputs exactly and report 0 for string
+inputs, which the engine tokenizes without reporting a count.
 
 `dimensions` may be used to request a vector no larger than the model's native
 output. Kapsl shortens the native vector and L2-normalizes the result; it cannot
@@ -138,8 +149,42 @@ turn a model that was not trained for dimension shortening into one that was.
 
 The endpoint enforces the OpenAI request ceilings: 8,192 tokens per input,
 300,000 tokens across a request, and at most 2,048 inputs. A smaller tokenizer
-or fixed model sequence limit wins. Empty and mixed-type inputs are rejected
-with an OpenAI-shaped `400` error.
+or fixed model sequence limit wins; for GGUF models the per-input limit is the
+smaller of `KAPSL_GGUF_CTX_PER_SEQ` (default 2,048) and the model's training
+context. Empty and mixed-type inputs are rejected with an OpenAI-shaped `400`
+error.
+
+## Rerank
+
+`POST /v1/rerank` scores documents against a query with a cross-encoder. It
+uses the Jina/Cohere request shape that llama-server also serves, so rerank
+clients written for those services work unchanged:
+
+```bash
+curl http://127.0.0.1:9095/v1/rerank \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "bge-reranker-v2-m3",
+    "query": "what is a panda?",
+    "documents": ["hi", "The giant panda is a bear species endemic to China."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+`documents` holds strings or `{"text": "..."}` objects (at most 2,048).
+`results` are sorted by descending `relevance_score`, each with the document's
+`index` in the request, cut to `top_n`, and carrying `document.text` when
+`return_documents` is true. The score is the model's raw head output, as
+llama-server returns it, so compare scores within one model rather than
+against a fixed threshold.
+
+The model must be a GGUF cross-encoder packaged with
+`model_type=seq-classifier` and `task=rerank`. Kapsl refuses to load a GGUF
+without a classification head for this task. Rerankers converted with a
+`rerank` prompt template (such as Qwen3-Reranker) use it; others use
+llama-server's `[BOS] query [EOS] [SEP] document [EOS]` layout. `usage`
+reports 0 tokens.
 
 ## Responses parameters
 
@@ -195,9 +240,14 @@ These are real gaps, not rough edges to discover in production:
 - **`stop` is enforced at the API layer**, not in the sampler. Output is
   truncated at the first stop string, and streaming cancels generation at that
   point. Non-streaming requests still pay for the tokens generated past it.
-- **Embeddings currently require ONNX `task=embed` packages.** GGUF embedding,
-  unusual encoder input tensors, and fixed batch sizes other than one are not
-  supported. String input also requires a packaged Hugging Face
-  `tokenizer.json`; token-ID input remains available without it.
+- **ONNX embeddings need a conventional encoder contract.** Unusual encoder
+  input tensors and fixed batch sizes other than one are not supported, and
+  string input requires a packaged Hugging Face `tokenizer.json` (token-ID
+  input works without it).
+- **GGUF embedding, rerank and classify run on the CPU llama.cpp pack.** The
+  standard pack ABI requires the governed device allocator for GPU packs, and
+  llama.cpp's CUDA buffers do not support it yet. Builds with an embedded
+  llama.cpp backend (`gguf-cuda` and related features) run these tasks
+  in-process instead. GGUF string inputs report 0 usage tokens.
 - **No function/tool calling, structured output, or `logprobs`**, and no
   `/v1/completions`. `/v1/responses` supports plain text generation only.

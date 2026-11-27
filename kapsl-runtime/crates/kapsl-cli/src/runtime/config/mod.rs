@@ -354,7 +354,9 @@ pub(crate) fn export_gguf_auto_sizing_hint(
     batch_size: usize,
     model_file_path: Option<&Path>,
 ) {
-    if !EngineKind::resolve(manifest).is_gguf() {
+    // Prefill and concurrency hints size the generation scheduler; pooled
+    // GGUF tasks have no decode loop to size.
+    if !EngineKind::resolve(manifest).is_gguf_generate() {
         return;
     }
     if env_auto_sizing_sealed() {

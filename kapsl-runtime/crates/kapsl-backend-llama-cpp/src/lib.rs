@@ -4,6 +4,10 @@
 //! handles, versioned C structs, JSON wire messages, and explicit buffer
 //! ownership. CUDA builds can expose either the runtime-owned shared-pool path
 //! or the separately signed native-KV rollback profile.
+//!
+//! Generation uses the legacy `kapsl_llama_cpp_backend_v1` table. The CPU pack
+//! also exports the backend-neutral `kapsl_backend_v1` table for the pooled
+//! GGUF tasks (embed, rerank, classify); see `pooled`.
 
 mod cancellation;
 mod ffi;
@@ -11,9 +15,14 @@ mod inference;
 mod lifecycle;
 mod logger;
 mod pack;
+#[cfg(not(any(feature = "cuda12", kapsl_llama_external_pool_sdk)))]
+mod pooled;
 mod reports;
 #[cfg(kapsl_llama_external_pool_sdk)]
 mod shared_pool;
+
+#[cfg(not(any(feature = "cuda12", kapsl_llama_external_pool_sdk)))]
+pub use pooled::kapsl_backend_v1;
 
 use kapsl_backend_abi::*;
 

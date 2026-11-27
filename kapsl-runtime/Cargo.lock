@@ -2365,8 +2365,8 @@ dependencies = [
 
 [[package]]
 name = "kapsl-backends"
-version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+version = "0.4.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2397,7 +2397,7 @@ dependencies = [
 [[package]]
 name = "kapsl-communication"
 version = "0.5.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "async-trait",
  "bincode",
@@ -2414,7 +2414,7 @@ dependencies = [
 [[package]]
 name = "kapsl-core"
 version = "0.3.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "flate2",
  "fs2",
@@ -2434,7 +2434,7 @@ dependencies = [
 [[package]]
 name = "kapsl-engine-api"
 version = "0.3.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "kapsl-hal"
 version = "0.3.4"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "cudarc",
  "half",
@@ -2484,8 +2484,8 @@ dependencies = [
 
 [[package]]
 name = "kapsl-kernels"
-version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+version = "0.3.1"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "cudarc",
  "half",
@@ -2497,7 +2497,7 @@ dependencies = [
 [[package]]
 name = "kapsl-kv-abi"
 version = "0.6.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -2506,7 +2506,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llama-cpp-2"
 version = "0.1.146-kapsl.2"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2519,7 +2519,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llama-cpp-sys-2"
 version = "0.1.146-kapsl.2"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "bindgen",
  "cc",
@@ -2532,7 +2532,7 @@ dependencies = [
 [[package]]
 name = "kapsl-llm"
 version = "0.3.8"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2562,8 +2562,8 @@ dependencies = [
 
 [[package]]
 name = "kapsl-loader"
-version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+version = "0.3.1"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "half",
  "log",
@@ -2615,8 +2615,8 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag"
-version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+version = "0.4.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2635,8 +2635,8 @@ dependencies = [
 
 [[package]]
 name = "kapsl-rag-sdk"
-version = "0.3.0"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+version = "0.4.0"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "async-trait",
  "futures",
@@ -2648,7 +2648,7 @@ dependencies = [
 [[package]]
 name = "kapsl-scheduler"
 version = "0.3.1"
-source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=ac878c8f602d693c60bac203a5e18dac98ed2506#ac878c8f602d693c60bac203a5e18dac98ed2506"
+source = "git+https://github.com/kapsl-runtime/kapsl-sdk?rev=375c6234a2533900d5d8417d8b69ac3252ed17c4#375c6234a2533900d5d8417d8b69ac3252ed17c4"
 dependencies = [
  "async-trait",
  "chrono",

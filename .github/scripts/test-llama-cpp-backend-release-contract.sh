@@ -37,6 +37,9 @@ require_literal "$packager" 'NVIDIA-CONTAINER-LICENSE'
 require_literal "$packager" 'nvidia_license="${nvidia_license:-/NGC-DL-CONTAINER-LICENSE}"'
 require_literal "$packager" 'NVIDIA driver libraries must not be bundled'
 require_literal "$packager" '"execution_mode": "native"'
+require_literal "$packager" '"adapter_abi": "kapsl-backend-v1"'
+require_literal "$packager" 'kapsl_backend_v1 for pooled GGUF tasks'
+require_literal "$loader" 'validate_llama_cpp_pooled_contract'
 require_literal "$packager" '"entrypoint": "lib/libkapsl_backend_llama_cpp.so"'
 
 for workflow in \
