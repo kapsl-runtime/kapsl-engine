@@ -33,7 +33,9 @@ vllm/cu130-flash-attn
 
 The managed vLLM and SGLang packs use external execution: each carries a
 Python environment that Kapsl launches as a supervised child process. SGLang is
-installed only for a package that names `sglang` as its serving backend.
+installed only for a package that names `sglang` as its serving backend. The
+SGLang pack is published on the beta channel only, until a stable release has
+qualified it through the release GPU gate.
 
 An ONNX model resolves exactly one execution provider after provider policy and
 declared fallbacks are resolved. The CPU pack contains and activates no CUDA

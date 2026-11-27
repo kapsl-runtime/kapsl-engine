@@ -319,7 +319,7 @@ class BuildPlanTests(TestCase):
         version, matrix = build.plan(self.values, self.manifest, self.lock)
         self.assertEqual(version, "0.2.7")
         self.assertEqual([item["component"] for item in matrix["include"]],
-                         ["engine", "llama-cpu", "llama-cuda12", "vllm", "sglang"])
+                         ["engine", "llama-cpu", "llama-cuda12", "vllm"])
         targets = [item["target"] for item in matrix["include"] if item["target"]]
         self.assertEqual(len(targets), len(set(targets)))
 
@@ -331,6 +331,7 @@ class BuildPlanTests(TestCase):
         }, self.manifest, self.lock)
         self.assertIn("beta", version)
         self.assertEqual(matrix["include"][-1]["component"], "ort-cpu")
+        self.assertIn("sglang", [item["component"] for item in matrix["include"]])
         self.assertFalse(any("onnx" in item["component"] for item in matrix["include"]))
 
     def test_cache_warming_is_main_only_and_produces_no_vllm_or_ort_release_parts(self):
