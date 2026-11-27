@@ -707,6 +707,11 @@ struct ManagedVllmSettings {
     legacy_top_level_fraction_authored: bool,
     max_model_len: usize,
     startup_timeout: Duration,
+    /// Launch vLLM with `--enforce-eager`, which turns off `torch.compile`
+    /// and CUDA graphs. Eager launches start faster and hold no graph memory
+    /// outside the planned grant, but small models decode two to three times
+    /// slower. `metadata.serving.vllm.enforce_eager: false` opts out.
+    enforce_eager: bool,
 }
 
 const MANAGED_VLLM_PLANNER_SCHEMA_VERSION: u64 = 1;
@@ -883,6 +888,7 @@ impl ManagedVllmSettings {
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            enforce_eager: true,
         };
         let Some(vllm) = manifest
             .metadata
@@ -949,6 +955,12 @@ impl ManagedVllmSettings {
                 );
             }
             settings.startup_timeout = Duration::from_secs(seconds);
+        }
+
+        if let Some(raw) = value("enforce_eager") {
+            settings.enforce_eager = raw.as_bool().ok_or_else(|| {
+                "metadata.serving.vllm.enforce_eager must be a boolean".to_string()
+            })?;
         }
         settings.apply_memory_mode_override(
             std::env::var(MANAGED_VLLM_MEMORY_MODE_ENV).ok().as_deref(),
@@ -2954,7 +2966,6 @@ impl ManagedVllmProcess {
                 "--max-model-len",
                 &self.spec.settings.max_model_len.to_string(),
             ])
-            .arg("--enforce-eager")
             .arg("--enable-prefix-caching")
             .args(["--kv-transfer-config", &launch.kv_transfer_config])
             .env("CUDA_VISIBLE_DEVICES", &self.spec.cuda_visible_devices)
@@ -2976,6 +2987,9 @@ impl ManagedVllmProcess {
                         EXACT_MODE_GPU_MEMORY_UTILIZATION_SENTINEL,
                     ]);
             }
+        }
+        if self.spec.settings.enforce_eager {
+            command.arg("--enforce-eager");
         }
         if self.spec.settings.live_resize.is_some() {
             // Pinned vLLM enables overlapping async batches by default. Safe
@@ -5170,6 +5184,7 @@ mod tests {
                     legacy_top_level_fraction_authored: false,
                     max_model_len: 512,
                     startup_timeout: Duration::from_secs(30),
+                    enforce_eager: true,
                 },
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
@@ -5227,6 +5242,7 @@ mod tests {
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
             startup_timeout: Duration::from_secs(300),
+            enforce_eager: true,
         };
         settings
             .apply_memory_mode_override(Some("legacy-fraction"))
@@ -6126,6 +6142,7 @@ serving:
                     legacy_top_level_fraction_authored: false,
                     max_model_len: 512,
                     startup_timeout: Duration::from_secs(30),
+                    enforce_eager: true,
                 },
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
@@ -6187,6 +6204,49 @@ serving:
         assert!(!arguments
             .iter()
             .any(|argument| argument == "--no-async-scheduling"));
+    }
+
+    #[test]
+    fn eager_execution_is_the_default_and_can_be_turned_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("model");
+        std::fs::create_dir(&model_root).unwrap();
+        let mut process = test_managed_process();
+        let process = Arc::get_mut(&mut process).expect("test owns the process");
+        process.spec.model_root = model_root;
+        process.spec.log_path = directory.path().join("vllm.log");
+        let eager_arguments = |process: &ManagedVllmProcess| {
+            process
+                .build_command()
+                .unwrap()
+                .get_args()
+                .filter(|argument| *argument == "--enforce-eager")
+                .count()
+        };
+
+        assert_eq!(eager_arguments(process), 1);
+        process.spec.settings.enforce_eager = false;
+        assert_eq!(eager_arguments(process), 0);
+    }
+
+    #[test]
+    fn enforce_eager_parses_as_an_optional_boolean() {
+        let settings = |vllm: &str| {
+            settings_from_metadata(&format!(
+                "
+serving:
+  vllm:
+    {vllm}
+"
+            ))
+        };
+
+        assert!(settings("max_model_len: 1024").unwrap().enforce_eager);
+        assert!(settings("enforce_eager: true").unwrap().enforce_eager);
+        assert!(!settings("enforce_eager: false").unwrap().enforce_eager);
+        assert!(settings("enforce_eager: 0")
+            .unwrap_err()
+            .contains("enforce_eager must be a boolean"));
     }
 
     #[test]
@@ -6285,6 +6345,7 @@ serving:
                     legacy_top_level_fraction_authored: false,
                     max_model_len: invocation.max_model_len,
                     startup_timeout: invocation.timeout,
+                    enforce_eager: true,
                 },
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),

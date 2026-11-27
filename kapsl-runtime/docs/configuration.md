@@ -340,6 +340,7 @@ metadata:
           shrink_utilization_percent: 25
           shrink_idle_seconds: 60
       startup_timeout_seconds: 300
+      enforce_eager: true
 ```
 
 The defaults are a 1,024-token context, exact `auto` sizing, 20% bounded KV
@@ -387,6 +388,19 @@ failure, or ambiguous detach fences the replica and retains or quarantines the
 affected charge; it is never reassigned speculatively. A scheduler that finds
 a referenced block in a tail it was asked to retire changes nothing and tries
 again on later steps until the acknowledgement deadline.
+
+`enforce_eager` defaults to `true`: Kapsl launches vLLM with `--enforce-eager`,
+which turns off `torch.compile` and CUDA graphs. Set it to `false` to run with
+vLLM's own compiled defaults. On an RTX 3090, plain vLLM on the pinned build
+decoded a 1.5B model about three times faster at one concurrent request and
+about twice as fast at sixteen with those defaults than with eager execution;
+the gap narrows as models grow. The compiled path costs more at startup
+(compilation and graph capture, so raise `startup_timeout_seconds` if needed)
+and holds CUDA graph memory outside the planned KV grant. Kapsl's check of the
+device budget after backend load still applies and rejects a replica that no
+longer fits. The shared-pool conformance profile was certified with eager
+execution, so validate a compiled launch on your hardware before relying on it,
+in particular together with `live_resize`.
 
 The deprecated top-level `gpu_memory_utilization` field and
 `kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
