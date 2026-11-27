@@ -17,7 +17,6 @@
 use super::types::openai_error;
 use super::*;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine as _;
 use kapsl_engine_api::{NamedTensor, RequestMetadata};
 use rand::RngCore;
 

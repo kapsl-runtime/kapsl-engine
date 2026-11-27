@@ -1068,7 +1068,7 @@ fn embeddings_response(
     model_name: &str,
     embeddings: &[Vec<f32>],
     encoding: EmbeddingEncoding,
-    prompt_tokens: usize,
+    prompt_tokens: u64,
 ) -> warp::reply::Response {
     let data = embeddings
         .iter()
@@ -1225,7 +1225,7 @@ async fn embed_with_text_contract(
             return openai_error(StatusCode::BAD_REQUEST, message, "invalid_request_error");
         }
     }
-    embeddings_response(&resolved.name, &embeddings, encoding, prompt_tokens)
+    embeddings_response(&resolved.name, &embeddings, encoding, prompt_tokens as u64)
 }
 
 #[cfg(test)]
