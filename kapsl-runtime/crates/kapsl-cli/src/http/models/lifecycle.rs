@@ -107,6 +107,9 @@ pub(crate) fn build_model_lifecycle_routes(
         topology: String,
         #[serde(default = "default_tp_degree")]
         tp_degree: usize,
+        /// Idle timeout for this model only; 0 keeps it loaded. Omitted
+        /// means the runtime's configured timeout applies.
+        idle_unload_seconds: Option<u64>,
     }
 
     /// `?wait=true` holds the response until the load is admitted and active,
@@ -271,48 +274,13 @@ pub(crate) fn build_model_lifecycle_routes(
                     let model_registry = models.registry().clone();
                     let model_path = model_path.clone();
                     let placement = ModelLoadPlacement::new(req.topology.clone(), req.tp_degree);
+                    let idle_unload_seconds = req.idle_unload_seconds;
                     let model_runtime = model_runtime.clone();
                     async move {
                         let _lifecycle_guard = lifecycle_guard;
-                        // A typed authority rejection may reclaim one idle,
-                        // strictly lower-weight victim at a time and retry from
-                        // a clean load transaction. Ordinary backend failures
-                        // never enter arbitration.
-                        let mut reclaim_attempts = 0usize;
-                        let res = loop {
-                            let model_path_for_attempt = model_path.clone();
-                            let placement_for_attempt = placement.clone();
-                            let model_runtime_for_attempt = model_runtime.clone();
-                            let attempt = tokio::task::spawn_blocking(move || {
-                                model_runtime_for_attempt.load_model_blocking(
-                                    model_id,
-                                    &model_path_for_attempt,
-                                    &placement_for_attempt,
-                                )
-                            })
+                        let res = model_runtime
+                            .load_model_with_reclaim(model_id, &model_path, &placement)
                             .await;
-
-                            let Ok(Err(error)) = &attempt else {
-                                break attempt;
-                            };
-                            let Some(failure) = error.downcast_ref::<MemoryAdmissionFailure>() else {
-                                break attempt;
-                            };
-                            if reclaim_attempts >= 32 {
-                                log::warn!(
-                                    "Priority arbitration for model {} reached its bounded retry limit",
-                                    model_id
-                                );
-                                break attempt;
-                            }
-                            let Some(_reclaimed) = model_runtime
-                                .reclaim_one_lower_priority_model(failure)
-                                .await
-                            else {
-                                break attempt;
-                            };
-                            reclaim_attempts += 1;
-                        };
 
                         match res {
                             Ok(Err(e)) => {
@@ -327,6 +295,15 @@ pub(crate) fn build_model_lifecycle_routes(
                             }
                             Ok(Ok((pool, handles))) => {
                                 models.install_loaded(model_id, model_path, pool, handles);
+                                // An idle reload repeats this load, so keep
+                                // what the request asked for.
+                                models.remember_load_placement(model_id, placement);
+                                if let Some(seconds) = idle_unload_seconds {
+                                    models.set_idle_timeout_override(
+                                        model_id,
+                                        (seconds > 0).then(|| Duration::from_secs(seconds)),
+                                    );
+                                }
                                 let _ = model_registry.set_status(model_id, ModelStatus::Active);
                                 ModelLoadOutcome::Active
                             }
@@ -390,6 +367,21 @@ pub(crate) fn build_model_lifecycle_routes(
                 #[derive(Serialize)]
                 struct ErrorResponse {
                     error: String,
+                }
+
+                // A model the idle unloader stopped is already down. Stopping
+                // it explicitly means "keep it down": cancel the reload that
+                // the next request would otherwise trigger.
+                if models.clear_idle_unloaded(model_id) {
+                    return warp::reply::with_status(
+                        warp::reply::json(&SuccessResponse {
+                            message: format!(
+                                "Model {} was already stopped for being idle; it will stay stopped until started",
+                                model_id
+                            ),
+                        }),
+                        StatusCode::OK,
+                    );
                 }
 
                 // Check if model exists

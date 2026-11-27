@@ -33,7 +33,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{ExitStatus, Stdio};
 
 pub(crate) const MANAGED_VLLM_ADAPTER_ID: &str = "kapsl-vllm-connector";
-pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.0";
+pub(crate) const MANAGED_VLLM_ADAPTER_VERSION: &str = "0.7.1";
 pub(crate) const MANAGED_VLLM_BACKEND_VERSION: &str = "0.26.1rc1.dev1130+g2ec6f0d71";
 pub(crate) const MANAGED_VLLM_PROFILE_ID: &str = "vllm-v1-packed-cuda-ipc/flash-attn";
 pub(crate) const MANAGED_VLLM_ELASTIC_PROFILE_ID: &str = "vllm-v1-packed-cuda-vmm/flash-attn-blnhc";
@@ -52,6 +52,10 @@ const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(2);
+/// Pause after a growth check that unmet KV demand triggered. A connector
+/// repeats a waiting reservation every 20 ms; this keeps the supervisor from
+/// re-evaluating at that rate while the growth it started is being applied.
+const KV_DEMAND_SUPERVISION_GAP: Duration = Duration::from_millis(100);
 const SUPERVISOR_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RESTARTS: u32 = 5;
 const MAX_CONSECUTIVE_HEALTH_FAILURES: u8 = 15;
@@ -711,6 +715,11 @@ struct ManagedVllmSettings {
     legacy_top_level_fraction_authored: bool,
     max_model_len: usize,
     startup_timeout: Duration,
+    /// Launch vLLM with `--enforce-eager`, which turns off `torch.compile`
+    /// and CUDA graphs. Eager launches start faster and hold no graph memory
+    /// outside the planned grant, but small models decode two to three times
+    /// slower. `metadata.serving.vllm.enforce_eager: false` opts out.
+    enforce_eager: bool,
 }
 
 const MANAGED_VLLM_PLANNER_SCHEMA_VERSION: u64 = 1;
@@ -887,6 +896,7 @@ impl ManagedVllmSettings {
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
+            enforce_eager: true,
         };
         let Some(vllm) = manifest
             .metadata
@@ -953,6 +963,12 @@ impl ManagedVllmSettings {
                 );
             }
             settings.startup_timeout = Duration::from_secs(seconds);
+        }
+
+        if let Some(raw) = value("enforce_eager") {
+            settings.enforce_eager = raw.as_bool().ok_or_else(|| {
+                "metadata.serving.vllm.enforce_eager must be a boolean".to_string()
+            })?;
         }
         settings.apply_memory_mode_override(
             std::env::var(MANAGED_VLLM_MEMORY_MODE_ENV).ok().as_deref(),
@@ -2958,7 +2974,6 @@ impl ManagedVllmProcess {
                 "--max-model-len",
                 &self.spec.settings.max_model_len.to_string(),
             ])
-            .arg("--enforce-eager")
             .arg("--enable-prefix-caching")
             .args(["--kv-transfer-config", &launch.kv_transfer_config])
             .env("CUDA_VISIBLE_DEVICES", &self.spec.cuda_visible_devices)
@@ -2980,6 +2995,9 @@ impl ManagedVllmProcess {
                         EXACT_MODE_GPU_MEMORY_UTILIZATION_SENTINEL,
                     ]);
             }
+        }
+        if self.spec.settings.enforce_eager {
+            command.arg("--enforce-eager");
         }
         if self.spec.settings.live_resize.is_some() {
             // Pinned vLLM enables overlapping async batches by default. Safe
@@ -3798,10 +3816,43 @@ fn start_managed_vllm_supervisor(
     tokio::spawn(async move {
         let mut consecutive_health_failures = 0u8;
         let mut low_kv_utilization_since = None;
+        let mut next_tick = tokio::time::Instant::now() + SUPERVISOR_INTERVAL;
+        let mut regular_tick_ran = false;
         loop {
-            tokio::time::sleep(SUPERVISOR_INTERVAL).await;
+            // A regular tick is due one interval after the previous one
+            // finished. Demand wake-ups in between leave that deadline alone,
+            // so a pool that keeps refusing a request cannot starve the
+            // health probe.
+            if regular_tick_ran {
+                next_tick = tokio::time::Instant::now() + SUPERVISOR_INTERVAL;
+            }
+            let demand = wait_for_supervision_tick(&process, &deployment, next_tick).await;
+            regular_tick_ran = !demand;
             if process.shutdown.load(Ordering::Acquire) {
                 break;
+            }
+            if demand {
+                // A request is waiting for KV capacity the pool can still
+                // grow into. Grow now; liveness stays with the regular tick,
+                // which also reports whatever this attempt could not do.
+                if matches!(deployment.participant_is_active(&participant_id), Ok(true)) {
+                    if let Err(error) = supervise_managed_vllm_live_resize(
+                        &process,
+                        &deployment,
+                        &participant_id,
+                        &mut low_kv_utilization_since,
+                    )
+                    .await
+                    {
+                        log::debug!(
+                            "[vllm-supervisor] demand-driven KV growth for model {} deferred to the next tick: {}",
+                            process.spec.served_model_name,
+                            error,
+                        );
+                    }
+                }
+                tokio::time::sleep(KV_DEMAND_SUPERVISION_GAP).await;
+                continue;
             }
 
             let exited = matches!(process.try_wait(), Ok(Some(_)) | Err(_));
@@ -3960,6 +4011,31 @@ fn start_managed_vllm_supervisor(
     });
 }
 
+/// Sleeps until the supervision tick due at `next_tick`. Returns `true` when
+/// unmet KV demand on a live-resize deployment ended the wait early. A tick
+/// that is already due wins over pending demand.
+async fn wait_for_supervision_tick(
+    process: &ManagedVllmProcess,
+    deployment: &ManagedVllmDeployment,
+    next_tick: tokio::time::Instant,
+) -> bool {
+    let coordinator = process
+        .spec
+        .settings
+        .live_resize
+        .as_ref()
+        .and_then(|_| deployment.coordinator().ok());
+    let Some(coordinator) = coordinator else {
+        tokio::time::sleep_until(next_tick).await;
+        return false;
+    };
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(next_tick) => false,
+        _ = coordinator.wait_for_unmet_kv_demand() => true,
+    }
+}
+
 async fn supervise_managed_vllm_live_resize(
     process: &Arc<ManagedVllmProcess>,
     deployment: &Arc<ManagedVllmDeployment>,
@@ -4011,13 +4087,21 @@ async fn supervise_managed_vllm_live_resize(
             .ok_or_else(|| "live KV resize target overflowed".to_string())
     };
 
-    let target = if utilization_percent >= policy.grow_utilization_percent as u64
+    // A reservation the pool turned away is demand that leased utilization
+    // does not show: two requests can fill 70% of a small pool and leave no
+    // room for a third. Grow for it without waiting for the threshold.
+    let target = if (utilization_percent >= policy.grow_utilization_percent as u64
+        || resize.unmet_demand_blocks != 0)
         && resize.current_block_count < resize.maximum_block_count
     {
         *low_utilization_since = None;
         Some(
-            aligned_up(resize.current_block_count.saturating_add(step))?
-                .min(resize.maximum_block_count),
+            aligned_up(
+                resize
+                    .current_block_count
+                    .saturating_add(step.max(resize.unmet_demand_blocks)),
+            )?
+            .min(resize.maximum_block_count),
         )
     } else if utilization_percent <= policy.shrink_utilization_percent as u64 {
         let since = low_utilization_since.get_or_insert_with(Instant::now);
@@ -4025,7 +4109,9 @@ async fn supervise_managed_vllm_live_resize(
         if since.elapsed() >= policy.shrink_idle && resize.current_block_count > floor {
             let raw = resize.current_block_count.saturating_sub(step).max(floor);
             let aligned = raw / resize.resize_alignment_blocks * resize.resize_alignment_blocks;
-            *low_utilization_since = None;
+            // The idle timer is cleared once the shrink is admitted. A shrink
+            // deferred because a sequence is running is retried every tick
+            // until the replica has a moment without one.
             Some(aligned.max(floor))
         } else {
             None
@@ -4035,6 +4121,10 @@ async fn supervise_managed_vllm_live_resize(
         None
     };
     let Some(target) = target.filter(|target| *target != resize.current_block_count) else {
+        if target.is_some() {
+            // Alignment left nothing to release; start a fresh idle window.
+            *low_utilization_since = None;
+        }
         return Ok(());
     };
     let resize_coordinator = coordinator.clone();
@@ -4045,7 +4135,10 @@ async fn supervise_managed_vllm_live_resize(
     .await
     .map_err(|error| format!("live KV resize task failed: {error}"))?;
     let generation = match requested {
-        Ok(generation) => generation,
+        Ok(generation) => {
+            *low_utilization_since = None;
+            generation
+        }
         Err(error) if error.contains("resize was not admitted") => {
             log::debug!(
                 "[vllm-supervisor] deferred live KV resize model={} target_blocks={}: {}",
@@ -4058,11 +4151,12 @@ async fn supervise_managed_vllm_live_resize(
         Err(error) => return Err(error),
     };
     log::info!(
-        "[vllm-supervisor] requested live KV resize model={} generation={} target_blocks={} utilization_percent={}",
+        "[vllm-supervisor] requested live KV resize model={} generation={} target_blocks={} utilization_percent={} unmet_demand_blocks={}",
         process.spec.served_model_name,
         generation,
         target,
         utilization_percent,
+        resize.unmet_demand_blocks,
     );
     Ok(())
 }
@@ -4998,10 +5092,10 @@ mod tests {
     use super::*;
     use futures::StreamExt;
 
-    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.0. Keeping
+    // Frozen output emitted by kapsl_vllm_connector.planning 0.7.1. Keeping
     // one exact cross-language fixture catches JSON/digest/arithmetic drift
     // before the executor-backed planner is exercised on a GPU host.
-    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.0","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
+    const SYNTHETIC_PLANNER_OUTPUT: &str = r#"{"geometry":{"attention_backend":"FLASH_ATTN","identity":{"adapter_id":"kapsl-vllm-connector","adapter_version":"0.7.1","backend_version":"0.26.1rc1.dev1130+g2ec6f0d71","layout_version":1,"profile_id":"vllm-v1-packed-cuda-ipc/flash-attn"},"layout_id":"vllm-v1-packed","max_model_len":1024,"model_fingerprint":"sha256:model","ranks":[{"cache_groups":[{"block_size_tokens":16,"bytes_per_group_block":1024,"element_type":{"bits":16,"bytes":2,"name":"float16"},"group_id":"vllm.group.0","key_head_dim":4,"kv_heads":4,"layers":["layer.0"],"policy":{"kind":"full_attention"},"required_blocks_per_sequence":64,"value_head_dim":4}],"device_id":0,"fixed_overhead_blocks":1,"pool_bytes_per_block":1024,"rank":0,"required_blocks_per_sequence":64}],"tensor_parallel_size":1,"total_pool_bytes_per_block":1024},"geometry_digest":"sha256:6f55e57f692f85faf9d1d905132782acc052af87233c0df4b4804ace0bdbfbd1","policy":{"alignment_blocks":1,"headroom_percent":20,"prefix_blocks":0,"strict_concurrency":false,"target_concurrency":4},"schema_version":1,"sizing":{"ranks":[{"base_blocks":257,"bytes_per_block":1024,"concurrency_reduced":false,"desired_blocks":309,"desired_bytes":316416,"device_id":0,"effective_target_concurrency":4,"headroom_blocks":52,"maximum_blocks":309,"maximum_bytes":316416,"minimum_blocks":65,"minimum_bytes":66560,"rank":0,"sequence_blocks":64}],"total_desired_bytes":316416,"total_maximum_bytes":316416},"status":"planned","supported":true}"#;
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -5092,6 +5186,7 @@ mod tests {
                     legacy_top_level_fraction_authored: false,
                     max_model_len: 512,
                     startup_timeout: Duration::from_secs(30),
+                    enforce_eager: true,
                 },
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
@@ -5109,11 +5204,11 @@ mod tests {
     fn certified_profile_matches_certified_tuple() {
         assert_eq!(
             certified_vllm_profile(),
-            "kapsl-vllm-connector,0.7.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
+            "kapsl-vllm-connector,0.7.1,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-ipc/flash-attn"
         );
         assert_eq!(
             certified_vllm_elastic_profile(),
-            "kapsl-vllm-connector,0.7.0,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
+            "kapsl-vllm-connector,0.7.1,0.26.1rc1.dev1130+g2ec6f0d71,vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
         );
     }
 
@@ -5149,6 +5244,7 @@ mod tests {
             legacy_top_level_fraction_authored: false,
             max_model_len: 1024,
             startup_timeout: Duration::from_secs(300),
+            enforce_eager: true,
         };
         settings
             .apply_memory_mode_override(Some("legacy-fraction"))
@@ -5200,7 +5296,7 @@ mod tests {
         assert_eq!(template.grant_request.candidates[0].bytes_per_block, 1024);
         assert_eq!(
             template.grant_request.geometry_digest,
-            "sha256:0221ae33b2c0585d8b3d97c875bbd9e8ceb6a8b7df5f4accd4ff435b6708b697"
+            "sha256:6f55e57f692f85faf9d1d905132782acc052af87233c0df4b4804ace0bdbfbd1"
         );
     }
 
@@ -6048,6 +6144,7 @@ serving:
                     legacy_top_level_fraction_authored: false,
                     max_model_len: 512,
                     startup_timeout: Duration::from_secs(30),
+                    enforce_eager: true,
                 },
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
@@ -6109,6 +6206,49 @@ serving:
         assert!(!arguments
             .iter()
             .any(|argument| argument == "--no-async-scheduling"));
+    }
+
+    #[test]
+    fn eager_execution_is_the_default_and_can_be_turned_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let model_root = directory.path().join("model");
+        std::fs::create_dir(&model_root).unwrap();
+        let mut process = test_managed_process();
+        let process = Arc::get_mut(&mut process).expect("test owns the process");
+        process.spec.model_root = model_root;
+        process.spec.log_path = directory.path().join("vllm.log");
+        let eager_arguments = |process: &ManagedVllmProcess| {
+            process
+                .build_command()
+                .unwrap()
+                .get_args()
+                .filter(|argument| *argument == "--enforce-eager")
+                .count()
+        };
+
+        assert_eq!(eager_arguments(process), 1);
+        process.spec.settings.enforce_eager = false;
+        assert_eq!(eager_arguments(process), 0);
+    }
+
+    #[test]
+    fn enforce_eager_parses_as_an_optional_boolean() {
+        let settings = |vllm: &str| {
+            settings_from_metadata(&format!(
+                "
+serving:
+  vllm:
+    {vllm}
+"
+            ))
+        };
+
+        assert!(settings("max_model_len: 1024").unwrap().enforce_eager);
+        assert!(settings("enforce_eager: true").unwrap().enforce_eager);
+        assert!(!settings("enforce_eager: false").unwrap().enforce_eager);
+        assert!(settings("enforce_eager: 0")
+            .unwrap_err()
+            .contains("enforce_eager must be a boolean"));
     }
 
     #[test]
@@ -6207,6 +6347,7 @@ serving:
                     legacy_top_level_fraction_authored: false,
                     max_model_len: invocation.max_model_len,
                     startup_timeout: invocation.timeout,
+                    enforce_eager: true,
                 },
                 tensor_parallel_size: 1,
                 cuda_visible_devices: "0".to_string(),
