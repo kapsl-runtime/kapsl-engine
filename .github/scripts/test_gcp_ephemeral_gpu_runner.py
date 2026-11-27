@@ -271,6 +271,7 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
             "docker-smoke.yml",
             "installer-smoke.yml",
             "ort-cpu-conformance.yml",
+            "llama-cpp-cpu-conformance.yml",
         ):
             with self.subTest(workflow=name):
                 workflow = (workflows / name).read_text(encoding="utf-8")

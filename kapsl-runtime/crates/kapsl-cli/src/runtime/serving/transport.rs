@@ -199,7 +199,7 @@ impl RuntimeTransport {
         &self.endpoint
     }
 
-    pub(crate) async fn run(&self) -> Result<(), kapsl_transport::TransportError> {
+    pub(crate) async fn run(&self) -> Result<(), kapsl_communication::transport::TransportError> {
         self.server.run().await
     }
 }

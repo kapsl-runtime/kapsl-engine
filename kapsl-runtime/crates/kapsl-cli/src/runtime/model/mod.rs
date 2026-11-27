@@ -2,8 +2,10 @@
 
 use super::*;
 
+mod activity;
 mod autoscaler;
 mod backend;
+mod idle_unload;
 mod lifecycle;
 pub(crate) mod load_plan;
 mod manager;
@@ -11,8 +13,10 @@ mod package_preflight;
 mod replica;
 mod scaling;
 
+pub(crate) use activity::*;
 pub(crate) use autoscaler::*;
 use backend::*;
+pub(crate) use idle_unload::*;
 pub(crate) use lifecycle::*;
 pub(crate) use load_plan::*;
 pub(crate) use manager::*;
@@ -129,6 +133,10 @@ impl ModelRuntime {
         base_model_id: u32,
     ) -> Result<Vec<ModelInfo>, String> {
         stop_model_and_replicas(base_model_id, &self.models, &self.resources)
+    }
+
+    pub(crate) fn unload_idle_models(&self, timeout: Duration, now: Instant) -> Vec<u32> {
+        unload_idle_models(timeout, now, &self.models, &self.resources)
     }
 
     /// Load a model using the ambient Tokio runtime from a blocking lifecycle task.

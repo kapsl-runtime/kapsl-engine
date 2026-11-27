@@ -66,7 +66,7 @@ where
     B: Buf,
 {
     futures::pin_mut!(body);
-    let limit = kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES;
+    let limit = kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES;
     let mut collected = Vec::new();
     while let Some(chunk) = body.next().await {
         let mut chunk = match chunk {
@@ -147,7 +147,7 @@ async fn handle_chat_completion(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
                     "Chat completion payload exceeds the {}-byte limit",
-                    kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
+                    kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
                 ),
                 "invalid_request_error",
             );
@@ -430,8 +430,8 @@ async fn relay_managed_vllm_wire(args: ManagedVllmWireArgs) -> warp::reply::Resp
             .with_metadata(metadata);
     request.session_id = session_id;
     request.cancellation = Some(kapsl_engine_api::CancellationToken::new());
-    if let Err(error) =
-        request.validate(kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
+    if let Err(error) = request
+        .validate(kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES)
     {
         return openai_error(
             status_code_for_engine_error(&error),
@@ -854,7 +854,11 @@ mod tests {
 
     #[tokio::test]
     async fn chat_body_filter_rejects_before_buffering_above_the_wire_limit() {
-        let body = vec![b'x'; kapsl_transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES + 1];
+        let body = vec![
+            b'x';
+            kapsl_communication::transport::protocol::MAX_OPENAI_WIRE_REQUEST_PAYLOAD_BYTES
+                + 1
+        ];
         let result = warp::test::request()
             .method("POST")
             .body(body)

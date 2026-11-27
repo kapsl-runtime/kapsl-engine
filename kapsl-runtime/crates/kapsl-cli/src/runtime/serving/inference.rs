@@ -92,7 +92,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<BinaryTensorPacket, EngineError> {
-        let pool = self.ready_pool(model_id)?;
+        let (pool, _activity) = self.ready_pool(model_id)?;
         self.apply_pressure_policy(&mut request, priority)?;
         let force_cpu = effective_force_cpu(&request, force_cpu);
         let cancellation = request
@@ -135,7 +135,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<InferenceStream, EngineError> {
-        let pool = self.ready_pool(model_id)?;
+        let (pool, activity) = self.ready_pool(model_id)?;
         self.apply_pressure_policy(&mut request, priority)?;
         let force_cpu = effective_force_cpu(&request, force_cpu);
         let cancellation = request
@@ -160,7 +160,7 @@ impl InferenceService {
 
         let guard = CancelOnDrop(cancellation);
         Ok(Box::pin(stream.map(move |item| {
-            let _hold = &guard;
+            let _hold = (&guard, &activity);
             item
         })))
     }
@@ -172,7 +172,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<OpenAiWireResponse, EngineError> {
-        let pool = self.ready_pool(model_id)?;
+        let (pool, _activity) = self.ready_pool(model_id)?;
         if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
             validate_openai_wire_generation_cap(&request, cap)?;
         }
@@ -216,7 +216,7 @@ impl InferenceService {
         priority: Priority,
         force_cpu: bool,
     ) -> Result<OpenAiWireStreamResponse, EngineError> {
-        let pool = self.ready_pool(model_id)?;
+        let (pool, activity) = self.ready_pool(model_id)?;
         if let Some(cap) = self.enforce_openai_wire_pressure(priority)? {
             validate_openai_wire_generation_cap(&request, cap)?;
         }
@@ -244,7 +244,7 @@ impl InferenceService {
         Ok(OpenAiWireStreamResponse {
             head: response.head,
             body: Box::pin(response.body.map(move |item| {
-                let _hold = &guard;
+                let _hold = (&guard, &activity);
                 item
             })),
         })
@@ -277,15 +277,21 @@ impl InferenceService {
             .collect()
     }
 
-    fn ready_pool(&self, model_id: u32) -> Result<Arc<ReplicaPool<Scheduler>>, EngineError> {
-        let pool = self
+    /// Resolve the live pool and count the request as in flight for idle
+    /// unloading. Callers hold the guard until the request, including any
+    /// response stream, is finished.
+    fn ready_pool(
+        &self,
+        model_id: u32,
+    ) -> Result<(Arc<ReplicaPool<Scheduler>>, ModelActivityGuard), EngineError> {
+        let (pool, activity) = self
             .models
-            .pool(model_id)
+            .pool_for_request(model_id)
             .ok_or(EngineError::ModelNotLoaded)?;
         if !pool.is_healthy() {
             return Err(EngineError::overloaded("Model pool is overloaded"));
         }
-        Ok(pool)
+        Ok((pool, activity))
     }
 
     fn apply_pressure_policy(
@@ -724,6 +730,44 @@ mod tests {
         assert!(!cancellation.is_cancelled());
         drop(stream);
         assert!(cancellation.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn an_open_stream_counts_as_in_flight_until_dropped() {
+        let state = Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8));
+        let (service, _) = service(state);
+        let activity = service.models.activity(MODEL_ID).expect("loaded");
+
+        let stream = service
+            .infer_stream(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect("start stream");
+        assert_eq!(activity.in_flight(), 1);
+
+        drop(stream);
+        assert_eq!(activity.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn requests_are_refused_while_the_idle_unloader_holds_the_model() {
+        let state = Arc::new(AtomicU8::new(RuntimePressureState::Normal as u8));
+        let (service, _) = service(state);
+        let activity = service.models.activity(MODEL_ID).expect("loaded");
+        assert!(activity.try_claim_idle(Duration::ZERO, Instant::now()));
+
+        let error = service
+            .infer(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect_err("a model being unloaded must not accept requests");
+        assert!(matches!(error, EngineError::ModelNotLoaded));
+        assert_eq!(activity.in_flight(), 0);
+
+        activity.release_idle_claim();
+        service
+            .infer(MODEL_ID, request(10), Priority::LatencyCritical, false)
+            .await
+            .expect("a released claim reopens the model");
+        assert_eq!(activity.in_flight(), 0);
     }
 
     #[tokio::test]
