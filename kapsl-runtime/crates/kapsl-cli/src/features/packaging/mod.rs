@@ -6,6 +6,7 @@ mod build;
 mod commands;
 mod context;
 mod remote;
+mod staged_upload;
 mod target;
 mod temp;
 mod transfer;
