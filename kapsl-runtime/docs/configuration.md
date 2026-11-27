@@ -404,8 +404,11 @@ the life of the process. Admission charges it on every device before the
 child starts, as 24 MiB per decoder layer (`num_hidden_layers` in
 `config.json`, or in its `text_config`) with a 512 MiB floor, or 2 GiB when
 the config does not say. The pinned build used 0.40 GiB for a 24-layer model
-and 0.48 GiB for 28-layer models. After startup Kapsl logs the figure vLLM
-reported next to the charge, and warns when vLLM used more.
+and 0.48 GiB for 28-layer models. The charge shows up as the `model-session`
+class of `kapsl_memory_authority_bytes`. After startup Kapsl logs the figure
+vLLM reported next to the charge at info level (for example
+`RUST_LOG=warn,kapsl::runtime::managed=info`), and warns at the default level
+when vLLM used more.
 
 The deprecated top-level `gpu_memory_utilization` field and
 `kv_cache.mode: legacy_fraction` remain available only as explicit compatibility
