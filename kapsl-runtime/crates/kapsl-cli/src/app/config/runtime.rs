@@ -21,9 +21,9 @@ pub(crate) struct ResolvedRuntimeConfig {
     pub(crate) transport: RuntimeTransportConfig,
     pub(crate) kv_control: KvControlConfig,
     pub(crate) model_loading: ModelLoadingConfig,
-    /// Stop models after this long without inference requests; `None` (the
-    /// default) keeps every model loaded until it is stopped explicitly.
-    pub(crate) idle_unload: Option<Duration>,
+    /// Idle unloading policy. The default keeps every model loaded until it
+    /// is stopped explicitly.
+    pub(crate) idle_unload: IdleUnloadConfig,
     worker: bool,
     worker_model_id: Option<u32>,
     startup_summary: RuntimeStartupSummary,
@@ -114,10 +114,28 @@ impl ResolvedRuntimeConfig {
                 tuning.rust_log
             );
         }
-        if let Some(timeout) = self.idle_unload {
+        let idle = &self.idle_unload;
+        if let Some(timeout) = idle.default_timeout {
             log::info!(
                 "Idle unload enabled: a model with no inference requests for {}s is stopped to release its memory",
                 timeout.as_secs()
+            );
+        }
+        if !idle.model_timeouts.is_empty() {
+            let mut entries: Vec<_> = idle.model_timeouts.iter().collect();
+            entries.sort_by_key(|(model_id, _)| **model_id);
+            let entries: Vec<String> = entries
+                .into_iter()
+                .map(|(model_id, timeout)| match timeout {
+                    Some(timeout) => format!("{model_id}={}s", timeout.as_secs()),
+                    None => format!("{model_id}=never"),
+                })
+                .collect();
+            log::info!("Per-model idle timeouts: {}", entries.join(", "));
+        }
+        if idle.reload_on_request {
+            log::info!(
+                "Idle reload enabled: a model stopped for being idle is loaded again by the next request for it"
             );
         }
         log_auth_configuration(&self.auth_state);
@@ -207,10 +225,17 @@ pub(crate) fn resolve_runtime_config(
     };
     let model_loading = ModelLoadingConfig::from_args(&args)
         .map_err(|error| format!("Invalid model loading configuration: {error}"))?;
-    let idle_unload = resolve_idle_unload(
-        args.idle_unload_seconds,
-        std::env::var(IDLE_UNLOAD_SECONDS_ENV).ok().as_deref(),
-    )?;
+    let idle_unload = IdleUnloadConfig {
+        default_timeout: resolve_idle_unload(
+            args.idle_unload_seconds,
+            std::env::var(IDLE_UNLOAD_SECONDS_ENV).ok().as_deref(),
+        )?,
+        model_timeouts: resolve_model_idle_timeouts(
+            &args.idle_unload_model,
+            std::env::var(MODEL_IDLE_UNLOAD_SECONDS_ENV).ok().as_deref(),
+        )?,
+        reload_on_request: args.idle_reload || env_flag(IDLE_RELOAD_ENV),
+    };
     let startup_summary = RuntimeStartupSummary {
         state_dir: args.state_dir.clone(),
         performance_profile: args.performance_profile,
@@ -264,6 +289,48 @@ fn resolve_idle_unload(
         })?,
     };
     Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
+}
+
+/// Resolve per-model idle timeouts given as `MODEL_ID=SECONDS` entries,
+/// separated by commas. A flag entry wins over the environment's entry for
+/// the same model, and 0 keeps that model loaded.
+fn resolve_model_idle_timeouts(
+    flag_values: &[String],
+    env_value: Option<&str>,
+) -> Result<HashMap<u32, Option<Duration>>, String> {
+    let sources = env_value
+        .into_iter()
+        .map(|raw| (MODEL_IDLE_UNLOAD_SECONDS_ENV, raw))
+        .chain(
+            flag_values
+                .iter()
+                .map(|raw| ("--idle-unload-model", raw.as_str())),
+        );
+    let mut timeouts = HashMap::new();
+    for (source, raw) in sources {
+        for entry in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let parsed = entry.split_once('=').and_then(|(model_id, seconds)| {
+                Some((
+                    model_id.trim().parse::<u32>().ok()?,
+                    seconds.trim().parse::<u64>().ok()?,
+                ))
+            });
+            let Some((model_id, seconds)) = parsed else {
+                return Err(format!(
+                    "{source} expects MODEL_ID=SECONDS entries, got {entry:?}"
+                ));
+            };
+            timeouts.insert(
+                model_id,
+                (seconds > 0).then(|| Duration::from_secs(seconds)),
+            );
+        }
+    }
+    Ok(timeouts)
 }
 
 fn propagate_kv_compression_bits(bits: Option<u8>) {
@@ -332,6 +399,35 @@ mod tests {
             resolve_idle_unload(Some(60), Some("soon")),
             Ok(Some(Duration::from_secs(60)))
         );
+    }
+
+    #[test]
+    fn per_model_idle_timeouts_merge_with_the_flag_winning() {
+        let minutes = |n: u64| Some(Duration::from_secs(n * 60));
+        assert_eq!(resolve_model_idle_timeouts(&[], None), Ok(HashMap::new()));
+        assert_eq!(
+            resolve_model_idle_timeouts(
+                &["1=600".to_string(), " 2 = 0 , 3=60".to_string()],
+                Some("0=300, 1=120,"),
+            ),
+            Ok(HashMap::from([
+                (0, minutes(5)),
+                (1, minutes(10)),
+                (2, None),
+                (3, minutes(1)),
+            ]))
+        );
+    }
+
+    #[test]
+    fn malformed_per_model_idle_timeouts_name_their_source() {
+        for bad in ["1", "one=60", "1=soon", "1=-5", "*=60"] {
+            let error = resolve_model_idle_timeouts(&[bad.to_string()], None).unwrap_err();
+            assert!(error.contains("--idle-unload-model"), "{error}");
+            assert!(error.contains(bad), "{error}");
+        }
+        let error = resolve_model_idle_timeouts(&[], Some("1=60,x")).unwrap_err();
+        assert!(error.contains(MODEL_IDLE_UNLOAD_SECONDS_ENV), "{error}");
     }
 
     #[test]
