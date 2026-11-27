@@ -22,6 +22,9 @@ Options:
   --http-port <PORT>          HTTP/API/UI port (default: 9095)
   --idle-unload-seconds <SECONDS>
                               Stop a model after this long without requests (default: off)
+  --idle-unload-model <MODEL_ID=SECONDS>
+                              Idle timeout for one model; 0 keeps it loaded (repeatable)
+  --idle-reload               Reload an idle-unloaded model on its next request (default: off)
   --provider <BACKEND>        cpu | cuda | tensorrt | metal | rocm | directml
   --admin-token <TOKEN>       Set admin token at startup
   --log-level <LEVEL>         trace | debug | info | warn | error (default: info)
@@ -101,12 +104,38 @@ that are not being used so the other work can use their memory:
 kapsl run --idle-unload-seconds 900 ./models/assistant.aimod
 ```
 
-| Variable | Description |
-|----------|-------------|
-| `KAPSL_IDLE_UNLOAD_SECONDS` | Same as `--idle-unload-seconds`. The flag wins when both are set, and `0` from either turns idle unloading off |
+| Flag | Variable | Description |
+|------|----------|-------------|
+| `--idle-unload-seconds <SECONDS>` | `KAPSL_IDLE_UNLOAD_SECONDS` | Idle timeout for every model; `0` turns it off |
+| `--idle-unload-model <MODEL_ID>=<SECONDS>` (repeatable) | `KAPSL_MODEL_IDLE_UNLOAD_SECONDS` (comma-separated entries) | Idle timeout for one model; `0` keeps that model loaded |
+| `--idle-reload` | `KAPSL_IDLE_RELOAD=1` | Load a model that was stopped for being idle again when the next request for it arrives |
 
-The setting applies to every model in the process, including models added
-later with `kapsl add-model` or `POST /api/models/start`.
+A flag wins over its variable. All three are off unless you set them.
+
+#### Which timeout applies to a model
+
+Kapsl uses the first of these that is set for the model:
+
+1. the `idle_unload_seconds` it was started with, through
+   `POST /api/models/start` or `kapsl add-model --idle-unload-seconds`;
+2. its `--idle-unload-model` or `KAPSL_MODEL_IDLE_UNLOAD_SECONDS` entry;
+3. `--idle-unload-seconds`.
+
+A model with none of these, or with `0`, stays loaded. A per-model value also
+works on its own, without `--idle-unload-seconds`.
+
+Models loaded at startup get IDs from 0 in command-line order (`--model` paths
+before positional ones), and `kapsl list` shows every model's ID. This keeps
+an embedding model loaded and stops the LLM after ten idle minutes:
+
+```bash
+kapsl run embed.aimod llm.aimod --idle-unload-model 0=0 --idle-unload-model 1=600
+```
+
+`GET /api/models` reports the timeout in effect for each model as
+`idle_unload_seconds`.
+
+#### What counts as idle
 
 A model's idle timer starts when it finishes loading and starts again each
 time an inference request ends. A request counts as running from the moment
@@ -117,22 +146,63 @@ the socket, TCP, and shared-memory transports. Health checks, metrics, and
 model listings do not count.
 
 Kapsl checks every few seconds. When a model has had no running request for
-the configured time, Kapsl stops it and all of its replicas, exactly as
+its timeout, Kapsl stops it and all of its replicas, exactly as
 `POST /api/models/{id}/stop` does. It does not stop a model while work is
 queued on it, or while a start, stop, swap, or scale operation for that model
-is running. A request that arrives just as the model is stopped either
-finishes on the loaded model or gets the usual "model not loaded" error. It
-is never cut off partway through.
+is running. A request that arrives just as the model is stopped is never cut
+off partway through: it either finishes on the loaded model or finds the
+model stopped.
 
-A model stopped this way:
+#### A stopped model
 
-- stays in `kapsl list` and `GET /api/models` as inactive, keeping its ID and
-  package path;
-- answers inference requests with the same "not loaded" error as a manually
-  stopped model;
-- is not reloaded automatically. Start it again with `POST /api/models/start`,
-  passing the same `model_id` and `model_path` to keep its ID, or with
-  `kapsl add-model`, which assigns a new ID.
+A model stopped for being idle keeps its ID and package path and stays
+listed. `kapsl list` shows its status as `idle`, and `GET /api/models` reports
+it as inactive with `idle_unloaded: true`.
+
+Without `--idle-reload` it answers inference requests with the same "not
+loaded" error as a manually stopped model, and it is not loaded again
+automatically. Start it with `POST /api/models/start`, passing the same
+`model_id` and `model_path` to keep its ID, or with `kapsl add-model`, which
+assigns a new ID.
+
+#### Reloading on the next request
+
+With `--idle-reload`, a model stopped for being idle is loaded again when a
+request for it arrives on any interface. While it is stopped it stays listed
+in `/v1/models` and addressable by name. `kapsl list` shows it as
+`idle (reloads)`, and `GET /api/models` reports `reloads_on_request: true`.
+
+The request waits for the load and is then served. Requests that arrive in
+the meantime wait for the same load. If the client disconnects, the load
+still finishes, so the next request is served straight away. Loading a large
+model can take minutes, so give clients a timeout that covers a cold start.
+
+The reload goes through the same memory admission as a normal start. If the
+memory the model needs is not free, for example because a training job is
+using the GPU, the request fails and the model stays stopped:
+
+| Interface | Response |
+|-----------|----------|
+| OpenAI-compatible routes | HTTP 503 with `Retry-After: 10` and an error message that names the model and the memory that was denied |
+| `/api/models/{id}/infer` and `/infer/stream` | HTTP 503 with `"reason": "idle_reload_memory_unavailable"` and `"retry_after_seconds": 10` |
+| gRPC, MCP, socket, TCP, shared memory | An error carrying the same message |
+
+After a failed reload Kapsl waits 10 seconds before it tries again; requests
+in between get the same error immediately. A reload that fails for another
+reason, such as a backend that does not start, returns HTTP 500 with the
+cause.
+
+Only models stopped by the idle unloader are reloaded. A model you stopped
+yourself stays stopped. To keep an idle-unloaded model down, stop it with
+`POST /api/models/{id}/stop` or remove it.
+
+A reload takes memory back from whatever else is using the device. If
+inference requests can arrive while a training job runs, the reload either
+fails as described above or, if the memory happens to be free at that moment,
+succeeds and holds memory the job may need later. Leave `--idle-reload` off
+when training must never lose memory to inference.
+
+#### Memory that is freed
 
 Stopping a model frees its weights, KV cache, and backend workspaces. On a
 CUDA device that uses Kapsl's device pool (see below), that memory goes back
@@ -141,7 +211,8 @@ driver once the last model using that device has stopped. While any other
 model on the same GPU stays loaded, the freed memory stays reserved for Kapsl
 and other processes cannot use it.
 
-Each idle stop is logged at `info` level with an `[idle-unload]` prefix.
+Each idle stop is logged at `info` level with an `[idle-unload]` prefix, and
+each reload with `[idle-reload]`.
 
 ### GPU memory and shared KV
 

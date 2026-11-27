@@ -111,7 +111,9 @@ Key run flags:
 - `--topology` and `--tp-degree` for parallel topology hints.
 - `--state-dir <PATH>`: root directory for runtime state (rag-data, extensions, extensions-config, auth-store.json). Overrides `KAPSL_RAG_STORAGE_ROOT`, `KAPSL_EXTENSIONS_ROOT`, `KAPSL_EXT_CONFIG_ROOT`, and `KAPSL_AUTH_STORE_PATH` when set.
 - `--shm-size-mb <MIB>` (default `256`): size of the shared memory segment when using `shm` or `hybrid` transport. Also read from `KAPSL_SHM_SIZE_MB`.
-- `--idle-unload-seconds <SECONDS>` (default off): stop a model after it has served no inference requests for this long, freeing its memory for other work on the same GPU. The model stays registered as inactive and must be started again explicitly. Also read from `KAPSL_IDLE_UNLOAD_SECONDS`; `0` turns it off. See [Idle model unloading](docs/configuration.md#idle-model-unloading).
+- `--idle-unload-seconds <SECONDS>` (default off): stop a model after it has served no inference requests for this long, freeing its memory for other work on the same GPU. The model stays registered as inactive. Also read from `KAPSL_IDLE_UNLOAD_SECONDS`; `0` turns it off. See [Idle model unloading](docs/configuration.md#idle-model-unloading).
+- `--idle-unload-model <MODEL_ID>=<SECONDS>` (repeatable): idle timeout for one model, overriding `--idle-unload-seconds`; `0` keeps that model loaded. Also read from `KAPSL_MODEL_IDLE_UNLOAD_SECONDS` as comma-separated entries.
+- `--idle-reload` (default off): load a model that was stopped for being idle again when the next request for it arrives. If its memory is in use, for example by a training job, the request fails with HTTP 503 and can be retried. Also read from `KAPSL_IDLE_RELOAD`.
 
 ONNX runtime tuning flags:
 
