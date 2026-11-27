@@ -27,7 +27,6 @@ jobs:
       GCP_GPU_PROVISIONER_SERVICE_ACCOUNT: ${{ vars.GCP_GPU_PROVISIONER_SERVICE_ACCOUNT }}
       GCP_GPU_RUNNER_GROUP_ID: ${{ vars.GCP_GPU_RUNNER_GROUP_ID }}
       GPU_RUNNER_GITHUB_APP_ID: ${{ vars.GPU_RUNNER_GITHUB_APP_ID }}
-      KAPSL_VLLM_SDK_REF: ${{ vars.KAPSL_VLLM_SDK_REF }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -58,10 +57,10 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: gh api "repos/$GITHUB_REPOSITORY/actions/runners?per_page=1" --jq .total_count
 
-      - name: Verify the exact certified SDK commit
+      - name: Verify the exact certified vLLM connector commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .github/scripts/preflight_release_environment.py --sdk
+        run: python3 .github/scripts/preflight_release_environment.py --vllm-integration
 
       - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:

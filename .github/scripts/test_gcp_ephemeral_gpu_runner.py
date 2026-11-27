@@ -69,6 +69,8 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
             '[package]\nname = "kapsl"\nversion = "0.2.4"\n',
             encoding="utf-8",
         )
+        self.lock = Path(self.temporary.name) / "vllm-integration.lock"
+        self.lock.write_text("a" * 40 + "\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -80,7 +82,7 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
             "ref_name": "v0.2.4",
             "release_tag": "v0.2.4",
             "manifest": self.manifest,
-            "sdk_ref": "a" * 40,
+            "vllm_integration_lock": self.lock,
         }
         values.update(overrides)
         policy.authorize(**values)
@@ -89,6 +91,8 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
         self.authorize()
 
     def test_manual_branch_beta_and_prerelease_contexts_are_rejected(self) -> None:
+        floating = self.lock.with_name("floating.lock")
+        floating.write_text("main\n", encoding="utf-8")
         invalid = (
             {"event_name": "workflow_dispatch"},
             {"ref_type": "branch", "ref_name": "main", "release_tag": "main"},
@@ -99,7 +103,8 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
             {"ref_name": "v0.2.4-rc.1", "release_tag": "v0.2.4-rc.1"},
             {"ref_name": "v0.2.5", "release_tag": "v0.2.5"},
             {"release_tag": "v0.2.5"},
-            {"sdk_ref": "main"},
+            {"vllm_integration_lock": floating},
+            {"vllm_integration_lock": self.lock.with_name("missing.lock")},
         )
         for overrides in invalid:
             with self.subTest(overrides), self.assertRaises(policy.AuthorizationError):
@@ -141,7 +146,13 @@ class StableGpuReleasePolicyTests(unittest.TestCase):
             stable_release,
         )
         self.assertIn("release_tag: ${{ github.ref_name }}", stable_release)
-        self.assertIn("sdk_ref: ${{ vars.KAPSL_VLLM_SDK_REF }}", stable_release)
+        for workflow in (dispatcher, conformance):
+            self.assertIn(
+                "--vllm-integration-lock .github/vllm-integration.lock", workflow
+            )
+        for workflow in (dispatcher, conformance, stable_release, beta_release):
+            self.assertNotIn("KAPSL_VLLM_SDK_REF", workflow)
+            self.assertNotIn("sdk_ref", workflow)
         self.assertNotIn("gpu-device-pool-integration.yml", beta_release)
 
     def test_cpu_performance_parity_is_not_a_pull_request_gate(self) -> None:

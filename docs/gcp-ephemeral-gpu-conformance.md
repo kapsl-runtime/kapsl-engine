@@ -227,10 +227,14 @@ Set this environment secret:
 | --- | --- |
 | `GPU_RUNNER_GITHUB_APP_PRIVATE_KEY` | Entire PEM private key downloaded from the App |
 
-Set the repository variable `KAPSL_VLLM_SDK_REF` to the exact lowercase
-40-character commit for the SDK release certified with the engine release.
-Update it deliberately when promoting a new SDK release; branch names and
-floating tags are rejected.
+The vLLM connector that a release packages and this job certifies is not a
+repository setting. `.github/vllm-integration.lock` holds the exact lowercase
+40-character `kapsl-integrations` commit the connector is built from, so the
+engine commit being released selects it. Promote a new connector with a pull
+request that changes that file together with the connector version the engine
+pins; branch names and floating tags are rejected. The repository variable
+`KAPSL_VLLM_SDK_REF`, which used to name a `kapsl-sdk` commit, is no longer
+read.
 
 After creating the environment in the repository settings and saving the App
 private key as `github-app-private-key.pem`, the non-interactive configuration
@@ -238,7 +242,6 @@ is:
 
 ```bash
 export GPU_RUNNER_GITHUB_APP_ID=123456
-export KAPSL_VLLM_SDK_REF=0123456789abcdef0123456789abcdef01234567
 
 gh api --method PUT \
   repos/kapsl-runtime/kapsl-engine/environments/gcp-gpu-conformance >/dev/null
@@ -262,9 +265,6 @@ gh secret set GPU_RUNNER_GITHUB_APP_PRIVATE_KEY \
   --repo kapsl-runtime/kapsl-engine \
   --env gcp-gpu-conformance \
   < github-app-private-key.pem
-gh variable set KAPSL_VLLM_SDK_REF \
-  --repo kapsl-runtime/kapsl-engine \
-  --body "$KAPSL_VLLM_SDK_REF"
 ```
 
 For the private-subnet option, also set `GCP_GPU_SUBNET` to the full resource

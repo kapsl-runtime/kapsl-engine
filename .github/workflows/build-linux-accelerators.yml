@@ -19,10 +19,6 @@ on:
         type: boolean
         required: false
         default: false
-      sdk_ref:
-        type: string
-        required: false
-        default: ""
     secrets:
       KAPSL_BACKEND_PUBLIC_KEYS:
         required: true
@@ -48,15 +44,13 @@ jobs:
           RELEASE_CHANNEL: ${{ inputs.channel }}
           STABLE_RELEASE: ${{ inputs.stable_release }}
           CACHE_ONLY: ${{ inputs.cache_only }}
-          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
         run: python3 .github/scripts/release_build_inputs.py
 
-      - name: Verify certified SDK availability before fan-out
+      - name: Verify the certified vLLM connector commit before fan-out
         if: '!inputs.cache_only'
         env:
           GH_TOKEN: ${{ github.token }}
-          KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
-        run: python3 .github/scripts/preflight_release_environment.py --sdk
+        run: python3 .github/scripts/preflight_release_environment.py --vllm-integration
 
   components:
     name: Build ${{ matrix.component }}
@@ -75,7 +69,6 @@ jobs:
       KAPSL_NVIDIA_LICENSE_FILE: /NGC-DL-CONTAINER-LICENSE
       KAPSL_VERSION: ${{ needs.prepare.outputs.version }}
       KAPSL_BACKEND_PUBLIC_KEYS: ${{ secrets.KAPSL_BACKEND_PUBLIC_KEYS }}
-      KAPSL_VLLM_SDK_REF: ${{ inputs.sdk_ref }}
       LIBRARY_PATH: /usr/local/cuda/lib64/stubs:/usr/local/cuda/targets/x86_64-linux/lib/stubs
     steps:
       - name: Install CUDA build dependencies
@@ -123,22 +116,33 @@ jobs:
           CMAKE_POSITION_INDEPENDENT_CODE: "ON"
         run: .github/scripts/package-linux-llama-cpp-backend-packs.sh
 
+      - name: Resolve certified vLLM integrations commit
+        if: matrix.component == 'vllm'
+        id: vllm-integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '\r\n' < .github/vllm-integration.lock)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "KAPSL_VLLM_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
       - name: Checkout certified vLLM connector
         if: matrix.component == 'vllm'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: kapsl-runtime/kapsl-sdk
-          ref: ${{ env.KAPSL_VLLM_SDK_REF }}
-          path: sdk-vllm
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.vllm-integrations.outputs.ref }}
+          path: kapsl-integrations-vllm
 
-      - name: Verify certified vLLM SDK checkout
+      - name: Verify certified vLLM integrations checkout
         if: matrix.component == 'vllm'
-        run: .github/scripts/verify-managed-vllm-sdk-checkout.sh sdk-vllm "$KAPSL_VLLM_SDK_REF"
+        run: .github/scripts/verify-vllm-integration-checkout.sh kapsl-integrations-vllm "$KAPSL_VLLM_INTEGRATIONS_REF"
 
       - name: Package certified managed-vLLM backend
         if: matrix.component == 'vllm'
         env:
-          KAPSL_VLLM_SDK_DIR: sdk-vllm
+          KAPSL_VLLM_INTEGRATIONS_DIR: kapsl-integrations-vllm
         run: .github/scripts/package-linux-vllm-backend.sh
 
       - name: Resolve certified ORT integrations commit

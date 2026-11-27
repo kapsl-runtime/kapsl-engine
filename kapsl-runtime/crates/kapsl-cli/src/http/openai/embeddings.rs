@@ -869,6 +869,9 @@ async fn handle_embeddings(
         );
     }
 
+    if let Err(response) = ensure_model_loaded(inference, &resolved).await {
+        return response;
+    }
     let Some(pool) = models.pool(resolved.id) else {
         return openai_error(
             StatusCode::SERVICE_UNAVAILABLE,

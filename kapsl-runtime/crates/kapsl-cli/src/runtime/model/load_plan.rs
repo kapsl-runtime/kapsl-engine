@@ -86,6 +86,11 @@ impl ModelLoadPlanner {
         self.device_info.as_ref()
     }
 
+    /// Topology used by loads that do not request their own.
+    pub(crate) fn default_placement(&self) -> &ModelLoadPlacement {
+        &self.defaults.placement
+    }
+
     /// Creates an immutable plan, applying an optional request-scoped placement.
     pub(crate) fn prepare(
         &self,

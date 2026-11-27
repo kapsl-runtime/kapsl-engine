@@ -271,6 +271,9 @@ async fn handle_response(
             return openai_error(StatusCode::NOT_FOUND, message, "invalid_request_error");
         }
     };
+    if let Err(response) = ensure_model_loaded(inference, &resolved).await {
+        return response;
+    }
 
     let prompt = match build_response_prompt(&response_request, &resolved.name) {
         Ok(prompt) => prompt,

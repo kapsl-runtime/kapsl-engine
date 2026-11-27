@@ -35,6 +35,18 @@ pub(crate) fn build_model_infer_route(
         let rag = rag_for_infer.clone();
         async move {
             use warp::http::StatusCode;
+            // With idle reload on, a model stopped for being idle is loaded
+            // again before the request is served.
+            if let Err(error) = inference.ensure_loaded(model_id).await {
+                if error != IdleReloadError::NotLoaded {
+                    log::warn!("Infer request could not reload model_id={}: {}", model_id, error);
+                    let (status, body) = idle_reload_error_reply(&error);
+                    return Ok::<_, warp::Rejection>(warp::reply::with_status(
+                        warp::reply::json(&body),
+                        status,
+                    ));
+                }
+            }
             let scheduler = models.pool(model_id);
 
             match scheduler {

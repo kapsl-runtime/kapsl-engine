@@ -11,6 +11,11 @@ import subprocess
 import tempfile
 
 
+# The exact kapsl-integrations commit the managed-vLLM connector is built from.
+VLLM_INTEGRATION_LOCK = Path(__file__).resolve().parents[1] / "vllm-integration.lock"
+INTEGRATIONS_REPOSITORY = "kapsl-runtime/kapsl-integrations"
+
+
 class PreflightError(RuntimeError):
     pass
 
@@ -25,7 +30,7 @@ def validate_gpu(environ):
     require(environ, (
         "GCP_GPU_PROJECT_ID", "GCP_GPU_ZONE", "GCP_GPU_RUNNER_IMAGE",
         "GCP_WORKLOAD_IDENTITY_PROVIDER", "GCP_GPU_PROVISIONER_SERVICE_ACCOUNT",
-        "GPU_RUNNER_GITHUB_APP_ID", "KAPSL_VLLM_SDK_REF",
+        "GPU_RUNNER_GITHUB_APP_ID",
     ))
     if not environ.get("GPU_RUNNER_GITHUB_APP_PRIVATE_KEY", "").strip():
         raise PreflightError(
@@ -37,8 +42,6 @@ def validate_gpu(environ):
             raise PreflightError(f"{name} must be a positive integer.")
     if (environ.get("GCP_GPU_EXTERNAL_IP") or "true") not in ("true", "false"):
         raise PreflightError("GCP_GPU_EXTERNAL_IP must be true or false.")
-    if not re.fullmatch(r"[0-9a-f]{40}", environ["KAPSL_VLLM_SDK_REF"]):
-        raise PreflightError("KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit.")
     image = environ["GCP_GPU_RUNNER_IMAGE"].removeprefix(
         "https://www.googleapis.com/compute/v1/"
     )
@@ -74,37 +77,52 @@ def validate_signing(environ):
         raise PreflightError("Backend signing configuration is invalid.") from error
 
 
-def validate_sdk(environ):
-    require(environ, ("KAPSL_VLLM_SDK_REF", "GH_TOKEN"))
-    ref = environ["KAPSL_VLLM_SDK_REF"]
-    if not re.fullmatch(r"[0-9a-f]{40}", ref):
-        raise PreflightError("KAPSL_VLLM_SDK_REF must be an exact lowercase 40-hex commit.")
+def vllm_integration_ref(lock=VLLM_INTEGRATION_LOCK):
+    """Return the one exact commit .github/vllm-integration.lock pins."""
+    try:
+        text = Path(lock).read_text()
+    except OSError as error:
+        raise PreflightError(".github/vllm-integration.lock is missing or unreadable.") from error
+    if not re.fullmatch(r"[0-9a-f]{40}\n?", text):
+        raise PreflightError(
+            ".github/vllm-integration.lock must contain one exact lowercase 40-hex commit."
+        )
+    return text.strip()
+
+
+def validate_vllm_integration(environ, lock=VLLM_INTEGRATION_LOCK):
+    require(environ, ("GH_TOKEN",))
+    ref = vllm_integration_ref(lock)
     try:
         result = subprocess.run(
-            ["gh", "api", f"repos/kapsl-runtime/kapsl-sdk/commits/{ref}", "--jq", ".sha"],
+            ["gh", "api", f"repos/{INTEGRATIONS_REPOSITORY}/commits/{ref}", "--jq", ".sha"],
             env=dict(environ), check=True, capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError) as error:
-        raise PreflightError("Could not verify the certified SDK commit before builds.") from error
+        raise PreflightError(
+            "Could not verify the certified vLLM connector commit before builds."
+        ) from error
     if result.stdout.strip() != ref:
-        raise PreflightError("Certified SDK commit did not resolve to the exact requested revision.")
+        raise PreflightError(
+            "Certified vLLM connector commit did not resolve to the exact requested revision."
+        )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpu", action="store_true")
     parser.add_argument("--signing", action="store_true")
-    parser.add_argument("--sdk", action="store_true")
+    parser.add_argument("--vllm-integration", action="store_true")
     args = parser.parse_args()
-    if not args.gpu and not args.signing and not args.sdk:
-        parser.error("select --gpu, --signing or --sdk")
+    if not args.gpu and not args.signing and not args.vllm_integration:
+        parser.error("select --gpu, --signing or --vllm-integration")
     try:
         if args.gpu:
             validate_gpu(os.environ)
         if args.signing:
             validate_signing(os.environ)
-        if args.sdk:
-            validate_sdk(os.environ)
+        if args.vllm_integration:
+            validate_vllm_integration(os.environ)
     except PreflightError as error:
         raise SystemExit(str(error)) from None
     print("Release environment configuration passed (no resources provisioned).")
