@@ -29,8 +29,17 @@ pub(crate) enum IdleReloadError {
 }
 
 impl IdleReloadError {
-    fn from_load_error(model_id: u32, error: &(dyn std::error::Error + 'static)) -> Self {
-        if error.downcast_ref::<MemoryAdmissionFailure>().is_some() {
+    /// Memory that is in use is either a denial by Kapsl's memory authority,
+    /// or a managed vLLM planner that could not allocate on its device (see
+    /// `ManagedVllmPlannerFailure::device_memory_unavailable`). Every other
+    /// load error is a plain failure.
+    pub(crate) fn from_load_error(
+        model_id: u32,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        if error.downcast_ref::<MemoryAdmissionFailure>().is_some()
+            || is_managed_vllm_device_memory_unavailable(error)
+        {
             Self::MemoryUnavailable {
                 message: format!(
                     "model {model_id} was stopped for being idle and cannot be reloaded right now: {error}. \
@@ -514,6 +523,41 @@ mod tests {
             IdleReloadError::from_load_error(MODEL_ID, other.as_ref()),
             IdleReloadError::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn a_managed_vllm_planner_out_of_memory_becomes_the_memory_in_use_error() {
+        let out_of_memory = managed_vllm_planner_load_error_for_tests(
+            "runtime_geometry_unavailable",
+            "certified runtime geometry provider failed: CUDA out of memory. Tried to allocate 260.00 MiB.",
+        );
+        let error = IdleReloadError::from_load_error(MODEL_ID, out_of_memory.as_ref());
+        assert!(
+            matches!(error, IdleReloadError::MemoryUnavailable { .. }),
+            "{error}"
+        );
+        assert_eq!(error.retry_after_seconds(), Some(IDLE_RELOAD_RETRY_SECONDS));
+        let message = error.to_string();
+        assert!(
+            message.contains("cannot be reloaded right now"),
+            "{message}"
+        );
+        // The planner's own explanation is kept.
+        assert!(
+            message.contains("CUDA out of memory. Tried to allocate 260.00 MiB."),
+            "{message}"
+        );
+
+        let rejected = managed_vllm_planner_load_error_for_tests(
+            "planning_failed",
+            "--max-model-len must be positive",
+        );
+        let error = IdleReloadError::from_load_error(MODEL_ID, rejected.as_ref());
+        assert!(matches!(error, IdleReloadError::Failed { .. }), "{error}");
+        assert_eq!(error.retry_after_seconds(), None);
+        assert!(error
+            .to_string()
+            .contains("--max-model-len must be positive"));
     }
 
     #[test]
