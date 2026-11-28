@@ -368,18 +368,15 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
 
         let kind = EngineKind::resolve(&plan.loader.manifest);
         let onnx_pool_opt_in = onnx_cuda_pool_opt_in();
-        let wants_pool = kind_uses_shared_pool(kind, onnx_pool_opt_in);
-        if wants_pool {
-            for &device_id in &cuda_device_ids {
-                bootstrap.mark_pool_consumer(device_id);
-            }
-        }
+        let signed_accelerator_pack = kind.uses_onnx_session()
+            && onnx_route_uses_signed_accelerator_pack(&plan.loader.manifest, device_info);
+        let wants_pool = plan_pool_route(
+            &mut bootstrap,
+            &cuda_device_ids,
+            route_uses_shared_pool(kind, onnx_pool_opt_in, signed_accelerator_pack),
+        );
 
-        // ONNX on ORT's own arena (the default) is external demand sized to
-        // its peak under load. With the pool opt-in, ORT CUDA/TensorRT sessions
-        // use the registered environment allocator, so their weights and
-        // workspaces are pool demand.
-        if kind.uses_onnx_session() && !wants_pool {
+        if kind.uses_onnx_session() {
             let model_bytes = std::fs::metadata(&plan.model_file_path)
                 .map_err(|error| {
                     format!(
@@ -394,51 +391,14 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
             } else {
                 model_bytes
             };
-            let peak = onnx_arena_peak_bytes(per_device_model_bytes, plan.onnx_peak_concurrency);
-            for &device_id in &cuda_device_ids {
-                bootstrap.add_external_allocation(
-                    device_id,
-                    format!(
-                        "bootstrap-onnx-arena:{}:{}:{}",
-                        plan.base_model_id, plan.replica_id, device_id
-                    ),
-                    peak,
-                );
-            }
-            continue;
-        }
-        if kind.uses_onnx_session() && wants_pool {
-            let model_bytes = std::fs::metadata(&plan.model_file_path)
-                .map_err(|error| {
-                    format!(
-                        "stat ONNX model {}: {error}",
-                        plan.model_file_path.display()
-                    )
-                })?
-                .len() as usize;
-            let per_device_model_bytes = if plan.use_pipeline_backend {
-                model_bytes.saturating_add(cuda_device_ids.len().saturating_sub(1))
-                    / cuda_device_ids.len().max(1)
-            } else {
-                model_bytes
-            };
-            // ORT keeps weights plus per-session CUDA arenas/workspaces in the
-            // registered allocator. Size both explicitly; serialized model
-            // bytes alone are not a peak device-memory plan.
-            let workspace_per_session = (per_device_model_bytes / 2).max(256 * 1024 * 1024);
-            let pooled_bytes = per_device_model_bytes
-                .saturating_add(workspace_per_session)
-                .saturating_mul(plan.onnx_peak_concurrency);
-            for &device_id in &cuda_device_ids {
-                bootstrap.add_pooled_allocation(
-                    device_id,
-                    format!(
-                        "bootstrap-onnx:{}:{}:{}",
-                        plan.base_model_id, plan.replica_id, device_id
-                    ),
-                    pooled_bytes,
-                );
-            }
+            plan_onnx_device_demand(
+                &mut bootstrap,
+                &cuda_device_ids,
+                wants_pool,
+                per_device_model_bytes,
+                plan.onnx_peak_concurrency,
+                (plan.base_model_id, plan.replica_id),
+            );
             continue;
         }
 
@@ -498,6 +458,63 @@ pub(crate) fn device_memory_bootstrap_plan<'a>(
     Ok(bootstrap)
 }
 
+/// Mark the model's devices as pool consumers when its route allocates from
+/// the runtime pool: automatic mode then provisions one there (and only there).
+#[cfg(feature = "gpu-device-pool")]
+fn plan_pool_route(
+    bootstrap: &mut DeviceMemoryBootstrapPlan,
+    cuda_device_ids: &[usize],
+    uses_pool: bool,
+) -> bool {
+    if uses_pool {
+        for &device_id in cuda_device_ids {
+            bootstrap.mark_pool_consumer(device_id);
+        }
+    }
+    uses_pool
+}
+
+/// Plan one ONNX model's device memory for automatic pool sizing.
+///
+/// On ORT's own arena (embedded ORT without the pool opt-in) it is external
+/// demand sized to its peak under load. When its allocations come from the
+/// runtime pool (the pool opt-in's registered environment allocator, or a
+/// signed native accelerator pack's governed allocator), weights plus
+/// per-session arenas/workspaces are pooled demand, sized explicitly:
+/// serialized model bytes alone are not a peak device-memory plan.
+#[cfg(feature = "gpu-device-pool")]
+fn plan_onnx_device_demand(
+    bootstrap: &mut DeviceMemoryBootstrapPlan,
+    cuda_device_ids: &[usize],
+    pooled: bool,
+    per_device_model_bytes: usize,
+    sessions: usize,
+    (model_id, replica_id): (u32, u32),
+) {
+    if !pooled {
+        let peak = onnx_arena_peak_bytes(per_device_model_bytes, sessions);
+        for &device_id in cuda_device_ids {
+            bootstrap.add_external_allocation(
+                device_id,
+                format!("bootstrap-onnx-arena:{model_id}:{replica_id}:{device_id}"),
+                peak,
+            );
+        }
+        return;
+    }
+    let workspace_per_session = (per_device_model_bytes / 2).max(256 * 1024 * 1024);
+    let pooled_bytes = per_device_model_bytes
+        .saturating_add(workspace_per_session)
+        .saturating_mul(sessions);
+    for &device_id in cuda_device_ids {
+        bootstrap.add_pooled_allocation(
+            device_id,
+            format!("bootstrap-onnx:{model_id}:{replica_id}:{device_id}"),
+            pooled_bytes,
+        );
+    }
+}
+
 /// Opt-in that puts ONNX CUDA sessions back on the shared Kapsl GPU pool.
 ///
 /// By default ONNX models use ORT's own per-session arenas: run 5 and run 6
@@ -526,6 +543,37 @@ pub(crate) fn kind_uses_shared_pool(kind: EngineKind, onnx_pool_opt_in: bool) ->
             feature = "gguf-cuda-shared-kv"
         )) || crate::backend::lazy_llama_cpp_packs_enabled()))
         || (kind == EngineKind::Native && cfg!(feature = "native"))
+}
+
+/// Whether the route a model loads on draws its device memory from the runtime
+/// pool, so automatic mode must provision one on its devices.
+/// `signed_accelerator_pack` says an ONNX model resolves to a signed native
+/// accelerator pack: such a pack must use the governed device allocator
+/// (`BackendManager` rejects one that does not), which allocates from the
+/// runtime-owned pool and refuses to start without it.
+#[cfg_attr(not(feature = "gpu-device-pool"), allow(dead_code))]
+pub(crate) fn route_uses_shared_pool(
+    kind: EngineKind,
+    onnx_pool_opt_in: bool,
+    signed_accelerator_pack: bool,
+) -> bool {
+    kind_uses_shared_pool(kind, onnx_pool_opt_in)
+        || (kind.uses_onnx_session() && signed_accelerator_pack)
+}
+
+/// Host-only and deterministic: whether `ensure_onnx_backend_pack` will route
+/// this ONNX model to a signed native CUDA or TensorRT pack on this host.
+#[cfg(feature = "gpu-device-pool")]
+pub(crate) fn onnx_route_uses_signed_accelerator_pack(
+    manifest: &kapsl_core::Manifest,
+    device_info: &DeviceInfo,
+) -> bool {
+    crate::backend::generic_native_backend_packs_enabled().unwrap_or(false)
+        && crate::backend::lazy_onnx_packs_enabled()
+        && matches!(
+            crate::backend::onnx_pack_profile_for_manifest(manifest, device_info),
+            Ok(Some(profile)) if profile != crate::backend::OnnxBackendPackProfile::Cpu
+        )
 }
 
 /// Whether an engine's CUDA claim is ORT's own arena, which the memory
@@ -782,6 +830,90 @@ mod device_memory_plan_tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    const ONNX_KINDS: [EngineKind; 5] = [
+        EngineKind::OnnxForward,
+        EngineKind::OnnxDetect,
+        EngineKind::OnnxClassify,
+        EngineKind::OnnxEmbed,
+        EngineKind::OnnxGenerate,
+    ];
+
+    #[test]
+    fn signed_onnx_accelerator_packs_use_the_pool_by_default() {
+        for kind in ONNX_KINDS {
+            assert!(
+                route_uses_shared_pool(kind, false, true),
+                "{kind:?} signed GPU pack"
+            );
+            assert!(
+                !route_uses_shared_pool(kind, false, false),
+                "{kind:?} embedded ORT keeps its own arena"
+            );
+            assert!(
+                route_uses_shared_pool(kind, true, false),
+                "{kind:?} opted in"
+            );
+        }
+        // The signed ONNX route says nothing about GGUF or native models.
+        for kind in [EngineKind::GgufGenerate, EngineKind::Native] {
+            assert_eq!(
+                route_uses_shared_pool(kind, false, true),
+                kind_uses_shared_pool(kind, false),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The v0.3.0 qualification's default ONNX-only starts (signed onnx/cuda12
+    /// and onnx/tensorrt10, no explicit pool mode) got no pool, and the pack
+    /// refused to start without one.
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn a_default_onnx_only_start_on_signed_gpu_packs_plans_a_pool_that_holds_it() {
+        const MIB: usize = 1024 * 1024;
+        let resnet = 102_576_593;
+        let mut bootstrap = DeviceMemoryBootstrapPlan::default();
+        let pooled = plan_pool_route(
+            &mut bootstrap,
+            &[0],
+            route_uses_shared_pool(EngineKind::OnnxClassify, false, true),
+        );
+        plan_onnx_device_demand(&mut bootstrap, &[0], pooled, resnet, 1, (0, 0));
+        let (minimum_pooled, external) = bootstrap
+            .implicit_pool_demand(0)
+            .expect("automatic mode provisions a pool for the governed allocator");
+        assert_eq!(minimum_pooled, resnet + 256 * MIB);
+        assert_eq!(external, 0, "the pool holds it; no ORT arena outside it");
+
+        // Embedded ORT on the same host: its own arena, external, no pool.
+        let mut bootstrap = DeviceMemoryBootstrapPlan::default();
+        let pooled = plan_pool_route(
+            &mut bootstrap,
+            &[0],
+            route_uses_shared_pool(EngineKind::OnnxClassify, false, false),
+        );
+        plan_onnx_device_demand(&mut bootstrap, &[0], pooled, resnet, 1, (0, 0));
+        assert_eq!(bootstrap.implicit_pool_demand(0), None);
+    }
+
+    /// GGUF on the signed llama.cpp pack already asks for the pool by default:
+    /// its weights and scratch stay external, its KV lives in the pool.
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn a_default_gguf_start_on_the_signed_pack_plans_a_pool() {
+        let mut bootstrap = DeviceMemoryBootstrapPlan::default();
+        let uses_pool = kind_uses_shared_pool(EngineKind::GgufGenerate, false);
+        plan_pool_route(&mut bootstrap, &[0], uses_pool);
+        bootstrap.add_external_allocation(0, "bootstrap-gguf:qwen", 491_400_032);
+        bootstrap.add_external_allocation(0, "bootstrap-scratch:1:0:0", 268_435_456);
+        let expected = (cfg!(any(
+            feature = "gguf-native",
+            feature = "gguf-cuda-shared-kv"
+        )) || crate::backend::lazy_llama_cpp_packs_enabled())
+        .then_some((0, 759_835_488));
+        assert_eq!(bootstrap.implicit_pool_demand(0), expected);
     }
 
     #[test]
