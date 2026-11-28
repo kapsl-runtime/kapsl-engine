@@ -417,8 +417,10 @@ kapsl build
 ## 7) Push Packages (`kapsl push`)
 
 Push target format:
-- Required: `<repo_name>/<model>:<label>`
-- Example: `alice/mnist:prod`
+- `[<repo>/]<model>[:<label>]`, for example `alice/mnist:prod`
+- The repo defaults to `kapsl`, the official public library, which only Kapsl maintainers can
+  publish to. Name your own repo (your Kapsl Hub username) when you push.
+- The label defaults to `latest`.
 
 Upload a package:
 
@@ -472,6 +474,16 @@ In SSH sessions, plain `kapsl login` automatically prefers device-code flow (Git
 If no token is configured and the remote returns `401`, `kapsl push`/`kapsl pull` will automatically start browser login and retry once.
 
 ## 8) Pull Packages (`kapsl pull`)
+
+Pull a model from the official Kapsl library. A target without a repo means the `kapsl`
+library, and one without a label means `latest`, so these are the same:
+
+```bash
+kapsl pull qwen3-4b --destination-dir ./models
+kapsl pull kapsl/qwen3-4b:latest --destination-dir ./models
+```
+
+Browse the library at https://kapsl.net/hub/library.
 
 Pull by target:
 
@@ -664,8 +676,8 @@ kapsl build <path-to-model-file> --output <output.aimod>
 kapsl build [<context-dir>]
 
 # push
-kapsl push <repo>/<model>:<label> [<path-to-kapsl>] [--remote-url <url>]
+kapsl push [<repo>/]<model>[:<label>] [<path-to-kapsl>] [--remote-url <url>]
 
 # pull
-kapsl pull <repo>/<model>:<label> [--destination-dir <dir>] [--remote-url <url>]
+kapsl pull [<repo>/]<model>[:<label>] [--destination-dir <dir>] [--remote-url <url>]
 ```

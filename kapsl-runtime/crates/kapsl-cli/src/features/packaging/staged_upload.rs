@@ -45,13 +45,17 @@ impl StagedUploadError {
     }
 
     fn from_ureq(context: impl std::fmt::Display, error: ureq::Error) -> Self {
-        let status_code = match &error {
-            ureq::Error::StatusCode(code) => Some(*code),
-            _ => None,
+        // Same wording as the rest of the CLI's remote errors, so callers and
+        // users see one format for an HTTP status.
+        let (status_code, detail) = match error {
+            ureq::Error::StatusCode(code) => {
+                (Some(code), format!("Remote backend returned HTTP {code}"))
+            }
+            other => (None, other.to_string()),
         };
         Self {
             status_code,
-            message: format!("{context}: {error}"),
+            message: format!("{context}: {detail}"),
         }
     }
 }

@@ -80,7 +80,8 @@ pub(crate) struct BundleCommandArgs {
 #[derive(clap::Args, Debug)]
 #[command(next_help_heading = "Push Options")]
 pub(crate) struct PushCommandArgs {
-    /// Destination in the registry. Format: <repo>/<model>:<label>  (e.g. acme/gpt2:prod)
+    /// Destination in the registry. Format: [<repo>/]<model>[:<label>]  (e.g. acme/gpt2:prod).
+    /// The repo defaults to the official `kapsl` library and the label to `latest`.
     #[arg(value_name = "TARGET")]
     pub(crate) target: String,
 
@@ -111,7 +112,8 @@ pub(crate) struct PushCommandArgs {
     )
 )]
 pub(crate) struct PullCommandArgs {
-    /// Package to download. Format: <repo>/<model>:<label>  (e.g. acme/gpt2:prod)
+    /// Package to download. Format: [<repo>/]<model>[:<label>]  (e.g. qwen3-4b or acme/gpt2:prod).
+    /// The repo defaults to the official `kapsl` library and the label to `latest`.
     #[arg(value_name = "TARGET")]
     pub(crate) target: Option<String>,
 
