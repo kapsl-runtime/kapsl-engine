@@ -2185,7 +2185,12 @@ pub(crate) fn execute_backend_command(
                     .into());
                 }
                 let uses_onnx = kapsl_core::EngineKind::resolve(&manifest).uses_onnx_session();
-                let signed_onnx_route = crate::backend::generic_native_backend_packs_enabled()?;
+                let signed_onnx_route = match requested.as_ref() {
+                    Some(target) => {
+                        crate::backend::generic_native_backend_packs_enabled_for(&target.platform)?
+                    }
+                    None => crate::backend::generic_native_backend_packs_enabled()?,
+                };
                 let lazy_onnx = match requested.as_ref() {
                     Some(target) => {
                         crate::backend::onnx_lazy_packs_supported_for_platform(&target.platform)

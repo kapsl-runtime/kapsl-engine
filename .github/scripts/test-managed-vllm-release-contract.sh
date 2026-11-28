@@ -9,7 +9,7 @@ runtime="kapsl-runtime/crates/kapsl-cli/src/runtime/managed/mod.rs"
 integration_verifier=".github/scripts/verify-vllm-integration-checkout.sh"
 integration_lock=".github/vllm-integration.lock"
 wheel_verifier=".github/scripts/verify-managed-vllm-connector-wheel.py"
-connector_version="0.7.1"
+connector_version="0.7.2"
 planner_schema_version="1"
 kv_abi_major="1"
 kv_abi_minor="5"
@@ -76,11 +76,10 @@ fi
 require_literal "$wheel_verifier" '"planner_entry_point": "kapsl_vllm_connector.plan:main"'
 require_literal "$index_generator" 'kapsl-backend-index-v1\0'
 require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
-require_literal "$rust_sdk_verifier" '"kapsl-engine-api": "0.3.0"'
-require_literal "$rust_sdk_verifier" '"kapsl-transport": "0.4.0"'
-require_literal "$rust_sdk_verifier" '"kapsl-ipc": "0.4.0"'
-require_literal "$rust_sdk_verifier" '"kapsl-shm": "0.4.0"'
-require_literal "$rust_sdk_verifier" '"kapsl-kv-abi": "0.6.0"'
+require_literal "$rust_sdk_verifier" '"kapsl-engine-api": "0.3.1"'
+require_literal "$rust_sdk_verifier" '"kapsl-communication": "0.5.0"'
+require_literal "$rust_sdk_verifier" '"kapsl-kv-abi": "0.6.2"'
+require_literal "$rust_sdk_verifier" '"kapsl-llm": "0.3.8"'
 require_literal "$rust_sdk_verifier" 'package.get("source") != CRATES_IO'
 
 for workflow in \
