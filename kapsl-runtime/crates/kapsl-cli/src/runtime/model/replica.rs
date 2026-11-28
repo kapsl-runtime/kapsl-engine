@@ -11,14 +11,14 @@ impl ReplicaLoadRole {
         self == Self::Primary
     }
 
-    fn selection_context(self, plan: &ModelLoadPlan) -> String {
+    pub(super) fn selection_context(self, plan: &ModelLoadPlan) -> String {
         match self {
             Self::Primary => format!("model {}", plan.base_model_id),
             Self::Autoscaled => format!("model {} replica {}", plan.base_model_id, plan.replica_id),
         }
     }
 
-    fn load_context(self, plan: &ModelLoadPlan, device_id: Option<usize>) -> String {
+    pub(super) fn load_context(self, plan: &ModelLoadPlan, device_id: Option<usize>) -> String {
         match (self, plan.use_pipeline_backend, device_id) {
             (Self::Primary, true, _) => {
                 format!("Failed to load pipeline model {}", plan.base_model_id)
@@ -46,38 +46,8 @@ pub(super) struct LoadedReplica {
     pub(super) model_info: ModelInfo,
 }
 
-struct ManagedVllmSchedulerMetrics {
-    metrics: kapsl_monitor::metrics::KapslMetrics,
-    model: String,
-    replica: String,
-}
-
-impl kapsl_scheduler::SchedulerObserver for ManagedVllmSchedulerMetrics {
-    fn observe_queue_wait(
-        &self,
-        _priority: kapsl_scheduler::Priority,
-        operation: &'static str,
-        elapsed: Duration,
-    ) {
-        self.metrics
-            .managed_vllm
-            .bridge_stage_seconds
-            .with_label_values(&[
-                self.model.as_str(),
-                self.replica.as_str(),
-                operation,
-                "scheduler_queue",
-            ])
-            .observe(elapsed.as_secs_f64());
-    }
-}
-
-/// Turn one immutable load plan into a fully loaded scheduler replica.
-///
-/// Primary and autoscaled loads share backend construction, memory admission,
-/// loading, reconciliation, monitoring, and scheduler policy. `role` captures
-/// only their intentional layout difference: a primary non-pipeline scheduler
-/// spans its selected mesh, while one autoscaled replica remains one engine.
+/// Turn one immutable load plan into a fully loaded scheduler replica, the way
+/// the plan's serving backend loads one.
 pub(super) async fn load_replica(
     plan: ModelLoadPlan,
     role: ReplicaLoadRole,
@@ -86,15 +56,24 @@ pub(super) async fn load_replica(
     shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
 ) -> Result<LoadedReplica, DynError> {
     log_package_plan(&plan);
+    serving_backend_strategy(plan.serving_backend.selected)
+        .load_replica(plan, role, device_info, resources, shared_metrics)
+        .await
+}
 
-    if plan.serving_backend.selected == ResolvedServingBackend::Vllm {
-        return load_managed_vllm_replica(plan, role, device_info, resources, shared_metrics).await;
-    }
-    if plan.serving_backend.selected == ResolvedServingBackend::Sglang {
-        return load_managed_sglang_replica(plan, role, device_info, resources, shared_metrics)
-            .await;
-    }
-
+/// Load a replica whose engine runs inside Kapsl or in an isolated worker.
+///
+/// Primary and autoscaled loads share backend construction, memory admission,
+/// loading, reconciliation, monitoring, and scheduler policy. `role` captures
+/// only their intentional layout difference: a primary non-pipeline scheduler
+/// spans its selected mesh, while one autoscaled replica remains one engine.
+pub(super) async fn load_in_process_replica(
+    plan: ModelLoadPlan,
+    role: ReplicaLoadRole,
+    device_info: &DeviceInfo,
+    resources: Arc<RuntimeResources>,
+    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
+) -> Result<LoadedReplica, DynError> {
     // Resolve and verify native packs before any backend library or model
     // session is constructed. Preliminary admission runs before a download.
     let memory_snapshot = resources.memory().snapshot();
@@ -393,186 +372,6 @@ pub(super) async fn load_replica(
     })
 }
 
-async fn load_managed_vllm_replica(
-    plan: ModelLoadPlan,
-    role: ReplicaLoadRole,
-    device_info: &DeviceInfo,
-    resources: Arc<RuntimeResources>,
-    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
-) -> Result<LoadedReplica, DynError> {
-    if plan.isolate_process {
-        log::info!(
-            "Ignoring generic process-isolation metadata for model {}: managed vLLM already runs in a supervised child process",
-            plan.base_model_id
-        );
-    }
-    if plan.use_pipeline_backend {
-        return Err("managed vLLM does not support pipeline topology".into());
-    }
-    let deployment = resources.managed_vllm().ok_or_else(|| {
-        "managed vLLM was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
-            .to_string()
-    })?;
-    let selection = select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
-        .map_err(|error| {
-        format!(
-            "Failed to select a CUDA device for {}: {}",
-            role.selection_context(&plan),
-            error
-        )
-    })?;
-    let device_ids =
-        select_managed_vllm_device_ids(&selection.devices, plan.worker_tp_degree, plan.replica_id)?;
-    let memory_domains = device_ids
-        .iter()
-        .map(|device_id| MemoryDomain::Cuda {
-            device_id: *device_id,
-        })
-        .collect::<Vec<_>>();
-    let backend = ManagedVllmEngine::create(
-        deployment,
-        &plan.loader.manifest,
-        &plan.model_file_path,
-        plan.base_model_id,
-        plan.replica_id,
-        device_ids.clone(),
-        plan.worker_tp_degree,
-        plan.batch_size.max(1),
-        shared_metrics.clone(),
-    )?;
-    let backend = load_runtime_backend(
-        backend.into(),
-        &plan.model_file_path,
-        &memory_domains,
-        &resources,
-        plan.base_model_id,
-        plan.replica_id,
-        EngineKind::Native,
-        plan.priority_weight,
-        &role.load_context(&plan, device_ids.first().copied()),
-    )
-    .await?;
-    let engine = monitor_runtime_backend(
-        backend,
-        plan.base_model_id,
-        &plan.loader.manifest.version,
-        shared_metrics,
-    );
-    let swap_handles = vec![engine.clone()];
-    let scheduler_metrics = Arc::new(ManagedVllmSchedulerMetrics {
-        metrics: shared_metrics.clone(),
-        model: plan.loader.manifest.project_name.clone(),
-        replica: plan.replica_id.to_string(),
-    });
-    let scheduler = Arc::new(
-        Scheduler::new(
-            vec![engine],
-            plan.batch_size,
-            1,
-            plan.scheduler_queue_size,
-            true,
-            plan.scheduler_max_micro_batch,
-            plan.scheduler_queue_delay_ms,
-            None,
-        )
-        .with_queue_overflow_policy(plan.queue_overflow_policy)
-        .with_observer(scheduler_metrics),
-    );
-    log::info!("✓ Loaded managed vLLM engine instance");
-    Ok(LoadedReplica {
-        scheduler,
-        swap_handles,
-        model_info: model_info_for_plan(&plan, role, "vllm"),
-    })
-}
-
-/// Load one SGLang replica: a supervised server on a single CUDA device whose
-/// static footprint is admitted here and whose requests lease KV capacity
-/// through the KV control socket.
-async fn load_managed_sglang_replica(
-    plan: ModelLoadPlan,
-    role: ReplicaLoadRole,
-    device_info: &DeviceInfo,
-    resources: Arc<RuntimeResources>,
-    shared_metrics: &kapsl_monitor::metrics::KapslMetrics,
-) -> Result<LoadedReplica, DynError> {
-    if plan.isolate_process {
-        log::info!(
-            "Ignoring generic process-isolation metadata for model {}: managed SGLang already runs in a supervised child process",
-            plan.base_model_id
-        );
-    }
-    if plan.use_pipeline_backend || plan.worker_tp_degree != 1 {
-        return Err(
-            "managed SGLang runs one scheduler rank on one CUDA device; pipeline and tensor-parallel topologies are not supported"
-                .into(),
-        );
-    }
-    let deployment = resources
-        .managed_server(ResolvedServingBackend::Sglang)
-        .ok_or_else(|| {
-            "managed SGLang was selected after startup without a configured backend deployment; restart Kapsl with this model in `kapsl run --model ...`"
-                .to_string()
-        })?;
-    let selection = select_mesh_devices(&plan.loader.manifest.hardware_requirements, device_info)
-        .map_err(|error| {
-        format!(
-            "Failed to select a CUDA device for {}: {}",
-            role.selection_context(&plan),
-            error
-        )
-    })?;
-    let device_id = select_managed_vllm_device_ids(&selection.devices, 1, plan.replica_id)?[0];
-    let memory_domains = [MemoryDomain::Cuda { device_id }];
-    let backend = create_managed_sglang_engine(
-        deployment,
-        &plan.loader.manifest,
-        &plan.model_file_path,
-        plan.base_model_id,
-        plan.replica_id,
-        device_id,
-        plan.batch_size.max(1),
-    )?;
-    let backend = load_runtime_backend(
-        backend.into(),
-        &plan.model_file_path,
-        &memory_domains,
-        &resources,
-        plan.base_model_id,
-        plan.replica_id,
-        EngineKind::Native,
-        plan.priority_weight,
-        &role.load_context(&plan, Some(device_id)),
-    )
-    .await?;
-    let engine = monitor_runtime_backend(
-        backend,
-        plan.base_model_id,
-        &plan.loader.manifest.version,
-        shared_metrics,
-    );
-    let swap_handles = vec![engine.clone()];
-    let scheduler = Arc::new(
-        Scheduler::new(
-            vec![engine],
-            plan.batch_size,
-            1,
-            plan.scheduler_queue_size,
-            true,
-            plan.scheduler_max_micro_batch,
-            plan.scheduler_queue_delay_ms,
-            None,
-        )
-        .with_queue_overflow_policy(plan.queue_overflow_policy),
-    );
-    log::info!("✓ Loaded managed SGLang engine instance");
-    Ok(LoadedReplica {
-        scheduler,
-        swap_handles,
-        model_info: model_info_for_plan(&plan, role, "sglang"),
-    })
-}
-
 fn create_pipeline_backend(
     plan: &ModelLoadPlan,
     onnx_route: Option<&OnnxBackendRoute>,
@@ -648,7 +447,7 @@ fn validate_pipeline_backend_route(
     }
 }
 
-fn model_info_for_plan(
+pub(super) fn model_info_for_plan(
     plan: &ModelLoadPlan,
     role: ReplicaLoadRole,
     selected_provider: &str,

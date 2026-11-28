@@ -13,6 +13,7 @@ mod manager;
 mod package_preflight;
 mod replica;
 mod scaling;
+mod serving_backend;
 
 pub(crate) use activity::*;
 pub(crate) use autoscaler::*;
@@ -24,6 +25,7 @@ pub(crate) use load_plan::*;
 pub(crate) use manager::*;
 use replica::*;
 pub(crate) use scaling::*;
+use serving_backend::*;
 
 /// Worker-only values translated from CLI arguments at the application edge.
 ///
@@ -59,31 +61,35 @@ pub(crate) struct ModelRuntime {
     shared_metrics: kapsl_monitor::metrics::KapslMetrics,
 }
 
-fn select_managed_vllm_device_ids(
+/// CUDA devices for the ranks of one managed-server replica.
+///
+/// Replicas take disjoint groups of `rank_count` devices in order and wrap
+/// around once the selection is used up.
+fn select_managed_server_device_ids(
     devices: &[kapsl_hal::device::Device],
-    tensor_parallel_size: usize,
+    rank_count: usize,
     replica_id: u32,
 ) -> Result<Vec<usize>, String> {
-    if tensor_parallel_size == 0 {
-        return Err("managed vLLM tensor-parallel size must be positive".to_string());
+    if rank_count == 0 {
+        return Err("a managed server replica needs at least one rank".to_string());
     }
     let cuda = devices
         .iter()
         .filter(|device| device.backend.to_string().eq_ignore_ascii_case("cuda"))
         .map(|device| device.id)
         .collect::<Vec<_>>();
-    if cuda.len() < tensor_parallel_size {
+    if cuda.len() < rank_count {
         return Err(format!(
-            "managed vLLM tensor parallelism requires {tensor_parallel_size} CUDA devices, but selection produced {}",
+            "a managed server replica with {rank_count} ranks requires {rank_count} CUDA devices, but selection produced {}",
             cuda.len()
         ));
     }
-    let disjoint_groups = cuda.len() / tensor_parallel_size;
+    let disjoint_groups = cuda.len() / rank_count;
     let group = usize::try_from(replica_id).unwrap_or(usize::MAX) % disjoint_groups;
     let start = group
-        .checked_mul(tensor_parallel_size)
-        .ok_or_else(|| "managed vLLM replica device-group index overflowed".to_string())?;
-    Ok(cuda[start..start + tensor_parallel_size].to_vec())
+        .checked_mul(rank_count)
+        .ok_or_else(|| "managed server replica device-group index overflowed".to_string())?;
+    Ok(cuda[start..start + rank_count].to_vec())
 }
 
 impl ModelRuntime {
@@ -109,10 +115,11 @@ impl ModelRuntime {
         self.resources.memory().snapshot()
     }
 
-    pub(crate) fn managed_vllm_has_live_resize_headroom(&self, model_id: u32) -> bool {
-        self.resources
-            .managed_vllm()
-            .is_some_and(|deployment| deployment.model_has_live_resize_headroom(model_id))
+    /// Whether the model's replicas can still grow their KV capacity in
+    /// place, so load on them need not mean another process.
+    pub(crate) fn has_in_place_kv_headroom(&self, model: &ModelInfo, base_model_id: u32) -> bool {
+        serving_backend_strategy_for_device(&model.device)
+            .is_some_and(|backend| backend.has_in_place_kv_headroom(&self.resources, base_model_id))
     }
 
     pub(crate) fn models(&self) -> &Arc<ModelManager> {
@@ -285,7 +292,7 @@ impl ModelRuntime {
                     plan.base_model_id
                 )
             })?;
-            let device_ids = select_managed_vllm_device_ids(
+            let device_ids = select_managed_server_device_ids(
                 &selection.devices,
                 plan.worker_tp_degree,
                 plan.replica_id,
@@ -421,18 +428,18 @@ mod managed_vllm_device_tests {
         let devices = vec![cuda(0), cuda(1), cuda(2), cuda(3)];
 
         assert_eq!(
-            select_managed_vllm_device_ids(&devices, 2, 0).unwrap(),
+            select_managed_server_device_ids(&devices, 2, 0).unwrap(),
             [0, 1]
         );
         assert_eq!(
-            select_managed_vllm_device_ids(&devices, 2, 1).unwrap(),
+            select_managed_server_device_ids(&devices, 2, 1).unwrap(),
             [2, 3]
         );
         assert_eq!(
-            select_managed_vllm_device_ids(&devices, 2, 2).unwrap(),
+            select_managed_server_device_ids(&devices, 2, 2).unwrap(),
             [0, 1]
         );
-        assert!(select_managed_vllm_device_ids(&devices, 5, 0)
+        assert!(select_managed_server_device_ids(&devices, 5, 0)
             .unwrap_err()
             .contains("requires 5 CUDA devices"));
     }
