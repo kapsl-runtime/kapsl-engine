@@ -74,7 +74,7 @@ jobs:
       EXPECTED_TORCHAUDIO_VERSION: "2.11.0+cu130"
       EXPECTED_TORCHCODEC_VERSION: "0.16.0+cu130"
       EXPECTED_VLLM_VERSION: "0.26.1rc1.dev1130+g2ec6f0d71"
-      EXPECTED_CONNECTOR_VERSION: "0.7.1"
+      EXPECTED_CONNECTOR_VERSION: "0.7.2"
       EXPECTED_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-ipc/flash-attn"
       EXPECTED_ELASTIC_CONNECTOR_PROFILE: "vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
       EXPECTED_PLANNER_SCHEMA_VERSION: "1"
@@ -852,7 +852,6 @@ jobs:
             --port "$direct_port" \
             --attention-backend FLASH_ATTN \
             --max-model-len 1024 \
-            --enforce-eager \
             --enable-prefix-caching \
             --kv-cache-memory-bytes "$DIRECT_KV_BYTES" \
             --tensor-parallel-size "$TP_SIZE" \

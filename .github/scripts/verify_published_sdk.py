@@ -16,15 +16,20 @@ CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
 # host-only lockfile check and the GPU job's resolved-metadata check.
 EXPECTED_VERSIONS = {
     "kapsl-backend-abi": "0.2.0",
-    "kapsl-engine-api": "0.3.0",
-    "kapsl-hal": "0.3.3",
-    "kapsl-ipc": "0.4.0",
-    "kapsl-kv-abi": "0.6.0",
-    "kapsl-llm": "0.3.4",
+    "kapsl-backends": "0.4.0",
+    "kapsl-communication": "0.5.0",
+    "kapsl-core": "0.3.1",
+    "kapsl-engine-api": "0.3.1",
+    "kapsl-hal": "0.3.4",
+    "kapsl-kv-abi": "0.6.2",
+    "kapsl-llama-cpp-2": "0.1.146-kapsl.2",
+    "kapsl-llama-cpp-sys-2": "0.1.146-kapsl.2",
+    "kapsl-llm": "0.3.8",
+    "kapsl-loader": "0.3.1",
     "kapsl-monitor": "0.3.0",
-    "kapsl-scheduler": "0.3.0",
-    "kapsl-shm": "0.4.0",
-    "kapsl-transport": "0.4.0",
+    "kapsl-rag": "0.4.0",
+    "kapsl-rag-sdk": "0.4.0",
+    "kapsl-scheduler": "0.3.1",
 }
 
 

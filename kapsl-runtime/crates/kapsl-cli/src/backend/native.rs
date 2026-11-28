@@ -73,23 +73,51 @@ fn active_native_packs() -> &'static Mutex<Vec<Arc<ActiveNativePack>>> {
     ACTIVE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// Signed native packs are the bridge-release default. Setting this switch to
-/// false is the explicit rollback that permits the embedded ORT path.
+/// Whether ONNX models on this host take the signed native pack route.
+///
+/// Signed ONNX packs are published only for some platforms (see
+/// `onnx_lazy_packs_supported_for_platform`). Where they exist they are the
+/// default; elsewhere the default is the embedded ONNX Runtime, because a
+/// signed route that can never install a pack would refuse every ONNX model.
+/// An explicit `KAPSL_GENERIC_NATIVE_PACKS` value always wins: `0` is the
+/// rollback to embedded ORT, `1` insists on signed packs.
 pub(crate) fn generic_native_backend_packs_enabled() -> Result<bool, String> {
-    let value = match std::env::var(GENERIC_NATIVE_PACKS_ENV) {
-        Ok(value) => Some(value),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(format!(
-                "{GENERIC_NATIVE_PACKS_ENV} must be valid UTF-8 and set to 0 or 1"
-            ))
-        }
-    };
-    resolve_generic_native_packs_switch(value.as_deref())
+    generic_native_backend_packs_enabled_for(&crate::backend::current_platform())
 }
 
-fn resolve_generic_native_packs_switch(value: Option<&str>) -> Result<bool, String> {
-    value.map_or(Ok(true), parse_generic_native_packs_switch)
+/// The same decision for packs that will be installed on `platform`, which is
+/// not the current host when preparing packs or bundles for another target.
+pub(crate) fn generic_native_backend_packs_enabled_for(platform: &str) -> Result<bool, String> {
+    let value = generic_native_packs_switch_value()?;
+    resolve_generic_native_packs_switch(value.as_deref(), platform)
+}
+
+/// Whether `KAPSL_GENERIC_NATIVE_PACKS` is set at all, so messages can tell an
+/// explicit rollback from the platform default.
+pub(crate) fn generic_native_packs_switch_is_set() -> Result<bool, String> {
+    Ok(generic_native_packs_switch_value()?.is_some())
+}
+
+fn generic_native_packs_switch_value() -> Result<Option<String>, String> {
+    match std::env::var(GENERIC_NATIVE_PACKS_ENV) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{GENERIC_NATIVE_PACKS_ENV} must be valid UTF-8 and set to 0 or 1"
+        )),
+    }
+}
+
+fn resolve_generic_native_packs_switch(
+    value: Option<&str>,
+    platform: &str,
+) -> Result<bool, String> {
+    match value {
+        Some(value) => parse_generic_native_packs_switch(value),
+        None => Ok(crate::backend::onnx_lazy_packs_supported_for_platform(
+            platform,
+        )),
+    }
 }
 
 fn parse_generic_native_packs_switch(value: &str) -> Result<bool, String> {
@@ -2635,7 +2663,11 @@ mod tests {
 
     #[test]
     fn migration_switch_is_strict_and_explicit() {
-        assert!(resolve_generic_native_packs_switch(None).unwrap());
+        assert!(resolve_generic_native_packs_switch(None, "linux-x86_64").unwrap());
+        assert!(!resolve_generic_native_packs_switch(None, "windows-x86_64").unwrap());
+        assert!(!resolve_generic_native_packs_switch(None, "macos-aarch64").unwrap());
+        assert!(resolve_generic_native_packs_switch(Some("1"), "windows-x86_64").unwrap());
+        assert!(!resolve_generic_native_packs_switch(Some("0"), "linux-x86_64").unwrap());
         assert!(parse_generic_native_packs_switch("1").unwrap());
         assert!(!parse_generic_native_packs_switch("off").unwrap());
         assert!(parse_generic_native_packs_switch("enabled").is_err());
