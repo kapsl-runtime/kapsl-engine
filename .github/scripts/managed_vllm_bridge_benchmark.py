@@ -223,7 +223,7 @@ def run_target(args: argparse.Namespace) -> dict[str, Any]:
             "tensor_parallel_size": args.tensor_parallel_size,
             "max_model_len": args.max_model_len,
             "attention_backend": "FLASH_ATTN",
-            "enforce_eager": True,
+            "enforce_eager": args.enforce_eager,
             "prefix_caching": True,
         },
         "target_artifacts": {
@@ -476,6 +476,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--kv-cache-memory-bytes", type=int, required=True)
     run.add_argument("--tensor-parallel-size", type=int, required=True)
     run.add_argument("--max-model-len", type=int, default=1024)
+    # Kapsl launches managed vLLM compiled unless the package sets
+    # enforce_eager: true; record the mode both targets were measured in.
+    run.add_argument(
+        "--enforce-eager", action=argparse.BooleanOptionalAction, default=False
+    )
     run.add_argument("--runtime-build-id", default="not-applicable")
     run.add_argument("--adapter-build-id", default="not-applicable")
     compare_parser = subparsers.add_parser("compare")

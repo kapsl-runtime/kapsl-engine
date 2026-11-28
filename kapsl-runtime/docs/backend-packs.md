@@ -41,9 +41,10 @@ An ONNX model resolves exactly one execution provider after provider policy and
 declared fallbacks are resolved. The CPU pack contains and activates no CUDA
 libraries. Every ORT pack declares `adapter_abi: kapsl-backend-v1`, model and
 task support, execution-provider requirements, memory behavior, and callable
-capabilities in its signed manifest. Signed packs are the primary ONNX route;
-the embedded ORT implementation is selected only by the explicit
-`KAPSL_GENERIC_NATIVE_PACKS=0` rollback.
+capabilities in its signed manifest. Signed packs are the primary ONNX route
+on platforms where they are published (today `linux-x86_64`). Elsewhere, and
+with the explicit `KAPSL_GENERIC_NATIVE_PACKS=0` rollback, the embedded ORT
+implementation is used.
 TensorRT is never an automatic fastest-provider upgrade: the package must name
 `tensorrt` as its preferred provider or an allowed fallback.
 GGUF models never trigger lazy ONNX or vLLM pack installation, and ONNX models
@@ -302,7 +303,7 @@ connected machine.
 | `KAPSL_OFFLINE=1` | Disable backend-index and artifact network access. |
 | `KAPSL_LAZY_BACKENDS=0` | Disable automatic lazy installation and require a preinstalled backend. |
 | `KAPSL_LAZY_ONNX_PACKS=0` | Disable automatic ONNX pack activation. This does not authorize embedded fallback; ONNX loads fail closed while the signed route is selected. |
-| `KAPSL_GENERIC_NATIVE_PACKS=0` | Explicitly select the embedded ORT rollback. The signed `kapsl-backend-v1` route is enabled by default, and failures never cross to embedded ORT. |
+| `KAPSL_GENERIC_NATIVE_PACKS=0` | Explicitly select the embedded ORT rollback. The signed `kapsl-backend-v1` route is the default where signed ONNX packs are published (today `linux-x86_64`) and embedded ORT is the default elsewhere; set `1` to insist on signed packs. On a host using the signed route, failures never cross to embedded ORT. |
 | `KAPSL_LAZY_LLAMA_CPP_PACKS=0` | Keep the eager/compiled llama.cpp layout. The portable Linux x86_64 core defaults to lazy CPU packs when no eager GGUF feature is compiled. |
 | `KAPSL_LLAMA_CPP_ALLOW_NATIVE_KV=1` | Explicitly allow a signed CUDA pack whose `kv_mode` is `native`. Shared-pool packs and the eager shared-KV profile do not require or consume this rollback override. |
 | `KAPSL_PROVIDER_PATH` | Additional Kapsl provider-manifest roots. Verified lazy ONNX pack roots are appended automatically; this is not a loader search path. |

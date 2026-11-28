@@ -295,6 +295,7 @@ impl ModelRuntime {
                 &device_ids,
                 plan.base_model_id,
                 plan.replica_id,
+                managed_vllm_uses_cuda_graphs(&plan.loader.manifest)?,
             )?;
             report.allocations.extend(model_report.allocations);
             for device_id in device_ids {

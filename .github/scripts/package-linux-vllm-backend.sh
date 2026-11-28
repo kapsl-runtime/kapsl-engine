@@ -16,7 +16,7 @@ fi
 
 integrations_dir="${KAPSL_VLLM_INTEGRATIONS_DIR:-kapsl-integrations-vllm}"
 integrations_ref="$KAPSL_VLLM_INTEGRATIONS_REF"
-connector_version="0.7.1"
+connector_version="0.7.2"
 connector_profile="vllm-v1-packed-cuda-ipc/flash-attn"
 connector_elastic_profile="vllm-v1-packed-cuda-vmm/flash-attn-blnhc"
 planner_schema_version="1"
