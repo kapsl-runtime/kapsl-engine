@@ -182,6 +182,35 @@ impl GpuDevicePool {
         ))
     }
 
+    /// Bind a backend under construction to this device's local arena.
+    ///
+    /// A backend is constructed before its load is admitted: load admission
+    /// (`MemoryAuthority::begin_load`) admits the workload with the plan the
+    /// constructed backend reports. A `Local` region request made during
+    /// construction is therefore always refused, because its owner is not
+    /// admitted yet. The binding refuses a device without a local arena now,
+    /// so a missing pool still fails at construction, and leaves admission to
+    /// [`LocalArenaBinding::acquire`], which requires it as before.
+    pub(crate) fn bind_local_arena(
+        self: &Arc<Self>,
+        owner: PoolOwner,
+    ) -> Result<LocalArenaBinding, String> {
+        let installed = self.regions.lock().values().any(|record| {
+            record.isolation == GpuRegionIsolation::Local
+                && record.storage.kind() == GpuRegionKind::Arena
+        });
+        if !installed {
+            return Err(format!(
+                "CUDA device {} has no runtime-owned arena (no device pool was materialized)",
+                self.device_id
+            ));
+        }
+        Ok(LocalArenaBinding {
+            pool: self.clone(),
+            owner,
+        })
+    }
+
     pub(crate) fn acquire_region(
         self: &Arc<Self>,
         request: GpuRegionRequest,
@@ -312,6 +341,39 @@ impl GpuDevicePool {
 
     pub(crate) fn snapshots(&self) -> Vec<GpuRegionSnapshot> {
         self.registry.snapshots()
+    }
+}
+
+/// A constructed backend's binding to its device's local arena, turned into a
+/// region lease once the backend's load admission exists. It holds no lease
+/// and no capacity: it neither pins the arena nor admits its owner.
+#[derive(Clone)]
+pub(crate) struct LocalArenaBinding {
+    pool: Arc<GpuDevicePool>,
+    owner: PoolOwner,
+}
+
+impl LocalArenaBinding {
+    pub(crate) fn owner(&self) -> PoolOwner {
+        self.owner
+    }
+
+    /// Lease the local arena for this owner. Refused, exactly as a direct
+    /// `Local` request is, unless load admission has admitted the owner's
+    /// workload on an arena that is still installed.
+    pub(crate) fn acquire(&self) -> Result<GpuRegionLease, String> {
+        self.pool
+            .acquire_region(GpuRegionRequest::Local {
+                owner: self.owner,
+                bytes: 0,
+                alignment: 1,
+            })
+            .map_err(|error| {
+                format!(
+                    "{:?} on CUDA device {}: {error}",
+                    self.owner, self.pool.device_id
+                )
+            })
     }
 }
 
@@ -552,4 +614,4 @@ impl AllocationStorage for ArenaExtent {
 
 #[cfg(test)]
 #[path = "gpu_pool_tests.rs"]
-mod tests;
+pub(crate) mod tests;

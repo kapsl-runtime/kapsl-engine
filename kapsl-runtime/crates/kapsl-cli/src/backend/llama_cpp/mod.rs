@@ -559,16 +559,13 @@ impl PackInstance {
             && pack.kv_mode == LlamaCppPackKvMode::SharedPool;
         #[cfg(feature = "gpu-device-pool")]
         let mut shared_pool_host = if requires_shared_pool {
-            use crate::runtime::memory::gpu_pool::GpuRegionRequest;
-            use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolOwner};
-            let pool = resources.memory().gpu_device_pool(device_id)?;
-            let region = pool.acquire_region(GpuRegionRequest::Local {
-                owner: PoolOwner::gguf(model_id, replica_id, PoolAllocationClass::KvCache),
-                bytes: 0,
-                alignment: 1,
-            })?;
+            // This runs before load admission admits the model (admission
+            // uses the plan this instance reports), so only bind the device's
+            // arena here. The arena is leased when the pack creates its KV
+            // pool during load_model, once the workload is admitted.
+            let regions = resources.memory().gpu_device_pool(device_id)?;
             Some(Box::new(LlamaCppSharedPoolHost::new(
-                region, device_id, model_id, replica_id,
+                &regions, device_id, model_id, replica_id,
             )?))
         } else {
             None

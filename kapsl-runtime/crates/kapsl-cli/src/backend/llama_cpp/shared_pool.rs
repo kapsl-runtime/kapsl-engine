@@ -206,16 +206,24 @@ impl ReservationBook {
 #[cfg(feature = "gpu-device-pool")]
 mod cuda {
     use super::*;
-    use crate::runtime::memory::gpu_pool::{GpuAllocationLease, GpuRegionLease};
+    use crate::runtime::memory::gpu_pool::{
+        GpuAllocationLease, GpuDevicePool, GpuRegionLease, LocalArenaBinding,
+    };
     use cudarc::driver::{result, sys};
     use kapsl_hal::gpu_arena::{GpuKvPoolView, PoolAllocationClass, PoolOwner};
     use kapsl_hal::gpu_arena_region::GpuArenaRegion;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
+    /// Core-side state behind a shared-pool pack's host callbacks.
+    ///
+    /// A pack instance is constructed before its load is admitted (load
+    /// admission uses the plan the constructed instance reports), so the host
+    /// only binds the device's arena here. The pack asks for its KV pool from
+    /// inside `load_model`, after admission, and each shared pool leases the
+    /// arena then.
     pub(crate) struct LlamaCppSharedPoolHost {
-        region: GpuRegionLease,
-        device_pool: Arc<GpuArenaRegion>,
+        arena: LocalArenaBinding,
         device_id: usize,
         model_id: u32,
         replica_id: u32,
@@ -223,21 +231,33 @@ mod cuda {
     }
 
     impl LlamaCppSharedPoolHost {
+        /// Refuses a device that has no runtime-owned arena; does not require
+        /// (or create) this model's admission.
         pub(crate) fn new(
-            region: GpuRegionLease,
+            regions: &Arc<GpuDevicePool>,
             device_id: usize,
             model_id: u32,
             replica_id: u32,
         ) -> Result<Self, String> {
-            let device_pool = region.arena()?.clone();
+            let owner = PoolOwner::gguf(model_id, replica_id, PoolAllocationClass::KvCache);
+            let arena = regions.bind_local_arena(owner).map_err(|error| {
+                format!(
+                    "llama.cpp CUDA pack requires the runtime-owned pool for device {device_id}: {error}"
+                )
+            })?;
             Ok(Self {
-                region,
-                device_pool,
+                arena,
                 device_id,
                 model_id,
                 replica_id,
                 live_pools: Mutex::new(HashSet::new()),
             })
+        }
+
+        /// Lease the arena for this model/replica's KV. Refused unless load
+        /// admission has admitted the workload.
+        pub(crate) fn lease_arena(&self) -> Result<GpuRegionLease, String> {
+            self.arena.acquire()
         }
 
         pub(crate) fn callbacks(&mut self) -> KapslLlamaHostCallbacksV1 {
@@ -314,10 +334,16 @@ mod cuda {
             let head_dim = geometry.key_head_dim as usize;
             let max_blocks_per_sequence = geometry.max_blocks_per_sequence as usize;
             let sequence_slots = (geometry.max_sequences as usize).max(1);
-            let owner =
-                PoolOwner::gguf(host.model_id, host.replica_id, PoolAllocationClass::KvCache);
+            // The pack creates its KV pool during load_model, after load
+            // admission admitted this model/replica, so the lease's admission
+            // check applies here as it does to every local request.
+            let region = host
+                .lease_arena()
+                .map_err(|error| format!("lease runtime shared KV arena: {error}"))?;
+            let device_pool = Arc::clone(region.arena()?);
+            let owner = host.arena.owner();
             let view = GpuKvPoolView::from_device_pool(
-                Arc::clone(&host.device_pool),
+                Arc::clone(&device_pool),
                 owner,
                 requested_blocks,
                 block_size_tokens,
@@ -340,13 +366,12 @@ mod cuda {
                 .checked_mul(std::mem::size_of::<u32>())
                 .ok_or_else(|| "shared KV block-table byte size overflow".to_string())?;
             let table_owner = owner.with_class(PoolAllocationClass::BlockTable);
-            let block_table = host
-                .region
+            let block_table = region
                 .allocate(table_owner, block_table_bytes, std::mem::align_of::<u32>())
                 .map_err(|error| format!("allocate runtime shared KV block table: {error}"))?;
             let pool = Self {
                 view,
-                device_pool: Arc::clone(&host.device_pool),
+                device_pool,
                 block_table: Some(block_table),
                 block_table_bytes,
                 block_size_tokens,
@@ -606,8 +631,11 @@ mod cuda {
             };
             host.register(pointer);
             unsafe { *descriptor_out = descriptor };
+            // The pack's own kapsl-llm log records stay inside the pack (it
+            // installs no logger), so its `[gguf] kv_path=...` line never
+            // reaches this log. Name the KV path here, where it is decided.
             log::info!(
-                "llama.cpp pack attached runtime-owned shared KV pool: device={} model={} replica={} cap_blocks={} addressable_blocks={}",
+                "llama.cpp pack attached runtime-owned shared KV pool: kv_path=shared-kv device={} model={} replica={} cap_blocks={} addressable_blocks={}",
                 host.device_id,
                 host.model_id,
                 host.replica_id,
@@ -829,6 +857,89 @@ mod tests {
         assert!(book.commit_growth(7, 0, 2, Vec::new()).is_err());
         assert!(book.commit_growth(7, 1, 1, Vec::new()).is_err());
         assert_eq!(book.combined_host, before);
+    }
+
+    /// The v0.3.0 stable gate: ORT model 0 is admitted on the automatic pool,
+    /// then GGUF model 1's signed llama-cpp/cuda12 pack instance is built.
+    /// Construction precedes the model's load admission, so building the host
+    /// must not need it; the KV lease, taken from load_model, still does.
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn shared_pool_pack_host_is_built_before_its_load_admission() {
+        use crate::runtime::memory::gpu_pool::tests::{
+            pool_with_admission_arena, GATE_ORT_GUARANTEED_BYTES, GATE_POOL_BYTES,
+        };
+        use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolOwner};
+
+        let (regions, _arena, admissions) = pool_with_admission_arena(0, GATE_POOL_BYTES);
+        admissions.admit(
+            PoolOwner::onnx(0, 0, PoolAllocationClass::PersistentWeights),
+            GATE_ORT_GUARANTEED_BYTES,
+        );
+        let host = LlamaCppSharedPoolHost::new(&regions, 0, 1, 0)
+            .expect("the GGUF pack instance is constructed before its load admission");
+        let refused = host
+            .lease_arena()
+            .err()
+            .expect("the KV lease needs admission");
+        assert!(refused.contains("admitted"), "{refused}");
+
+        // What load admission (DeviceMemoryManager::admit_pool) does next.
+        admissions.admit(
+            PoolOwner::gguf(1, 0, PoolAllocationClass::PersistentWeights),
+            GATE_POOL_BYTES / 4,
+        );
+        let lease = host
+            .lease_arena()
+            .expect("an admitted model's KV pool leases the arena");
+        let table = lease
+            .allocate(
+                PoolOwner::gguf(1, 0, PoolAllocationClass::BlockTable),
+                4096,
+                std::mem::align_of::<u32>(),
+            )
+            .expect("block table");
+        unsafe { table.release_after_fence().unwrap() };
+    }
+
+    /// Two GGUF models on the pack: each is built before admission and each
+    /// leases only on its own admission, never on the other's.
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn shared_pool_pack_hosts_lease_only_on_their_own_admission() {
+        use crate::runtime::memory::gpu_pool::tests::{pool_with_admission_arena, GATE_POOL_BYTES};
+        use kapsl_hal::gpu_arena::{PoolAllocationClass, PoolOwner};
+
+        let (regions, _arena, admissions) = pool_with_admission_arena(0, GATE_POOL_BYTES);
+        let first = LlamaCppSharedPoolHost::new(&regions, 0, 1, 0).unwrap();
+        let second = LlamaCppSharedPoolHost::new(&regions, 0, 2, 0).unwrap();
+        admissions.admit(
+            PoolOwner::gguf(2, 0, PoolAllocationClass::PersistentWeights),
+            GATE_POOL_BYTES / 4,
+        );
+        assert!(second.lease_arena().is_ok());
+        assert!(first.lease_arena().is_err());
+        admissions.admit(
+            PoolOwner::gguf(1, 0, PoolAllocationClass::PersistentWeights),
+            GATE_POOL_BYTES / 4,
+        );
+        assert!(first.lease_arena().is_ok());
+    }
+
+    #[cfg(feature = "gpu-device-pool")]
+    #[test]
+    fn shared_pool_pack_host_refuses_a_device_without_a_runtime_pool() {
+        use crate::runtime::memory::gpu_pool::tests::{pool_with_admission_arena, GATE_POOL_BYTES};
+
+        let (regions, arena, _admissions) = pool_with_admission_arena(0, GATE_POOL_BYTES);
+        assert!(regions.retire_arena(&arena).unwrap());
+        let error = LlamaCppSharedPoolHost::new(&regions, 0, 1, 0)
+            .err()
+            .expect("no pool, no shared-pool pack");
+        assert!(
+            error.contains("requires the runtime-owned pool for device 0"),
+            "{error}"
+        );
     }
 
     #[test]
