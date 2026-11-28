@@ -242,6 +242,14 @@ releases the allocation and creates a new one for the next pooled model.
 When the process starts without models, implicit automatic pool creation
 remains deferred until the first pooled model targets that device.
 
+A model is pooled when its route allocates from the runtime pool: GGUF on the
+compiled shared-KV backend or the signed `llama-cpp/cuda12` pack (KV), native
+safetensors models, ONNX with `KAPSL_ONNX_CUDA_POOL=1`, and ONNX on a signed
+`onnx/cuda12` or `onnx/tensorrt10` pack, whose governed device allocator
+requires the pool. Its planned weights and session workspaces then count
+toward the pooled minimum. ONNX on embedded ORT without the opt-in keeps its
+own arena and does not create a pool.
+
 | Variable | Description |
 |----------|-------------|
 | `KAPSL_GPU_DEVICE_POOL_MODE[_N]` | `auto`, `fixed`, or `off`. Per-device values win. Omitted means automatic in the stable shared-KV CUDA profile, fixed when bytes are supplied, and off in other profiles. |
