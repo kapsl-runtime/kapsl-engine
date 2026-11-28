@@ -36,6 +36,7 @@ def load(name):
 environment = load("preflight_release_environment")
 build = load("release_build_inputs")
 sdk = load("verify_published_sdk")
+waiver = load("stable_gpu_gate_waiver")
 
 
 def workflow(name):
@@ -1072,6 +1073,167 @@ class VllmIntegrationPinTests(TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual(written["github-env"] + written["github-output"], "")
                     self.assertEqual(written["evidence/run-context.txt"], "engine_sha=fixture\n")
+
+
+class StableGpuGateWaiverTests(TestCase):
+    DIGEST = "sha256:" + "ab" * 32
+    VALID = {
+        "schema_version": 1,
+        "release_tag": "v1.2.3",
+        "run_id": 42,
+        "candidate": {"artifact": "runtime-cuda-linux-x86_64", "digest": DIGEST},
+        "reason": "GCP had no L4 capacity.",
+        "manual_qualification": {
+            "performed_on": "2026-11-28",
+            "hardware": "1x RTX 3090 24 GB",
+            "evidence": "https://github.com/kapsl-runtime/kapsl-engine/pull/1#issuecomment-1",
+        },
+    }
+    MATCH = dict(release_tag="v1.2.3", run_id=42, artifact="runtime-cuda-linux-x86_64")
+
+    def write(self, document):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "waiver.json"
+        path.write_text(document if isinstance(document, str) else json.dumps(document))
+        return path
+
+    def changed(self, **fields):
+        document = json.loads(json.dumps(self.VALID))
+        for key, value in fields.items():
+            for section in ("candidate", "manual_qualification"):
+                if key in document[section]:
+                    document[section][key] = value
+                    break
+            else:
+                document[key] = value
+        return document
+
+    def test_a_waiver_authorizes_only_its_own_tag_run_and_artifact(self):
+        path = self.write(self.VALID)
+        waiver.authorize(path, **self.MATCH, artifact_digests=[self.DIGEST])
+        mismatches = {
+            "other tag": dict(self.MATCH, release_tag="v1.2.4"),
+            "prerelease tag": dict(self.MATCH, release_tag="v1.2.3-beta.1"),
+            "other run": dict(self.MATCH, run_id=43),
+            "other artifact": dict(self.MATCH, artifact="runtime-installers-ubuntu-22.04"),
+        }
+        for name, match in mismatches.items():
+            with self.subTest(name), self.assertRaises(waiver.WaiverError):
+                waiver.authorize(path, **match, artifact_digests=[self.DIGEST])
+        for name, digests in {
+            "rebuilt artifact": ["sha256:" + "cd" * 32],
+            "no artifact": [],
+            "ambiguous artifacts": [self.DIGEST, self.DIGEST],
+        }.items():
+            with self.subTest(name), self.assertRaises(waiver.WaiverError):
+                waiver.authorize(path, **self.MATCH, artifact_digests=digests)
+        with self.assertRaises(waiver.WaiverError):
+            waiver.authorize(path.with_name("absent.json"), **self.MATCH, artifact_digests=[self.DIGEST])
+
+    def test_a_malformed_waiver_fails_instead_of_being_ignored(self):
+        broken = {
+            "not json": "{",
+            "extra key": {**self.VALID, "always": True},
+            "missing candidate": {k: v for k, v in self.VALID.items() if k != "candidate"},
+            "schema": self.changed(schema_version=2),
+            "prerelease tag": self.changed(release_tag="v1.2.3-beta.1"),
+            "wildcard tag": self.changed(release_tag="v1.2.*"),
+            "run id as text": self.changed(run_id="42"),
+            "run id boolean": self.changed(run_id=True),
+            "run id zero": self.changed(run_id=0),
+            "empty reason": self.changed(reason=" "),
+            "digest without algorithm": self.changed(digest="ab" * 32),
+            "uppercase digest": self.changed(digest="sha256:" + "AB" * 32),
+            "bad date": self.changed(performed_on="yesterday"),
+            "empty hardware": self.changed(hardware=""),
+            "evidence elsewhere": self.changed(evidence="https://example.com/results"),
+        }
+        for name, document in broken.items():
+            with self.subTest(name), self.assertRaises(waiver.WaiverError):
+                waiver.authorize(self.write(document), **self.MATCH, artifact_digests=[self.DIGEST])
+
+    def test_the_command_fails_closed(self):
+        script = str(ROOT / ".github/scripts/stable_gpu_gate_waiver.py")
+
+        def run(path, digests, run_id="42"):
+            return subprocess.run(
+                [sys.executable, script, "--waiver", str(path), "--release-tag", "v1.2.3",
+                 "--run-id", run_id, "--artifact", "runtime-cuda-linux-x86_64",
+                 "--artifact-digests", digests],
+                capture_output=True, text=True, check=False,
+            )
+
+        path = self.write(self.VALID)
+        accepted = run(path, self.DIGEST)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("run 42", accepted.stdout)
+        for name, result in {
+            "other digest": run(path, "sha256:" + "cd" * 32),
+            "no digest": run(path, ""),
+            "other run": run(path, self.DIGEST, run_id="43"),
+            "malformed": run(self.write("{"), self.DIGEST),
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("stable GPU gate waiver refused", result.stderr)
+
+    def test_a_committed_waiver_is_well_formed(self):
+        waiver.load_waiver(ROOT / waiver.DEFAULT_WAIVER)
+
+    def test_the_gate_waives_only_the_gpu_job_from_the_default_branch(self):
+        source = workflow("release-runtime-installers")
+        # The GPU job itself is unchanged: every stable tag still runs it.
+        gpu = job(source, "stable-release-gpu-conformance")
+        self.assertIn("if: needs.prepare-version.outputs.is_stable_release == 'true'\n", gpu)
+        self.assertIn("uses: ./.github/workflows/gpu-device-pool-integration.yml", gpu)
+        self.assertNotIn("waive", job(source, "prepare-version"))
+
+        gate = job(source, "release-conformance-gate")
+        self.assertIn("gpu_waived: ${{ steps.qualification.outputs.gpu_waived }}", gate)
+        checks = step(gate, "Require the appropriate qualification results")
+        before, waived = checks.split('if [[ "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "success" ]]; then', 1)
+        # CPU parity and infrastructure authentication are never waived.
+        self.assertIn('"$CPU_CONFORMANCE_RESULT" != "success"', before)
+        self.assertIn('"$INFRASTRUCTURE_RESULT" != "success"', before)
+        waived = waived.split("\n          else\n", 1)[0]
+        self.assertIn("contents/.github/stable-gpu-gate-waiver.json?ref=$DEFAULT_BRANCH", waived)
+        self.assertIn("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}", checks)
+        self.assertIn("actions/runs/$GITHUB_RUN_ID/artifacts?name=$CANDIDATE_ARTIFACT", waived)
+        self.assertIn("CANDIDATE_ARTIFACT: runtime-cuda-linux-x86_64", checks)
+        for argument in ('--release-tag "$GITHUB_REF_NAME"', '--run-id "$GITHUB_RUN_ID"',
+                         '--artifact "$CANDIDATE_ARTIFACT"', '--artifact-digests "$digests"'):
+            self.assertIn(argument, waived)
+        self.assertLess(waived.index("stable_gpu_gate_waiver.py"), waived.index('echo "gpu_waived=true"'))
+        self.assertIn('echo "gpu_waived=false" >> "$GITHUB_OUTPUT"', checks)
+        # The decision never comes from workflow inputs or repository settings.
+        for forbidden in ("inputs.", "vars.", "secrets."):
+            self.assertNotIn(forbidden, gate)
+        self.assertEqual(source.count("stable_gpu_gate_waiver.py"), 2)  # sparse checkout + call
+
+    def test_publication_follows_the_gate_result_only(self):
+        source = workflow("release-runtime-installers")
+        for name, required in {
+            "upload-release-assets": ("build-runtime-installers", "build-cuda-runtime", "release-conformance-gate"),
+            "upload-r2": ("build-runtime-installers", "build-cuda-runtime", "release-conformance-gate"),
+            "publish-docker": ("upload-release-assets", "upload-r2"),
+        }.items():
+            with self.subTest(name):
+                block = job(source, name)
+                condition = re.search(r"(?m)^    if: >-\n((?:      .*\n)+)", block)[1]
+                self.assertTrue(condition.lstrip().startswith("!cancelled() &&"), condition)
+                needs = re.search(r"(?m)^    needs: \[(.*)\]$", block)[1].split(", ")
+                for dependency in required:
+                    self.assertIn(dependency, needs)
+                    self.assertIn(f"needs.{dependency}.result == 'success'", condition)
+                self.assertNotIn("always()", block)
+                self.assertNotIn("success() ||", block)
+        self.assertIn("startsWith(github.ref, 'refs/tags/v') &&", job(source, "upload-release-assets"))
+        self.assertIn("needs.prepare-version.outputs.is_release == 'true' &&", job(source, "publish-docker"))
+
+    def test_betas_and_gpu_workflows_cannot_be_waived(self):
+        for name in ("beta-runtime-installers", "gpu-device-pool-integration", "vllm-shared-pool-conformance"):
+            self.assertNotIn("waive", workflow(name).lower(), name)
 
 
 if __name__ == "__main__":

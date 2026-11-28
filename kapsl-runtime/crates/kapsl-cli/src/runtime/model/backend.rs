@@ -1087,6 +1087,35 @@ pub(super) async fn reserve_isolated_worker_memory(
     })
 }
 
+/// A backend's own load failure behind the load context. The backend's error
+/// stays the source, so callers can still tell why the load failed.
+#[derive(Debug)]
+pub(crate) struct BackendLoadFailure {
+    context: String,
+    source: EngineError,
+}
+
+impl BackendLoadFailure {
+    pub(crate) fn new(context: impl Into<String>, source: EngineError) -> Self {
+        Self {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+impl std::fmt::Display for BackendLoadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for BackendLoadFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Execute the runtime-owned backend load transaction.
 ///
 /// One backend-neutral plan is admitted before the backend can allocate,
@@ -1144,7 +1173,7 @@ pub(super) async fn load_runtime_backend(
 
     if let Err(error) = backend.load(model_file_path).await {
         backend.unload();
-        return Err(format!("{load_context}: {error}").into());
+        return Err(Box::new(BackendLoadFailure::new(load_context, error)));
     }
 
     let actual_report = backend.actual_memory();

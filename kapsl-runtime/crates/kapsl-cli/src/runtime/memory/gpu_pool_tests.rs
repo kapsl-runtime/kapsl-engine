@@ -1,6 +1,7 @@
 use super::super::MemoryOwner;
 use super::*;
 use kapsl_hal::gpu_arena::PoolAllocationClass;
+use std::collections::HashMap;
 
 #[derive(Default)]
 struct State {
@@ -359,6 +360,266 @@ fn failed_export_release_keeps_backing_visible_and_retry_retires_it() {
     unsafe {
         region.release_export_after_fence().unwrap();
     }
+}
+
+/// The admission contract of `HalStorage::Arena` without CUDA: a local request
+/// needs its workload admitted (any allocation class of the same backend,
+/// model and replica), and an allocation must leave every other admitted
+/// workload's unmet guarantee free, as `PoolPolicy::available_for` does.
+#[derive(Default)]
+struct AdmissionState {
+    capacity: usize,
+    guaranteed: HashMap<PoolWorkload, usize>,
+    usage: HashMap<PoolWorkload, usize>,
+    live: HashMap<u64, (PoolWorkload, usize)>,
+    next_id: u64,
+}
+
+impl AdmissionState {
+    fn available_for(&self, workload: PoolWorkload) -> usize {
+        let used: usize = self.usage.values().sum();
+        let unmet_others: usize = self
+            .guaranteed
+            .iter()
+            .filter(|(other, _)| **other != workload)
+            .map(|(other, guaranteed)| {
+                guaranteed.saturating_sub(self.usage.get(other).copied().unwrap_or(0))
+            })
+            .sum();
+        self.capacity
+            .saturating_sub(used)
+            .saturating_sub(unmet_others)
+    }
+}
+
+struct AdmissionArena {
+    state: Arc<Mutex<AdmissionState>>,
+}
+
+struct AdmissionExtent {
+    state: Arc<Mutex<AdmissionState>>,
+    id: u64,
+    bytes: usize,
+}
+
+/// What `DeviceMemoryManager::admit_pool` and `try_finish_release` do to an
+/// arena's owners during load admission and unload.
+#[derive(Clone)]
+pub(crate) struct ArenaAdmissions(Arc<Mutex<AdmissionState>>);
+
+impl ArenaAdmissions {
+    pub(crate) fn admit(&self, owner: PoolOwner, guaranteed_bytes: usize) {
+        self.0
+            .lock()
+            .guaranteed
+            .insert(owner.workload(), guaranteed_bytes);
+    }
+}
+
+impl GpuRegionSource for AdmissionArena {
+    fn region_usage(&self) -> Option<GpuRegionUsage> {
+        let state = self.state.lock();
+        let used: usize = state.usage.values().sum();
+        let mut usage = GpuRegionUsage::exported(state.capacity, state.capacity, 0);
+        usage.logical_allocated_bytes = Some(used);
+        usage.reusable_bytes = Some(state.capacity - used);
+        usage.largest_free_range_bytes = usage.reusable_bytes;
+        Some(usage)
+    }
+}
+
+impl RegionStorage for AdmissionArena {
+    fn kind(&self) -> GpuRegionKind {
+        GpuRegionKind::Arena
+    }
+    fn fits_local(&self, owner: PoolOwner, bytes: usize, _alignment: usize) -> bool {
+        let state = self.state.lock();
+        state.guaranteed.contains_key(&owner.workload())
+            && (bytes == 0 || state.available_for(owner.workload()) >= bytes)
+    }
+    fn allocate(
+        &self,
+        owner: PoolOwner,
+        bytes: usize,
+        _alignment: usize,
+    ) -> Result<Box<dyn AllocationStorage>, String> {
+        let mut state = self.state.lock();
+        let workload = owner.workload();
+        if !state.guaranteed.contains_key(&workload) {
+            return Err("allocation owner has no memory admission".into());
+        }
+        let available = state.available_for(workload);
+        if bytes > available {
+            return Err(format!(
+                "quota exceeded: requested {bytes}, available {available}"
+            ));
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        state.live.insert(id, (workload, bytes));
+        *state.usage.entry(workload).or_default() += bytes;
+        Ok(Box::new(AdmissionExtent {
+            state: self.state.clone(),
+            id,
+            bytes,
+        }))
+    }
+    fn can_retire_arena(&self) -> bool {
+        self.state.lock().live.is_empty()
+    }
+}
+
+impl AllocationStorage for AdmissionExtent {
+    fn pointer(&self) -> usize {
+        4096 * self.id as usize
+    }
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+    fn free_after_fence(&self) -> Result<(), String> {
+        let mut state = self.state.lock();
+        let (workload, bytes) = state.live.remove(&self.id).ok_or("stale extent")?;
+        if let Some(usage) = state.usage.get_mut(&workload) {
+            *usage = usage.saturating_sub(bytes);
+        }
+        Ok(())
+    }
+}
+
+/// A device pool with one installed local arena that enforces admission as
+/// the CUDA arena does. The lease is the manager's own (installation) lease.
+pub(crate) fn pool_with_admission_arena(
+    device_id: usize,
+    capacity: usize,
+) -> (Arc<GpuDevicePool>, GpuRegionLease, ArenaAdmissions) {
+    let pool = pool(device_id);
+    let state = Arc::new(Mutex::new(AdmissionState {
+        capacity,
+        ..AdmissionState::default()
+    }));
+    let lease = pool.insert(
+        GpuRegionIsolation::Local,
+        Box::new(AdmissionArena {
+            state: state.clone(),
+        }),
+    );
+    (pool, lease, ArenaAdmissions(state))
+}
+
+/// The v0.3.0 qualification on an RTX 3090: automatic sizing gave the pool
+/// 1,669,332,992 bytes and ORT model 0 was admitted with a quarter of it
+/// guaranteed. GGUF model 1 was not admitted yet when its backend asked.
+pub(crate) const GATE_POOL_BYTES: usize = 1_669_332_992;
+pub(crate) const GATE_ORT_GUARANTEED_BYTES: usize = GATE_POOL_BYTES / 4;
+const GATE_REFUSAL: &str =
+    "no compatible arena has admitted, ready capacity; request a separate capacity change";
+
+#[test]
+fn a_local_request_before_load_admission_is_refused_with_the_gate_error() {
+    let (pool, _arena, admissions) = pool_with_admission_arena(0, GATE_POOL_BYTES);
+    admissions.admit(
+        PoolOwner::onnx(0, 0, PoolAllocationClass::PersistentWeights),
+        GATE_ORT_GUARANTEED_BYTES,
+    );
+    let gguf_kv = PoolOwner::gguf(1, 0, PoolAllocationClass::KvCache);
+    let refused = pool
+        .acquire_region(GpuRegionRequest::Local {
+            owner: gguf_kv,
+            bytes: 0,
+            alignment: 1,
+        })
+        .err()
+        .expect("an unadmitted owner gets no lease, whatever the free capacity");
+    assert_eq!(refused, GATE_REFUSAL);
+
+    // Load admission admits the workload under its weights class; every class
+    // of the same model/replica then shares it.
+    admissions.admit(
+        gguf_kv.with_class(PoolAllocationClass::PersistentWeights),
+        GATE_POOL_BYTES / 4,
+    );
+    assert!(pool
+        .acquire_region(GpuRegionRequest::Local {
+            owner: gguf_kv,
+            bytes: 0,
+            alignment: 1,
+        })
+        .is_ok());
+}
+
+#[test]
+fn a_construction_binding_leases_the_arena_only_after_load_admission() {
+    let (pool, _arena, admissions) = pool_with_admission_arena(0, GATE_POOL_BYTES);
+    let ort = PoolOwner::onnx(0, 0, PoolAllocationClass::PersistentWeights);
+    admissions.admit(ort, GATE_ORT_GUARANTEED_BYTES);
+    let gguf_kv = PoolOwner::gguf(1, 0, PoolAllocationClass::KvCache);
+
+    // Backend construction: binds without an admission and without a lease.
+    let binding = pool
+        .bind_local_arena(gguf_kv)
+        .expect("binding at construction must not require the admission that follows it");
+    assert_eq!(binding.owner(), gguf_kv);
+    let early = binding.acquire().err().expect("still no admission");
+    assert!(early.contains(GATE_REFUSAL), "{early}");
+    assert!(early.contains("Gguf"), "{early}");
+    assert_eq!(pool.snapshots().len(), 1);
+
+    // Load admission, then the pack creates its KV pool from load_model.
+    admissions.admit(
+        gguf_kv.with_class(PoolAllocationClass::PersistentWeights),
+        GATE_POOL_BYTES / 4,
+    );
+    let lease = binding
+        .acquire()
+        .expect("admitted workload leases the arena");
+    let table_owner = gguf_kv.with_class(PoolAllocationClass::BlockTable);
+    let table = lease
+        .allocate(table_owner, 64 * 1024, 4)
+        .expect("block table fits");
+    // Admission is unchanged: the ORT guarantee stays out of the GGUF's reach.
+    let beyond = GATE_POOL_BYTES - GATE_ORT_GUARANTEED_BYTES;
+    assert!(lease.allocate(gguf_kv, beyond, 1).is_err());
+    // Another workload cannot allocate through this workload's lease.
+    assert!(lease.allocate(ort, 64, 1).is_err());
+    unsafe {
+        table.release_after_fence().unwrap();
+    }
+}
+
+#[test]
+fn a_construction_binding_refuses_a_device_without_an_arena() {
+    let pool = pool(0);
+    let gguf_kv = PoolOwner::gguf(1, 0, PoolAllocationClass::KvCache);
+    let error = pool
+        .bind_local_arena(gguf_kv)
+        .err()
+        .expect("no pool, no binding");
+    assert!(error.contains("no runtime-owned arena"), "{error}");
+
+    // Exported participant backing is not a local arena either.
+    let state = Arc::new(Mutex::new(State {
+        capacity: 128,
+        ..State::default()
+    }));
+    let export = pool.insert(
+        isolated(),
+        Box::new(FakeRegion {
+            kind: GpuRegionKind::Ipc,
+            state,
+        }),
+    );
+    assert!(pool.bind_local_arena(gguf_kv).is_err());
+    unsafe {
+        export.release_export_after_fence().unwrap();
+    }
+
+    // A binding whose arena was reclaimed before admission is refused, not
+    // redirected: the lease still needs an installed, admitted arena.
+    let (pool, arena, admissions) = pool_with_admission_arena(0, GATE_POOL_BYTES);
+    let binding = pool.bind_local_arena(gguf_kv).unwrap();
+    assert!(pool.retire_arena(&arena).unwrap());
+    admissions.admit(gguf_kv, GATE_POOL_BYTES / 4);
+    assert!(binding.acquire().is_err());
 }
 
 #[test]
