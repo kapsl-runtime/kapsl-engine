@@ -390,7 +390,9 @@ class AssemblyTests(TestCase):
 
     def test_complete_component_set_is_moved_without_duplicate_disk_usage(self):
         self.assemble()
-        self.assertEqual(len(list(self.output.iterdir())), 14)
+        # A stable build has no SGLang pack (betas only), so its three files
+        # (archive, checksum, manifest) are not part of the set.
+        self.assertEqual(len(list(self.output.iterdir())), 11)
         self.assertTrue(all(not list(directory.iterdir()) for directory in self.root.iterdir()))
 
     def test_missing_component_fails_without_moving_existing_outputs(self):
