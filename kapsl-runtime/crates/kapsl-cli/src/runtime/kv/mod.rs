@@ -81,6 +81,9 @@ impl KvControlConfig {
         if let Some(deployment) = resources.managed_vllm() {
             deployment.install_coordinator(coordinator.clone())?;
         }
+        for deployment in resources.managed_servers() {
+            deployment.install_coordinator(coordinator.clone())?;
+        }
         let control_server = KvControlServer::bind(socket_path, coordinator).await?;
         log::info!(
             "KV participant control: unix://{} (maximum lease TTL={}ms)",

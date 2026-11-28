@@ -78,7 +78,7 @@ require_literal "$index_generator" 'kapsl-backend-index-v1\0'
 require_literal "$index_generator" 'kapsl-backend-artifact-v1\0'
 require_literal "$rust_sdk_verifier" '"kapsl-engine-api": "0.3.1"'
 require_literal "$rust_sdk_verifier" '"kapsl-communication": "0.5.0"'
-require_literal "$rust_sdk_verifier" '"kapsl-kv-abi": "0.6.1"'
+require_literal "$rust_sdk_verifier" '"kapsl-kv-abi": "0.6.2"'
 require_literal "$rust_sdk_verifier" '"kapsl-llm": "0.3.8"'
 require_literal "$rust_sdk_verifier" 'package.get("source") != CRATES_IO'
 

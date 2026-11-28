@@ -41,6 +41,8 @@ const RESIZE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// that is still real is always fresher than this.
 const UNMET_KV_DEMAND_TTL: Duration = Duration::from_secs(5);
 
+mod managed_opaque;
+
 /// Physical data-plane storage retained for the lifetime of a provisioned
 /// shared pool. Implementations clear every newly assigned block before its
 /// handle is published to a participant.

@@ -21,7 +21,7 @@ EXPECTED_VERSIONS = {
     "kapsl-core": "0.3.1",
     "kapsl-engine-api": "0.3.1",
     "kapsl-hal": "0.3.4",
-    "kapsl-kv-abi": "0.6.1",
+    "kapsl-kv-abi": "0.6.2",
     "kapsl-llama-cpp-2": "0.1.146-kapsl.2",
     "kapsl-llama-cpp-sys-2": "0.1.146-kapsl.2",
     "kapsl-llm": "0.3.8",

@@ -150,6 +150,14 @@ impl ModelLoadPlan {
     pub(crate) fn uses_managed_vllm(&self) -> bool {
         self.serving_backend.selected == ResolvedServingBackend::Vllm
     }
+
+    pub(crate) fn uses_managed_sglang(&self) -> bool {
+        self.serving_backend.selected == ResolvedServingBackend::Sglang
+    }
+
+    pub(crate) fn manifest(&self) -> &Manifest {
+        &self.loader.manifest
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

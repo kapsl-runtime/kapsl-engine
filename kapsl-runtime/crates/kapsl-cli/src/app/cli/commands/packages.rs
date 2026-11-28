@@ -43,7 +43,7 @@ pub(crate) struct BuildCommandArgs {
     #[arg(long)]
     pub(crate) task: Option<String>,
 
-    /// Deployment backend policy: auto, llama_cpp, or vllm.
+    /// Deployment backend policy: auto, llama_cpp, vllm, or sglang.
     /// Stored as metadata.serving.backend; omitted for legacy behavior.
     #[arg(long, value_enum, value_name = "BACKEND")]
     pub(crate) serving_backend: Option<ServingBackendPolicy>,

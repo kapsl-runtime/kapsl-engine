@@ -2304,6 +2304,11 @@ pub(crate) fn execute_backend_command(
                         "{} uses the embedded ORT rollback ({})",
                         manifest.project_name, reason
                     );
+                } else if decision.selected == crate::backend::ResolvedServingBackend::Sglang {
+                    println!(
+                        "{} is served by SGLang from an operator-provided environment (KAPSL_SGLANG_PYTHON); there is no signed pack to install",
+                        manifest.project_name
+                    );
                 } else if decision.selected != crate::backend::ResolvedServingBackend::Vllm {
                     println!(
                         "{} uses the in-process {} backend; no lazy pack is required by this runtime build",

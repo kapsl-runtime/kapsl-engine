@@ -140,6 +140,7 @@ Selection is deterministic:
 | omitted | any | Existing built-in backend factory |
 | `llama_cpp` | GGUF | llama.cpp; other formats are rejected |
 | `vllm` | CUDA + explicit SafeTensors/causal-lm/generate axes | Managed vLLM; other contracts are rejected |
+| `sglang` | CUDA + explicit SafeTensors/causal-lm/generate axes | Managed SGLang from an operator-provided environment; other contracts are rejected. Never chosen by `auto` |
 | `auto` | GGUF | llama.cpp |
 | `auto` | CUDA + explicit SafeTensors/causal-lm/generate axes | Managed vLLM |
 | `auto` | SafeTensors without a matching external target | Built-in native backend when compiled; otherwise rejected before ONNX Runtime |
