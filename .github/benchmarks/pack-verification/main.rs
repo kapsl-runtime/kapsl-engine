@@ -20,6 +20,11 @@ fn verify_serial(root: &Path, files: &BTreeMap<String, String>) -> std::io::Resu
     Ok(true)
 }
 
+fn verify_parallel(root: &Path, files: &BTreeMap<String, String>) -> std::io::Result<bool> {
+    // The candidate: the production verifier on the SHA-256 `files` map.
+    checksums::verify_installed_files(root, files, checksums::Algorithm::Sha256)
+}
+
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
@@ -49,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bytes = files.keys().try_fold(0_u64, |total, name| {
         Ok::<_, std::io::Error>(total.saturating_add(root.join(name).metadata()?.len()))
     })?;
-    if !verify_serial(root, &files)? || !checksums::verify_installed_files(root, &files)? {
+    if !verify_serial(root, &files)? || !verify_parallel(root, &files)? {
         return Err("input files failed checksum verification before measurement".into());
     }
 
@@ -60,7 +65,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         for parallel in [false, true, true, false] {
             let started = Instant::now();
             let valid = if parallel {
-                checksums::verify_installed_files(root, &files)?
+                verify_parallel(root, &files)?
             } else {
                 verify_serial(root, &files)?
             };
