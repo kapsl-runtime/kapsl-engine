@@ -806,8 +806,7 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
     };
     let mut selection_reason = decision.reason.to_string();
     let (selected_backend, installed, download_required, download_bytes, execution_mode, profile) =
-        if decision.selected == ResolvedServingBackend::Vllm
-            && memory.status != MemoryAdmissionStatus::Rejected
+        if decision.selected.is_managed_server() && memory.status != MemoryAdmissionStatus::Rejected
         {
             let mut target = BackendTarget::current(&planned_device_info);
             if synthetic_cuda_target {
@@ -818,30 +817,23 @@ pub(crate) fn execute_backend_plan_command(args: BackendPlanCommandArgs) -> Resu
                 target.driver_version = Some("9999.0".to_string());
             }
             let manager = BackendManager::from_env(args.offline)?;
-            let plan = manager.plan_vllm(&target)?;
+            let plan = if decision.selected == ResolvedServingBackend::Sglang {
+                manager.plan_sglang(&target)?
+            } else {
+                manager.plan_vllm(&target)?
+            };
             selection_reason = plan.selection_reason.clone();
             (
-                "vllm".to_string(),
+                decision.selected.as_str().to_string(),
                 plan.installed,
                 plan.download_required,
                 plan.download_bytes,
                 plan.execution_mode,
                 Some(plan.profile),
             )
-        } else if decision.selected == ResolvedServingBackend::Vllm {
+        } else if decision.selected.is_managed_server() {
             (
-                "vllm".to_string(),
-                false,
-                false,
-                0,
-                "external".to_string(),
-                None,
-            )
-        } else if decision.selected == ResolvedServingBackend::Sglang {
-            // No signed SGLang pack exists, so there is nothing to download:
-            // the operator provides the environment when the runtime starts.
-            (
-                "sglang".to_string(),
+                decision.selected.as_str().to_string(),
                 false,
                 false,
                 0,

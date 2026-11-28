@@ -335,6 +335,7 @@ class BuildPlanTests(TestCase):
         }, self.manifest, self.lock)
         self.assertIn("beta", version)
         self.assertEqual(matrix["include"][-1]["component"], "ort-cpu")
+        self.assertIn("sglang", [item["component"] for item in matrix["include"]])
         self.assertFalse(any("onnx" in item["component"] for item in matrix["include"]))
 
     def test_cache_warming_is_main_only_and_produces_no_vllm_or_ort_release_parts(self):
@@ -389,6 +390,8 @@ class AssemblyTests(TestCase):
 
     def test_complete_component_set_is_moved_without_duplicate_disk_usage(self):
         self.assemble()
+        # A stable build has no SGLang pack (betas only), so its three files
+        # (archive, checksum, manifest) are not part of the set.
         self.assertEqual(len(list(self.output.iterdir())), 11)
         self.assertTrue(all(not list(directory.iterdir()) for directory in self.root.iterdir()))
 

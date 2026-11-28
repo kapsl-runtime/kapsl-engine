@@ -81,7 +81,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        if: matrix.component != 'vllm'
+        if: matrix.component != 'vllm' && matrix.component != 'sglang'
         uses: ./.github/actions/setup-rust
 
       - name: Cache engine and native backend dependencies
@@ -144,6 +144,35 @@ jobs:
         env:
           KAPSL_VLLM_INTEGRATIONS_DIR: kapsl-integrations-vllm
         run: .github/scripts/package-linux-vllm-backend.sh
+
+      - name: Resolve certified SGLang integrations commit
+        if: matrix.component == 'sglang'
+        id: sglang-integrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(tr -d '\r\n' < .github/sglang-integration.lock)"
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          echo "KAPSL_SGLANG_INTEGRATIONS_REF=$ref" >> "$GITHUB_ENV"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout certified SGLang adapter
+        if: matrix.component == 'sglang'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: kapsl-runtime/kapsl-integrations
+          ref: ${{ steps.sglang-integrations.outputs.ref }}
+          path: kapsl-integrations-sglang
+
+      - name: Verify certified SGLang integrations checkout
+        if: matrix.component == 'sglang'
+        run: .github/scripts/verify-sglang-integration-checkout.sh kapsl-integrations-sglang "$KAPSL_SGLANG_INTEGRATIONS_REF"
+
+      - name: Package certified managed-SGLang backend
+        if: matrix.component == 'sglang'
+        env:
+          KAPSL_SGLANG_INTEGRATIONS_DIR: kapsl-integrations-sglang
+        run: .github/scripts/package-linux-sglang-backend.sh
 
       - name: Resolve certified ORT integrations commit
         if: matrix.component == 'ort-cpu'

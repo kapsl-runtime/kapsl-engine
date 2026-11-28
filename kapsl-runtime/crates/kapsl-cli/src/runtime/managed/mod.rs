@@ -9,7 +9,8 @@ mod sglang;
 use self::server::managed_kv_participant_config;
 pub(crate) use self::server::{ManagedServerDeployment, PreparedManagedServerDeployment};
 pub(crate) use self::sglang::{
-    create_managed_sglang_engine, prepare_managed_sglang, validate_managed_sglang_launch_policy,
+    certified_managed_sglang_source, create_managed_sglang_engine, prepare_managed_sglang,
+    validate_managed_sglang_launch_policy, CertifiedManagedSglangSource,
 };
 
 use self::bridge::{

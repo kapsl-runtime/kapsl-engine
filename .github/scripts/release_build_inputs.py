@@ -41,6 +41,9 @@ def components(stable, cache_only=False):
     if not cache_only:
         result.append({"component": "vllm", "target": "", "profile": ""})
         if not stable:
+            # Managed SGLang ships in betas until a stable release has
+            # qualified it on a GPU through the release gate.
+            result.append({"component": "sglang", "target": "", "profile": ""})
             result.append({"component": "ort-cpu", "target": "", "profile": ""})
     return result
 

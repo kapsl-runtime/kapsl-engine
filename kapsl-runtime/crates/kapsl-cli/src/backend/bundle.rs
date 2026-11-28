@@ -9,7 +9,7 @@ use crate::backend::{
     backend_cache_root, current_platform, runtime_release_version, safe_extract_tar_gz,
     sha256_file, BackendAccelerator, BackendIndex, BackendManager, BackendPackManifest,
     BackendTarget, LlamaCppBackendPackProfile, OnnxBackendPackProfile, GENERIC_NATIVE_PACKS_ENV,
-    MANAGED_VLLM_PACK_PROFILE,
+    MANAGED_SGLANG_PACK_PROFILE, MANAGED_VLLM_PACK_PROFILE,
 };
 use crate::backend::{
     embedded_onnx_rollback_reason, generic_native_backend_packs_enabled,
@@ -161,6 +161,15 @@ fn create_bundle(
         if decision.selected == ResolvedServingBackend::Vllm {
             let pack =
                 manager.select_pack(&index, "vllm", Some(MANAGED_VLLM_PACK_PROFILE), &target)?;
+            required_packs.insert((pack.backend.clone(), pack.profile.clone()), pack);
+        }
+        if decision.selected == ResolvedServingBackend::Sglang {
+            let pack = manager.select_pack(
+                &index,
+                "sglang",
+                Some(MANAGED_SGLANG_PACK_PROFILE),
+                &target,
+            )?;
             required_packs.insert((pack.backend.clone(), pack.profile.clone()), pack);
         }
         if kapsl_core::EngineKind::resolve(&manifest).uses_onnx_session() {
@@ -631,6 +640,12 @@ fn validate_extracted_bundle(
         if decision.selected == ResolvedServingBackend::Vllm {
             required_backend_ids
                 .insert(("vllm".to_string(), MANAGED_VLLM_PACK_PROFILE.to_string()));
+        }
+        if decision.selected == ResolvedServingBackend::Sglang {
+            required_backend_ids.insert((
+                "sglang".to_string(),
+                MANAGED_SGLANG_PACK_PROFILE.to_string(),
+            ));
         }
         if kapsl_core::EngineKind::resolve(&embedded_manifest).uses_onnx_session() {
             if signed_onnx_route {

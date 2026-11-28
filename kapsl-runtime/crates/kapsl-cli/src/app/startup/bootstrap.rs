@@ -340,15 +340,8 @@ async fn prepare_managed_backends(
         .preflight_managed_vllm_admission(startup_plans)
         .await?;
 
+    let lazy_enabled = lazy_backends_enabled();
     if let Some(source) = uses_managed_vllm.then(certified_managed_vllm_source) {
-        let lazy_enabled = std::env::var("KAPSL_LAZY_BACKENDS")
-            .ok()
-            .is_none_or(|value| {
-                !matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "no" | "off"
-                )
-            });
         let validate_lazy_cache = source == CertifiedManagedVllmSource::LazyCache;
         let install_missing = source == CertifiedManagedVllmSource::Missing && lazy_enabled;
         if validate_lazy_cache || install_missing {
@@ -381,6 +374,15 @@ async fn prepare_managed_backends(
         {
             validate_managed_sglang_launch_policy(plan.manifest())?;
         }
+        // As for vLLM: the manager re-validates a cached pack on every start
+        // and installs a missing one when lazy backends are enabled.
+        let source = certified_managed_sglang_source();
+        let validate_lazy_cache = source == CertifiedManagedSglangSource::LazyCache;
+        let install_missing = source == CertifiedManagedSglangSource::Missing && lazy_enabled;
+        if validate_lazy_cache || install_missing {
+            let manager = BackendManager::from_env(config.offline || !lazy_enabled)?;
+            manager.ensure_sglang(&BackendTarget::current(device_info))?;
+        }
         let prepared = prepare_managed_sglang(
             config.state_dir.as_deref(),
             config.kv_control.socket_path.as_deref(),
@@ -399,6 +401,19 @@ async fn prepare_managed_backends(
         resources.install_managed_server(deployment)?;
     }
     Ok(())
+}
+
+/// `KAPSL_LAZY_BACKENDS` (default on) lets the runtime install a missing
+/// signed backend pack on first use.
+fn lazy_backends_enabled() -> bool {
+    std::env::var("KAPSL_LAZY_BACKENDS")
+        .ok()
+        .is_none_or(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
 }
 
 async fn load_startup_models(
