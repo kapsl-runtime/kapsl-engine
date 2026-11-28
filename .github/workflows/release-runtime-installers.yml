@@ -31,6 +31,7 @@ jobs:
       deb_version: ${{ steps.version.outputs.deb_version }}
       is_release: ${{ steps.version.outputs.is_release }}
       is_stable_release: ${{ steps.version.outputs.is_stable_release }}
+      gpu_gate_waived: ${{ steps.gpu-waiver.outputs.gpu_gate_waived }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,6 +74,24 @@ jobs:
           echo "is_release=$is_release" >> "$GITHUB_OUTPUT"
           echo "is_stable_release=$is_stable_release" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve a tag-scoped waiver of the automated GPU conformance job
+        id: gpu-waiver
+        shell: bash
+        env:
+          IS_STABLE_RELEASE: ${{ steps.version.outputs.is_stable_release }}
+        run: |
+          set -euo pipefail
+          # Only a waiver that names this exact stable tag applies; a malformed
+          # waiver fails the release. See docs/gcp-ephemeral-gpu-conformance.md.
+          gpu_gate_waived=false
+          if [[ "$IS_STABLE_RELEASE" == "true" ]]; then
+            gpu_gate_waived="$(python3 .github/scripts/stable_gpu_gate_waiver.py --release-tag "$GITHUB_REF_NAME")"
+          fi
+          if [[ "$gpu_gate_waived" == "true" ]]; then
+            echo "::warning::The automated GPU conformance job is waived for $GITHUB_REF_NAME by .github/stable-gpu-gate-waiver.json."
+          fi
+          echo "gpu_gate_waived=$gpu_gate_waived" >> "$GITHUB_OUTPUT"
+
       - name: Verify signed ORT release before any builds or qualification
         if: steps.version.outputs.is_stable_release == 'true'
         run: python3 .github/scripts/preflight-ort-release.py --require-runtime-trust
@@ -98,7 +117,14 @@ jobs:
   publish-docker:
     name: Publish Docker images after qualified installers
     needs: [prepare-version, upload-release-assets, upload-r2]
-    if: needs.prepare-version.outputs.is_release == 'true'
+    # Skipped jobs skip everything downstream by default; the waived path
+    # therefore names the results it requires.
+    if: >-
+      needs.prepare-version.outputs.is_release == 'true' &&
+      (success() ||
+      (!cancelled() && needs.prepare-version.outputs.gpu_gate_waived == 'true' &&
+      needs.upload-release-assets.result == 'success' &&
+      needs.upload-r2.result == 'success'))
     permissions:
       actions: read
       contents: read
@@ -117,7 +143,11 @@ jobs:
   stable-release-gpu-conformance:
     name: Stable release GPU conformance
     needs: [prepare-version, build-cuda-runtime]
-    if: needs.prepare-version.outputs.is_stable_release == 'true'
+    # A waiver for this exact tag replaces the GCP run with a recorded manual
+    # qualification; the publication gate below still has to pass.
+    if: >-
+      needs.prepare-version.outputs.is_stable_release == 'true' &&
+      needs.prepare-version.outputs.gpu_gate_waived != 'true'
     # Reusable workflows cannot elevate permissions: both GCP setup and teardown
     # require OIDC, but ordinary build and publication jobs do not.
     permissions:
@@ -151,6 +181,7 @@ jobs:
           INFRASTRUCTURE_RESULT: ${{ needs.stable-release-infrastructure-preflight.result }}
           CPU_CONFORMANCE_RESULT: ${{ needs.stable-release-cpu-conformance.result }}
           GPU_CONFORMANCE_AND_TEARDOWN_RESULT: ${{ needs.stable-release-gpu-conformance.result }}
+          GPU_GATE_WAIVED: ${{ needs.prepare-version.outputs.gpu_gate_waived }}
         run: |
           set -euo pipefail
           if [[ "$PREPARE_RESULT" != "success" ]]; then
@@ -166,7 +197,13 @@ jobs:
               echo "Stable CPU performance parity did not succeed." >&2
               exit 1
             fi
-            if [[ "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "success" ]]; then
+            if [[ "$GPU_GATE_WAIVED" == "true" ]]; then
+              if [[ "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "skipped" ]]; then
+                echo "A waived GPU conformance job must not have run." >&2
+                exit 1
+              fi
+              echo "::warning::Publishing $GITHUB_REF_NAME on the manual GPU qualification recorded in .github/stable-gpu-gate-waiver.json."
+            elif [[ "$GPU_CONFORMANCE_AND_TEARDOWN_RESULT" != "success" ]]; then
               echo "Stable GPU conformance or its unconditional teardown did not succeed." >&2
               exit 1
             fi
@@ -478,8 +515,14 @@ jobs:
       KAPSL_BACKEND_SIGNING_KEY_B64: ${{ secrets.KAPSL_BACKEND_SIGNING_KEY_B64 }}
 
   upload-release-assets:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-runtime-installers, build-cuda-runtime, release-conformance-gate]
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      (success() ||
+      (!cancelled() && needs.prepare-version.outputs.gpu_gate_waived == 'true' &&
+      needs.build-runtime-installers.result == 'success' &&
+      needs.build-cuda-runtime.result == 'success' &&
+      needs.release-conformance-gate.result == 'success'))
+    needs: [prepare-version, build-runtime-installers, build-cuda-runtime, release-conformance-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Download installer artifacts
@@ -550,6 +593,12 @@ jobs:
 
   upload-r2:
     needs: [prepare-version, build-runtime-installers, build-cuda-runtime, release-conformance-gate]
+    if: >-
+      success() ||
+      (!cancelled() && needs.prepare-version.outputs.gpu_gate_waived == 'true' &&
+      needs.build-runtime-installers.result == 'success' &&
+      needs.build-cuda-runtime.result == 'success' &&
+      needs.release-conformance-gate.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

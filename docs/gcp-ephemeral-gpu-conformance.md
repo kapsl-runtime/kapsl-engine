@@ -320,6 +320,49 @@ in the past, and both the instance name and zone pass strict validation. The
 normal cleanup path deletes only the deterministic instance for the current
 GitHub run.
 
+## When GCP has no L4 capacity
+
+Provisioning fails with `ZONE_RESOURCE_POOL_EXHAUSTED` (`STOCKOUT`) when the
+zone has no L4 machine. Nothing was built wrong, and the built artifacts stay
+attached to the run. In order of preference:
+
+1. Point `GCP_GPU_ZONE` at another L4 zone of the subnet's region, then re-run
+   only the failed jobs. The run reuses its signed artifacts.
+2. Wait and re-run the failed jobs later.
+3. Waive the automated job for that one tag and qualify the candidate by hand.
+
+A waiver is the file `.github/stable-gpu-gate-waiver.json` in the tagged
+commit:
+
+```json
+{
+  "schema_version": 1,
+  "release_tag": "v1.2.3",
+  "reason": "Why the automated job could not run.",
+  "manual_qualification": {
+    "performed_on": "2026-11-28",
+    "hardware": "1x RTX 3090 24 GB, driver 580",
+    "candidate": "runtime-cuda-linux-x86_64 from release run <id>",
+    "evidence": "https://github.com/kapsl-runtime/kapsl-engine/..."
+  }
+}
+```
+
+- It applies only to the stable tag it names, so the next release runs the
+  automated job again without anyone removing the file.
+- `evidence` must link to the recorded results in this repository. Run the
+  manual qualification before the waiver is merged, on the exact CUDA candidate
+  the failed run built, and cover what the automated job covers: the managed
+  vLLM shared pool, llama.cpp next to vLLM, and the signed ORT CUDA 12 and
+  TensorRT 10 packs.
+- A malformed waiver fails the release. `stable_gpu_gate_waiver.py` validates
+  it and `test_release_pipeline.py` checks the committed file on every PR.
+- Only the GCP job is replaced. Infrastructure authentication, signing, CPU
+  parity and the publication gate still run.
+
+The tag has to point at a commit that contains the waiver, so a waiver added
+after tagging means moving the tag, which rebuilds and re-signs every artifact.
+
 Official references:
 
 - [GitHub JIT runner REST API](https://docs.github.com/en/rest/actions/self-hosted-runners)
