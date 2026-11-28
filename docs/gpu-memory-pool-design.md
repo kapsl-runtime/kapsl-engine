@@ -421,7 +421,12 @@ abandoning an allocation without a fence leaves it allocated and charged.
 
 The native governed allocator obtains region and allocation leases from the
 common pool. The llama.cpp adapter pins one arena for its existing `GpuKvPoolView`
-and allocates its block table through an allocation lease. ONNX's registered
+and allocates its block table through an allocation lease. Both take their
+leases only once load admission has admitted the workload: a backend is
+constructed before that admission (admission uses the plan the constructed
+backend reports), so construction may only bind the device's arena
+(`GpuDevicePool::bind_local_arena`), which refuses a device without one. The
+llama.cpp pack leases when it creates its KV pool from `load_model`. ONNX's registered
 allocator callbacks continue using a pinned arena under the existing admission
 and client-retirement contract. No backend gains permission to export another
 workload's arena or replace vLLM's native block allocator.

@@ -17,6 +17,8 @@ mod scaling;
 pub(crate) use activity::*;
 pub(crate) use autoscaler::*;
 use backend::*;
+#[cfg(test)]
+pub(crate) use backend::BackendLoadFailure;
 pub(crate) use idle_reload::*;
 pub(crate) use idle_unload::*;
 pub(crate) use lifecycle::*;

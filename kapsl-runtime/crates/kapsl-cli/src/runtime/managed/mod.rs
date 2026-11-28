@@ -2080,10 +2080,245 @@ fn managed_vllm_planner_live_resize_arguments(
     }
 }
 
+/// How much of the end of one planner run's log is searched for its error
+/// document. The document is a single line; teardown may log after it.
+const MANAGED_VLLM_PLANNER_ERROR_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Longest planner explanation copied into the load error.
+const MANAGED_VLLM_PLANNER_ERROR_MESSAGE_CHARS: usize = 1024;
+
+/// Text PyTorch and the CUDA runtime put in the exception for a failed device
+/// allocation: `torch.OutOfMemoryError` from the caching allocator, and
+/// `cudaErrorMemoryAllocation` raised through a CUDA call.
+const CUDA_OUT_OF_MEMORY_SIGNATURES: [&str; 2] =
+    ["CUDA out of memory", "CUDA error: out of memory"];
+
+/// The fail-closed document the connector planner prints as one stderr line
+/// before it exits 2 (`planner_error_json_schema()` in
+/// `kapsl_vllm_connector.planning`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerErrorDocument {
+    schema_version: u64,
+    status: String,
+    supported: bool,
+    error: ManagedVllmPlannerErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmPlannerErrorBody {
+    kind: String,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedVllmPlannerErrorKind {
+    /// The pinned runtime could not supply cache geometry: vLLM missing or
+    /// without the planning APIs, no model directory, malformed cache specs,
+    /// or any exception the executor-backed provider raised.
+    RuntimeGeometryUnavailable,
+    /// Arguments, sizing policy, or plan arithmetic were rejected.
+    PlanningFailed,
+}
+
+impl ManagedVllmPlannerErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeGeometryUnavailable => "runtime_geometry_unavailable",
+            Self::PlanningFailed => "planning_failed",
+        }
+    }
+}
+
+/// A planner run that exited unsuccessfully after reporting why in its error
+/// document.
+#[derive(Debug)]
+pub(crate) struct ManagedVllmPlannerFailure {
+    exit: String,
+    kind: ManagedVllmPlannerErrorKind,
+    message: String,
+    log_path: PathBuf,
+}
+
+impl ManagedVllmPlannerFailure {
+    /// The error document of this run, from the end of its log output. The
+    /// last line that is a valid document wins; anything else (no document,
+    /// malformed JSON, another schema, an unknown kind) gives `None`.
+    pub(crate) fn from_log(
+        exit: impl std::fmt::Display,
+        log_path: &Path,
+        log_tail: &str,
+    ) -> Option<Self> {
+        log_tail.lines().rev().find_map(|line| {
+            let line = line.trim();
+            if !line.starts_with('{') {
+                return None;
+            }
+            let document: ManagedVllmPlannerErrorDocument = serde_json::from_str(line).ok()?;
+            if document.schema_version != MANAGED_VLLM_PLANNER_SCHEMA_VERSION
+                || document.status != "error"
+                || document.supported
+            {
+                return None;
+            }
+            let kind = match document.error.kind.as_str() {
+                "runtime_geometry_unavailable" => {
+                    ManagedVllmPlannerErrorKind::RuntimeGeometryUnavailable
+                }
+                "planning_failed" => ManagedVllmPlannerErrorKind::PlanningFailed,
+                _ => return None,
+            };
+            let message = document.error.message.trim();
+            if message.is_empty() {
+                return None;
+            }
+            Some(Self {
+                exit: exit.to_string(),
+                kind,
+                message: message.to_string(),
+                log_path: log_path.to_path_buf(),
+            })
+        })
+    }
+
+    /// Whether the planner failed only because its devices lacked the free
+    /// memory to load the model at that moment, for example while a training
+    /// job held it. The same load can then succeed later, so callers may
+    /// answer "retry later" instead of reporting a broken model.
+    ///
+    /// The rule: the run's error document has kind
+    /// `runtime_geometry_unavailable` *and* its message carries a CUDA
+    /// out-of-memory signature from PyTorch or the CUDA runtime.
+    /// - `runtime_geometry_unavailable` alone is not enough: the planner also
+    ///   uses it for a missing vLLM or model directory, malformed cache specs,
+    ///   and every other exception of the geometry provider.
+    /// - `planning_failed` never qualifies: it rejects arguments, sizing
+    ///   policy, or plan arithmetic, which fail the same way on every retry.
+    /// - The document does not name the exception type, so the signature is
+    ///   matched in the planner's own message, never in free-form log lines.
+    ///
+    /// A model too large for an empty device fails the same way. An idle
+    /// reload repeats a placement that held the model before, so there the
+    /// condition is the transient one.
+    pub(crate) fn device_memory_unavailable(&self) -> bool {
+        self.kind == ManagedVllmPlannerErrorKind::RuntimeGeometryUnavailable
+            && CUDA_OUT_OF_MEMORY_SIGNATURES
+                .iter()
+                .any(|signature| self.message.contains(signature))
+    }
+}
+
+impl std::fmt::Display for ManagedVllmPlannerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self
+            .message
+            .char_indices()
+            .nth(MANAGED_VLLM_PLANNER_ERROR_MESSAGE_CHARS)
+        {
+            Some((end, _)) => format!("{}…", &self.message[..end]),
+            None => self.message.clone(),
+        };
+        write!(
+            formatter,
+            "managed vLLM geometry planner exited with {}: {message} (planner error {}; log: {})",
+            self.exit,
+            self.kind.as_str(),
+            self.log_path.display()
+        )
+    }
+}
+
+impl std::error::Error for ManagedVllmPlannerFailure {}
+
+impl From<ManagedVllmPlannerFailure> for EngineError {
+    fn from(failure: ManagedVllmPlannerFailure) -> Self {
+        EngineError::Backend {
+            message: failure.to_string(),
+            source: Some(Box::new(failure)),
+        }
+    }
+}
+
+/// Whether a load error, or any error in its source chain, is a managed vLLM
+/// planner failure caused by device memory that is in use (see
+/// [`ManagedVllmPlannerFailure::device_memory_unavailable`]).
+pub(crate) fn is_managed_vllm_device_memory_unavailable(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        error
+            .downcast_ref::<ManagedVllmPlannerFailure>()
+            .is_some_and(ManagedVllmPlannerFailure::device_memory_unavailable)
+    })
+}
+
+/// The load error a managed vLLM load returns when its planner reports
+/// `kind` and `message`, wrapped the way the load transaction wraps it.
+#[cfg(test)]
+pub(crate) fn managed_vllm_planner_load_error_for_tests(kind: &str, message: &str) -> DynError {
+    let document = serde_json::json!({
+        "error": {"kind": kind, "message": message},
+        "schema_version": MANAGED_VLLM_PLANNER_SCHEMA_VERSION,
+        "status": "error",
+        "supported": false,
+    });
+    let failure = ManagedVllmPlannerFailure::from_log(
+        "exit status: 2",
+        Path::new("/tmp/kapsl-vllm-1/model-0-replica-0/kv-planner.log"),
+        &document.to_string(),
+    )
+    .expect("a valid planner error document");
+    Box::new(BackendLoadFailure::new(
+        "Failed to load model 7 on device 0",
+        EngineError::from(failure),
+    ))
+}
+
+/// Why a planner run produced no plan.
+#[derive(Debug)]
+enum ManagedVllmPlannerError {
+    /// The planner exited after reporting its own failure.
+    Reported(ManagedVllmPlannerFailure),
+    /// Spawning, supervising, or validating the planner failed.
+    Other(String),
+}
+
+impl From<String> for ManagedVllmPlannerError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl From<ManagedVllmPlannerError> for EngineError {
+    fn from(error: ManagedVllmPlannerError) -> Self {
+        match error {
+            ManagedVllmPlannerError::Reported(failure) => failure.into(),
+            ManagedVllmPlannerError::Other(message) => EngineError::backend(message),
+        }
+    }
+}
+
+/// The part of the planner log written after `run_start`, at most its last
+/// [`MANAGED_VLLM_PLANNER_ERROR_TAIL_BYTES`].
+fn managed_vllm_planner_log_tail(log_path: &Path, run_start: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let end = file.metadata().ok()?.len();
+    let start = run_start.max(end.saturating_sub(MANAGED_VLLM_PLANNER_ERROR_TAIL_BYTES));
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(end.saturating_sub(start))
+        .read_to_end(&mut bytes)
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn run_managed_vllm_planner(
     python: &Path,
     invocation: &ManagedVllmPlannerInvocation,
-) -> Result<ManagedVllmExactPlanTemplate, String> {
+) -> Result<ManagedVllmExactPlanTemplate, ManagedVllmPlannerError> {
     let expected_policy = planner_policy_for_invocation(
         &invocation.policy,
         invocation.resolved_target_concurrency,
@@ -2110,6 +2345,11 @@ fn run_managed_vllm_planner(
                 invocation.log_path.display()
             )
         })?;
+    // The log is appended across runs; only this run's lines count.
+    let log_start = log_file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let mut command = Command::new(python);
     command
         .arg("-m")
@@ -2188,19 +2428,28 @@ fn run_managed_vllm_planner(
                     "managed vLLM geometry planner exceeded {}s; log: {}",
                     invocation.timeout.as_secs(),
                     invocation.log_path.display()
-                ));
+                )
+                .into());
             }
             Err(error) => {
                 stop_managed_vllm_planner(&mut child);
-                return Err(format!("inspect managed vLLM geometry planner: {error}"));
+                return Err(format!("inspect managed vLLM geometry planner: {error}").into());
             }
         }
     };
     if !status.success() {
-        return Err(format!(
-            "managed vLLM geometry planner exited with {status}; log: {}",
-            invocation.log_path.display()
-        ));
+        let reported =
+            managed_vllm_planner_log_tail(&invocation.log_path, log_start).and_then(|tail| {
+                ManagedVllmPlannerFailure::from_log(status, &invocation.log_path, &tail)
+            });
+        return Err(match reported {
+            Some(failure) => ManagedVllmPlannerError::Reported(failure),
+            None => format!(
+                "managed vLLM geometry planner exited with {status}; log: {}",
+                invocation.log_path.display()
+            )
+            .into(),
+        });
     }
     #[cfg(unix)]
     {
@@ -2212,7 +2461,8 @@ fn run_managed_vllm_planner(
             stop_managed_vllm_planner(&mut child);
             return Err(
                 "managed vLLM planner parent exited but its process group remained alive; refusing to start the serving generation"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
     }
@@ -3165,7 +3415,7 @@ impl ManagedVllmProcess {
                     "managed vLLM planner task failed before completion: {error}"
                 ))
             })
-            .and_then(|result| result.map_err(EngineError::backend));
+            .and_then(|result| result.map_err(EngineError::from));
             let mut template = match planned {
                 Ok(template) => template,
                 Err(error) => {
@@ -7114,5 +7364,165 @@ serving:
         assert_eq!(value[MANAGED_VLLM_CHAT_MARKER], true);
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["stop"][0], "stop");
+    }
+
+    /// The end of a real planner log (RTX 3090, 2026-11-28): a training job
+    /// held 21.8 GiB when an idle reload started the planner.
+    const PLANNER_OOM_LOG: &str = concat!(
+        "[W1128 10:41:07.000000000 CUDACachingAllocator.cpp:1270] memory allocation failed with OOM on device 0\n",
+        r#"{"error": {"kind": "runtime_geometry_unavailable", "message": "certified runtime geometry provider failed: CUDA out of memory. Tried to allocate 260.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 176.44 MiB is free. Process 27165 has 256.00 MiB memory in use. Process 27985 has 21.83 GiB memory in use."}, "schema_version": 1, "status": "error", "supported": false}"#,
+        "\n[rank0]:[W1128 10:41:08.000000000 ProcessGroupNCCL.cpp:1479] process group destroyed at exit\n",
+    );
+
+    const PLANNER_LOG_PATH: &str = "/tmp/kapsl-vllm-1/model-0-replica-0/kv-planner.log";
+
+    fn planner_failure(log: &str) -> Option<ManagedVllmPlannerFailure> {
+        ManagedVllmPlannerFailure::from_log("exit status: 2", Path::new(PLANNER_LOG_PATH), log)
+    }
+
+    fn planner_document(kind: &str, message: &str) -> String {
+        serde_json::json!({
+            "error": {"kind": kind, "message": message},
+            "schema_version": MANAGED_VLLM_PLANNER_SCHEMA_VERSION,
+            "status": "error",
+            "supported": false,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_planner_out_of_memory_report_is_device_memory_unavailable() {
+        let failure = planner_failure(PLANNER_OOM_LOG).expect("the planner's error document");
+        assert!(failure.device_memory_unavailable());
+        let message = failure.to_string();
+        assert!(
+            message.starts_with(
+                "managed vLLM geometry planner exited with exit status: 2: certified runtime geometry provider failed: CUDA out of memory."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(
+                "(planner error runtime_geometry_unavailable; log: {PLANNER_LOG_PATH})"
+            )),
+            "{message}"
+        );
+
+        // The CUDA runtime's own allocation error counts too.
+        let cuda_error = planner_document(
+            "runtime_geometry_unavailable",
+            "certified runtime geometry provider failed: CUDA error: out of memory",
+        );
+        assert!(planner_failure(&cuda_error)
+            .expect("document")
+            .device_memory_unavailable());
+
+        // The load transaction keeps the failure as a source, so the whole
+        // load error is recognisable and reads the same as before.
+        let load_error = managed_vllm_planner_load_error_for_tests(
+            "runtime_geometry_unavailable",
+            "certified runtime geometry provider failed: CUDA out of memory. Tried to allocate 260.00 MiB.",
+        );
+        assert!(is_managed_vllm_device_memory_unavailable(
+            load_error.as_ref()
+        ));
+        assert!(load_error.to_string().starts_with(
+            "Failed to load model 7 on device 0: Backend error: managed vLLM geometry planner exited with exit status: 2: certified runtime geometry provider failed: CUDA out of memory."
+        ));
+    }
+
+    #[test]
+    fn other_planner_failures_are_not_device_memory_unavailable() {
+        // Planning rejections fail the same way on every retry, even when
+        // their message talks about memory.
+        let rejected = planner_failure(&planner_document(
+            "planning_failed",
+            "--max-bytes is below the one-sequence minimum; CUDA out of memory would follow",
+        ))
+        .expect("document");
+        assert!(!rejected.device_memory_unavailable());
+        assert!(rejected
+            .to_string()
+            .contains("(planner error planning_failed; log: "));
+        assert!(!is_managed_vllm_device_memory_unavailable(
+            managed_vllm_planner_load_error_for_tests(
+                "planning_failed",
+                "--max-model-len must be positive"
+            )
+            .as_ref()
+        ));
+
+        // Geometry that is unavailable for any reason but CUDA memory.
+        for message in [
+            "pinned vLLM is not installed; certified runtime geometry is unavailable",
+            "model must be an existing Hugging Face directory: /models/missing",
+            "certified runtime geometry provider failed: NCCL error: unhandled system error",
+        ] {
+            let failure =
+                planner_failure(&planner_document("runtime_geometry_unavailable", message))
+                    .expect("document");
+            assert!(!failure.device_memory_unavailable(), "{message}");
+        }
+
+        // No usable document: the failure stays an unstructured exit.
+        let oom_document = planner_document(
+            "runtime_geometry_unavailable",
+            "certified runtime geometry provider failed: CUDA out of memory.",
+        );
+        for log in [
+            String::new(),
+            "Traceback (most recent call last):\ntorch.OutOfMemoryError: CUDA out of memory.\n"
+                .to_string(),
+            oom_document[..oom_document.len() - 10].to_string(),
+            oom_document.replace("\"status\":\"error\"", "\"status\":\"planned\""),
+            oom_document.replace("\"supported\":false", "\"supported\":true"),
+            oom_document.replace("\"schema_version\":1", "\"schema_version\":2"),
+            oom_document.replace("runtime_geometry_unavailable", "out_of_memory"),
+            planner_document("runtime_geometry_unavailable", "  "),
+        ] {
+            assert!(planner_failure(&log).is_none(), "{log}");
+        }
+
+        let plain: DynError = "Failed to load model 7 on device 0: Backend error: managed vLLM geometry planner exited with exit status: 2; log: /tmp/kv-planner.log".into();
+        assert!(!is_managed_vllm_device_memory_unavailable(plain.as_ref()));
+    }
+
+    #[test]
+    fn only_the_current_planner_run_is_read_from_its_log() {
+        let directory = tempfile::tempdir().unwrap();
+        let log_path = directory.path().join("kv-planner.log");
+        std::fs::write(&log_path, PLANNER_OOM_LOG).unwrap();
+        let run_start = std::fs::metadata(&log_path).unwrap().len();
+
+        // An earlier run's out-of-memory report does not describe this run.
+        let tail = managed_vllm_planner_log_tail(&log_path, run_start).unwrap();
+        assert!(ManagedVllmPlannerFailure::from_log("exit status: 1", &log_path, &tail).is_none());
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        use std::io::Write as _;
+        writeln!(
+            log,
+            "{}",
+            planner_document("planning_failed", "--max-model-len must be positive")
+        )
+        .unwrap();
+        let tail = managed_vllm_planner_log_tail(&log_path, run_start).unwrap();
+        let failure = ManagedVllmPlannerFailure::from_log("exit status: 2", &log_path, &tail)
+            .expect("this run's document");
+        assert!(!failure.device_memory_unavailable());
+
+        // A long explanation is cut in the message but still classified.
+        let long = format!(
+            "certified runtime geometry provider failed: CUDA out of memory. {}",
+            "é".repeat(4 * MANAGED_VLLM_PLANNER_ERROR_MESSAGE_CHARS)
+        );
+        let failure = planner_failure(&planner_document("runtime_geometry_unavailable", &long))
+            .expect("document");
+        assert!(failure.device_memory_unavailable());
+        assert!(failure.to_string().contains("é… (planner error"));
+        assert!(failure.to_string().chars().count() < 2 * MANAGED_VLLM_PLANNER_ERROR_MESSAGE_CHARS);
     }
 }

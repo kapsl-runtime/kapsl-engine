@@ -92,6 +92,13 @@ impl DeviceBootstrapDemand {
             .copied()
             .fold(0usize, usize::saturating_add)
     }
+
+    /// Whether automatic mode the operator did not request explicitly
+    /// provisions a pool: some model's route allocates from it, and no
+    /// isolated worker on the device would compete with a parent backing.
+    fn wants_implicit_pool(&self) -> bool {
+        self.wants_pool && !self.has_isolated_worker
+    }
 }
 
 /// Why a dynamic load that needs a bigger pool than the one already admitted is refused. The harness
@@ -198,6 +205,16 @@ impl DeviceMemoryBootstrapPlan {
 
     fn demand(&self, device_id: usize) -> DeviceBootstrapDemand {
         self.devices.get(&device_id).cloned().unwrap_or_default()
+    }
+
+    /// `(minimum pooled, planned external)` bytes on a device whose demand
+    /// makes automatic mode provision a pool; `None` when it would not.
+    #[cfg(test)]
+    pub(crate) fn implicit_pool_demand(&self, device_id: usize) -> Option<(usize, usize)> {
+        let demand = self.demand(device_id);
+        demand
+            .wants_implicit_pool()
+            .then(|| (demand.minimum_pool_bytes(), demand.planned_external_bytes()))
     }
 }
 
@@ -497,9 +514,7 @@ impl DeviceMemoryManager {
                 DevicePoolMode::Fixed(capacity) => {
                     self.validate_fixed_pool(device_id, capacity, &demand)?;
                 }
-                DevicePoolMode::Auto { explicit }
-                    if explicit || (demand.wants_pool && !demand.has_isolated_worker) =>
-                {
+                DevicePoolMode::Auto { explicit } if explicit || demand.wants_implicit_pool() => {
                     let (_, decision) = self.auto_pool_sizing_decision(device_id, &demand)?;
                     if explicit && decision.capacity_bytes.is_none() {
                         return Err(format!(
@@ -521,9 +536,7 @@ impl DeviceMemoryManager {
                 DevicePoolMode::Fixed(capacity) => {
                     self.materialize_pool(device_id, capacity, false)?;
                 }
-                DevicePoolMode::Auto { explicit }
-                    if explicit || (demand.wants_pool && !demand.has_isolated_worker) =>
-                {
+                DevicePoolMode::Auto { explicit } if explicit || demand.wants_implicit_pool() => {
                     self.materialize_auto_pool(device_id, &demand, explicit)?;
                 }
                 DevicePoolMode::Auto { .. } => {}
@@ -567,7 +580,7 @@ impl DeviceMemoryManager {
         bootstrap: &DeviceMemoryBootstrapPlan,
     ) -> Result<(), String> {
         for (&device_id, demand) in &bootstrap.devices {
-            if !demand.wants_pool || demand.has_isolated_worker {
+            if !demand.wants_implicit_pool() {
                 continue;
             }
             let Some(authority) = self.devices.get(&device_id) else {

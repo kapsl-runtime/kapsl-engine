@@ -966,7 +966,16 @@ fn test_openai_routes_with_embedding_model(
 fn idle_unloaded_model(
     reload: Result<(), IdleReloadError>,
 ) -> (Arc<ModelManager>, Arc<InferenceService>) {
+    let (models, inference, _) = counted_idle_unloaded_model(reload);
+    (models, inference)
+}
+
+/// [`idle_unloaded_model`], also counting the loads its reloader starts.
+fn counted_idle_unloaded_model(
+    reload: Result<(), IdleReloadError>,
+) -> (Arc<ModelManager>, Arc<InferenceService>, Arc<AtomicUsize>) {
     const MODEL_ID: u32 = 7;
+    let loads = Arc::new(AtomicUsize::new(0));
     let registry = Arc::new(ModelRegistry::new());
     registry.register(ModelInfo::new(
         MODEL_ID,
@@ -991,13 +1000,13 @@ fn idle_unloaded_model(
     models.begin_idle_unload(MODEL_ID);
     models.stop_runtime(MODEL_ID);
 
-    let reloader = IdleReloader::new(
-        models.clone(),
-        Duration::from_secs(10),
+    let reloader = IdleReloader::new(models.clone(), Duration::from_secs(10), {
+        let loads = loads.clone();
         move |_,
               _,
               _|
               -> futures::future::BoxFuture<'static, Result<LoadedModel, IdleReloadError>> {
+            loads.fetch_add(1, Ordering::SeqCst);
             let reload = reload.clone();
             Box::pin(async move {
                 reload.map(|()| {
@@ -1009,8 +1018,8 @@ fn idle_unloaded_model(
                     (Arc::new(pool), Vec::new())
                 })
             })
-        },
-    );
+        }
+    });
     let inference = InferenceService::new_with_idle_reloader(
         models.clone(),
         ResourcePressure::new(
@@ -1020,7 +1029,7 @@ fn idle_unloaded_model(
         Arc::new(ModelTelemetry::default()),
         reloader,
     );
-    (models, inference)
+    (models, inference, loads)
 }
 
 fn memory_held_by_training() -> IdleReloadError {
@@ -1145,6 +1154,99 @@ async fn native_infer_routes_report_a_denied_idle_reload_as_unavailable() {
         .reply(&infer)
         .await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+}
+
+/// The failure seen on a GPU shared with training: the managed vLLM planner
+/// of an idle reload ran out of CUDA memory.
+#[tokio::test]
+async fn a_planner_out_of_memory_idle_reload_is_503_with_retry_after_also_when_cached() {
+    let load_error = managed_vllm_planner_load_error_for_tests(
+        "runtime_geometry_unavailable",
+        "certified runtime geometry provider failed: CUDA out of memory. Tried to allocate 260.00 MiB. Process 27985 has 21.83 GiB memory in use.",
+    );
+    let (models, inference, loads) = counted_idle_unloaded_model(Err(
+        IdleReloadError::from_load_error(7, load_error.as_ref()),
+    ));
+    let routes = build_openai_routes(OpenAiRoutesConfig {
+        models: models.clone(),
+        inference: inference.clone(),
+    });
+
+    // The first request runs the reload; the second gets its cached failure.
+    for attempt in 1..=2 {
+        let response = warp::test::request()
+            .method("POST")
+            .path("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#)
+            .reply(&routes)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attempt {attempt}"
+        );
+        assert_eq!(response.headers()["retry-after"], "10", "attempt {attempt}");
+        let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("cannot be reloaded right now"),
+            "{message}"
+        );
+        assert!(message.contains("CUDA out of memory"), "{message}");
+        assert!(message.contains("21.83 GiB memory in use"), "{message}");
+    }
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+    let infer = build_model_infer_route(ModelInferRouteConfig {
+        models: models.clone(),
+        inference,
+        log_sensitive_ids: false,
+        rag: generation_rag("idle-reload-planner-oom-rag"),
+    });
+    let response = warp::test::request()
+        .method("POST")
+        .path("/api/models/7/infer")
+        .header("content-type", "application/json")
+        .body(format!(r#"{{{GEN_INPUT}}}"#))
+        .reply(&infer)
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+    assert_eq!(body["reason"], "idle_reload_memory_unavailable");
+    assert_eq!(body["retry_after_seconds"], 10);
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+    assert!(models.reloads_on_request(7), "a later request tries again");
+}
+
+#[tokio::test]
+async fn other_planner_failures_of_an_idle_reload_stay_500_without_retry_after() {
+    let load_error = managed_vllm_planner_load_error_for_tests(
+        "planning_failed",
+        "--max-model-len must be positive",
+    );
+    let (models, inference) = idle_unloaded_model(Err(IdleReloadError::from_load_error(
+        7,
+        load_error.as_ref(),
+    )));
+    let routes = build_openai_routes(OpenAiRoutesConfig { models, inference });
+
+    let response = warp::test::request()
+        .method("POST")
+        .path("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .reply(&routes)
+        .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(response.headers().get("retry-after").is_none());
+    let body: serde_json::Value = serde_json::from_slice(response.body()).expect("error json");
+    let message = body["error"]["message"].as_str().expect("message");
+    assert!(message.contains("could not be reloaded"), "{message}");
+    assert!(
+        message.contains("--max-model-len must be positive"),
+        "{message}"
+    );
 }
 
 async fn post_chat_completion(body: &str) -> warp::http::Response<warp::hyper::body::Bytes> {
