@@ -78,6 +78,8 @@ on:
       - ".github/scripts/gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/github_jit_runner.py"
       - ".github/scripts/validate_stable_gpu_release.py"
+      - ".github/scripts/stable_gpu_gate_waiver.py"
+      - ".github/stable-gpu-gate-waiver.json"
       - ".github/scripts/test_gcp_ephemeral_gpu_runner.py"
       - ".github/scripts/test_github_jit_runner.py"
       - ".github/scripts/validate_model_package_backend.py"
