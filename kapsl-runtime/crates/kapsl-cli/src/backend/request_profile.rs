@@ -67,6 +67,15 @@ impl RequestProfile {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn enabled_for_test(
+        component: &'static str,
+        model_id: u32,
+        replica_id: u32,
+    ) -> Self {
+        Self::with_limit(component, model_id, replica_id, LIMIT)
+    }
+
     fn with_limit(component: &'static str, model_id: u32, replica_id: u32, limit: usize) -> Self {
         Self {
             component,
