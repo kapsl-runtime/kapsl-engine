@@ -179,6 +179,13 @@ cd ./models/mnist
 kapsl push alice/mnist:prod
 ```
 
+Pull a model from the official Kapsl library (the repo defaults to `kapsl` and the label to
+`latest`):
+
+```bash
+kapsl pull qwen3-4b --destination-dir ./models
+```
+
 Pull package:
 
 ```bash

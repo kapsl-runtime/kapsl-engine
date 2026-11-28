@@ -1,6 +1,6 @@
 use super::super::{
-    parse_model_target, pull_kapsl_from_remote, push_kapsl_to_remote, PullKapslRequest,
-    PushKapslRequest,
+    parse_model_target, pull_kapsl_from_remote, push_kapsl_to_remote, target_uses_default_repo,
+    PullKapslRequest, PushKapslRequest, DEFAULT_REPO,
 };
 use super::output::print_transfer_summary;
 use crate::app::{dyn_error_from_message, run_with_loading, PullCommandArgs, PushCommandArgs};
@@ -36,7 +36,7 @@ fn discover_package_in_current_directory() -> Result<PathBuf, String> {
 
     candidates.sort();
     if candidates.is_empty() {
-        return Err("No .aimod files found in the current directory. Pass an explicit package path via `kapsl push <repo>/<model>:<label> <PATH>` or `--model <PATH>`.".to_string());
+        return Err("No .aimod files found in the current directory. Pass an explicit package path via `kapsl push [<repo>/]<model>[:<label>] <PATH>` or `--model <PATH>`.".to_string());
     }
     if candidates.len() == 1 {
         return Ok(candidates.remove(0));
@@ -62,10 +62,24 @@ fn discover_package_in_current_directory() -> Result<PathBuf, String> {
     ))
 }
 
+/// Explains a refused push whose target named no repo: it went to the official
+/// library, which only its maintainers can publish to.
+fn push_error_hint(error: String, uses_default_repo: bool) -> String {
+    if uses_default_repo && error.contains("HTTP 403") {
+        format!(
+            "{error}\nThe target names no repo, so it means the official `{DEFAULT_REPO}` \
+             library, which only its maintainers can publish to. Push to your own repo \
+             instead: `kapsl push <your-repo>/<model>`."
+        )
+    } else {
+        error
+    }
+}
+
 pub(crate) fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError> {
     if args.kapsl.is_some() && args.model.is_some() {
         return Err(dyn_error_from_message(
-            "Push expects a single `.aimod` argument. Use either `kapsl push <repo>/<model>:<label> <KAPSL>` or `kapsl push <repo>/<model>:<label> --model <PATH>`.",
+            "Push expects a single `.aimod` argument. Use either `kapsl push [<repo>/]<model>[:<label>] <KAPSL>` or `kapsl push [<repo>/]<model>[:<label>] --model <PATH>`.",
         ));
     }
     let target = parse_model_target(&args.target).map_err(dyn_error_from_message)?;
@@ -82,8 +96,10 @@ pub(crate) fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError
     };
 
     let started_at = Instant::now();
+    let uses_default_repo = target_uses_default_repo(&args.target);
     let response = run_with_loading("Uploading package", || {
-        push_kapsl_to_remote(&request).map_err(dyn_error_from_message)
+        push_kapsl_to_remote(&request)
+            .map_err(|error| dyn_error_from_message(push_error_hint(error, uses_default_repo)))
     })?;
     print_transfer_summary(
         "Uploaded",
@@ -97,11 +113,13 @@ pub(crate) fn execute_push_command(args: PushCommandArgs) -> Result<(), DynError
 pub(crate) fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError> {
     if args.target.is_some() && args.model.is_some() {
         return Err(dyn_error_from_message(
-            "Pull expects a single target argument. Use either `kapsl pull <repo>/<model>:<label>` or `kapsl pull --model <repo>/<model>:<label>`.",
+            "Pull expects a single target argument. Use either `kapsl pull [<repo>/]<model>[:<label>]` or `kapsl pull --model [<repo>/]<model>[:<label>]`.",
         ));
     }
     let target = args.target.or(args.model).ok_or_else(|| {
-        dyn_error_from_message("Target is required. Usage: `kapsl pull <repo>/<model>:<label>`.")
+        dyn_error_from_message(
+            "Target is required. Usage: `kapsl pull [<repo>/]<model>[:<label>]`.",
+        )
     })?;
     let target = parse_model_target(&target).map_err(dyn_error_from_message)?;
     let request = PullKapslRequest {
@@ -125,4 +143,29 @@ pub(crate) fn execute_pull_command(args: PullCommandArgs) -> Result<(), DynError
         &response.kapsl_path,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_error_hint;
+
+    const REFUSED: &str = "Failed to request an upload URL from https://example.invalid/v1/aimod/kapsl/m:latest/upload: Remote backend returned HTTP 403";
+
+    #[test]
+    fn a_refused_push_to_the_implied_official_library_explains_itself() {
+        let message = push_error_hint(REFUSED.to_string(), true);
+        assert!(message.starts_with(REFUSED), "{message}");
+        assert!(message.contains("official `kapsl` library"), "{message}");
+        assert!(
+            message.contains("kapsl push <your-repo>/<model>"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn other_push_errors_are_left_alone() {
+        assert_eq!(push_error_hint(REFUSED.to_string(), false), REFUSED);
+        let unavailable = "Failed to upload: Remote backend returned HTTP 503".to_string();
+        assert_eq!(push_error_hint(unavailable.clone(), true), unavailable);
+    }
 }

@@ -39,8 +39,8 @@ use context::{
 #[cfg(test)]
 pub(crate) use context::{prompt_model_file_with_default, prompt_with_default};
 pub(crate) use remote::{pull_kapsl_from_remote, push_kapsl_to_remote};
-pub(crate) use target::parse_model_target;
 use target::ModelTargetRef;
+pub(crate) use target::{parse_model_target, target_uses_default_repo, DEFAULT_REPO};
 #[cfg(test)]
 pub(crate) use temp::TempDirGuard;
 use temp::{replace_output_file, staged_output_path};

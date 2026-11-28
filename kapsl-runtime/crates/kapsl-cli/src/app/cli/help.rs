@@ -49,6 +49,10 @@ const HELP_EXAMPLES: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "# Pull a model from the official Kapsl library (same as kapsl/qwen3-4b:latest)",
+        &["kapsl pull qwen3-4b --destination-dir ./models"],
+    ),
+    (
         "# Push / pull packages to/from a remote registry",
         &[
             "kapsl push acme/gpt2:prod ./model.aimod",
