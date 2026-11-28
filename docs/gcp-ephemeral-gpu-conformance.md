@@ -323,45 +323,57 @@ GitHub run.
 ## When GCP has no L4 capacity
 
 Provisioning fails with `ZONE_RESOURCE_POOL_EXHAUSTED` (`STOCKOUT`) when the
-zone has no L4 machine. Nothing was built wrong, and the built artifacts stay
-attached to the run. In order of preference:
+zone has no L4 machine. Nothing was built wrong, and the run keeps its signed
+artifacts. In order of preference:
 
 1. Point `GCP_GPU_ZONE` at another L4 zone of the subnet's region, then re-run
-   only the failed jobs. The run reuses its signed artifacts.
+   only the failed jobs. The run reuses its artifacts.
 2. Wait and re-run the failed jobs later.
-3. Waive the automated job for that one tag and qualify the candidate by hand.
+3. Qualify that run's CUDA artifact by hand and waive the automated job for
+   that run only.
 
-A waiver is the file `.github/stable-gpu-gate-waiver.json` in the tagged
-commit:
+### Waiving the GCP job for one run
 
-```json
-{
-  "schema_version": 1,
-  "release_tag": "v1.2.3",
-  "reason": "Why the automated job could not run.",
-  "manual_qualification": {
-    "performed_on": "2026-11-28",
-    "hardware": "1x RTX 3090 24 GB, driver 580",
-    "candidate": "runtime-cuda-linux-x86_64 from release run <id>",
-    "evidence": "https://github.com/kapsl-runtime/kapsl-engine/..."
-  }
-}
-```
+1. Download the run's `runtime-cuda-linux-x86_64` artifact on a GPU host and
+   cover what the automated job covers: the signed ORT CUDA 12 and TensorRT 10
+   packs, the managed vLLM shared pool, and llama.cpp next to vLLM. Record the
+   artifact digest that the artifacts API reports
+   (`gh api repos/kapsl-runtime/kapsl-engine/actions/runs/<run>/artifacts --jq '.artifacts[] | {name, digest}'`)
+   and check that the downloaded zip has the same SHA-256.
+2. Post the results in this repository (an issue or PR comment).
+3. Merge `.github/stable-gpu-gate-waiver.json` into `main`:
 
-- It applies only to the stable tag it names, so the next release runs the
-  automated job again without anyone removing the file.
-- `evidence` must link to the recorded results in this repository. Run the
-  manual qualification before the waiver is merged, on the exact CUDA candidate
-  the failed run built, and cover what the automated job covers: the managed
-  vLLM shared pool, llama.cpp next to vLLM, and the signed ORT CUDA 12 and
-  TensorRT 10 packs.
-- A malformed waiver fails the release. `stable_gpu_gate_waiver.py` validates
-  it and `test_release_pipeline.py` checks the committed file on every PR.
-- Only the GCP job is replaced. Infrastructure authentication, signing, CPU
-  parity and the publication gate still run.
+   ```json
+   {
+     "schema_version": 1,
+     "release_tag": "v1.2.3",
+     "run_id": 46080324165,
+     "candidate": {
+       "artifact": "runtime-cuda-linux-x86_64",
+       "digest": "sha256:<64 hex digits>"
+     },
+     "reason": "Why the automated job could not run.",
+     "manual_qualification": {
+       "performed_on": "2026-11-28",
+       "hardware": "1x RTX 3090 24 GB, driver 595",
+       "evidence": "https://github.com/kapsl-runtime/kapsl-engine/..."
+     }
+   }
+   ```
 
-The tag has to point at a commit that contains the waiver, so a waiver added
-after tagging means moving the tag, which rebuilds and re-signs every artifact.
+4. Re-run the failed jobs of that release run. The GCP job is tried again. If
+   it still fails, `release-conformance-gate` reads the waiver from `main` and
+   `stable_gpu_gate_waiver.py` accepts it only when the tag, the run ID and the
+   digest of that run's CUDA artifact all match. Then the run publishes the
+   artifacts that were qualified.
+
+- The waiver is read when the gate runs, not from the tag, so no rebuild is
+  needed, and it can only publish the exact artifact that was qualified.
+- Only the GPU job can be waived. Infrastructure authentication, signing and
+  CPU parity must still pass.
+- Anything malformed or mismatched keeps publication blocked.
+- The run still ends as failed, because the GCP job failed. The gate's warning
+  names the waiver, so the record stays in the run.
 
 Official references:
 
